@@ -18,6 +18,7 @@ from aero_bot.audit import (
     AuditVerificationStatus,
     RiskDecisionAuditPayload,
     TransactionPlanAuditPayload,
+    TransactionSimulationAuditPayload,
 )
 from aero_bot.concentrated import (
     ConcentratedLiquidityAnalyzer,
@@ -254,7 +255,23 @@ def create_app(
     @application.post("/api/transactions/simulate", response_model=PlanSimulationResult)
     def simulate_transaction_plan(plan: UnsignedTransactionPlan) -> PlanSimulationResult:
         """Revalidate and submit an unsigned plan to read-only simulation only."""
-        return resolved_transaction_planner.simulate(plan)
+        # Simulation performs complete policy revalidation before any optional eth_call backend.
+        result = resolved_transaction_planner.simulate(plan)
+        # Envelope retains the submitted unsigned plan, active policy, and complete result.
+        audit_payload = TransactionSimulationAuditPayload(
+            plan=plan,
+            policy=resolved_transaction_planner.policy,
+            result=result,
+        )
+        # Durable append is required for every simulation status before returning evidence.
+        _append_audit_event(
+            resolved_audit_store,
+            AuditEventType.TRANSACTION_SIMULATION,
+            audit_payload,
+            resolved_clock(),
+            "Transaction simulation",
+        )
+        return result
 
     @application.post(
         "/api/analysis/concentrated-position", response_model=ConcentratedPositionAnalysis

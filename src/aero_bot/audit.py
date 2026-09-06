@@ -19,7 +19,13 @@ from aero_bot.domain import (
     RiskDecision,
     RiskPolicy,
 )
-from aero_bot.transactions import AllowancePlanResult, ExactAllowanceRequest, TransactionPolicy
+from aero_bot.transactions import (
+    AllowancePlanResult,
+    ExactAllowanceRequest,
+    PlanSimulationResult,
+    TransactionPolicy,
+    UnsignedTransactionPlan,
+)
 
 # Schema version permits explicit future migrations rather than silent table changes.
 AUDIT_SCHEMA_VERSION = 1
@@ -139,6 +145,20 @@ class TransactionPlanAuditPayload(BaseModel):
     policy: TransactionPolicy
     # Result contains the exact blocked, no-action, or unsigned ready outcome returned by the API.
     result: AllowancePlanResult
+
+
+class TransactionSimulationAuditPayload(BaseModel):
+    """Capture every validated dependency and output of read-only plan simulation."""
+
+    # Frozen strict fields preserve one coherent simulation evidence envelope.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # Plan retains the exact caller-submitted unsigned content that was revalidated.
+    plan: UnsignedTransactionPlan
+    # Policy contains the emergency state and complete contract allowlists used for revalidation.
+    policy: TransactionPolicy
+    # Result contains the exact blocked, unavailable, rejected, reverted, or passed outcome.
+    result: PlanSimulationResult
 
 
 class AuditStore:

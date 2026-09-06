@@ -76,5 +76,5 @@ It rejects credential-shaped fields before persistence and uses restrictive user
 The dashboard, process health route, and `/api/audit/health` expose complete chain verification.
 Every risk response is persisted with its validated input, active policy, and exact decision before it is returned.
 Every exact-allowance planning response is persisted with its public request, active policy, and exact result before it is returned.
-Read-only simulation audit integration remains pending.
+Every read-only simulation response is persisted with its submitted unsigned plan, active revalidation policy, and complete result before it is returned.
 See [the audit log design](docs/audit-log.md) for guarantees, limitations, and integration status.

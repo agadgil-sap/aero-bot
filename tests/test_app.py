@@ -14,7 +14,13 @@ from aero_bot.audit import AuditEventType, AuditStore, AuditVerificationStatus
 from aero_bot.config import Settings
 from aero_bot.domain import RiskPolicy
 from aero_bot.registry import B20RegistryResult, RegistryStatus
-from aero_bot.transactions import TransactionPlanner, TransactionPolicy
+from aero_bot.transactions import (
+    SimulationBatch,
+    SimulationObservation,
+    TransactionPlanner,
+    TransactionPolicy,
+    UnsignedTransactionPlan,
+)
 from aero_bot.venues import (
     PoolCandidate,
     PoolDiscoveryResult,
@@ -66,6 +72,37 @@ def allowance_request_payload(
         "current_allowance_raw": current_allowance_raw,
         "block_number": 35_000_000,
     }
+
+
+class PassingSimulationBackend:
+    """Return complete deterministic read-only observations for HTTP audit tests."""
+
+    def simulate(self, plan: UnsignedTransactionPlan) -> SimulationBatch:
+        """Simulate every unsigned fixture transaction without signing or broadcasting.
+
+        Args:
+            plan: Revalidated unsigned plan pinned to one Base block.
+
+        Returns:
+            Complete ordered fixture observations for the submitted plan.
+        """
+        # Every planned call receives one successful empty-byte eth_call observation.
+        observations = tuple(
+            SimulationObservation(
+                transaction_index=index,
+                success=True,
+                gas_used=45_000,
+                return_data="0x",
+                revert_reason=None,
+            )
+            for index in range(len(plan.transactions))
+        )
+        return SimulationBatch(
+            source="fixture:block-35000000",
+            block_number=plan.block_number,
+            observed_at=datetime(2026, 9, 6, 11, 0, tzinfo=UTC),
+            observations=observations,
+        )
 
 
 @pytest.mark.anyio
@@ -322,14 +359,20 @@ async def test_transaction_routes_plan_then_report_simulation_unavailable(
     assert simulation_response.status_code == 200
     assert simulation_response.json()["status"] == "unavailable"
     assert simulation_response.json()["observations"] == []
-    # Both planning responses are audited, while simulation remains pending this iteration.
+    # Both planning responses and the read-only simulation result are durably audited.
     audit_records = audit_store.read_records()
     # First canonical payload contains the exact ready response and immutable policy.
     ready_audit_payload = json.loads(audit_records[0].payload_json)
     # Second canonical payload retains the exact no-action evidence without a transaction plan.
     no_action_audit_payload = json.loads(audit_records[1].payload_json)
-    assert len(audit_records) == 2
-    assert all(record.event_type is AuditEventType.TRANSACTION_PLAN for record in audit_records)
+    # Third canonical payload binds the submitted unsigned plan to the unavailable result.
+    simulation_audit_payload = json.loads(audit_records[2].payload_json)
+    assert len(audit_records) == 3
+    assert [record.event_type for record in audit_records] == [
+        AuditEventType.TRANSACTION_PLAN,
+        AuditEventType.TRANSACTION_PLAN,
+        AuditEventType.TRANSACTION_SIMULATION,
+    ]
     assert ready_audit_payload["request"] == allowance_request_payload()
     assert ready_audit_payload["policy"]["emergency_halt"] is False
     assert ready_audit_payload["result"] == planning_response.json()
@@ -339,6 +382,72 @@ async def test_transaction_routes_plan_then_report_simulation_unavailable(
         current_allowance_raw=1_250_000
     )
     assert no_action_audit_payload["result"] == no_action_response.json()
+    assert simulation_audit_payload["plan"] == planning_response.json()["plan"]
+    assert simulation_audit_payload["policy"]["emergency_halt"] is False
+    assert simulation_audit_payload["result"] == simulation_response.json()
+    assert simulation_audit_payload["result"]["status"] == "unavailable"
+    assert simulation_audit_payload["plan"]["signing_available"] is False
+    assert simulation_audit_payload["plan"]["broadcast_available"] is False
+
+
+@pytest.mark.anyio
+async def test_passed_simulation_persists_complete_read_only_evidence(tmp_path: Path) -> None:
+    """Successful backend observations are durably bound to their unsigned plan."""
+    # Enabled fixture policy permits only the public token and spender in the request helper.
+    transaction_policy = TransactionPolicy(
+        emergency_halt=False,
+        allowed_token_addresses=frozenset({"0xb20000000000000000000078ee7ce2fe4908108c"}),
+        allowed_spender_addresses=frozenset({"0x2222222222222222222222222222222222222222"}),
+    )
+    # Backend implements only the read-only simulation protocol required by the planner.
+    transaction_planner = TransactionPlanner(transaction_policy, PassingSimulationBackend())
+    # Dedicated store makes the plan and simulation event sequence directly inspectable.
+    audit_store = AuditStore(tmp_path / "passed-simulation-audit" / "audit.sqlite3")
+    # Complete ASGI boundary exercises validation, planning, simulation, serialization, and audit.
+    transport = httpx.ASGITransport(
+        app=create_app(
+            Settings(),
+            transaction_planner=transaction_planner,
+            audit_store=audit_store,
+        )
+    )
+    # One client passes the returned unsigned plan unchanged into read-only simulation.
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Planning produces the sole supported unsigned exact-allowance action.
+        planning_response = await client.post(
+            "/api/transactions/plan/exact-allowance",
+            json=allowance_request_payload(),
+        )
+        # Simulation consumes only the public unsigned plan returned by the prior response.
+        simulation_response = await client.post(
+            "/api/transactions/simulate",
+            json=planning_response.json()["plan"],
+        )
+
+    # Second record is the simulation event linked after its originating plan event.
+    audit_records = audit_store.read_records()
+    # Canonical payload contains complete backend evidence and immutable revalidation policy.
+    simulation_audit_payload = json.loads(audit_records[1].payload_json)
+    assert planning_response.status_code == 200
+    assert simulation_response.status_code == 200
+    assert simulation_response.json()["status"] == "passed"
+    assert len(audit_records) == 2
+    assert audit_records[1].event_type is AuditEventType.TRANSACTION_SIMULATION
+    assert simulation_audit_payload["plan"] == planning_response.json()["plan"]
+    assert simulation_audit_payload["result"] == simulation_response.json()
+    assert simulation_audit_payload["result"]["source"] == "fixture:block-35000000"
+    assert simulation_audit_payload["result"]["observations"] == [
+        {
+            "gas_used": 45_000,
+            "return_data": "0x",
+            "revert_reason": None,
+            "success": True,
+            "transaction_index": 0,
+        }
+    ]
+    assert simulation_audit_payload["plan"]["signing_available"] is False
+    assert simulation_audit_payload["plan"]["broadcast_available"] is False
+    assert audit_store.verify_chain().status is AuditVerificationStatus.VERIFIED
 
 
 @pytest.mark.anyio

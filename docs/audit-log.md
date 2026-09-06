@@ -41,5 +41,7 @@ Every `/api/transactions/plan/exact-allowance` response is also appended before 
 The event contains the complete public request, immutable transaction policy, and exact blocked, no-action, or unsigned ready result.
 No audit payload includes a private key, signature, signed transaction, or broadcast capability.
 
-Read-only simulation events are not connected yet.
-A later slice must append their submitted unsigned plan and complete result at that service boundary.
+Every `/api/transactions/simulate` response is appended before it is returned.
+The event contains the exact caller-submitted unsigned plan, immutable revalidation policy, and complete blocked, unavailable, rejected, reverted, or passed result.
+Passed results preserve the read-only backend source, pinned Base block, aware observation time, and one ordered `eth_call` observation per unsigned transaction.
+An audit failure can suppress a simulation response after a backend call, but that external operation remains read-only and cannot sign or broadcast.

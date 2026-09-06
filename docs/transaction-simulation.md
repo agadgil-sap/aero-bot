@@ -38,4 +38,6 @@ Every exact-allowance planning response is appended to the local immutable audit
 The record includes the validated public request, complete active transaction policy, and exact blocked, no-action, or ready result.
 Ready records contain only unsigned transaction plans and retain explicit false signing and broadcasting capabilities.
 Audit integrity failure returns an evidence-backed service-unavailable response instead of an unaudited plan.
-Read-only simulation results will be connected to the audit chain in a separate integration slice.
+Every read-only simulation response is also appended before it is returned.
+The simulation record binds the exact submitted unsigned plan and active revalidation policy to the complete result, including ordered backend observations when available.
+Blocked, unavailable, rejected, reverted, and passed statuses share the same required durable boundary.
