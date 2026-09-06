@@ -66,3 +66,10 @@ See [the concentrated-liquidity policy](docs/concentrated-liquidity.md) for form
 The deterministic risk engine models unstaked swap fees and staked AERO emissions as mutually exclusive Aerodrome compensation modes.
 It compares retained fee APR with conservatively discounted emission APR but credits only the selected mode before subtracting impermanent-loss and adverse-selection costs.
 The `/api/risk/evaluate` endpoint exposes complete hold or eligible evidence without enabling a transaction.
+
+## Immutable local audit storage
+
+The local persistence boundary uses a versioned SQLite database with append-only triggers, canonical model payloads, contiguous sequences, and a verifiable SHA-256 hash chain.
+It rejects credential-shaped fields before persistence and uses restrictive user-only filesystem permissions.
+The storage layer is currently standalone and will be connected to risk, planning, and simulation service boundaries only after its behavior is independently proven.
+See [the audit log design](docs/audit-log.md) for guarantees, limitations, and integration status.
