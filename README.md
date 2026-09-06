@@ -15,6 +15,8 @@ uv run aero-bot
 
 Open <http://127.0.0.1:8765> in a browser.
 The server rejects non-loopback bind addresses by design.
+Immutable records default to `~/Library/Application Support/Aero Bot/audit.sqlite3`.
+Set `AERO_BOT_AUDIT_DATABASE_PATH` to another absolute path only when its dedicated parent directory is private to the current user.
 
 ## Verify
 
@@ -71,5 +73,7 @@ The `/api/risk/evaluate` endpoint exposes complete hold or eligible evidence wit
 
 The local persistence boundary uses a versioned SQLite database with append-only triggers, canonical model payloads, contiguous sequences, and a verifiable SHA-256 hash chain.
 It rejects credential-shaped fields before persistence and uses restrictive user-only filesystem permissions.
-The storage layer is currently standalone and will be connected to risk, planning, and simulation service boundaries only after its behavior is independently proven.
+The dashboard, process health route, and `/api/audit/health` expose complete chain verification.
+Every risk response is persisted with its validated input, active policy, and exact decision before it is returned.
+Transaction planning and simulation audit integration remains pending.
 See [the audit log design](docs/audit-log.md) for guarantees, limitations, and integration status.

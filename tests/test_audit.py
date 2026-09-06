@@ -13,6 +13,7 @@ from aero_bot.audit import (
     DATABASE_FILE_MODE,
     GENESIS_HASH,
     AuditEventType,
+    AuditIntegrityError,
     AuditStore,
     AuditVerificationStatus,
 )
@@ -142,9 +143,13 @@ def test_hash_verification_detects_privileged_tampering(tmp_path: Path) -> None:
     finally:
         connection.close()
 
+    # A corrupt chain rejects later valid-looking events instead of extending bad history.
+    with pytest.raises(AuditIntegrityError, match="record hash"):
+        store.append(AuditEventType.SYSTEM_STATE, fixture_payload(3), CREATED_AT)
     # Verification fails at the directly modified first record before trusting its successor.
     verification = store.verify_chain()
     assert verification.status is AuditVerificationStatus.CORRUPT
+    assert verification.record_count == 2
     assert verification.first_bad_sequence == 1
     assert "record hash" in verification.diagnostic
 

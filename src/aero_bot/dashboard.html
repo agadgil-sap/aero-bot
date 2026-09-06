@@ -15,11 +15,13 @@
     .lead { max-width: 650px; margin: 0; color: #9bb3aa; font-size: 1.08rem; line-height: 1.65; }
     .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 40px; }
     .card { min-width: 0; padding: 22px; border: 1px solid #1d3931; border-radius: 18px; background: #0b1915; box-shadow: 0 18px 50px #0005; }
+    .audit-card { grid-column: 1 / -1; }
     .label { margin: 0 0 16px; color: #739087; font-size: .72rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
     .value { margin: 0; font-size: 1.35rem; font-weight: 720; }
     .detail { margin: 8px 0 0; color: #91a9a0; font-size: .9rem; line-height: 1.5; }
     .good { color: #65e6b4; }
     .pending { color: #ffc66d; }
+    .danger { color: #ff8585; }
     .disabled-control { width: 100%; margin-top: 16px; padding: 11px 14px; border: 1px solid #2c4940; border-radius: 10px; background: #13251f; color: #6f8a81; font: inherit; font-size: .86rem; font-weight: 700; cursor: not-allowed; }
     .notice { display: flex; gap: 12px; margin-top: 18px; padding: 16px 18px; border-radius: 14px; background: #10231d; color: #b7ccc4; line-height: 1.5; }
     .dot { flex: 0 0 auto; width: 9px; height: 9px; margin-top: 7px; border-radius: 99px; background: #65e6b4; box-shadow: 0 0 14px #65e6b4; }
@@ -65,6 +67,11 @@
         <p class="label">Unsigned transaction planning</p>
         <p class="value pending">{{SIMULATION_STATUS}}</p>
         <p class="detail">{{TRANSACTION_DIAGNOSTIC}}</p>
+      </article>
+      <article class="card audit-card">
+        <p class="label">Immutable audit chain</p>
+        <p class="value {{AUDIT_TONE}}">{{AUDIT_STATUS}}</p>
+        <p class="detail">{{AUDIT_DIAGNOSTIC}}</p>
       </article>
     </section>
     <div class="notice">

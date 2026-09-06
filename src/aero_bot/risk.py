@@ -29,6 +29,11 @@ class RiskEngine:
         # The immutable policy remains fixed for the lifetime of this evaluator.
         self._policy = policy
 
+    @property
+    def policy(self) -> RiskPolicy:
+        """Return the immutable policy required to reproduce audited decisions."""
+        return self._policy
+
     def evaluate(self, snapshot: OpportunitySnapshot) -> RiskDecision:
         """Return hold unless every configured safety and opportunity gate passes.
 

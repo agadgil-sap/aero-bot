@@ -1,6 +1,7 @@
 """Typed configuration with local-only security constraints."""
 
 from ipaddress import ip_address
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
@@ -14,6 +15,10 @@ LOCAL_ENVIRONMENT: Literal["local"] = "local"
 DEFAULT_BIND_HOST = "127.0.0.1"
 # The default unprivileged port is stable for local bookmarks and operating instructions.
 DEFAULT_BIND_PORT = 8765
+# The default audit file lives in a dedicated private macOS application-data directory.
+DEFAULT_AUDIT_DATABASE_PATH = (
+    Path.home() / "Library" / "Application Support" / "Aero Bot" / "audit.sqlite3"
+)
 
 
 class Settings(BaseSettings):
@@ -30,6 +35,8 @@ class Settings(BaseSettings):
     bind_host: str = DEFAULT_BIND_HOST
     # The bind port must be an unprivileged TCP port.
     bind_port: Annotated[int, Field(ge=1024, le=65535)] = DEFAULT_BIND_PORT
+    # The audit path keeps durable evidence outside the source repository by default.
+    audit_database_path: Path = DEFAULT_AUDIT_DATABASE_PATH
 
     @field_validator("bind_host")
     @classmethod
@@ -40,3 +47,13 @@ class Settings(BaseSettings):
         if not parsed_address.is_loopback:
             raise ValueError("bind_host must be a loopback IP address")
         return value
+
+    @field_validator("audit_database_path")
+    @classmethod
+    def require_absolute_audit_path(cls, value: Path) -> Path:
+        """Expand and require an absolute path for durable audit storage."""
+        # Expansion permits the environment setting to use an operator-local home path.
+        expanded_path = value.expanduser()
+        if not expanded_path.is_absolute():
+            raise ValueError("audit_database_path must be absolute")
+        return expanded_path

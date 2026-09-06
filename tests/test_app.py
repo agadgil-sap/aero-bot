@@ -1,13 +1,18 @@
 """Behavior tests for the local dashboard and safety metadata."""
 
+import json
+import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import pytest
 
 from aero_bot.app import create_app
+from aero_bot.audit import AuditEventType, AuditStore, AuditVerificationStatus
 from aero_bot.config import Settings
+from aero_bot.domain import RiskPolicy
 from aero_bot.registry import B20RegistryResult, RegistryStatus
 from aero_bot.transactions import TransactionPlanner, TransactionPolicy
 from aero_bot.venues import (
@@ -17,6 +22,29 @@ from aero_bot.venues import (
     PoolKind,
     VenueId,
 )
+
+
+def risk_request_payload() -> dict[str, object]:
+    """Build complete public fixture evidence for the risk HTTP boundary."""
+    return {
+        "token_address": "0xb20000000000000000000078ee7ce2fe4908108c",
+        "pool_address": "0x2222222222222222222222222222222222222222",
+        "token_paused": False,
+        "market_regime": "market_open",
+        "oracle_healthy": True,
+        "oracle_age_seconds": 60,
+        "oracle_deviation_bps": "25",
+        "pool_tvl_usd": "2000000",
+        "exit_depth_usd": "50000",
+        "compensation_mode": "unstaked_fees",
+        "fee_apr": "4",
+        "fee_retention_fraction": "0.9",
+        "emissions_apr": "20",
+        "impermanent_loss_apr": "0",
+        "adverse_selection_apr": "0",
+        "proposed_capital_usd": "5000",
+        "realized_daily_loss_usd": "0",
+    }
 
 
 @pytest.mark.anyio
@@ -39,6 +67,8 @@ async def test_health_exposes_wallet_free_operating_boundary() -> None:
         "chain_id": 8453,
         "enabled_venues": ["aerodrome"],
         "execution_mode": "simulation_only",
+        "audit_status": "empty",
+        "audit_record_count": 0,
     }
 
 
@@ -64,6 +94,8 @@ async def test_dashboard_states_truthful_initial_status() -> None:
     assert "no reviewed proxy-address snapshot" in response.text
     assert "Wallet onboarding unavailable" in response.text
     assert "Simulation backend unavailable" in response.text
+    assert "Immutable audit chain" in response.text
+    assert "Ready, no records" in response.text
     assert "Hold USDC is always a valid outcome." in response.text
 
 
@@ -302,25 +334,7 @@ async def test_risk_endpoint_holds_and_never_combines_exclusive_returns() -> Non
         # Unstaked fixture quotes both fee and emission alternatives for explicit comparison.
         response = await client.post(
             "/api/risk/evaluate",
-            json={
-                "token_address": "0xb20000000000000000000078ee7ce2fe4908108c",
-                "pool_address": "0x2222222222222222222222222222222222222222",
-                "token_paused": False,
-                "market_regime": "market_open",
-                "oracle_healthy": True,
-                "oracle_age_seconds": 60,
-                "oracle_deviation_bps": "25",
-                "pool_tvl_usd": "2000000",
-                "exit_depth_usd": "50000",
-                "compensation_mode": "unstaked_fees",
-                "fee_apr": "4",
-                "fee_retention_fraction": "0.9",
-                "emissions_apr": "20",
-                "impermanent_loss_apr": "0",
-                "adverse_selection_apr": "0",
-                "proposed_capital_usd": "5000",
-                "realized_daily_loss_usd": "0",
-            },
+            json=risk_request_payload(),
         )
 
     # Default safety gates hold while compensation remains mathematically inspectable.
@@ -335,3 +349,91 @@ async def test_risk_endpoint_holds_and_never_combines_exclusive_returns() -> Non
     assert Decimal(payload["compensation"]["selected_apr"]) == Decimal("3.6")
     assert Decimal(payload["compensation"]["alternative_apr"]) == Decimal("10")
     assert Decimal(payload["net_apr"]) == Decimal("3.6")
+
+
+@pytest.mark.anyio
+async def test_risk_endpoint_persists_reproducible_audit_evidence(tmp_path: Path) -> None:
+    """A risk response is durably recorded with its input, policy, and output."""
+    # Explicit store makes durable records inspectable through the real HTTP service boundary.
+    audit_store = AuditStore(tmp_path / "risk-audit" / "audit.sqlite3")
+
+    def fixed_clock() -> datetime:
+        """Return one deterministic aware event time for the audited request."""
+        # Fixed UTC evidence keeps the complete persisted envelope exactly assertable.
+        return datetime(2026, 9, 6, 13, 15, tzinfo=UTC)
+
+    # Injected storage and clock isolate persistence without changing application behavior.
+    transport = httpx.ASGITransport(
+        app=create_app(Settings(), audit_store=audit_store, clock=fixed_clock)
+    )
+    # One client checks the decision and both audit-health views after the append.
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Request contains the complete public evidence required by deterministic evaluation.
+        decision_response = await client.post(
+            "/api/risk/evaluate",
+            json=risk_request_payload(),
+        )
+        # Audit endpoint verifies the complete chain after the risk route returns.
+        audit_response = await client.get("/api/audit/health")
+        # Process health reports the same verified durable record count.
+        health_response = await client.get("/health")
+        # Dashboard must render the newly durable record with polished status copy.
+        dashboard_response = await client.get("/")
+
+    # Direct read confirms the API did not merely increment an in-memory counter.
+    records = audit_store.read_records()
+    # Canonical payload decoding exposes the exact persisted decision envelope.
+    persisted_payload = json.loads(records[0].payload_json)
+    assert decision_response.status_code == 200
+    assert len(records) == 1
+    assert records[0].event_type is AuditEventType.RISK_DECISION
+    assert records[0].created_at == fixed_clock()
+    assert persisted_payload["snapshot"]["token_address"] == (
+        "0xb20000000000000000000078ee7ce2fe4908108c"  # noqa: S105
+    )
+    assert persisted_payload["policy"]["emergency_halt"] is True
+    assert persisted_payload["decision"] == decision_response.json()
+    assert audit_response.json()["status"] == AuditVerificationStatus.VERIFIED
+    assert audit_response.json()["record_count"] == 1
+    assert health_response.json()["audit_status"] == AuditVerificationStatus.VERIFIED
+    assert health_response.json()["audit_record_count"] == 1
+    assert "1 record verified" in dashboard_response.text
+
+
+@pytest.mark.anyio
+async def test_corrupt_audit_chain_degrades_health_and_dashboard(tmp_path: Path) -> None:
+    """Local health surfaces durable audit corruption instead of reporting success."""
+    # One valid record provides durable content for the tampering fixture.
+    audit_store = AuditStore(tmp_path / "corrupt-audit" / "audit.sqlite3")
+    audit_store.append(
+        AuditEventType.SYSTEM_STATE,
+        RiskPolicy(),
+        datetime(2026, 9, 6, 14, 0, tzinfo=UTC),
+    )
+    # Privileged direct SQL models compromise beyond the ordinary append-only trigger boundary.
+    connection = sqlite3.connect(audit_store.database_path)
+    try:
+        connection.execute("DROP TRIGGER audit_records_no_update")
+        connection.execute("UPDATE audit_records SET payload_json = '{}' WHERE sequence = 1")
+        connection.commit()
+    finally:
+        connection.close()
+
+    # Injected corrupt store must remain visible so the operator can inspect its diagnostic.
+    transport = httpx.ASGITransport(app=create_app(Settings(), audit_store=audit_store))
+    # Health and dashboard exercise machine-readable and user-visible failure behavior.
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Both views independently verify the complete persistent chain.
+        health_response = await client.get("/health")
+        dashboard_response = await client.get("/")
+        # Risk route must block rather than return a decision that cannot be audited.
+        risk_response = await client.post("/api/risk/evaluate", json=risk_request_payload())
+
+    assert health_response.status_code == 200
+    assert health_response.json()["status"] == "degraded"
+    assert health_response.json()["audit_status"] == AuditVerificationStatus.CORRUPT
+    assert "Integrity failure" in dashboard_response.text
+    assert "Audit record hash does not match its durable content." in dashboard_response.text
+    assert risk_response.status_code == 503
+    assert "audit integrity failed" in risk_response.json()["detail"]
+    assert audit_store.verify_chain().record_count == 1

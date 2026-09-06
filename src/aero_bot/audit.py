@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from collections.abc import Sequence
 from contextlib import closing
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -12,7 +13,12 @@ from typing import Annotated
 
 from pydantic import BaseModel, Field
 
-from aero_bot.domain import IMMUTABLE_MODEL_CONFIG
+from aero_bot.domain import (
+    IMMUTABLE_MODEL_CONFIG,
+    OpportunitySnapshot,
+    RiskDecision,
+    RiskPolicy,
+)
 
 # Schema version permits explicit future migrations rather than silent table changes.
 AUDIT_SCHEMA_VERSION = 1
@@ -40,6 +46,10 @@ SENSITIVE_FIELD_NAMES = frozenset(
         "signedtransaction",
     }
 )
+
+
+class AuditIntegrityError(RuntimeError):
+    """Indicate that a corrupt chain cannot accept another durable event."""
 
 
 class AuditEventType(StrEnum):
@@ -100,6 +110,20 @@ class AuditVerification(BaseModel):
     first_bad_sequence: int | None
     # Diagnostic provides stable evidence suitable for local health reporting.
     diagnostic: str
+
+
+class RiskDecisionAuditPayload(BaseModel):
+    """Capture every validated dependency and output of one risk evaluation."""
+
+    # Frozen strict fields preserve a coherent deterministic decision envelope.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # Snapshot contains the complete market, oracle, pool, and portfolio input evidence.
+    snapshot: OpportunitySnapshot
+    # Policy contains every allowlist, threshold, cap, haircut, and emergency setting.
+    policy: RiskPolicy
+    # Decision contains the ordered hold or eligible result and exact calculations.
+    decision: RiskDecision
 
 
 class AuditStore:
@@ -182,10 +206,16 @@ class AuditStore:
         with closing(self._connect()) as connection, connection:
             # Immediate mode serializes sequence and predecessor selection across local writers.
             connection.execute("BEGIN IMMEDIATE")
-            # Latest row supplies both the next sequence and exact predecessor hash.
-            predecessor = connection.execute(
-                "SELECT sequence, record_hash FROM audit_records ORDER BY sequence DESC LIMIT 1"
-            ).fetchone()
+            # Full verification under the write lock blocks appending to corrupt history.
+            existing_rows = connection.execute(
+                "SELECT * FROM audit_records ORDER BY sequence ASC"
+            ).fetchall()
+            # Corruption fails closed before a new sequence or hash can be allocated.
+            verification = self._verification_from_rows(existing_rows)
+            if verification.status is AuditVerificationStatus.CORRUPT:
+                raise AuditIntegrityError(verification.diagnostic)
+            # Verified latest row supplies both the next sequence and exact predecessor hash.
+            predecessor = existing_rows[-1] if existing_rows else None
             # Genesis begins at one, while every later record increments the durable sequence.
             sequence = 1 if predecessor is None else int(predecessor["sequence"]) + 1
             # Genesis uses the explicit zero hash rather than an ambiguous null predecessor.
@@ -252,6 +282,20 @@ class AuditStore:
             rows = connection.execute(
                 "SELECT * FROM audit_records ORDER BY sequence ASC"
             ).fetchall()
+        return self._verification_from_rows(rows)
+
+    def _verification_from_rows(
+        self,
+        rows: Sequence[sqlite3.Row],
+    ) -> AuditVerification:
+        """Verify one ordered SQLite snapshot of the complete audit chain.
+
+        Args:
+            rows: Ascending durable rows read within one coherent database transaction.
+
+        Returns:
+            Empty, verified, or first-failure evidence for the supplied complete snapshot.
+        """
         if not rows:
             return AuditVerification(
                 status=AuditVerificationStatus.EMPTY,

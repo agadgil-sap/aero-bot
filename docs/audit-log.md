@@ -27,6 +27,15 @@ It reports the first bad sequence and never treats a verified prefix as a verifi
 
 ## Integration status
 
-This iteration establishes and verifies the persistence boundary without enabling it in application routes.
-A later slice must configure the macOS application-data path, expose health diagnostics, and append complete risk, plan, and simulation evidence atomically at their service boundaries.
-No private key, signature, or broadcast payload may be introduced during that integration.
+The application defaults to `~/Library/Application Support/Aero Bot/audit.sqlite3` and permits an absolute-path override through `AERO_BOT_AUDIT_DATABASE_PATH`.
+Startup initializes the private audit store before exposing any route.
+The process health response, `/api/audit/health`, and dashboard verify the complete chain and expose its status and record count.
+A corrupt chain degrades process health and is shown as an integrity failure rather than a healthy prefix.
+
+Every `/api/risk/evaluate` response is appended before it is returned.
+The event contains the complete validated opportunity snapshot, immutable active policy, and exact deterministic hold or eligible decision.
+If durable append fails, the endpoint does not return an unaudited decision.
+Each append verifies the complete existing chain under its immediate write transaction and refuses to extend corrupt history.
+
+Transaction planning and read-only simulation events are not connected yet.
+A later slice must append their complete public evidence at those service boundaries without introducing any private key, signature, or broadcast payload.

@@ -1,13 +1,23 @@
 """FastAPI application factory and wallet-free dashboard routes."""
 
+from collections.abc import Callable
+from datetime import UTC, datetime
 from html import escape
 from importlib.resources import files
 from typing import Literal
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+from aero_bot.audit import (
+    AuditEventType,
+    AuditIntegrityError,
+    AuditStore,
+    AuditVerification,
+    AuditVerificationStatus,
+    RiskDecisionAuditPayload,
+)
 from aero_bot.concentrated import (
     ConcentratedLiquidityAnalyzer,
     ConcentratedPositionAnalysis,
@@ -47,8 +57,8 @@ BASE_CHAIN_ID = 8453
 class HealthResponse(BaseModel):
     """Describe the process and immutable safety boundary for health checks."""
 
-    # Status indicates that the HTTP process is accepting requests.
-    status: Literal["ok"]
+    # Status is degraded when durable audit verification detects corrupt evidence.
+    status: Literal["ok", "degraded"]
     # Version identifies the running application build.
     version: str
     # Environment confirms that only the local operating mode is active.
@@ -59,11 +69,20 @@ class HealthResponse(BaseModel):
     enabled_venues: tuple[Literal["aerodrome"], ...]
     # Execution mode confirms that signing and broadcasting are unavailable.
     execution_mode: Literal["simulation_only"]
+    # Audit status reports complete immutable-chain verification at request time.
+    audit_status: AuditVerificationStatus
+    # Audit record count makes persistence activity visible to local monitoring.
+    audit_record_count: int
 
 
 def get_settings() -> Settings:
     """Load validated application settings from the local environment."""
     return Settings()
+
+
+def utc_now() -> datetime:
+    """Return the current aware UTC time for durable audit event timestamps."""
+    return datetime.now(UTC)
 
 
 def create_app(
@@ -73,6 +92,8 @@ def create_app(
     oracle_coverage: ChainlinkCoverageReport | None = None,
     transaction_planner: TransactionPlanner | None = None,
     risk_engine: RiskEngine | None = None,
+    audit_store: AuditStore | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     """Create an application instance with explicit local safety metadata.
 
@@ -83,6 +104,8 @@ def create_app(
         oracle_coverage: Optional preloaded Chainlink coverage for deterministic tests.
         transaction_planner: Optional policy-bound wallet-free transaction planner.
         risk_engine: Optional explicit deterministic policy engine for this application.
+        audit_store: Optional initialized immutable local audit store.
+        clock: Optional aware UTC clock used to timestamp durable events.
 
     Returns:
         A configured FastAPI application with dashboard and diagnostic routes.
@@ -107,6 +130,10 @@ def create_app(
     concentrated_analyzer = ConcentratedLiquidityAnalyzer()
     # Default policy is emergency-halted with empty token and pool allowlists.
     resolved_risk_engine = risk_engine or RiskEngine(RiskPolicy())
+    # Default storage writes immutable evidence to the configured private application path.
+    resolved_audit_store = audit_store or AuditStore(resolved_settings.audit_database_path)
+    # Injectable clock makes event-time behavior deterministic in complete HTTP tests.
+    resolved_clock = clock or utc_now
     # The FastAPI instance owns this process's routes and OpenAPI metadata.
     application = FastAPI(
         title=resolved_settings.app_name,
@@ -125,18 +152,33 @@ def create_app(
     application.state.transaction_planner = resolved_transaction_planner
     # Storing the engine keeps every request behind the same immutable risk policy.
     application.state.risk_engine = resolved_risk_engine
+    # Storing the audit boundary keeps all route writes on one durable hash chain.
+    application.state.audit_store = resolved_audit_store
 
     @application.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
         """Return process health and the active execution constraints."""
+        # Complete verification prevents health from trusting only the newest record.
+        audit_verification = resolved_audit_store.verify_chain()
+        # Corruption degrades process health while an empty initialized store remains healthy.
+        process_status: Literal["ok", "degraded"] = (
+            "degraded" if audit_verification.status is AuditVerificationStatus.CORRUPT else "ok"
+        )
         return HealthResponse(
-            status="ok",
+            status=process_status,
             version=APP_VERSION,
             environment=resolved_settings.environment,
             chain_id=BASE_CHAIN_ID,
             enabled_venues=(ENABLED_VENUE,),
             execution_mode="simulation_only",
+            audit_status=audit_verification.status,
+            audit_record_count=audit_verification.record_count,
         )
+
+    @application.get("/api/audit/health", response_model=AuditVerification)
+    def audit_health() -> AuditVerification:
+        """Verify and return the complete immutable local audit chain status."""
+        return resolved_audit_store.verify_chain()
 
     @application.get("/api/registry/b20", response_model=B20RegistryResult)
     def official_b20_registry() -> B20RegistryResult:
@@ -180,7 +222,28 @@ def create_app(
     @application.post("/api/risk/evaluate", response_model=RiskDecision)
     def evaluate_risk(snapshot: OpportunitySnapshot) -> RiskDecision:
         """Return a deterministic hold or eligible decision without execution."""
-        return resolved_risk_engine.evaluate(snapshot)
+        # Pure evaluation completes before any response can leave the service boundary.
+        decision = resolved_risk_engine.evaluate(snapshot)
+        # Envelope retains the exact immutable policy needed to reproduce the outcome.
+        audit_payload = RiskDecisionAuditPayload(
+            snapshot=snapshot,
+            policy=resolved_risk_engine.policy,
+            decision=decision,
+        )
+        # Durable append must succeed before the evaluated result is returned to the caller.
+        try:
+            resolved_audit_store.append(
+                AuditEventType.RISK_DECISION,
+                audit_payload,
+                resolved_clock(),
+            )
+        except AuditIntegrityError as error:
+            # Known integrity failure returns evidence without leaking an unaudited decision.
+            raise HTTPException(
+                status_code=503,
+                detail=f"Risk evaluation blocked because audit integrity failed: {error}",
+            ) from error
+        return decision
 
     @application.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
@@ -191,6 +254,7 @@ def create_app(
             resolved_pool_discovery,
             resolved_oracle_coverage,
             resolved_transaction_planner.capabilities(),
+            resolved_audit_store.verify_chain(),
         )
 
     return application
@@ -202,6 +266,7 @@ def _dashboard_html(
     pool_discovery: PoolDiscoveryResult,
     oracle_coverage: ChainlinkCoverageReport,
     transaction_capabilities: TransactionCapabilities,
+    audit_verification: AuditVerification,
 ) -> str:
     """Build the dependency-free dashboard shell for the local first release.
 
@@ -211,6 +276,7 @@ def _dashboard_html(
         pool_discovery: Validated Aerodrome pools or fail-closed diagnostic.
         oracle_coverage: Chainlink B20 coverage evidence or fail-closed diagnostic.
         transaction_capabilities: Immutable wallet-free capability declaration.
+        audit_verification: Complete immutable local audit-chain status.
 
     Returns:
         A complete HTML document with escaped dynamic evidence.
@@ -253,6 +319,21 @@ def _dashboard_html(
         if transaction_capabilities.simulation_backend_configured
         else "Simulation backend unavailable"
     )
+    # Corruption is visually distinct from both empty and successfully verified chains.
+    audit_tone = (
+        "danger" if audit_verification.status is AuditVerificationStatus.CORRUPT else "good"
+    )
+    # Empty is ready, verified reports durable activity, and corruption fails visibly.
+    if audit_verification.status is AuditVerificationStatus.EMPTY:
+        audit_status = "Ready, no records"
+    elif audit_verification.status is AuditVerificationStatus.VERIFIED:
+        # Singular label avoids visibly broken status copy after the first durable event.
+        record_label = "record" if audit_verification.record_count == 1 else "records"
+        audit_status = f"{audit_verification.record_count} {record_label} verified"
+    else:
+        audit_status = "Integrity failure"
+    # Audit diagnostic is escaped because storage failures can contain local text.
+    audit_diagnostic = escape(audit_verification.diagnostic)
     return (
         dashboard_template.replace("{{APP_NAME}}", display_name)
         .replace("{{B20_TONE}}", registry_tone)
@@ -266,4 +347,7 @@ def _dashboard_html(
         .replace("{{ORACLE_DIAGNOSTIC}}", oracle_diagnostic)
         .replace("{{SIMULATION_STATUS}}", simulation_status)
         .replace("{{TRANSACTION_DIAGNOSTIC}}", transaction_diagnostic)
+        .replace("{{AUDIT_TONE}}", audit_tone)
+        .replace("{{AUDIT_STATUS}}", audit_status)
+        .replace("{{AUDIT_DIAGNOSTIC}}", audit_diagnostic)
     )

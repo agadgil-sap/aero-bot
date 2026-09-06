@@ -1,5 +1,7 @@
 """Behavior tests for security-sensitive application settings."""
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -20,3 +22,9 @@ def test_settings_accept_loopback_addresses(host: str) -> None:
     settings = Settings(bind_host=host)
 
     assert settings.bind_host == host
+
+
+def test_settings_requires_absolute_audit_database_path() -> None:
+    """Relative durable storage paths fail before application startup."""
+    with pytest.raises(ValidationError, match="must be absolute"):
+        Settings(audit_database_path=Path("repository-local-audit.sqlite3"))
