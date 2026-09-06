@@ -290,3 +290,48 @@ async def test_concentrated_position_endpoint_exposes_position_aware_loss() -> N
     assert Decimal(payload["hold_value_usd"]) == Decimal(200)
     assert Decimal(payload["impermanent_loss_fraction"]) == Decimal("0.5")
     assert Decimal(payload["impermanent_loss_apr"]) == Decimal("0.5")
+
+
+@pytest.mark.anyio
+async def test_risk_endpoint_holds_and_never_combines_exclusive_returns() -> None:
+    """Default API policy holds while exposing the selected compensation stream only."""
+    # Default application keeps the risk engine emergency-halted and contract allowlists empty.
+    transport = httpx.ASGITransport(app=create_app(Settings()))
+    # The request exercises validation, compensation comparison, and risk routing together.
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Unstaked fixture quotes both fee and emission alternatives for explicit comparison.
+        response = await client.post(
+            "/api/risk/evaluate",
+            json={
+                "token_address": "0xb20000000000000000000078ee7ce2fe4908108c",
+                "pool_address": "0x2222222222222222222222222222222222222222",
+                "token_paused": False,
+                "market_regime": "market_open",
+                "oracle_healthy": True,
+                "oracle_age_seconds": 60,
+                "oracle_deviation_bps": "25",
+                "pool_tvl_usd": "2000000",
+                "exit_depth_usd": "50000",
+                "compensation_mode": "unstaked_fees",
+                "fee_apr": "4",
+                "fee_retention_fraction": "0.9",
+                "emissions_apr": "20",
+                "impermanent_loss_apr": "0",
+                "adverse_selection_apr": "0",
+                "proposed_capital_usd": "5000",
+                "realized_daily_loss_usd": "0",
+            },
+        )
+
+    # Default safety gates hold while compensation remains mathematically inspectable.
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["status"] == "hold"
+    assert payload["reasons"][:3] == [
+        "emergency_halt",
+        "token_not_allowlisted",
+        "pool_not_allowlisted",
+    ]
+    assert Decimal(payload["compensation"]["selected_apr"]) == Decimal("3.6")
+    assert Decimal(payload["compensation"]["alternative_apr"]) == Decimal("10")
+    assert Decimal(payload["net_apr"]) == Decimal("3.6")

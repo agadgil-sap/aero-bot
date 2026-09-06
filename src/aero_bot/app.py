@@ -14,12 +14,14 @@ from aero_bot.concentrated import (
     ConcentratedPositionSnapshot,
 )
 from aero_bot.config import Settings
+from aero_bot.domain import OpportunitySnapshot, RiskDecision, RiskPolicy
 from aero_bot.oracles import (
     ChainlinkCoverageReport,
     OracleCoverageStatus,
     unavailable_chainlink_coverage,
 )
 from aero_bot.registry import B20RegistryResult, RegistryStatus, load_official_b20_registry
+from aero_bot.risk import RiskEngine
 from aero_bot.transactions import (
     AllowancePlanResult,
     ExactAllowanceRequest,
@@ -70,6 +72,7 @@ def create_app(
     pool_discovery: PoolDiscoveryResult | None = None,
     oracle_coverage: ChainlinkCoverageReport | None = None,
     transaction_planner: TransactionPlanner | None = None,
+    risk_engine: RiskEngine | None = None,
 ) -> FastAPI:
     """Create an application instance with explicit local safety metadata.
 
@@ -79,6 +82,7 @@ def create_app(
         pool_discovery: Optional preloaded Aerodrome discovery result for deterministic tests.
         oracle_coverage: Optional preloaded Chainlink coverage for deterministic tests.
         transaction_planner: Optional policy-bound wallet-free transaction planner.
+        risk_engine: Optional explicit deterministic policy engine for this application.
 
     Returns:
         A configured FastAPI application with dashboard and diagnostic routes.
@@ -101,6 +105,8 @@ def create_app(
     resolved_transaction_planner = transaction_planner or TransactionPlanner()
     # Pure Decimal analysis is stateless and shares no wallet or network capability.
     concentrated_analyzer = ConcentratedLiquidityAnalyzer()
+    # Default policy is emergency-halted with empty token and pool allowlists.
+    resolved_risk_engine = risk_engine or RiskEngine(RiskPolicy())
     # The FastAPI instance owns this process's routes and OpenAPI metadata.
     application = FastAPI(
         title=resolved_settings.app_name,
@@ -117,6 +123,8 @@ def create_app(
     application.state.oracle_coverage = resolved_oracle_coverage
     # Storing the planner keeps all requests behind one immutable safety policy.
     application.state.transaction_planner = resolved_transaction_planner
+    # Storing the engine keeps every request behind the same immutable risk policy.
+    application.state.risk_engine = resolved_risk_engine
 
     @application.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -168,6 +176,11 @@ def create_app(
     ) -> ConcentratedPositionAnalysis:
         """Calculate deterministic Slipstream inventory and loss evidence."""
         return concentrated_analyzer.analyze(snapshot)
+
+    @application.post("/api/risk/evaluate", response_model=RiskDecision)
+    def evaluate_risk(snapshot: OpportunitySnapshot) -> RiskDecision:
+        """Return a deterministic hold or eligible decision without execution."""
+        return resolved_risk_engine.evaluate(snapshot)
 
     @application.get("/", response_class=HTMLResponse)
     def dashboard() -> str:

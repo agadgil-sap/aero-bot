@@ -60,3 +60,9 @@ The position analyzer implements Slipstream's inherited square-root-price invent
 It distinguishes below-range, active, and above-range positions, reports current asset concentration, and compares current LP inventory with holding the entry assets.
 Fees and AERO emissions remain separate from the conservative impermanent-loss estimate.
 See [the concentrated-liquidity policy](docs/concentrated-liquidity.md) for formulas, assumptions, and adapter requirements.
+
+## Fee versus AERO compensation
+
+The deterministic risk engine models unstaked swap fees and staked AERO emissions as mutually exclusive Aerodrome compensation modes.
+It compares retained fee APR with conservatively discounted emission APR but credits only the selected mode before subtracting impermanent-loss and adverse-selection costs.
+The `/api/risk/evaluate` endpoint exposes complete hold or eligible evidence without enabling a transaction.

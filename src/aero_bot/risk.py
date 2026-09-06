@@ -3,6 +3,8 @@
 from decimal import Decimal
 
 from aero_bot.domain import (
+    CompensationAnalysis,
+    CompensationMode,
     DecisionStatus,
     MarketRegime,
     OpportunitySnapshot,
@@ -36,12 +38,14 @@ class RiskEngine:
         Returns:
             A deterministic decision with ordered reason codes and yield calculations.
         """
-        # Discounted emissions prevent volatile AERO rewards dominating the decision.
-        adjusted_emissions_apr = snapshot.emissions_apr * self._policy.emissions_reward_haircut
-        # Gross APR shows fee revenue and discounted emissions before risk costs.
-        gross_apr = snapshot.fee_apr + adjusted_emissions_apr
+        # Compensation comparison prevents mutually exclusive fee and emission returns being added.
+        compensation = self._analyze_compensation(snapshot)
         # Net APR accounts for both LP divergence and informed-flow costs.
-        net_apr = gross_apr - snapshot.impermanent_loss_apr - snapshot.adverse_selection_apr
+        net_apr = (
+            compensation.selected_apr
+            - snapshot.impermanent_loss_apr
+            - snapshot.adverse_selection_apr
+        )
         # Daily rate is compared with the opportunity threshold without implying a promise.
         net_daily_rate = net_apr / DAYS_PER_YEAR
         # Reasons accumulate in fixed order for reproducible output from identical inputs.
@@ -81,8 +85,51 @@ class RiskEngine:
         return RiskDecision(
             status=status,
             reasons=tuple(reasons),
-            gross_apr=gross_apr,
-            adjusted_emissions_apr=adjusted_emissions_apr,
+            compensation=compensation,
             net_apr=net_apr,
             net_daily_rate=net_daily_rate,
+        )
+
+    def _analyze_compensation(self, snapshot: OpportunitySnapshot) -> CompensationAnalysis:
+        """Compare adjusted fees and emissions without combining exclusive streams.
+
+        Args:
+            snapshot: Opportunity containing mode and observed headline APR values.
+
+        Returns:
+            Deterministic selected, alternative, preferred, and opportunity-cost evidence.
+        """
+        # Retained fees account for the observed protocol share on unstaked liquidity.
+        retained_fee_apr = snapshot.fee_apr * snapshot.fee_retention_fraction
+        # Discounted emissions prevent volatile AERO rewards dominating the comparison.
+        adjusted_emissions_apr = snapshot.emissions_apr * self._policy.emissions_reward_haircut
+        if snapshot.compensation_mode is CompensationMode.UNSTAKED_FEES:
+            # Unstaked positions earn retained fees and forgo AERO emissions.
+            selected_apr = retained_fee_apr
+            # Discounted emissions remain visible only as the alternative.
+            alternative_apr = adjusted_emissions_apr
+        else:
+            # Staked positions earn discounted AERO emissions and relinquish swap fees.
+            selected_apr = adjusted_emissions_apr
+            # Retained fee yield remains visible only as the alternative.
+            alternative_apr = retained_fee_apr
+        if retained_fee_apr > adjusted_emissions_apr:
+            # Strictly higher retained fees make unstaked compensation preferable.
+            preferred_mode = CompensationMode.UNSTAKED_FEES
+        elif adjusted_emissions_apr > retained_fee_apr:
+            # Strictly higher adjusted emissions make gauge staking preferable.
+            preferred_mode = CompensationMode.STAKED_EMISSIONS
+        else:
+            # A tie preserves the selected mode rather than implying needless churn.
+            preferred_mode = snapshot.compensation_mode
+        # Opportunity cost is zero when the selected mode is at least as valuable.
+        opportunity_cost_apr = max(Decimal(0), alternative_apr - selected_apr)
+        return CompensationAnalysis(
+            selected_mode=snapshot.compensation_mode,
+            retained_fee_apr=retained_fee_apr,
+            adjusted_emissions_apr=adjusted_emissions_apr,
+            selected_apr=selected_apr,
+            alternative_apr=alternative_apr,
+            preferred_mode=preferred_mode,
+            opportunity_cost_apr=opportunity_cost_apr,
         )
