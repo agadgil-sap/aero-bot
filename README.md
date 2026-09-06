@@ -32,3 +32,10 @@ Do not place wallet seed phrases, private keys, signing material, or other secre
 The only venue enabled by the product is Aerodrome on Base.
 Transaction signing and broadcasting are intentionally absent.
 
+## Official B20 identities
+
+The packaged B20 registry is sourced from the [official Base stocks list](https://www.base.org/stocks).
+The source states that its list is the complete set of Coinbase-issued tokenized stocks and advises matching contract addresses before interaction.
+Each bundled identity retains the official BaseScan link and the date the source was observed.
+The application validates the entire registry and rejects duplicate or malformed identities before exposing any address.
+If the evidence resource is missing or invalid, the API and dashboard show an explicit blocked diagnostic and expose no token identities.

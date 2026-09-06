@@ -1,0 +1,108 @@
+# Base identifies this as the Base mainnet chain ID.
+chain_id = 8453
+# The official Base listing identifies Coinbase as the token issuer.
+issuer = "Coinbase"
+# Base publishes the complete issuer-verified token list at this URL.
+source_url = "https://www.base.org/stocks"
+# This date records when the bundled evidence was verified against the source page.
+source_observed_at = 2026-09-06
+
+[[assets]]
+# The official token symbol shown by Base.
+symbol = "NVDAc"
+# The underlying company name shown by Base.
+name = "NVIDIA"
+# The full contract address linked by the official Base page.
+address = "0xb20000000000000000000078ee7ce2fE4908108C"
+# The block explorer link exposed by the official Base page.
+explorer_url = "https://basescan.org/token/0xb20000000000000000000078ee7ce2fE4908108C"
+
+[[assets]]
+# The official token symbol shown by Base.
+symbol = "METAc"
+# The underlying company name shown by Base.
+name = "Meta"
+# The full contract address linked by the official Base page.
+address = "0xb2000000000000000000008bC8786B856E61707C"
+# The block explorer link exposed by the official Base page.
+explorer_url = "https://basescan.org/token/0xb2000000000000000000008bC8786B856E61707C"
+
+[[assets]]
+# The official token symbol shown by Base.
+symbol = "AAPLc"
+# The underlying company name shown by Base.
+name = "Apple"
+# The full contract address linked by the official Base page.
+address = "0xb200000000000000000000C2e324d24d7eEcd1fb"
+# The block explorer link exposed by the official Base page.
+explorer_url = "https://basescan.org/token/0xb200000000000000000000C2e324d24d7eEcd1fb"
+
+[[assets]]
+# The official token symbol shown by Base.
+symbol = "GOOGLc"
+# The underlying company name shown by Base.
+name = "Alphabet"
+# The full contract address linked by the official Base page.
+address = "0xb2000000000000000000002D0BA3164cc74f58B7"
+# The block explorer link exposed by the official Base page.
+explorer_url = "https://basescan.org/token/0xb2000000000000000000002D0BA3164cc74f58B7"
+
+[[assets]]
+# The official token symbol shown by Base.
+symbol = "AMZNc"
+# The underlying company name shown by Base.
+name = "Amazon"
+# The full contract address linked by the official Base page.
+address = "0xb200000000000000000000d9192b6B456483C2E8"
+# The block explorer link exposed by the official Base page.
+explorer_url = "https://basescan.org/token/0xb200000000000000000000d9192b6B456483C2E8"
+
+[[assets]]
+# The official token symbol shown by Base.
+symbol = "MSFTc"
+# The underlying company name shown by Base.
+name = "Microsoft"
+# The full contract address linked by the official Base page.
+address = "0xB200000000000000000000Ab99cFa739E253872B"
+# The block explorer link exposed by the official Base page.
+explorer_url = "https://basescan.org/token/0xB200000000000000000000Ab99cFa739E253872B"
+
+[[assets]]
+# The official token symbol shown by Base.
+symbol = "MSTRc"
+# The underlying company name shown by Base.
+name = "MicroStrategy"
+# The full contract address linked by the official Base page.
+address = "0xb2000000000000000000004884b426556b92883d"
+# The block explorer link exposed by the official Base page.
+explorer_url = "https://basescan.org/token/0xb2000000000000000000004884b426556b92883d"
+
+[[assets]]
+# The official token symbol shown by Base.
+symbol = "SNDKc"
+# The underlying company name shown by Base.
+name = "SanDisk"
+# The full contract address linked by the official Base page.
+address = "0xb200000000000000000000397293Cb8cda9a10c5"
+# The block explorer link exposed by the official Base page.
+explorer_url = "https://basescan.org/token/0xb200000000000000000000397293Cb8cda9a10c5"
+
+[[assets]]
+# The official token symbol shown by Base.
+symbol = "SPCXc"
+# The underlying company name shown by Base.
+name = "SpaceX"
+# The full contract address linked by the official Base page.
+address = "0xb2000000000000000000007b9fcbd005511aCBd5"
+# The block explorer link exposed by the official Base page.
+explorer_url = "https://basescan.org/token/0xb2000000000000000000007b9fcbd005511aCBd5"
+
+[[assets]]
+# The official token symbol shown by Base.
+symbol = "TSLAc"
+# The underlying company name shown by Base.
+name = "Tesla"
+# The full contract address linked by the official Base page.
+address = "0xb2000000000000000000001e800a7f5189430cD0"
+# The block explorer link exposed by the official Base page.
+explorer_url = "https://basescan.org/token/0xb2000000000000000000001e800a7f5189430cD0"
