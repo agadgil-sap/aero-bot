@@ -9,6 +9,11 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from aero_bot.config import Settings
+from aero_bot.oracles import (
+    ChainlinkCoverageReport,
+    OracleCoverageStatus,
+    unavailable_chainlink_coverage,
+)
 from aero_bot.registry import B20RegistryResult, RegistryStatus, load_official_b20_registry
 from aero_bot.venues import (
     AerodromeVenueAdapter,
@@ -50,6 +55,7 @@ def create_app(
     settings: Settings | None = None,
     b20_registry: B20RegistryResult | None = None,
     pool_discovery: PoolDiscoveryResult | None = None,
+    oracle_coverage: ChainlinkCoverageReport | None = None,
 ) -> FastAPI:
     """Create an application instance with explicit local safety metadata.
 
@@ -57,6 +63,7 @@ def create_app(
         settings: Optional validated local configuration for this application instance.
         b20_registry: Optional preloaded official registry result for deterministic tests.
         pool_discovery: Optional preloaded Aerodrome discovery result for deterministic tests.
+        oracle_coverage: Optional preloaded Chainlink coverage for deterministic tests.
 
     Returns:
         A configured FastAPI application with dashboard and diagnostic routes.
@@ -71,6 +78,10 @@ def create_app(
     resolved_pool_discovery = pool_discovery or AerodromeVenueAdapter().discover_pools(
         official_b20_addresses
     )
+    # Without injected observations, oracle output explicitly reports the missing trust inputs.
+    resolved_oracle_coverage = oracle_coverage or unavailable_chainlink_coverage(
+        expected_assets=len(official_b20_addresses)
+    )
     # The FastAPI instance owns this process's routes and OpenAPI metadata.
     application = FastAPI(
         title=resolved_settings.app_name,
@@ -83,6 +94,8 @@ def create_app(
     application.state.b20_registry = resolved_registry
     # Storing pool evidence gives every route the same all-or-nothing discovery outcome.
     application.state.pool_discovery = resolved_pool_discovery
+    # Storing oracle evidence keeps API and dashboard health claims on one snapshot.
+    application.state.oracle_coverage = resolved_oracle_coverage
 
     @application.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -106,6 +119,11 @@ def create_app(
         """Return validated B20/USDC pools or an evidence-backed discovery diagnostic."""
         return resolved_pool_discovery
 
+    @application.get("/api/oracles/chainlink", response_model=ChainlinkCoverageReport)
+    def chainlink_oracle_coverage() -> ChainlinkCoverageReport:
+        """Return evaluated B20 feed health or an evidence-backed connector diagnostic."""
+        return resolved_oracle_coverage
+
     @application.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
         """Render the initial local dashboard with honest connector status."""
@@ -113,6 +131,7 @@ def create_app(
             resolved_settings.app_name,
             resolved_registry,
             resolved_pool_discovery,
+            resolved_oracle_coverage,
         )
 
     return application
@@ -122,6 +141,7 @@ def _dashboard_html(
     app_name: str,
     registry: B20RegistryResult,
     pool_discovery: PoolDiscoveryResult,
+    oracle_coverage: ChainlinkCoverageReport,
 ) -> str:
     """Build the dependency-free dashboard shell for the local first release.
 
@@ -129,6 +149,7 @@ def _dashboard_html(
         app_name: Validated local product title.
         registry: Official B20 registry evidence or fail-closed diagnostic.
         pool_discovery: Validated Aerodrome pools or fail-closed diagnostic.
+        oracle_coverage: Chainlink B20 coverage evidence or fail-closed diagnostic.
 
     Returns:
         A complete HTML document with escaped dynamic evidence.
@@ -153,6 +174,16 @@ def _dashboard_html(
     )
     # Combining ordered diagnostics gives the operator complete escaped evidence.
     pool_diagnostic = escape(" ".join(pool_discovery.diagnostics))
+    # Only a fully verified coverage snapshot receives a positive visual status.
+    oracle_tone = "good" if oracle_coverage.status is OracleCoverageStatus.VERIFIED else "pending"
+    # The count label makes zero configured feeds visible without implying a transient error.
+    oracle_status = (
+        f"{oracle_coverage.healthy_feeds} of {oracle_coverage.configured_feeds} feeds healthy"
+        if oracle_coverage.status is OracleCoverageStatus.VERIFIED
+        else "Health unavailable"
+    )
+    # Ordered diagnostics preserve the evidence behind the coverage outcome.
+    oracle_diagnostic = escape(" ".join(oracle_coverage.diagnostics))
     return (
         dashboard_template.replace("{{APP_NAME}}", display_name)
         .replace("{{B20_TONE}}", registry_tone)
@@ -161,4 +192,7 @@ def _dashboard_html(
         .replace("{{POOL_TONE}}", pool_tone)
         .replace("{{POOL_STATUS}}", pool_status)
         .replace("{{POOL_DIAGNOSTIC}}", pool_diagnostic)
+        .replace("{{ORACLE_TONE}}", oracle_tone)
+        .replace("{{ORACLE_STATUS}}", oracle_status)
+        .replace("{{ORACLE_DIAGNOSTIC}}", oracle_diagnostic)
     )

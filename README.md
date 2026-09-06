@@ -39,3 +39,10 @@ The source states that its list is the complete set of Coinbase-issued tokenized
 Each bundled identity retains the official BaseScan link and the date the source was observed.
 The application validates the entire registry and rejects duplicate or malformed identities before exposing any address.
 If the evidence resource is missing or invalid, the API and dashboard show an explicit blocked diagnostic and expose no token identities.
+
+## Chainlink health
+
+The application models Chainlink Coinbase B20 total-return rounds, Coinbase multiplier pause state, and the Base sequencer recovery boundary as deterministic health gates.
+Only a market-open observation that passes every gate is healthy.
+The current release has no reviewed B20 proxy-address snapshot or read-only observation backend, so `/api/oracles/chainlink` and the dashboard report an explicit unavailable diagnostic instead of making live feed claims.
+See [the oracle health policy](docs/oracle-health.md) for evidence sources and exact gate ordering.

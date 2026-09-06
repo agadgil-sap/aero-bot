@@ -58,6 +58,8 @@ async def test_dashboard_states_truthful_initial_status() -> None:
     assert "Verified 10 Coinbase-issued B20 listings" in response.text
     assert "Discovery blocked" in response.text
     assert "No read-only Base RPC discovery backend is configured" in response.text
+    assert "Health unavailable" in response.text
+    assert "no reviewed proxy-address snapshot" in response.text
     assert "Hold USDC is always a valid outcome." in response.text
 
 
@@ -153,3 +155,24 @@ async def test_pool_endpoint_and_dashboard_expose_verified_discovery() -> None:
     assert len(api_response.json()["pools"]) == 1
     assert "1 pools verified" in dashboard_response.text
     assert "Accepted one fixture pool." in dashboard_response.text
+
+
+@pytest.mark.anyio
+async def test_chainlink_endpoint_exposes_evidence_backed_unavailable_state() -> None:
+    """The default oracle route names missing trust inputs and makes no feed claims."""
+    # The default application has verified B20 identities but no reviewed live feed backend.
+    transport = httpx.ASGITransport(app=create_app(Settings()))
+    # The HTTP client exercises routing and response-model serialization together.
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # The request represents the machine-readable diagnostic used by the dashboard.
+        response = await client.get("/api/oracles/chainlink")
+
+    # The payload proves that documented semantics are not confused with live observations.
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["status"] == "unavailable"
+    assert payload["expected_assets"] == 10
+    assert payload["configured_feeds"] == 0
+    assert payload["healthy_feeds"] == 0
+    assert payload["assessments"] == []
+    assert payload["source_url"].endswith("/tokenized-equity-feeds/coinbase")
