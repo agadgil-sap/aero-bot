@@ -1,11 +1,20 @@
 """Behavior tests for the local dashboard and safety metadata."""
 
+from datetime import UTC, datetime
+
 import httpx
 import pytest
 
 from aero_bot.app import create_app
 from aero_bot.config import Settings
 from aero_bot.registry import B20RegistryResult, RegistryStatus
+from aero_bot.venues import (
+    PoolCandidate,
+    PoolDiscoveryResult,
+    PoolDiscoveryStatus,
+    PoolKind,
+    VenueId,
+)
 
 
 @pytest.mark.anyio
@@ -47,7 +56,8 @@ async def test_dashboard_states_truthful_initial_status() -> None:
     assert "Aerodrome" in response.text
     assert "Source verified" in response.text
     assert "Verified 10 Coinbase-issued B20 listings" in response.text
-    assert "Not connected" in response.text
+    assert "Discovery blocked" in response.text
+    assert "No read-only Base RPC discovery backend is configured" in response.text
     assert "Hold USDC is always a valid outcome." in response.text
 
 
@@ -106,3 +116,40 @@ async def test_dashboard_displays_registry_failure_diagnostic() -> None:
 
     assert "Blocked" in response.text
     assert "Evidence &lt;failed&gt; validation" in response.text
+
+
+@pytest.mark.anyio
+async def test_pool_endpoint_and_dashboard_expose_verified_discovery() -> None:
+    """Injected verified discovery is visible through both JSON and the user-facing page."""
+    # The candidate is valid fixture evidence and does not claim a real deployed pool.
+    candidate = PoolCandidate(
+        pool_address="0x1111111111111111111111111111111111111111",
+        factory_address="0xf8f2eb4940cfe7d13603dddd87f123820fc061ef",
+        token0_address="0xb20000000000000000000078ee7ce2fe4908108c",
+        token1_address="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        pool_kind=PoolKind.SLIPSTREAM,
+        fee_bps=30,
+        gauge_address=None,
+    )
+    # The discovery result simulates a completed read-only backend after adapter validation.
+    pool_discovery = PoolDiscoveryResult(
+        venue=VenueId.AERODROME,
+        status=PoolDiscoveryStatus.VERIFIED,
+        source="fixture:block-123",
+        observed_at=datetime(2026, 9, 6, 10, 30, tzinfo=UTC),
+        pools=(candidate,),
+        diagnostics=("Accepted one fixture pool.",),
+    )
+    # The transport carries one coherent injected result across both routes.
+    transport = httpx.ASGITransport(app=create_app(Settings(), pool_discovery=pool_discovery))
+    # The HTTP client exercises JSON serialization and HTML rendering together.
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Both requests represent the operator's machine-readable and visual views.
+        api_response = await client.get("/api/venues/aerodrome/pools")
+        dashboard_response = await client.get("/")
+
+    assert api_response.status_code == 200
+    assert api_response.json()["status"] == "verified"
+    assert len(api_response.json()["pools"]) == 1
+    assert "1 pools verified" in dashboard_response.text
+    assert "Accepted one fixture pool." in dashboard_response.text
