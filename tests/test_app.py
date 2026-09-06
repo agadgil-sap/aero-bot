@@ -1,6 +1,7 @@
 """Behavior tests for the local dashboard and safety metadata."""
 
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -254,3 +255,38 @@ async def test_transaction_routes_plan_then_report_simulation_unavailable() -> N
     assert simulation_response.status_code == 200
     assert simulation_response.json()["status"] == "unavailable"
     assert simulation_response.json()["observations"] == []
+
+
+@pytest.mark.anyio
+async def test_concentrated_position_endpoint_exposes_position_aware_loss() -> None:
+    """The HTTP analysis boundary returns inventory and hold-relative loss evidence."""
+    # Default application provides the pure analyzer without enabling transaction execution.
+    transport = httpx.ASGITransport(app=create_app(Settings()))
+    # The request exercises validation, Decimal math, routing, and JSON serialization together.
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Exact-square fixture moves from a mixed entry position to token1-only above range.
+        response = await client.post(
+            "/api/analysis/concentrated-position",
+            json={
+                "liquidity": "100",
+                "lower_price": "1",
+                "upper_price": "4",
+                "entry_price": "2.25",
+                "current_price": "9",
+                "entry_token0_usd": "2.25",
+                "entry_token1_usd": "1",
+                "current_token0_usd": "9",
+                "current_token1_usd": "1",
+                "holding_period_seconds": 31_536_000,
+            },
+        )
+
+    # API result keeps values as JSON decimal strings or exact-compatible serialized numbers.
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["range_state"] == "above_range"
+    assert payload["current_amounts"] == {"token0": "0", "token1": "100"}
+    assert payload["current_position_value_usd"] == "100"
+    assert Decimal(payload["hold_value_usd"]) == Decimal(200)
+    assert Decimal(payload["impermanent_loss_fraction"]) == Decimal("0.5")
+    assert Decimal(payload["impermanent_loss_apr"]) == Decimal("0.5")

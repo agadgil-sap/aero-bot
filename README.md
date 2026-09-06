@@ -53,3 +53,10 @@ The application can plan deterministic unsigned exact allowances and can pass a 
 The default policy is emergency-halted with empty transaction allowlists and no simulation backend.
 Wallet onboarding, private-key input, signing, and broadcasting remain structurally unavailable through both the API and dashboard.
 See [the transaction simulation boundary](docs/transaction-simulation.md) for exact allowance and backend evidence rules.
+
+## Concentrated-liquidity analysis
+
+The position analyzer implements Slipstream's inherited square-root-price inventory formulas with exact Decimal arithmetic.
+It distinguishes below-range, active, and above-range positions, reports current asset concentration, and compares current LP inventory with holding the entry assets.
+Fees and AERO emissions remain separate from the conservative impermanent-loss estimate.
+See [the concentrated-liquidity policy](docs/concentrated-liquidity.md) for formulas, assumptions, and adapter requirements.

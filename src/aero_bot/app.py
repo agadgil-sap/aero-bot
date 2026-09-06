@@ -8,6 +8,11 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+from aero_bot.concentrated import (
+    ConcentratedLiquidityAnalyzer,
+    ConcentratedPositionAnalysis,
+    ConcentratedPositionSnapshot,
+)
 from aero_bot.config import Settings
 from aero_bot.oracles import (
     ChainlinkCoverageReport,
@@ -94,6 +99,8 @@ def create_app(
     )
     # Default transaction policy is emergency-halted with no targets or live backend.
     resolved_transaction_planner = transaction_planner or TransactionPlanner()
+    # Pure Decimal analysis is stateless and shares no wallet or network capability.
+    concentrated_analyzer = ConcentratedLiquidityAnalyzer()
     # The FastAPI instance owns this process's routes and OpenAPI metadata.
     application = FastAPI(
         title=resolved_settings.app_name,
@@ -152,6 +159,15 @@ def create_app(
     def simulate_transaction_plan(plan: UnsignedTransactionPlan) -> PlanSimulationResult:
         """Revalidate and submit an unsigned plan to read-only simulation only."""
         return resolved_transaction_planner.simulate(plan)
+
+    @application.post(
+        "/api/analysis/concentrated-position", response_model=ConcentratedPositionAnalysis
+    )
+    def analyze_concentrated_position(
+        snapshot: ConcentratedPositionSnapshot,
+    ) -> ConcentratedPositionAnalysis:
+        """Calculate deterministic Slipstream inventory and loss evidence."""
+        return concentrated_analyzer.analyze(snapshot)
 
     @application.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
