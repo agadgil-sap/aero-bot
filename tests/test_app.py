@@ -8,6 +8,7 @@ import pytest
 from aero_bot.app import create_app
 from aero_bot.config import Settings
 from aero_bot.registry import B20RegistryResult, RegistryStatus
+from aero_bot.transactions import TransactionPlanner, TransactionPolicy
 from aero_bot.venues import (
     PoolCandidate,
     PoolDiscoveryResult,
@@ -60,6 +61,8 @@ async def test_dashboard_states_truthful_initial_status() -> None:
     assert "No read-only Base RPC discovery backend is configured" in response.text
     assert "Health unavailable" in response.text
     assert "no reviewed proxy-address snapshot" in response.text
+    assert "Wallet onboarding unavailable" in response.text
+    assert "Simulation backend unavailable" in response.text
     assert "Hold USDC is always a valid outcome." in response.text
 
 
@@ -176,3 +179,78 @@ async def test_chainlink_endpoint_exposes_evidence_backed_unavailable_state() ->
     assert payload["healthy_feeds"] == 0
     assert payload["assessments"] == []
     assert payload["source_url"].endswith("/tokenized-equity-feeds/coinbase")
+
+
+@pytest.mark.anyio
+async def test_transaction_api_is_wallet_free_and_emergency_halted_by_default() -> None:
+    """Public capabilities remain disabled and default planning produces no payload."""
+    # Default application uses an emergency-halted planner with no contract allowlists.
+    transport = httpx.ASGITransport(app=create_app(Settings()))
+    # The HTTP client exercises public capability and planning boundaries together.
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Capability request provides the machine-readable first-release safety contract.
+        capabilities_response = await client.get("/api/transactions/capabilities")
+        # Planning request contains only public fixture identities and no wallet credential.
+        planning_response = await client.post(
+            "/api/transactions/plan/exact-allowance",
+            json={
+                "owner_address": "0x1111111111111111111111111111111111111111",
+                "token_address": "0xb20000000000000000000078ee7ce2fe4908108c",
+                "spender_address": "0x2222222222222222222222222222222222222222",
+                "amount_raw": 1_250_000,
+                "current_allowance_raw": 0,
+                "block_number": 35_000_000,
+            },
+        )
+
+    # Capabilities make absence of all key-bearing operations explicit.
+    capabilities = capabilities_response.json()
+    assert capabilities_response.status_code == 200
+    assert capabilities["execution_mode"] == "simulation_only"
+    assert capabilities["private_key_input_available"] is False
+    assert capabilities["signing_available"] is False
+    assert capabilities["broadcast_available"] is False
+    assert capabilities["wallet_onboarding_available"] is False
+    # Default policy returns no unsigned payload while emergency halt remains enabled.
+    assert planning_response.status_code == 200
+    assert planning_response.json()["status"] == "blocked"
+    assert planning_response.json()["plan"] is None
+
+
+@pytest.mark.anyio
+async def test_transaction_routes_plan_then_report_simulation_unavailable() -> None:
+    """An enabled fixture policy can plan but cannot sign, broadcast, or fake simulation."""
+    # Explicit fixture policy allows only one token and one spender for this app instance.
+    planner = TransactionPlanner(
+        TransactionPolicy(
+            emergency_halt=False,
+            allowed_token_addresses=frozenset({"0xb20000000000000000000078ee7ce2fe4908108c"}),
+            allowed_spender_addresses=frozenset({"0x2222222222222222222222222222222222222222"}),
+        )
+    )
+    # Injected planner exercises ready behavior without changing safe application defaults.
+    transport = httpx.ASGITransport(app=create_app(Settings(), transaction_planner=planner))
+    # The client passes the serialized plan directly into stateless revalidation and simulation.
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Planning input contains public state only.
+        planning_response = await client.post(
+            "/api/transactions/plan/exact-allowance",
+            json={
+                "owner_address": "0x1111111111111111111111111111111111111111",
+                "token_address": "0xb20000000000000000000078ee7ce2fe4908108c",
+                "spender_address": "0x2222222222222222222222222222222222222222",
+                "amount_raw": 1_250_000,
+                "current_allowance_raw": 0,
+                "block_number": 35_000_000,
+            },
+        )
+        # Returned plan is untrusted input again at the simulation endpoint.
+        simulation_response = await client.post(
+            "/api/transactions/simulate", json=planning_response.json()["plan"]
+        )
+
+    assert planning_response.status_code == 200
+    assert planning_response.json()["status"] == "ready"
+    assert simulation_response.status_code == 200
+    assert simulation_response.json()["status"] == "unavailable"
+    assert simulation_response.json()["observations"] == []

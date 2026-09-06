@@ -46,3 +46,10 @@ The application models Chainlink Coinbase B20 total-return rounds, Coinbase mult
 Only a market-open observation that passes every gate is healthy.
 The current release has no reviewed B20 proxy-address snapshot or read-only observation backend, so `/api/oracles/chainlink` and the dashboard report an explicit unavailable diagnostic instead of making live feed claims.
 See [the oracle health policy](docs/oracle-health.md) for evidence sources and exact gate ordering.
+
+## Wallet-free transaction planning
+
+The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.
+The default policy is emergency-halted with empty transaction allowlists and no simulation backend.
+Wallet onboarding, private-key input, signing, and broadcasting remain structurally unavailable through both the API and dashboard.
+See [the transaction simulation boundary](docs/transaction-simulation.md) for exact allowance and backend evidence rules.

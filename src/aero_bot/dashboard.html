@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='16'%20fill='%230b1915'/%3E%3Cpath%20d='M18%2042%2030%2016h4l12%2026h-8l-2-5H25l-2%205zm10-12h6l-3-7z'%20fill='%2365e6b4'/%3E%3C/svg%3E">
   <title>{{APP_NAME}}</title>
   <style>
     :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
@@ -19,6 +20,7 @@
     .detail { margin: 8px 0 0; color: #91a9a0; font-size: .9rem; line-height: 1.5; }
     .good { color: #65e6b4; }
     .pending { color: #ffc66d; }
+    .disabled-control { width: 100%; margin-top: 16px; padding: 11px 14px; border: 1px solid #2c4940; border-radius: 10px; background: #13251f; color: #6f8a81; font: inherit; font-size: .86rem; font-weight: 700; cursor: not-allowed; }
     .notice { display: flex; gap: 12px; margin-top: 18px; padding: 16px 18px; border-radius: 14px; background: #10231d; color: #b7ccc4; line-height: 1.5; }
     .dot { flex: 0 0 auto; width: 9px; height: 9px; margin-top: 7px; border-radius: 99px; background: #65e6b4; box-shadow: 0 0 14px #65e6b4; }
     @media (max-width: 760px) {
@@ -37,6 +39,7 @@
         <p class="label">Execution boundary</p>
         <p class="value good">Simulation only</p>
         <p class="detail">No wallet, signer, private key, or broadcast path is present.</p>
+        <button class="disabled-control" type="button" disabled aria-disabled="true">Wallet onboarding unavailable</button>
       </article>
       <article class="card">
         <p class="label">Enabled venue</p>
@@ -57,6 +60,11 @@
         <p class="label">Chainlink oracle health</p>
         <p class="value {{ORACLE_TONE}}">{{ORACLE_STATUS}}</p>
         <p class="detail">{{ORACLE_DIAGNOSTIC}}</p>
+      </article>
+      <article class="card">
+        <p class="label">Unsigned transaction planning</p>
+        <p class="value pending">{{SIMULATION_STATUS}}</p>
+        <p class="detail">{{TRANSACTION_DIAGNOSTIC}}</p>
       </article>
     </section>
     <div class="notice">

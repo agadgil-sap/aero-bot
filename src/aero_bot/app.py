@@ -15,6 +15,14 @@ from aero_bot.oracles import (
     unavailable_chainlink_coverage,
 )
 from aero_bot.registry import B20RegistryResult, RegistryStatus, load_official_b20_registry
+from aero_bot.transactions import (
+    AllowancePlanResult,
+    ExactAllowanceRequest,
+    PlanSimulationResult,
+    TransactionCapabilities,
+    TransactionPlanner,
+    UnsignedTransactionPlan,
+)
 from aero_bot.venues import (
     AerodromeVenueAdapter,
     PoolDiscoveryResult,
@@ -56,6 +64,7 @@ def create_app(
     b20_registry: B20RegistryResult | None = None,
     pool_discovery: PoolDiscoveryResult | None = None,
     oracle_coverage: ChainlinkCoverageReport | None = None,
+    transaction_planner: TransactionPlanner | None = None,
 ) -> FastAPI:
     """Create an application instance with explicit local safety metadata.
 
@@ -64,6 +73,7 @@ def create_app(
         b20_registry: Optional preloaded official registry result for deterministic tests.
         pool_discovery: Optional preloaded Aerodrome discovery result for deterministic tests.
         oracle_coverage: Optional preloaded Chainlink coverage for deterministic tests.
+        transaction_planner: Optional policy-bound wallet-free transaction planner.
 
     Returns:
         A configured FastAPI application with dashboard and diagnostic routes.
@@ -82,6 +92,8 @@ def create_app(
     resolved_oracle_coverage = oracle_coverage or unavailable_chainlink_coverage(
         expected_assets=len(official_b20_addresses)
     )
+    # Default transaction policy is emergency-halted with no targets or live backend.
+    resolved_transaction_planner = transaction_planner or TransactionPlanner()
     # The FastAPI instance owns this process's routes and OpenAPI metadata.
     application = FastAPI(
         title=resolved_settings.app_name,
@@ -96,6 +108,8 @@ def create_app(
     application.state.pool_discovery = resolved_pool_discovery
     # Storing oracle evidence keeps API and dashboard health claims on one snapshot.
     application.state.oracle_coverage = resolved_oracle_coverage
+    # Storing the planner keeps all requests behind one immutable safety policy.
+    application.state.transaction_planner = resolved_transaction_planner
 
     @application.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -124,6 +138,21 @@ def create_app(
         """Return evaluated B20 feed health or an evidence-backed connector diagnostic."""
         return resolved_oracle_coverage
 
+    @application.get("/api/transactions/capabilities", response_model=TransactionCapabilities)
+    def transaction_capabilities() -> TransactionCapabilities:
+        """Return immutable wallet, signing, broadcast, and simulation capabilities."""
+        return resolved_transaction_planner.capabilities()
+
+    @application.post("/api/transactions/plan/exact-allowance", response_model=AllowancePlanResult)
+    def plan_exact_allowance(request: ExactAllowanceRequest) -> AllowancePlanResult:
+        """Plan an allowlisted exact approval without wallet access or signing."""
+        return resolved_transaction_planner.plan_exact_allowance(request)
+
+    @application.post("/api/transactions/simulate", response_model=PlanSimulationResult)
+    def simulate_transaction_plan(plan: UnsignedTransactionPlan) -> PlanSimulationResult:
+        """Revalidate and submit an unsigned plan to read-only simulation only."""
+        return resolved_transaction_planner.simulate(plan)
+
     @application.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
         """Render the initial local dashboard with honest connector status."""
@@ -132,6 +161,7 @@ def create_app(
             resolved_registry,
             resolved_pool_discovery,
             resolved_oracle_coverage,
+            resolved_transaction_planner.capabilities(),
         )
 
     return application
@@ -142,6 +172,7 @@ def _dashboard_html(
     registry: B20RegistryResult,
     pool_discovery: PoolDiscoveryResult,
     oracle_coverage: ChainlinkCoverageReport,
+    transaction_capabilities: TransactionCapabilities,
 ) -> str:
     """Build the dependency-free dashboard shell for the local first release.
 
@@ -150,6 +181,7 @@ def _dashboard_html(
         registry: Official B20 registry evidence or fail-closed diagnostic.
         pool_discovery: Validated Aerodrome pools or fail-closed diagnostic.
         oracle_coverage: Chainlink B20 coverage evidence or fail-closed diagnostic.
+        transaction_capabilities: Immutable wallet-free capability declaration.
 
     Returns:
         A complete HTML document with escaped dynamic evidence.
@@ -184,6 +216,14 @@ def _dashboard_html(
     )
     # Ordered diagnostics preserve the evidence behind the coverage outcome.
     oracle_diagnostic = escape(" ".join(oracle_coverage.diagnostics))
+    # Escaping preserves the HTML boundary if a future backend supplies local diagnostic text.
+    transaction_diagnostic = escape(transaction_capabilities.diagnostic)
+    # Backend status names unavailable simulation without weakening local planning guarantees.
+    simulation_status = (
+        "Read-only backend configured"
+        if transaction_capabilities.simulation_backend_configured
+        else "Simulation backend unavailable"
+    )
     return (
         dashboard_template.replace("{{APP_NAME}}", display_name)
         .replace("{{B20_TONE}}", registry_tone)
@@ -195,4 +235,6 @@ def _dashboard_html(
         .replace("{{ORACLE_TONE}}", oracle_tone)
         .replace("{{ORACLE_STATUS}}", oracle_status)
         .replace("{{ORACLE_DIAGNOSTIC}}", oracle_diagnostic)
+        .replace("{{SIMULATION_STATUS}}", simulation_status)
+        .replace("{{TRANSACTION_DIAGNOSTIC}}", transaction_diagnostic)
     )
