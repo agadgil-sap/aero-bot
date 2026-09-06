@@ -1,0 +1,30 @@
+# Local secrets and environment overrides.
+.env
+.env.*
+!.env.example
+
+# Python cache and build artifacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.venv/
+
+# Local runtime state.
+*.db
+*.db-shm
+*.db-wal
+logs/
+run/
+
+# Local design-review artifacts.
+.lavish/
+
+# macOS metadata.
+.DS_Store
