@@ -1,0 +1,87 @@
+[build-system]
+# Hatchling provides a small, standards-based wheel build backend.
+requires = ["hatchling>=1.27,<2"]
+# The PEP 517 backend used to build source and wheel distributions.
+build-backend = "hatchling.build"
+
+[project]
+# The distribution name used by package installers.
+name = "aero-bot"
+# The initial pre-release version while the wallet-free product is assembled.
+version = "0.1.0"
+# A concise package summary for local installation metadata.
+description = "A safe, wallet-free local Aerodrome LP analysis application"
+# The repository README supplies long-form package metadata.
+readme = "README.md"
+# Python 3.12 is the oldest runtime supported by the application.
+requires-python = ">=3.12"
+# Runtime dependencies are bounded to compatible major versions.
+dependencies = [
+  "fastapi>=0.116,<1",
+  "pydantic-settings>=2.10,<3",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+# Development tools provide tests, linting, formatting, and static type checks.
+dev = [
+  "httpx>=0.28,<1",
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<9",
+  "pytest-cov>=6.2,<7",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+# The local command starts the loopback-only ASGI server.
+aero-bot = "aero_bot.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+# The wheel contains only the application package under the src layout.
+packages = ["src/aero_bot"]
+
+[tool.pytest.ini_options]
+# Pytest imports the installed src-layout package and reports terse failures.
+addopts = "--strict-config --strict-markers -ra"
+# Tests live in the repository's dedicated behavior-test directory.
+testpaths = ["tests"]
+
+[tool.coverage.run]
+# Branch coverage ensures both sides of security decisions are exercised.
+branch = true
+# Coverage is limited to first-party application modules.
+source = ["aero_bot"]
+
+[tool.coverage.report]
+# Missing line numbers make incomplete behavior coverage actionable.
+show_missing = true
+# Initial coverage must remain high as the application grows.
+fail_under = 90
+
+[tool.ruff]
+# Source and tests share a clear, review-friendly line length.
+line-length = 100
+# Ruff analyzes code supported by the minimum Python runtime.
+target-version = "py312"
+
+[tool.ruff.lint]
+# The selected rules cover correctness, imports, security, annotations, and docs.
+select = ["A", "ANN", "B", "C4", "D", "E", "F", "I", "N", "S", "SIM", "UP"]
+# Package module docstrings add noise without improving the public API.
+ignore = ["D104"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test functions use pytest assertions and need no return annotations beyond None.
+"tests/**/*.py" = ["S101", "S104"]
+
+[tool.ruff.lint.pydocstyle]
+# Google-style docstrings are readable in source and generated documentation.
+convention = "google"
+
+[tool.mypy]
+# Strict mode prevents accidental Any values from entering risk decisions later.
+strict = true
+# Mypy interprets code using the minimum supported Python language level.
+python_version = "3.12"
+# Error messages identify exact columns for faster diagnosis.
+show_column_numbers = true
