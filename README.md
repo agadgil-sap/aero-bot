@@ -75,5 +75,6 @@ The local persistence boundary uses a versioned SQLite database with append-only
 It rejects credential-shaped fields before persistence and uses restrictive user-only filesystem permissions.
 The dashboard, process health route, and `/api/audit/health` expose complete chain verification.
 Every risk response is persisted with its validated input, active policy, and exact decision before it is returned.
-Transaction planning and simulation audit integration remains pending.
+Every exact-allowance planning response is persisted with its public request, active policy, and exact result before it is returned.
+Read-only simulation audit integration remains pending.
 See [the audit log design](docs/audit-log.md) for guarantees, limitations, and integration status.

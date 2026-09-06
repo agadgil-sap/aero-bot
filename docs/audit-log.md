@@ -37,5 +37,9 @@ The event contains the complete validated opportunity snapshot, immutable active
 If durable append fails, the endpoint does not return an unaudited decision.
 Each append verifies the complete existing chain under its immediate write transaction and refuses to extend corrupt history.
 
-Transaction planning and read-only simulation events are not connected yet.
-A later slice must append their complete public evidence at those service boundaries without introducing any private key, signature, or broadcast payload.
+Every `/api/transactions/plan/exact-allowance` response is also appended before it is returned.
+The event contains the complete public request, immutable transaction policy, and exact blocked, no-action, or unsigned ready result.
+No audit payload includes a private key, signature, signed transaction, or broadcast capability.
+
+Read-only simulation events are not connected yet.
+A later slice must append their submitted unsigned plan and complete result at that service boundary.

@@ -341,6 +341,11 @@ class TransactionPlanner:
         # Missing backend is a supported state with explicit unavailable diagnostics.
         self._simulation_backend = simulation_backend
 
+    @property
+    def policy(self) -> TransactionPolicy:
+        """Return the immutable policy required to reproduce audited plans."""
+        return self._policy
+
     def capabilities(self) -> TransactionCapabilities:
         """Return the immutable wallet-free execution boundary."""
         # Backend presence reports simulation availability without performing a network call.

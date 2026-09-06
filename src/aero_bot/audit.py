@@ -19,6 +19,7 @@ from aero_bot.domain import (
     RiskDecision,
     RiskPolicy,
 )
+from aero_bot.transactions import AllowancePlanResult, ExactAllowanceRequest, TransactionPolicy
 
 # Schema version permits explicit future migrations rather than silent table changes.
 AUDIT_SCHEMA_VERSION = 1
@@ -124,6 +125,20 @@ class RiskDecisionAuditPayload(BaseModel):
     policy: RiskPolicy
     # Decision contains the ordered hold or eligible result and exact calculations.
     decision: RiskDecision
+
+
+class TransactionPlanAuditPayload(BaseModel):
+    """Capture every validated dependency and output of exact-allowance planning."""
+
+    # Frozen strict fields preserve one coherent deterministic planning envelope.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # Request contains only public addresses, allowance quantities, and Base block evidence.
+    request: ExactAllowanceRequest
+    # Policy contains the emergency state and complete contract allowlists used for planning.
+    policy: TransactionPolicy
+    # Result contains the exact blocked, no-action, or unsigned ready outcome returned by the API.
+    result: AllowancePlanResult
 
 
 class AuditStore:

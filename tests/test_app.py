@@ -47,6 +47,27 @@ def risk_request_payload() -> dict[str, object]:
     }
 
 
+def allowance_request_payload(
+    current_allowance_raw: int = 0,
+) -> dict[str, object]:
+    """Build complete public fixture evidence for the allowance-planning boundary.
+
+    Args:
+        current_allowance_raw: Public onchain allowance observed at the pinned Base block.
+
+    Returns:
+        JSON-compatible exact-allowance request with no signing material.
+    """
+    return {
+        "owner_address": "0x1111111111111111111111111111111111111111",
+        "token_address": "0xb20000000000000000000078ee7ce2fe4908108c",
+        "spender_address": "0x2222222222222222222222222222222222222222",
+        "amount_raw": 1_250_000,
+        "current_allowance_raw": current_allowance_raw,
+        "block_number": 35_000_000,
+    }
+
+
 @pytest.mark.anyio
 async def test_health_exposes_wallet_free_operating_boundary() -> None:
     """Health output identifies the chain, venue, and simulation-only mode."""
@@ -217,8 +238,10 @@ async def test_chainlink_endpoint_exposes_evidence_backed_unavailable_state() ->
 @pytest.mark.anyio
 async def test_transaction_api_is_wallet_free_and_emergency_halted_by_default() -> None:
     """Public capabilities remain disabled and default planning produces no payload."""
+    # Resolved settings identify the isolated persistent audit database for later inspection.
+    settings = Settings()
     # Default application uses an emergency-halted planner with no contract allowlists.
-    transport = httpx.ASGITransport(app=create_app(Settings()))
+    transport = httpx.ASGITransport(app=create_app(settings))
     # The HTTP client exercises public capability and planning boundaries together.
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         # Capability request provides the machine-readable first-release safety contract.
@@ -226,14 +249,7 @@ async def test_transaction_api_is_wallet_free_and_emergency_halted_by_default() 
         # Planning request contains only public fixture identities and no wallet credential.
         planning_response = await client.post(
             "/api/transactions/plan/exact-allowance",
-            json={
-                "owner_address": "0x1111111111111111111111111111111111111111",
-                "token_address": "0xb20000000000000000000078ee7ce2fe4908108c",
-                "spender_address": "0x2222222222222222222222222222222222222222",
-                "amount_raw": 1_250_000,
-                "current_allowance_raw": 0,
-                "block_number": 35_000_000,
-            },
+            json=allowance_request_payload(),
         )
 
     # Capabilities make absence of all key-bearing operations explicit.
@@ -248,10 +264,20 @@ async def test_transaction_api_is_wallet_free_and_emergency_halted_by_default() 
     assert planning_response.status_code == 200
     assert planning_response.json()["status"] == "blocked"
     assert planning_response.json()["plan"] is None
+    # Reopening the configured store proves the blocked outcome was durably recorded.
+    audit_records = AuditStore(settings.audit_database_path).read_records()
+    # Decoded canonical payload exposes the complete transaction-planning envelope.
+    audit_payload = json.loads(audit_records[0].payload_json)
+    assert len(audit_records) == 1
+    assert audit_records[0].event_type is AuditEventType.TRANSACTION_PLAN
+    assert audit_payload["policy"]["emergency_halt"] is True
+    assert audit_payload["result"] == planning_response.json()
 
 
 @pytest.mark.anyio
-async def test_transaction_routes_plan_then_report_simulation_unavailable() -> None:
+async def test_transaction_routes_plan_then_report_simulation_unavailable(
+    tmp_path: Path,
+) -> None:
     """An enabled fixture policy can plan but cannot sign, broadcast, or fake simulation."""
     # Explicit fixture policy allows only one token and one spender for this app instance.
     planner = TransactionPlanner(
@@ -261,21 +287,27 @@ async def test_transaction_routes_plan_then_report_simulation_unavailable() -> N
             allowed_spender_addresses=frozenset({"0x2222222222222222222222222222222222222222"}),
         )
     )
+    # Explicit audit store makes the exact ready-plan record inspectable after both requests.
+    audit_store = AuditStore(tmp_path / "transaction-audit" / "audit.sqlite3")
     # Injected planner exercises ready behavior without changing safe application defaults.
-    transport = httpx.ASGITransport(app=create_app(Settings(), transaction_planner=planner))
+    transport = httpx.ASGITransport(
+        app=create_app(
+            Settings(),
+            transaction_planner=planner,
+            audit_store=audit_store,
+        )
+    )
     # The client passes the serialized plan directly into stateless revalidation and simulation.
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         # Planning input contains public state only.
         planning_response = await client.post(
             "/api/transactions/plan/exact-allowance",
-            json={
-                "owner_address": "0x1111111111111111111111111111111111111111",
-                "token_address": "0xb20000000000000000000078ee7ce2fe4908108c",
-                "spender_address": "0x2222222222222222222222222222222222222222",
-                "amount_raw": 1_250_000,
-                "current_allowance_raw": 0,
-                "block_number": 35_000_000,
-            },
+            json=allowance_request_payload(),
+        )
+        # Matching current allowance exercises the first-class no-action planning outcome.
+        no_action_response = await client.post(
+            "/api/transactions/plan/exact-allowance",
+            json=allowance_request_payload(current_allowance_raw=1_250_000),
         )
         # Returned plan is untrusted input again at the simulation endpoint.
         simulation_response = await client.post(
@@ -284,9 +316,29 @@ async def test_transaction_routes_plan_then_report_simulation_unavailable() -> N
 
     assert planning_response.status_code == 200
     assert planning_response.json()["status"] == "ready"
+    assert no_action_response.status_code == 200
+    assert no_action_response.json()["status"] == "no_action"
+    assert no_action_response.json()["plan"] is None
     assert simulation_response.status_code == 200
     assert simulation_response.json()["status"] == "unavailable"
     assert simulation_response.json()["observations"] == []
+    # Both planning responses are audited, while simulation remains pending this iteration.
+    audit_records = audit_store.read_records()
+    # First canonical payload contains the exact ready response and immutable policy.
+    ready_audit_payload = json.loads(audit_records[0].payload_json)
+    # Second canonical payload retains the exact no-action evidence without a transaction plan.
+    no_action_audit_payload = json.loads(audit_records[1].payload_json)
+    assert len(audit_records) == 2
+    assert all(record.event_type is AuditEventType.TRANSACTION_PLAN for record in audit_records)
+    assert ready_audit_payload["request"] == allowance_request_payload()
+    assert ready_audit_payload["policy"]["emergency_halt"] is False
+    assert ready_audit_payload["result"] == planning_response.json()
+    assert ready_audit_payload["result"]["plan"]["signing_available"] is False
+    assert ready_audit_payload["result"]["plan"]["broadcast_available"] is False
+    assert no_action_audit_payload["request"] == allowance_request_payload(
+        current_allowance_raw=1_250_000
+    )
+    assert no_action_audit_payload["result"] == no_action_response.json()
 
 
 @pytest.mark.anyio
@@ -428,6 +480,11 @@ async def test_corrupt_audit_chain_degrades_health_and_dashboard(tmp_path: Path)
         dashboard_response = await client.get("/")
         # Risk route must block rather than return a decision that cannot be audited.
         risk_response = await client.post("/api/risk/evaluate", json=risk_request_payload())
+        # Planning route must enforce the identical fail-closed persistence requirement.
+        planning_response = await client.post(
+            "/api/transactions/plan/exact-allowance",
+            json=allowance_request_payload(),
+        )
 
     assert health_response.status_code == 200
     assert health_response.json()["status"] == "degraded"
@@ -436,4 +493,6 @@ async def test_corrupt_audit_chain_degrades_health_and_dashboard(tmp_path: Path)
     assert "Audit record hash does not match its durable content." in dashboard_response.text
     assert risk_response.status_code == 503
     assert "audit integrity failed" in risk_response.json()["detail"]
+    assert planning_response.status_code == 503
+    assert "Transaction planning blocked" in planning_response.json()["detail"]
     assert audit_store.verify_chain().record_count == 1

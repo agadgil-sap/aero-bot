@@ -17,6 +17,7 @@ from aero_bot.audit import (
     AuditVerification,
     AuditVerificationStatus,
     RiskDecisionAuditPayload,
+    TransactionPlanAuditPayload,
 )
 from aero_bot.concentrated import (
     ConcentratedLiquidityAnalyzer,
@@ -83,6 +84,35 @@ def get_settings() -> Settings:
 def utc_now() -> datetime:
     """Return the current aware UTC time for durable audit event timestamps."""
     return datetime.now(UTC)
+
+
+def _append_audit_event(
+    audit_store: AuditStore,
+    event_type: AuditEventType,
+    payload: BaseModel,
+    created_at: datetime,
+    operation: str,
+) -> None:
+    """Append required service evidence or return an explicit unavailable response.
+
+    Args:
+        audit_store: Immutable local persistence boundary receiving the event.
+        event_type: Reviewed event category for the service operation.
+        payload: Complete validated public input, policy, and output envelope.
+        created_at: Aware event time supplied by the application clock.
+        operation: Human-readable operation name used in failure diagnostics.
+
+    Raises:
+        HTTPException: If existing audit history fails complete integrity verification.
+    """
+    try:
+        audit_store.append(event_type, payload, created_at)
+    except AuditIntegrityError as error:
+        # Known integrity failure blocks output without hiding the first corrupt-record evidence.
+        raise HTTPException(
+            status_code=503,
+            detail=f"{operation} blocked because audit integrity failed: {error}",
+        ) from error
 
 
 def create_app(
@@ -203,7 +233,23 @@ def create_app(
     @application.post("/api/transactions/plan/exact-allowance", response_model=AllowancePlanResult)
     def plan_exact_allowance(request: ExactAllowanceRequest) -> AllowancePlanResult:
         """Plan an allowlisted exact approval without wallet access or signing."""
-        return resolved_transaction_planner.plan_exact_allowance(request)
+        # Deterministic planning completes before any response can leave the service boundary.
+        result = resolved_transaction_planner.plan_exact_allowance(request)
+        # Envelope retains the exact immutable policy needed to reproduce all plan outcomes.
+        audit_payload = TransactionPlanAuditPayload(
+            request=request,
+            policy=resolved_transaction_planner.policy,
+            result=result,
+        )
+        # Durable append is required for blocked, no-action, and unsigned ready results alike.
+        _append_audit_event(
+            resolved_audit_store,
+            AuditEventType.TRANSACTION_PLAN,
+            audit_payload,
+            resolved_clock(),
+            "Transaction planning",
+        )
+        return result
 
     @application.post("/api/transactions/simulate", response_model=PlanSimulationResult)
     def simulate_transaction_plan(plan: UnsignedTransactionPlan) -> PlanSimulationResult:
@@ -231,18 +277,13 @@ def create_app(
             decision=decision,
         )
         # Durable append must succeed before the evaluated result is returned to the caller.
-        try:
-            resolved_audit_store.append(
-                AuditEventType.RISK_DECISION,
-                audit_payload,
-                resolved_clock(),
-            )
-        except AuditIntegrityError as error:
-            # Known integrity failure returns evidence without leaking an unaudited decision.
-            raise HTTPException(
-                status_code=503,
-                detail=f"Risk evaluation blocked because audit integrity failed: {error}",
-            ) from error
+        _append_audit_event(
+            resolved_audit_store,
+            AuditEventType.RISK_DECISION,
+            audit_payload,
+            resolved_clock(),
+            "Risk evaluation",
+        )
         return decision
 
     @application.get("/", response_class=HTMLResponse)

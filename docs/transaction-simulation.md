@@ -31,3 +31,11 @@ Before any backend call, the application recalculates the plan identifier, verif
 The backend must return one observation for every transaction in order and at the plan's exact block.
 A revert blocks the complete plan, and incomplete or mismatched evidence is rejected.
 Backend unavailability never falls back to signing or broadcasting.
+
+## Immutable planning evidence
+
+Every exact-allowance planning response is appended to the local immutable audit chain before the API returns it.
+The record includes the validated public request, complete active transaction policy, and exact blocked, no-action, or ready result.
+Ready records contain only unsigned transaction plans and retain explicit false signing and broadcasting capabilities.
+Audit integrity failure returns an evidence-backed service-unavailable response instead of an unaudited plan.
+Read-only simulation results will be connected to the audit chain in a separate integration slice.
