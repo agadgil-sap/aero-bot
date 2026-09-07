@@ -254,6 +254,7 @@ def test_decode_page_round_trips_one_slipstream_record() -> None:
     assert record.emissions_token_address == AERO_TOKEN_ADDRESS.lower()
     assert record.pool_fee_ppm == 500
     assert record.unstaked_fee_ppm == 100_000
+    assert record.nfpm_address == "0x" + "55" * 20
 
 
 def test_decode_page_maps_absent_contracts_to_none() -> None:
@@ -267,6 +268,15 @@ def test_decode_page_maps_absent_contracts_to_none() -> None:
     assert record.gauge_address is None
     assert record.emissions_token_address is None
     assert record.emissions_per_second == 0
+
+
+def test_decode_page_maps_absent_nfpm_to_none() -> None:
+    """A classic pool's zero nfpm address decodes to explicit absence."""
+    # Classic pools carry no position manager, so Sugar reports the zero address.
+    encoded = encode_lp_page([lp_record(type=-1, nfpm=ZERO_ADDRESS)])
+    record = decode_lp_page(bytes.fromhex(encoded[2:]))[0]
+
+    assert record.nfpm_address is None
 
 
 def test_decode_page_rejects_malformed_encodings() -> None:
@@ -378,6 +388,9 @@ def test_discover_paginates_and_scopes_pairs_to_b20_and_usdc() -> None:
     assert len(batch.candidates) == 2
     assert batch.candidates[0].pool_address == POOL_ADDRESS
     assert batch.candidates[0].pool_kind is PoolKind.SLIPSTREAM
+    # The candidate carries the pool's own position manager for the LP lifecycle.
+    assert batch.candidates[0].nfpm_address == "0x" + "55" * 20
+    assert batch.candidates[0].pool_active_liquidity == 123_456
     assert batch.candidates[1].pool_kind is PoolKind.CLASSIC_VOLATILE
     # The batch retains the complete enumeration size before pair scoping.
     assert batch.enumerated_pool_count == 4

@@ -148,6 +148,9 @@ class LpSugarRecord(BaseModel):
     token0_fees: Annotated[int, Field(ge=0)]
     # Accumulated token-one fees evidence the pool's fee revenue.
     token1_fees: Annotated[int, Field(ge=0)]
+    # The NonfungiblePositionManager that mints this pool's positions; absent
+    # for classic pools and always present for Slipstream pools.
+    nfpm_address: EvmAddress | None
 
 
 def _read_word(data: bytes, byte_offset: int) -> int:
@@ -304,6 +307,7 @@ def _decode_lp_record(data: bytes, element_start: int) -> LpSugarRecord:
             "unstaked_fee_ppm": slots["unstaked_fee"],
             "token0_fees": slots["token0_fees"],
             "token1_fees": slots["token1_fees"],
+            "nfpm_address": _optional_address_word(slots["nfpm"]),
         }
     )
 
@@ -602,4 +606,6 @@ def _candidate_from_record(record: LpSugarRecord) -> PoolCandidate:
         gauge_alive=record.gauge_alive,
         emissions_per_second=record.emissions_per_second,
         emissions_token_address=record.emissions_token_address,
+        pool_active_liquidity=record.pool_active_liquidity,
+        nfpm_address=record.nfpm_address,
     )

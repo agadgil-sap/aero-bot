@@ -172,6 +172,13 @@ class PoolCandidate(BaseModel):
     emissions_per_second: Annotated[int, Field(ge=0)]
     # The emissions token is absent when the gauge is not emitting.
     emissions_token_address: EvmAddress | None
+    # The pool's active in-range liquidity in raw L units; zero for classic
+    # pools, and the depth base the LP position-size cap measures against.
+    pool_active_liquidity: Annotated[int, Field(ge=0)] = 0
+    # The Slipstream NonfungiblePositionManager that mints this pool's
+    # positions; absent for classic pools. The LP lifecycle executor builds
+    # every position through this address and never a hardcoded constant.
+    nfpm_address: EvmAddress | None = None
 
 
 class PoolDiscoveryBatch(BaseModel):
