@@ -61,7 +61,7 @@ See [the venue trust boundary](docs/venue-boundary.md) for the complete acceptan
 The dashboard and `/api/market-data/aerodrome-yields` perform a bounded read-only query against DefiLlama's public yield dataset.
 The scanner accepts only Base records from `aerodrome-slipstream` whose underlying contracts are exactly native USDC and one address in the verified official B20 registry.
 Positive reward yield must identify the official AERO token contract.
-Fee APY and AERO emissions APY remain separate, and the displayed daily screen compares fee APY with fifty-percent-haircut emissions APY without adding them.
+Fee APY and AERO emissions APY remain separate inputs, and the displayed daily screen adds fee APY to fifty-percent-haircut emissions APY because a staked in-range position earns both streams.
 This secondary-source screen is not eligible for execution until onchain pool identity, oracle, exit-depth, concentrated-liquidity, IL, and adverse-selection checks also pass.
 
 ## Wallet-free transaction planning
@@ -78,10 +78,10 @@ It distinguishes below-range, active, and above-range positions, reports current
 Fees and AERO emissions remain separate from the conservative impermanent-loss estimate.
 See [the concentrated-liquidity policy](docs/concentrated-liquidity.md) for formulas, assumptions, and adapter requirements.
 
-## Fee versus AERO compensation
+## Fee plus AERO compensation
 
-The deterministic risk engine models unstaked swap fees and staked AERO emissions as mutually exclusive Aerodrome compensation modes.
-It compares retained fee APR with conservatively discounted emission APR but credits only the selected mode before subtracting impermanent-loss and adverse-selection costs.
+The deterministic risk engine models Aerodrome compensation additively.
+A staked in-range position earns swap fees and AERO emissions at the same time, so the engine adds retained fee APR to haircut emission APR before subtracting impermanent-loss and adverse-selection costs.
 The `/api/risk/evaluate` endpoint exposes complete hold or eligible evidence without enabling a transaction.
 
 ## Immutable local audit storage

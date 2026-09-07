@@ -78,8 +78,8 @@ class YieldObservation(BaseModel):
     fee_simple_daily_rate: NonNegativeDecimal
     # Haircut emissions daily rate discounts volatile AERO before daily conversion.
     haircut_emissions_simple_daily_rate: NonNegativeDecimal
-    # Best screen rate compares mutually exclusive modes and never adds them together.
-    best_haircut_simple_daily_rate: NonNegativeDecimal
+    # Combined daily rate adds fee and haircut-emission streams the same staked position earns.
+    combined_haircut_simple_daily_rate: NonNegativeDecimal
     # Pool metadata describes the reported concentrated-liquidity configuration.
     pool_meta: str
     # One-day volume is optional because the source may omit it.
@@ -342,7 +342,7 @@ class DefiLlamaYieldScanner:
             if source_pool_id in seen_source_pool_ids:
                 raise ValueError("a relevant source pool ID appeared more than once")
             seen_source_pool_ids.add(source_pool_id)
-            # Base APY remains separate from the mutually exclusive emissions stream.
+            # Base APY remains the swap-fee stream, kept separate from emissions inputs.
             fee_apy_percent = self._decimal_field(
                 raw_record,
                 "apyBase",
@@ -362,8 +362,8 @@ class DefiLlamaYieldScanner:
             haircut_emissions_daily_rate = (
                 reward_apy_percent * self._emissions_haircut * PERCENT_TO_FRACTION / DAYS_PER_YEAR
             )
-            # Best rate compares exclusive compensation modes rather than adding them.
-            best_daily_rate = max(fee_daily_rate, haircut_emissions_daily_rate)
+            # A staked in-range position earns both streams, so the screen adds them.
+            combined_daily_rate = fee_daily_rate + haircut_emissions_daily_rate
             # Optional one-day volume stays absent when the source has no usable value.
             volume_usd_1d = self._optional_decimal_field(raw_record, "volumeUsd1d")
             # Boolean outlier is required because it is a first-class stability warning.
@@ -390,16 +390,16 @@ class DefiLlamaYieldScanner:
                     source_combined_apy_percent=combined_apy_percent,
                     fee_simple_daily_rate=fee_daily_rate,
                     haircut_emissions_simple_daily_rate=haircut_emissions_daily_rate,
-                    best_haircut_simple_daily_rate=best_daily_rate,
+                    combined_haircut_simple_daily_rate=combined_daily_rate,
                     pool_meta=self._string_field(raw_record, "poolMeta"),
                     volume_usd_1d=volume_usd_1d,
                     outlier=raw_outlier,
                     sample_count=raw_sample_count,
                 )
             )
-        # Descending rate makes the strongest screened opportunity visible first.
+        # Descending combined rate makes the strongest screened opportunity visible first.
         observations.sort(
-            key=lambda observation: observation.best_haircut_simple_daily_rate, reverse=True
+            key=lambda observation: observation.combined_haircut_simple_daily_rate, reverse=True
         )
         return tuple(observations)
 

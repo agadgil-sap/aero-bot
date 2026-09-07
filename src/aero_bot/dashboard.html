@@ -107,7 +107,7 @@
                 <th>TVL</th>
                 <th>Fee APY</th>
                 <th>AERO APY</th>
-                <th>50% haircut daily</th>
+                <th>Fee + 50% haircut daily</th>
                 <th>History</th>
               </tr>
             </thead>
@@ -115,7 +115,7 @@
           </table>
         </div>
         <p id="yield-empty" class="empty-screen" hidden></p>
-        <p class="source-note">The daily figure compares fee APY with haircut AERO APY as separate choices. It does not add them, and it excludes IL, adverse selection, slippage, gas, and exit risk.</p>
+        <p class="source-note">The daily figure adds fee APY to haircut AERO APY because a staked in-range position earns both streams. It still excludes IL, adverse selection, slippage, gas, and exit risk.</p>
       </article>
     </section>
     <div class="notice">
@@ -164,7 +164,7 @@
       appendCell(row, formatUsd(observation.tvl_usd));
       appendCell(row, formatApy(observation.fee_apy_percent));
       appendCell(row, formatApy(observation.aero_emissions_apy_percent));
-      const dailyRate = Number(observation.best_haircut_simple_daily_rate);
+      const dailyRate = Number(observation.combined_haircut_simple_daily_rate);
       appendCell(row, formatPercent(dailyRate), dailyRate >= dailyThreshold ? "rate-pass" : "rate-hold");
       appendCell(row, `${observation.sample_count} samples`);
       yieldRows.appendChild(row);

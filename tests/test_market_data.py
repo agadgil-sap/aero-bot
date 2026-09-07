@@ -71,8 +71,8 @@ def source_record(**overrides: object) -> dict[str, object]:
     return record
 
 
-def test_verified_screen_filters_and_calculates_mutually_exclusive_rates() -> None:
-    """An official pair is accepted without adding fee and emission returns."""
+def test_verified_screen_filters_and_calculates_additive_rates() -> None:
+    """An official pair is accepted with fee and emission daily rates added together."""
     # One unrelated venue record proves the scanner ignores arbitrary venues.
     unrelated_record = source_record(
         project="uniswap-v3", pool="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -96,17 +96,21 @@ def test_verified_screen_filters_and_calculates_mutually_exclusive_rates() -> No
     assert observation.quote_token_address == BASE_USDC_ADDRESS.lower()
     assert observation.outlier is True
     assert observation.sample_count == 20
-    # Best screen rate equals haircut emissions because they exceed fee APY.
+    # Combined daily rate sums fee and haircut-emission streams the staked position earns.
+    expected_fee_daily = Decimal("18.91475") / Decimal(100) / Decimal(365)
     expected_emissions_daily = Decimal("163.4859") * Decimal("0.50") / Decimal(100) / Decimal(365)
+    assert observation.fee_simple_daily_rate == expected_fee_daily
     assert observation.haircut_emissions_simple_daily_rate == expected_emissions_daily
-    assert observation.best_haircut_simple_daily_rate == expected_emissions_daily
-    # The external combined value remains evidence only and is never the calculated best rate.
-    combined_daily = Decimal("182.40065") / Decimal(100) / Decimal(365)
-    assert observation.best_haircut_simple_daily_rate != combined_daily
+    assert observation.combined_haircut_simple_daily_rate == (
+        expected_fee_daily + expected_emissions_daily
+    )
+    # The external combined value remains evidence only because the haircut changes emissions.
+    external_combined_daily = Decimal("182.40065") / Decimal(100) / Decimal(365)
+    assert observation.combined_haircut_simple_daily_rate != external_combined_daily
 
 
 def test_screen_orders_multiple_official_records_by_conservative_daily_rate() -> None:
-    """Strongest mutually exclusive haircut rate appears first without hiding peers."""
+    """Strongest combined haircut rate appears first without hiding peers."""
     # GOOGLc is another official B20 identity in the packaged registry.
     googlc_address = "0xb2000000000000000000002d0ba3164cc74f58b7"
     # Second source record has a lower fee and reward screen rate.

@@ -43,7 +43,6 @@ def risk_request_payload() -> dict[str, object]:
         "oracle_deviation_bps": "25",
         "pool_tvl_usd": "2000000",
         "exit_depth_usd": "50000",
-        "compensation_mode": "unstaked_fees",
         "fee_apr": "4",
         "fee_retention_fraction": "0.9",
         "emissions_apr": "20",
@@ -499,13 +498,13 @@ async def test_concentrated_position_endpoint_exposes_position_aware_loss() -> N
 
 
 @pytest.mark.anyio
-async def test_risk_endpoint_holds_and_never_combines_exclusive_returns() -> None:
-    """Default API policy holds while exposing the selected compensation stream only."""
+async def test_risk_endpoint_holds_while_exposing_additive_returns() -> None:
+    """Default API policy holds while exposing summed fee and emission compensation."""
     # Default application keeps the risk engine emergency-halted and contract allowlists empty.
     transport = httpx.ASGITransport(app=create_app(Settings()))
-    # The request exercises validation, compensation comparison, and risk routing together.
+    # The request exercises validation, compensation calculation, and risk routing together.
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # Unstaked fixture quotes both fee and emission alternatives for explicit comparison.
+        # Fixture quotes both fee and emission streams for explicit additive comparison.
         response = await client.post(
             "/api/risk/evaluate",
             json=risk_request_payload(),
@@ -520,9 +519,10 @@ async def test_risk_endpoint_holds_and_never_combines_exclusive_returns() -> Non
         "token_not_allowlisted",
         "pool_not_allowlisted",
     ]
-    assert Decimal(payload["compensation"]["selected_apr"]) == Decimal("3.6")
-    assert Decimal(payload["compensation"]["alternative_apr"]) == Decimal("10")
-    assert Decimal(payload["net_apr"]) == Decimal("3.6")
+    assert Decimal(payload["compensation"]["retained_fee_apr"]) == Decimal("3.6")
+    assert Decimal(payload["compensation"]["adjusted_emissions_apr"]) == Decimal("10")
+    assert Decimal(payload["compensation"]["total_compensation_apr"]) == Decimal("13.6")
+    assert Decimal(payload["net_apr"]) == Decimal("13.6")
 
 
 @pytest.mark.anyio

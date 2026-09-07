@@ -58,15 +58,6 @@ class DecisionStatus(StrEnum):
     ELIGIBLE = "eligible"
 
 
-class CompensationMode(StrEnum):
-    """Identify the mutually exclusive Aerodrome LP compensation choice."""
-
-    # Unstaked positions retain eligible swap fees and receive no AERO emissions.
-    UNSTAKED_FEES = "unstaked_fees"
-    # Staked positions receive AERO emissions and relinquish their swap-fee claim.
-    STAKED_EMISSIONS = "staked_emissions"
-
-
 class RiskReason(StrEnum):
     """Provide stable, machine-readable evidence for a hold decision."""
 
@@ -156,11 +147,9 @@ class OpportunitySnapshot(BaseModel):
     pool_tvl_usd: NonNegativeDecimal
     # Exit depth estimates executable US-dollar value within the configured slippage bound.
     exit_depth_usd: NonNegativeDecimal
-    # Compensation mode records whether this position is unstaked or gauge-staked.
-    compensation_mode: CompensationMode
     # Fee APR annualizes gross swap-fee revenue before the observed retention fraction.
     fee_apr: NonNegativeDecimal
-    # Fee retention records the observed fraction an unstaked LP keeps after protocol fees.
+    # Fee retention records the observed fraction of swap fees kept after protocol fees.
     fee_retention_fraction: UnitDecimal
     # Emissions APR annualizes AERO rewards before the conservative reward haircut.
     emissions_apr: NonNegativeDecimal
@@ -175,25 +164,17 @@ class OpportunitySnapshot(BaseModel):
 
 
 class CompensationAnalysis(BaseModel):
-    """Compare mutually exclusive fee and emission returns for one position."""
+    """Add the concurrent fee and emission return streams for one staked position."""
 
-    # Frozen strict fields preserve one deterministic compensation comparison.
+    # Frozen strict fields preserve one deterministic compensation calculation.
     model_config = IMMUTABLE_MODEL_CONFIG
 
-    # Selected mode is the position state actually evaluated for eligibility.
-    selected_mode: CompensationMode
-    # Retained fee APR applies the observed unstaked protocol-fee fraction.
+    # Retained fee APR applies the observed protocol-fee retention fraction.
     retained_fee_apr: NonNegativeDecimal
     # Adjusted emissions APR applies the configured AERO reward haircut.
     adjusted_emissions_apr: NonNegativeDecimal
-    # Selected APR is the sole return stream credited before risk costs.
-    selected_apr: NonNegativeDecimal
-    # Alternative APR shows the mutually exclusive return stream not selected.
-    alternative_apr: NonNegativeDecimal
-    # Preferred mode identifies the higher adjusted stream without instructing a change.
-    preferred_mode: CompensationMode
-    # Opportunity cost is the non-negative APR shortfall from selecting the lower stream.
-    opportunity_cost_apr: NonNegativeDecimal
+    # Total compensation APR adds both streams Aerodrome pays the same staked position.
+    total_compensation_apr: NonNegativeDecimal
 
 
 class RiskDecision(BaseModel):
@@ -206,7 +187,7 @@ class RiskDecision(BaseModel):
     status: DecisionStatus
     # Reasons are ordered by stable policy-gate order for reproducible diagnostics.
     reasons: tuple[RiskReason, ...]
-    # Compensation exposes selected and foregone mutually exclusive LP returns.
+    # Compensation exposes the additive fee and emission return streams.
     compensation: CompensationAnalysis
     # Net APR subtracts impermanent-loss and adverse-selection estimates.
     net_apr: Decimal

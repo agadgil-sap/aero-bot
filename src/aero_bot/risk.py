@@ -4,7 +4,6 @@ from decimal import Decimal
 
 from aero_bot.domain import (
     CompensationAnalysis,
-    CompensationMode,
     DecisionStatus,
     MarketRegime,
     OpportunitySnapshot,
@@ -43,11 +42,11 @@ class RiskEngine:
         Returns:
             A deterministic decision with ordered reason codes and yield calculations.
         """
-        # Compensation comparison prevents mutually exclusive fee and emission returns being added.
+        # Additive compensation credits both streams Aerodrome pays the same staked position.
         compensation = self._analyze_compensation(snapshot)
         # Net APR accounts for both LP divergence and informed-flow costs.
         net_apr = (
-            compensation.selected_apr
+            compensation.total_compensation_apr
             - snapshot.impermanent_loss_apr
             - snapshot.adverse_selection_apr
         )
@@ -96,45 +95,23 @@ class RiskEngine:
         )
 
     def _analyze_compensation(self, snapshot: OpportunitySnapshot) -> CompensationAnalysis:
-        """Compare adjusted fees and emissions without combining exclusive streams.
+        """Add retained fees and haircut emissions into one additive return estimate.
 
         Args:
-            snapshot: Opportunity containing mode and observed headline APR values.
+            snapshot: Opportunity containing observed fee and emission APR evidence.
 
         Returns:
-            Deterministic selected, alternative, preferred, and opportunity-cost evidence.
+            Deterministic retained, discounted, and total compensation components.
         """
-        # Retained fees account for the observed protocol share on unstaked liquidity.
+        # Retained fees account for the observed protocol fee share on swap revenue.
         retained_fee_apr = snapshot.fee_apr * snapshot.fee_retention_fraction
-        # Discounted emissions prevent volatile AERO rewards dominating the comparison.
+        # Discounted emissions prevent volatile AERO rewards dominating the total.
         adjusted_emissions_apr = snapshot.emissions_apr * self._policy.emissions_reward_haircut
-        if snapshot.compensation_mode is CompensationMode.UNSTAKED_FEES:
-            # Unstaked positions earn retained fees and forgo AERO emissions.
-            selected_apr = retained_fee_apr
-            # Discounted emissions remain visible only as the alternative.
-            alternative_apr = adjusted_emissions_apr
-        else:
-            # Staked positions earn discounted AERO emissions and relinquish swap fees.
-            selected_apr = adjusted_emissions_apr
-            # Retained fee yield remains visible only as the alternative.
-            alternative_apr = retained_fee_apr
-        if retained_fee_apr > adjusted_emissions_apr:
-            # Strictly higher retained fees make unstaked compensation preferable.
-            preferred_mode = CompensationMode.UNSTAKED_FEES
-        elif adjusted_emissions_apr > retained_fee_apr:
-            # Strictly higher adjusted emissions make gauge staking preferable.
-            preferred_mode = CompensationMode.STAKED_EMISSIONS
-        else:
-            # A tie preserves the selected mode rather than implying needless churn.
-            preferred_mode = snapshot.compensation_mode
-        # Opportunity cost is zero when the selected mode is at least as valuable.
-        opportunity_cost_apr = max(Decimal(0), alternative_apr - selected_apr)
+        # Aerodrome pays swap fees and AERO emissions to the same staked in-range
+        # position, so the two streams are additive rather than alternatives.
+        total_compensation_apr = retained_fee_apr + adjusted_emissions_apr
         return CompensationAnalysis(
-            selected_mode=snapshot.compensation_mode,
             retained_fee_apr=retained_fee_apr,
             adjusted_emissions_apr=adjusted_emissions_apr,
-            selected_apr=selected_apr,
-            alternative_apr=alternative_apr,
-            preferred_mode=preferred_mode,
-            opportunity_cost_apr=opportunity_cost_apr,
+            total_compensation_apr=total_compensation_apr,
         )

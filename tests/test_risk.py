@@ -6,7 +6,6 @@ import pytest
 from pydantic import ValidationError
 
 from aero_bot.domain import (
-    CompensationMode,
     DecisionStatus,
     MarketRegime,
     OpportunitySnapshot,
@@ -50,7 +49,6 @@ def eligible_snapshot(**overrides: object) -> OpportunitySnapshot:
         "oracle_deviation_bps": Decimal("25"),
         "pool_tvl_usd": Decimal("2000000"),
         "exit_depth_usd": Decimal("50000"),
-        "compensation_mode": CompensationMode.UNSTAKED_FEES,
         "fee_apr": Decimal("4.50"),
         "fee_retention_fraction": Decimal("0.90"),
         "emissions_apr": Decimal("8.00"),
@@ -74,12 +72,9 @@ def test_engine_marks_opportunity_eligible_only_after_every_gate_passes() -> Non
     assert decision.reasons == ()
     assert decision.compensation.retained_fee_apr == Decimal("4.0500")
     assert decision.compensation.adjusted_emissions_apr == Decimal("4.000")
-    assert decision.compensation.selected_apr == Decimal("4.0500")
-    assert decision.compensation.alternative_apr == Decimal("4.000")
-    assert decision.compensation.preferred_mode is CompensationMode.UNSTAKED_FEES
-    assert decision.compensation.opportunity_cost_apr == 0
-    assert decision.net_apr == Decimal("3.7000")
-    assert decision.net_daily_rate == Decimal("3.7000") / Decimal(365)
+    assert decision.compensation.total_compensation_apr == Decimal("8.0500")
+    assert decision.net_apr == Decimal("7.7000")
+    assert decision.net_daily_rate == Decimal("7.7000") / Decimal(365)
 
 
 def test_default_policy_fails_closed() -> None:
@@ -157,7 +152,6 @@ def test_emissions_haircut_can_move_headline_yield_below_threshold() -> None:
     """Quoted AERO rewards are discounted before the one-percent opportunity comparison."""
     # Headline emissions appear sufficient before the configured fifty-percent haircut.
     snapshot = eligible_snapshot(
-        compensation_mode=CompensationMode.STAKED_EMISSIONS,
         fee_apr=Decimal("0"),
         emissions_apr=Decimal("7.20"),
         impermanent_loss_apr=Decimal("0"),
@@ -167,7 +161,7 @@ def test_emissions_haircut_can_move_headline_yield_below_threshold() -> None:
     decision = RiskEngine(eligible_policy()).evaluate(snapshot)
 
     assert decision.compensation.adjusted_emissions_apr == Decimal("3.600")
-    assert decision.compensation.selected_apr == Decimal("3.600")
+    assert decision.compensation.total_compensation_apr == Decimal("3.600")
     assert decision.net_daily_rate < Decimal("0.01")
     assert decision.status is DecisionStatus.HOLD
     assert decision.reasons == (RiskReason.OPPORTUNITY_BELOW_THRESHOLD,)
@@ -190,48 +184,43 @@ def test_threshold_boundary_is_eligible() -> None:
     assert decision.status is DecisionStatus.ELIGIBLE
 
 
-def test_unstaked_position_never_adds_foregone_emissions() -> None:
-    """Unstaked fee eligibility uses only retained fees despite larger quoted emissions."""
-    # Emissions dominate the comparison but cannot be credited to the unstaked position.
+def test_staked_position_adds_fees_and_emissions_streams() -> None:
+    """A staked in-range position earns both retained swap fees and discounted AERO."""
+    # Streams are sized so a max-based rule would credit only the dominant emission side.
     snapshot = eligible_snapshot(
-        compensation_mode=CompensationMode.UNSTAKED_FEES,
         fee_apr=Decimal("4"),
         fee_retention_fraction=Decimal("0.90"),
         emissions_apr=Decimal("20"),
         impermanent_loss_apr=Decimal("0"),
         adverse_selection_apr=Decimal("0"),
     )
-    # Selected net yield remains 3.6 rather than the invalid summed value of 13.6.
+    # Total compensation is the sum, not the larger, of the two adjusted streams.
     decision = RiskEngine(eligible_policy()).evaluate(snapshot)
 
-    assert decision.compensation.selected_apr == Decimal("3.60")
-    assert decision.compensation.alternative_apr == Decimal("10.0")
-    assert decision.compensation.preferred_mode is CompensationMode.STAKED_EMISSIONS
-    assert decision.compensation.opportunity_cost_apr == Decimal("6.40")
-    assert decision.net_apr == Decimal("3.60")
-    assert decision.status is DecisionStatus.HOLD
-    assert decision.reasons == (RiskReason.OPPORTUNITY_BELOW_THRESHOLD,)
+    assert decision.compensation.retained_fee_apr == Decimal("3.60")
+    assert decision.compensation.adjusted_emissions_apr == Decimal("10.0")
+    assert decision.compensation.total_compensation_apr == Decimal("13.60")
+    assert decision.net_apr == Decimal("13.60")
+    assert decision.status is DecisionStatus.ELIGIBLE
 
 
-def test_staked_position_never_adds_foregone_fees() -> None:
-    """Gauge-staked eligibility uses only discounted emissions despite larger quoted fees."""
-    # Large fees make the excluded alternative obvious while adjusted emissions still pass.
+def test_fee_dominant_position_still_adds_discounted_emissions() -> None:
+    """Large swap-fee yield still receives the discounted AERO stream on top."""
+    # Fees dominate the inputs while adjusted emissions remain a visible contribution.
     snapshot = eligible_snapshot(
-        compensation_mode=CompensationMode.STAKED_EMISSIONS,
         fee_apr=Decimal("100"),
         fee_retention_fraction=Decimal("1"),
         emissions_apr=Decimal("8"),
         impermanent_loss_apr=Decimal("0"),
         adverse_selection_apr=Decimal("0"),
     )
-    # Staked selected return is four, not the invalid combined value of 104.
+    # Total compensation credits 104, not the fee-only value of 100.
     decision = RiskEngine(eligible_policy()).evaluate(snapshot)
 
-    assert decision.compensation.selected_apr == Decimal("4.0")
-    assert decision.compensation.alternative_apr == Decimal("100")
-    assert decision.compensation.preferred_mode is CompensationMode.UNSTAKED_FEES
-    assert decision.compensation.opportunity_cost_apr == Decimal("96.0")
-    assert decision.net_apr == Decimal("4.0")
+    assert decision.compensation.retained_fee_apr == Decimal("100")
+    assert decision.compensation.adjusted_emissions_apr == Decimal("4.0")
+    assert decision.compensation.total_compensation_apr == Decimal("104.0")
+    assert decision.net_apr == Decimal("104.0")
     assert decision.status is DecisionStatus.ELIGIBLE
 
 
