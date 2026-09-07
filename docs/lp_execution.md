@@ -46,9 +46,21 @@ A burned token id reverts with the message `ID`.
 | getReward | `getReward(uint256)` | `0x1c4b774b` |
 | earned | `earned(address,uint256)` | `0x3e491d47` |
 | rewards | `rewards(uint256)` | `0xf301af42` |
+| gaugeFactory | `gaugeFactory()` | `0x0d52333c` |
+| depositTimestamp | `depositTimestamp(uint256)` | `0x4ede8c85` |
 
 The classic-gauge shape `getReward(uint256,address[])` does not exist on any deployed CL gauge and must never be encoded; the per-token form is the only claim path.
 Staking requires the NFPM to carry an operator approval for the gauge first, because the gauge's `deposit` pulls the NFT with `safeTransferFrom` from the caller.
+
+The penalty-window views live on the factory the gauge's own `gaugeFactory()` names, not on the gauge or the v3 gauges factory:
+
+| Function | Canonical signature | Selector |
+| --- | --- | --- |
+| penaltyRate | `penaltyRate()` | `0xd6b7494f` |
+| minStakeTimes | `minStakeTimes(address)` | `0xe782453b` |
+
+Live on the AAPLc gauge, `gaugeFactory()` returns `0x385293cae378c813f16f0c1334d774adddf56abb`, whose `penaltyRate()` is 10000 basis points and whose `minStakeTimes(pool)` for the AAPLc pool is 300 seconds.
+The gauge-side `depositTimestamp(uint256)` maps a staked token id to its stake time, so one position's window closes at exactly `depositTimestamp + minStakeTimes(pool)`.
 
 ### Lifecycle mechanics that shape the executor
 
@@ -85,6 +97,9 @@ Position amounts come from the exact v3 identities over raw `sqrtPriceX96`, eval
 A unit of liquidity is valued over the range to split the budget into both sides; desired amounts floor to raw units and minima sit exactly one slippage tolerance (default 0.1 percent) below.
 A snapshot price at or beyond either bound refuses rather than producing a one-sided position.
 The two-sided formulas are pinned by independent inversion (each side recovers the input liquidity), the geometric-mean identity `amount0 = amount1 * 2**192 / (Sa * Sb)`, and a float cross-reference.
+The exit side instead reads amounts through `position_amounts_at_sqrt_ratio`, the general-case sibling that accepts any price: below the range the position is entirely token zero (`L * 2**96 * (Sb - Sa) / (Sa * Sb)`), above it entirely token one (`L * (Sb - Sa) / 2**96`), and zero liquidity is allowed because an emptied position still owes fees.
+Both functions agree exactly on a strictly inside price, and the boundary continuity, one-sided collapses, and refusal paths are pinned by their own tests.
+Range classification for status reporting is exact in tick space through `position_range_state`, under the range's inclusive-lower and exclusive-upper semantics, so a snapshot tick that has left the range reports honestly even when the raw square-root price rounds near a boundary.
 
 ### Pilot cap table
 
@@ -161,6 +176,14 @@ The NFPM itself executes the mint's `transferFrom` pull (the payer is the callin
 A stake composes `nfpm_gauge_approval` (only when `isApprovedForAll` reports the gauge unapproved) then `gauge_deposit`, because the gauge's `deposit` pulls the NFT with `safeTransferFrom`.
 A stake dry run may name a token id that does not exist yet: the report labels the missing ownership honestly instead of refusing, so the signing and encoding path can be proven before the mint confirms.
 
+The exit side completes the lifecycle with five more actions, every one first resolving the token id through `ownerOf` into one of three custodies - the Safe itself (unstaked), this pool's gauge (staked), or anything else (refused):
+
+1. `unstake` requires the gauge's custody, reads `earned` and `rewards` for the accrued emissions, resolves the penalty window, and composes exactly `gauge_withdraw`, whose source-verified behavior auto-sweeps the position's checkpointed fees, auto-claims the accrued emissions, and returns the NFT to the Safe.
+2. `withdraw` requires the Safe's custody (the gauge holding the NFT blocks every NFPM operation) and composes `nfpm_decrease_liquidity` for the position's full liquidity at the snapshot price with slippage-floored minima, then `nfpm_collect` for both fee sides; a position with no liquidity and no fees collapses to the bare collect, and one with neither refuses as empty.
+3. `collect` routes by custody: staked it composes `gauge_get_reward` (checkpointed position fees never flow through the gauge; they arrive on the unstaking withdraw), unstaked it composes the NFPM `collect`.
+4. `recenter` recycles one position into a fresh mint inside a single sequenced batch: the gauge withdraw when staked, the decrease and collect when either liquidity or fees remain, the `nfpm_burn` clearing the emptied NFT, then the planner's full entry composition (bounded router allowance, balancing swap, exact approvals, mint) over a projected inventory that credits the decrease outputs and the collected fees, and finally the gauge operator approval when missing.
+5. `status` composes nothing: it is a completely read-only observation of custody, both sides' amounts and values at the snapshot price, accrued AERO, the penalty window, a quoted emissions APR, and the unrealized P&L against a supplied entry cost.
+
 Each composed step is signed over its EIP-712 SafeTx hash, proven read-only against the live Safe with `checkSignatures`, gas-estimated with `eth_estimateGas`, and appended to the local audit chain before the report returns.
 A sequenced transaction's estimate legitimately reverts while its predecessors remain unexecuted, so an estimate revert behind index zero carries the diagnostic suffix "(expected while this transaction's predecessors in the sequence remain unexecuted)" instead of being treated as an anomaly.
 Every swap and mint carries a deadline eight minutes past its build time, matching the swap executor's convention.
@@ -187,19 +210,58 @@ The untracked-positions gate is deliberately fail-closed: once the Safe holds an
 The `derived_width_unavailable` gate stands until the emissions-APR convention fix lands, because the solver's APR input is known understated; no solver-derived width can masquerade as an operator override in the meantime.
 The router whitelist is exactly the swap executor's single router address, enforced by a validator that rejects any other configuration.
 
+### Exit-side gates
+
+The exit-side actions add their own gates, each enforcing the custody and emission-safety facts the contract interface established:
+
+| Gate | Bound | Refusal code |
+| --- | --- | --- |
+| Token exists | `ownerOf` resolves or the positions view decodes | `position_unknown` |
+| Known custody | owner is the Safe or this pool's gauge | `position_not_owned` |
+| Unstake requires staking | gauge custody | `position_not_staked` |
+| NFPM ops require custody | Safe custody | `position_staked` |
+| Withdraw needs contents | liquidity or fees above zero | `position_empty` |
+| Penalty window clear | clears-at at or before now when emissions accrued | `within_penalty_window` |
+| Penalty state readable | all four window views answer | `penalty_state_unreadable` |
+
+The penalty gate refuses only when all three conditions hold together: the window is still open, the penalty rate is above zero, and emissions have actually accrued.
+An open window with nothing accrued forfeits nothing, so the unstake proceeds and the report still prints the window state; a zero rate makes the window moot for any balance.
+Every one of the four window reads (gauge factory, penalty rate, minimum stake time, deposit timestamp) fails closed: any revert refuses the whole action with `penalty_state_unreadable` rather than guessing.
+
+### Recenter and the restake follow-up
+
+The recenter's mint planning runs over a projected inventory: the Safe's live balances plus the decrease outputs plus both collected fee sides, all floored to raw units.
+The default budget is therefore the recycled position value itself, and an explicit `--amount` may raise it into a balancing swap for the stock side or lower it, with every pilot cap still enforced by the same planner in the same order.
+The fresh mint's gauge deposit cannot be bound into the same pre-execution batch: the NFPM exposes no next-id view (`nextTokenId()` reverts, verified live), so the new token id exists only after the mint confirms.
+The report's `restake_followup` therefore documents the stake command with the confirmed token id as the explicit second step, and the batch's audit record carries that follow-up verbatim.
+
+### Position status and the pre-fix APR label
+
+Status values the position's two sides at the snapshot price, reports the accrued AERO from `earned` and `rewards`, resolves the penalty window, and quotes a pool-level emissions APR from the gauge's per-second rate, the caller-supplied AERO price, and the staked reserves valued at the snapshot price.
+That quote follows the rehearsal convention and is labeled `PRE-FIX APR INPUT` in the report, because the emissions-APR convention fix (deliverable 2) has not landed and Aerodrome's own displayed numbers use a different base; the label stands on the report, the diagnostic, and the audit payload.
+The unrealized P&L is reported only against an explicitly supplied `--entry-cost`; without one the diagnostic says the entry cost is unknown rather than implying zero.
+Nothing in the status path builds, signs, estimates, or audits a transaction: the single audit event is `lp_status_reported`, and the read-only proof in tests is that the Safe script's preloaded nonce and signature queues are never consumed.
+
 ### Audit chain and CLI surface
 
-Every plan, built transaction, and refusal appends to the same append-only hash-chained SQLite store as the swap executor, with four new event types: `lp_mint_planned`, `lp_stake_planned`, `lp_transaction_built`, and `lp_refused`.
-Refusal records carry the executor catalog code plus the planner's own code when the planner refused, so both layers' decisions stay inspectable offline.
+Every plan, built transaction, and refusal appends to the same append-only hash-chained SQLite store as the swap executor, with these event types: `lp_mint_planned`, `lp_stake_planned`, `lp_unstake_planned`, `lp_exit_planned`, `lp_collect_planned`, `lp_recenter_planned`, `lp_status_reported`, `lp_transaction_built`, and `lp_refused`.
+A recenter appends its inner mint plan as `lp_mint_planned` followed by the `lp_recenter_planned` batch record, so the recycled entry stays inspectable as a first-class plan.
+Refusal records carry the executor catalog code plus the planner's own code when the planner refused, and the action name (`mint`, `stake`, `unstake`, `withdraw`, `collect`, `recenter`, `status`), so both layers' decisions stay inspectable offline.
 The CLI exits zero on success, one on failures, and two on any refusal, with the catalog code printed to stderr as `refused [<code>]`.
 
 ```text
 aero-bot-lp plan mint --symbol AAPLc --amount 7 --width-ticks 1
 aero-bot-lp dry-run mint --symbol AAPLc --amount 7 --width-ticks 1
 aero-bot-lp dry-run stake --symbol AAPLc --token-id 0
+aero-bot-lp dry-run unstake --symbol AAPLc --token-id 0
+aero-bot-lp dry-run withdraw --symbol AAPLc --token-id 0
+aero-bot-lp dry-run collect --symbol AAPLc --token-id 0
+aero-bot-lp dry-run recenter --symbol AAPLc --token-id 0 --width-ticks 1 [--amount 12]
+aero-bot-lp status --symbol AAPLc --token-id 0 --aero-price 0.30 [--entry-cost 7]
 ```
 
 Every subcommand accepts `--json` for the complete typed report; the dry-run subcommands accept `--ephemeral-key` to sign with a throwaway key whose signature check then honestly reports rejection.
+Status takes no key at all, because nothing is signed, and requires the AERO price explicitly rather than reading one from an unregistered source.
 
 ### Live real-key dry-run evidence (verbatim, 2026-09-08)
 
@@ -272,3 +334,27 @@ build took 188123.104 ms
 
 Both dry runs refuse nothing because every gate passes on the live state: the registry validates, the pool and its NFPM and gauge resolve from live discovery, the snapshot is fresh, the Safe holds no position NFTs, the swap plans a single tranche, the 6-mwei gas price sits far below the 1-gwei cap, and the Safe's 0.0001 ETH clears the floor.
 The build duration is dominated by the Sugar pool enumeration over the public RPC; the signing and validation themselves are local and instant.
+
+### Live read-only refusal evidence (verbatim, 2026-09-08)
+
+Two exit-side captures against Base mainnet, neither touching any key material (the first is the keyless status command, the second signs with a throwaway ephemeral key); both refuse honestly and exit two.
+
+A status against a token id the NFPM has never minted:
+
+```text
+$ uv run aero-bot-lp status --symbol AAPLc --token-id 999999999 --aero-price 1
+refused [position_unknown]: token 999999999 has no position on NFPM 0xe1f8cd9ac4e4a65f54f38a5cdafca44f6dd68b53 (RPC call reverted: execution reverted: ID); verify the token id and pool symbol
+exit=2
+```
+
+An unstake against the real gauge-staked token 5660106 - a position the canary Safe never staked, so it is foreign despite the gauge's custody:
+
+```text
+$ uv run aero-bot-lp dry-run unstake --symbol AAPLc --token-id 5660106 --ephemeral-key
+refused [penalty_state_unreadable]: the gauge read earned(address,uint256) reverted (RPC call reverted: execution reverted: NA); the accrued emissions and penalty exposure cannot be established, so the attempt is refused rather than guessed at
+exit=2
+```
+
+The `NA` revert is the gauge's own answer: `earned(owner, tokenId)` reports only for the address that staked the token, and the canary Safe is not 5660106's staker.
+The executor treats that unreadable reward state exactly like an unreadable penalty window - fail-closed with the chain's reason quoted verbatim - rather than assuming zero emissions and proceeding into a withdraw that could forfeit someone else's accrued rewards.
+Once the canary's own mint and stake confirm, its positions resolve through the same reads with the Safe as the staker, and the unstake path opens.

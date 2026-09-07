@@ -4,8 +4,12 @@ import pytest
 
 from aero_bot.lp_calldata import (
     GAUGE_DEPOSIT_SELECTOR,
+    GAUGE_DEPOSIT_TIMESTAMP_SELECTOR,
     GAUGE_EARNED_SELECTOR,
+    GAUGE_GAUGE_FACTORY_SELECTOR,
     GAUGE_GET_REWARD_SELECTOR,
+    GAUGE_MIN_STAKE_TIMES_SELECTOR,
+    GAUGE_PENALTY_RATE_SELECTOR,
     GAUGE_REWARDS_SELECTOR,
     GAUGE_WITHDRAW_SELECTOR,
     LP_COLLECT_SELECTOR,
@@ -17,8 +21,12 @@ from aero_bot.lp_calldata import (
     LpDecreaseLiquidityParams,
     LpMintParams,
     build_gauge_deposit_calldata,
+    build_gauge_deposit_timestamp_read_calldata,
     build_gauge_earned_read_calldata,
+    build_gauge_gauge_factory_read_calldata,
     build_gauge_get_reward_calldata,
+    build_gauge_min_stake_times_read_calldata,
+    build_gauge_penalty_rate_read_calldata,
     build_gauge_rewards_read_calldata,
     build_gauge_withdraw_calldata,
     build_lp_burn_calldata,
@@ -36,6 +44,8 @@ SAFE_ADDRESS = "0xb69ab6c7e73f711d5f2d10fed8f0d09b1d028c28"
 USDC_ADDRESS = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 # The Coinbase-issued AAPLc stock token, the pool's token-one side.
 AAPLC_ADDRESS = "0xb200000000000000000000c2e324d24d7eecd1fb"
+# The live AAPLc/USDC Slipstream pool whose gauge the penalty reads target.
+POOL_ADDRESS = "0xa3b1e3f9747065e2073722ff4c9027d3ea4994f0"
 # The Gauges V3 Slipstream NFPM the AAPLc pool's Sugar record names; live
 # verified as name() "Slipstream Position NFT v1", symbol() "AERO-CL-POS".
 NFPM_ADDRESS = "0xe1f8cd9ac4e4a65f54f38a5cdafca44f6dd68b53"
@@ -124,6 +134,14 @@ CANONICAL_EARNED_READ_CALLDATA = (
 CANONICAL_REWARDS_READ_CALLDATA = (
     "0xf301af420000000000000000000000000000000000000000000000000000000000565dca"
 )
+CANONICAL_GAUGE_FACTORY_READ_CALLDATA = "0x0d52333c"
+CANONICAL_PENALTY_RATE_READ_CALLDATA = "0xd6b7494f"
+CANONICAL_MIN_STAKE_TIMES_READ_CALLDATA = (
+    "0xe782453b000000000000000000000000a3b1e3f9747065e2073722ff4c9027d3ea4994f0"
+)
+CANONICAL_DEPOSIT_TIMESTAMP_READ_CALLDATA = (
+    "0x4ede8c850000000000000000000000000000000000000000000000000000000000565dca"
+)
 
 # The live positions() return for the staked AAPLc/USDC token 5660106, fetched
 # read-only on 2026-09-08; the decoder must reproduce every field exactly.
@@ -210,6 +228,30 @@ def test_gauge_reward_read_calldata_matches_cast_canonical_vectors() -> None:
     rewards = build_gauge_rewards_read_calldata(STAKED_TOKEN_ID)
     assert rewards == CANONICAL_REWARDS_READ_CALLDATA
     assert CANONICAL_REWARDS_READ_CALLDATA.startswith(f"0x{GAUGE_REWARDS_SELECTOR}")
+
+
+def test_penalty_window_read_calldata_matches_cast_canonical_vectors() -> None:
+    """Every penalty-window read encoding matches cast byte for byte."""
+    factory_read = build_gauge_gauge_factory_read_calldata()
+    assert factory_read == CANONICAL_GAUGE_FACTORY_READ_CALLDATA
+    assert f"0x{GAUGE_GAUGE_FACTORY_SELECTOR}" == CANONICAL_GAUGE_FACTORY_READ_CALLDATA
+    penalty_rate = build_gauge_penalty_rate_read_calldata()
+    assert penalty_rate == CANONICAL_PENALTY_RATE_READ_CALLDATA
+    assert f"0x{GAUGE_PENALTY_RATE_SELECTOR}" == CANONICAL_PENALTY_RATE_READ_CALLDATA
+    min_stake = build_gauge_min_stake_times_read_calldata(POOL_ADDRESS)
+    assert min_stake == CANONICAL_MIN_STAKE_TIMES_READ_CALLDATA
+    assert CANONICAL_MIN_STAKE_TIMES_READ_CALLDATA.startswith(f"0x{GAUGE_MIN_STAKE_TIMES_SELECTOR}")
+    deposit_timestamp = build_gauge_deposit_timestamp_read_calldata(STAKED_TOKEN_ID)
+    assert deposit_timestamp == CANONICAL_DEPOSIT_TIMESTAMP_READ_CALLDATA
+    assert CANONICAL_DEPOSIT_TIMESTAMP_READ_CALLDATA.startswith(
+        f"0x{GAUGE_DEPOSIT_TIMESTAMP_SELECTOR}"
+    )
+
+
+def test_penalty_window_reads_refuse_negative_ids() -> None:
+    """A negative token id refuses rather than encoding two's complement."""
+    with pytest.raises(ValueError, match="non-negative"):
+        build_gauge_deposit_timestamp_read_calldata(-1)
 
 
 def test_decode_positions_view_reproduces_live_staked_position() -> None:

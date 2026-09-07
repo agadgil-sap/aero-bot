@@ -27,7 +27,19 @@ from aero_bot.executor import (
     ExecutorRpcBackend,
     build_approval_calldata,
 )
-from aero_bot.lp_calldata import LpMintParams, build_lp_mint_calldata
+from aero_bot.history import price_usdc_per_stock
+from aero_bot.lp_calldata import (
+    MAX_UINT128,
+    LpCollectParams,
+    LpDecreaseLiquidityParams,
+    LpMintParams,
+    build_gauge_get_reward_calldata,
+    build_gauge_withdraw_calldata,
+    build_lp_burn_calldata,
+    build_lp_collect_calldata,
+    build_lp_decrease_liquidity_calldata,
+    build_lp_mint_calldata,
+)
 from aero_bot.lp_executor import (
     LpExecutionRefusalCode,
     LpExecutionRefusalError,
@@ -36,7 +48,12 @@ from aero_bot.lp_executor import (
     LpSafeExecutionPolicy,
     main,
 )
-from aero_bot.lp_plan import LpExecutionPolicy, LpPlanRefusalError
+from aero_bot.lp_plan import (
+    DEFAULT_MINT_SLIPPAGE_TOLERANCE,
+    LpExecutionPolicy,
+    LpPlanRefusalError,
+    position_amounts_at_sqrt_ratio,
+)
 from aero_bot.registry import B20AssetListing, B20RegistryResult, RegistryStatus
 from aero_bot.safe_tx import (
     CHECK_SIGNATURES_SELECTOR,
@@ -59,6 +76,9 @@ B20_ADDRESS = "0xb20000000000000000000078ee7ce2fe4908108c"
 POOL_ADDRESS = "0x1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
 GAUGE_ADDRESS = "0x3111111111111111111111111111111111111111"
 NFPM_ADDRESS = "0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"
+# The live CLGaugeFactory the gauge's own gaugeFactory() view names; penalty
+# views live there, not on the gauge or the v3 gauges factory.
+GAUGE_FACTORY_ADDRESS = "0x385293cae378c813f16f0c1334d774adddf56abb"
 SAFE_ADDRESS = "0xb69ab6c7e73f711d5f2d10fed8f0d09b1d028c28"
 # A distinct Safe the environment-override test threads through the CLI.
 OVERRIDE_SAFE_ADDRESS = "0x5aa5aa5aa5aa5aa5aa5aa5aa5aa5aa5aa5aa5aa5"
@@ -99,6 +119,13 @@ MINT_BUDGET_USDC = Decimal("7")
 MINT_WIDTH_SPACINGS = 1
 # The whole-word allowance fixtures that satisfy every skip condition.
 SATISFIED_ALLOWANCE_UNITS = 10**9
+# The fixture penalty window: deposited 1000 seconds ago under a 300-second
+# minimum and a total-forfeiture rate, so the window has already cleared.
+PENALTY_DEPOSIT_AGE_SECONDS = 1000
+PENALTY_MIN_STAKE_SECONDS = 300
+PENALTY_RATE_BPS = 10_000
+# A fixture AERO price for status quotes; one USDC keeps the math readable.
+FIXTURE_AERO_PRICE_USDC = Decimal("1")
 
 
 def word_hex(value: int) -> str:
@@ -270,6 +297,17 @@ class LpRpcScript:
         swap_gas_estimate: int | None = 200_000,
         mint_gas_estimate: int | None = 400_000,
         deposit_gas_estimate: int | None = 120_000,
+        gauge_earned_units: int = 0,
+        gauge_rewards_units: int = 0,
+        penalty_rate_bps: int = PENALTY_RATE_BPS,
+        min_stake_seconds: int = PENALTY_MIN_STAKE_SECONDS,
+        deposit_age_seconds: int = PENALTY_DEPOSIT_AGE_SECONDS,
+        penalty_reads_revert: bool = False,
+        withdraw_gas_estimate: int | None = 130_000,
+        decrease_gas_estimate: int | None = 160_000,
+        collect_gas_estimate: int | None = 90_000,
+        burn_gas_estimate: int | None = 60_000,
+        get_reward_gas_estimate: int | None = 110_000,
     ) -> None:
         """Configure every scripted answer the LP executor's calls receive.
 
@@ -297,6 +335,24 @@ class LpRpcScript:
                 make that estimate revert.
             deposit_gas_estimate: Gas served for the deposit inner call, or
                 None to make that estimate revert.
+            gauge_earned_units: The gauge earned(address,uint256) answer.
+            gauge_rewards_units: The gauge rewards(uint256) checkpoint answer.
+            penalty_rate_bps: The factory penaltyRate() answer.
+            min_stake_seconds: The factory minStakeTimes(pool) answer.
+            deposit_age_seconds: How long ago depositTimestamp(tokenId) sits;
+                the window clears at deposit plus the minimum stake time.
+            penalty_reads_revert: Make every penalty-window read revert, so the
+                fail-closed path can be exercised.
+            withdraw_gas_estimate: Gas served for the gauge withdraw, or None
+                to make that estimate revert.
+            decrease_gas_estimate: Gas served for decreaseLiquidity, or None
+                to make that estimate revert.
+            collect_gas_estimate: Gas served for NFPM collect, or None to make
+                that estimate revert.
+            burn_gas_estimate: Gas served for NFPM burn, or None to make that
+                estimate revert.
+            get_reward_gas_estimate: Gas served for gauge getReward, or None
+                to make that estimate revert.
         """
         self.gas_price_wei = gas_price_wei
         self.safe_eth_wei = safe_eth_wei
@@ -314,6 +370,17 @@ class LpRpcScript:
         self.swap_gas_estimate = swap_gas_estimate
         self.mint_gas_estimate = mint_gas_estimate
         self.deposit_gas_estimate = deposit_gas_estimate
+        self.gauge_earned_units = gauge_earned_units
+        self.gauge_rewards_units = gauge_rewards_units
+        self.penalty_rate_bps = penalty_rate_bps
+        self.min_stake_seconds = min_stake_seconds
+        self.deposit_timestamp = int(BASE_NOW.timestamp()) - deposit_age_seconds
+        self.penalty_reads_revert = penalty_reads_revert
+        self.withdraw_gas_estimate = withdraw_gas_estimate
+        self.decrease_gas_estimate = decrease_gas_estimate
+        self.collect_gas_estimate = collect_gas_estimate
+        self.burn_gas_estimate = burn_gas_estimate
+        self.get_reward_gas_estimate = get_reward_gas_estimate
         self.broadcasts: list[str] = []
         self.estimate_requests: list[str] = []
 
@@ -376,7 +443,32 @@ class LpRpcScript:
             if self.position_words is None:
                 raise _ScriptedRevertError("NFPM: unknown token ID")
             return "0x" + b"".join(self.position_words).hex()
+        if to_address == GAUGE_ADDRESS:
+            if data.startswith("0x3e491d47"):
+                self._require_penalty_reads()
+                return word_hex(self.gauge_earned_units)
+            if data.startswith("0xf301af42"):
+                self._require_penalty_reads()
+                return word_hex(self.gauge_rewards_units)
+            if data.startswith("0x0d52333c"):
+                self._require_penalty_reads()
+                return word_hex(int(GAUGE_FACTORY_ADDRESS, 16))
+            if data.startswith("0x4ede8c85"):
+                self._require_penalty_reads()
+                return word_hex(self.deposit_timestamp)
+        if to_address == GAUGE_FACTORY_ADDRESS:
+            if data.startswith("0xd6b7494f"):
+                self._require_penalty_reads()
+                return word_hex(self.penalty_rate_bps)
+            if data.startswith("0xe782453b"):
+                self._require_penalty_reads()
+                return word_hex(self.min_stake_seconds)
         raise AssertionError(f"unexpected LP eth_call payload {data[:10]}")
+
+    def _require_penalty_reads(self) -> None:
+        """Raise the scripted revert when penalty-state reads must fail."""
+        if self.penalty_reads_revert:
+            raise _ScriptedRevertError("penalty state unavailable")
 
     def _estimate(self, calldata: str) -> str:
         """Answer one gas estimate by the inner call embedded in the exec data."""
@@ -392,6 +484,16 @@ class LpRpcScript:
             return self._estimate_or_revert(self.approval_gas_estimate, "operator refused")
         if selector == "b6b55f25":
             return self._estimate_or_revert(self.deposit_gas_estimate, "deposit refused")
+        if selector == "2e1a7d4d":
+            return self._estimate_or_revert(self.withdraw_gas_estimate, "withdraw refused")
+        if selector == "0c49ccbe":
+            return self._estimate_or_revert(self.decrease_gas_estimate, "decrease refused")
+        if selector == "fc6f7865":
+            return self._estimate_or_revert(self.collect_gas_estimate, "collect refused")
+        if selector == "42966c68":
+            return self._estimate_or_revert(self.burn_gas_estimate, "burn refused")
+        if selector == "1c4b774b":
+            return self._estimate_or_revert(self.get_reward_gas_estimate, "reward refused")
         raise AssertionError(f"unexpected inner selector {selector}")
 
     @staticmethod
@@ -828,22 +930,71 @@ def test_planner_refusals_surface_with_their_own_codes() -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_position_words() -> list[bytes]:
-    """Encode one coherent twelve-word positions view for the fixture pool."""
+def make_position_words(
+    *,
+    liquidity: int = 12_345,
+    fees_owed0: int = 10,
+    fees_owed1: int = 11,
+    tick_lower: int = LP_RANGE_LOWER,
+    tick_upper: int = LP_RANGE_UPPER,
+) -> list[bytes]:
+    """Encode one coherent twelve-word positions view for the fixture pool.
+
+    Args:
+        liquidity: The position's raw L units.
+        fees_owed0: Checkpointed token-zero fees awaiting collection.
+        fees_owed1: Checkpointed token-one fees awaiting collection.
+        tick_lower: The position's inclusive lower tick.
+        tick_upper: The position's exclusive upper tick.
+
+    Returns:
+        The twelve ABI words the NFPM positions view returns.
+    """
     return [
         (0).to_bytes(32, "big"),
         bytes.fromhex(address_word("0x" + "00" * 20)),
         bytes.fromhex(address_word(BASE_USDC_ADDRESS)),
         bytes.fromhex(address_word(B20_ADDRESS)),
         LP_TICK_SPACING.to_bytes(32, "big"),
-        signed_word(LP_RANGE_LOWER),
-        signed_word(LP_RANGE_UPPER),
-        (12_345).to_bytes(32, "big"),
+        signed_word(tick_lower),
+        signed_word(tick_upper),
+        liquidity.to_bytes(32, "big"),
         (0).to_bytes(32, "big"),
         (0).to_bytes(32, "big"),
-        (10).to_bytes(32, "big"),
-        (11).to_bytes(32, "big"),
+        fees_owed0.to_bytes(32, "big"),
+        fees_owed1.to_bytes(32, "big"),
     ]
+
+
+def expected_exit_amounts(liquidity: int = 12_345) -> tuple[Decimal, Decimal]:
+    """Compute the fixture position's two-sided amounts at the snapshot price.
+
+    Args:
+        liquidity: The position's raw L units.
+
+    Returns:
+        The raw token-zero and token-one amounts the full decrease returns.
+    """
+    return position_amounts_at_sqrt_ratio(
+        LP_SQRT_RATIO, LP_RANGE_LOWER, LP_RANGE_UPPER, Decimal(liquidity)
+    )
+
+
+def expected_exit_minima(liquidity: int = 12_345) -> tuple[int, int]:
+    """Compute the slippage-floored minima the decrease calldata carries.
+
+    Args:
+        liquidity: The position's raw L units.
+
+    Returns:
+        The floored token-zero and token-one minima.
+    """
+    amount0, amount1 = expected_exit_amounts(liquidity)
+    tolerance = Decimal(1) - DEFAULT_MINT_SLIPPAGE_TOLERANCE
+    return (
+        int((amount0 * tolerance).to_integral_value(rounding=ROUND_FLOOR)),
+        int((amount1 * tolerance).to_integral_value(rounding=ROUND_FLOOR)),
+    )
 
 
 def test_dry_run_stake_builds_the_pre_mint_sequence() -> None:
@@ -896,6 +1047,616 @@ def test_dry_run_stake_on_an_owned_position_skips_the_approval() -> None:
     assert report.position.tokens_owed0_units == 10
     roles = tuple(transaction.role for transaction in report.transactions)
     assert roles == (LpExecutionRole.GAUGE_DEPOSIT,)
+
+
+# ---------------------------------------------------------------------------
+# Unstake dry-run composition
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_unstake_builds_the_withdraw_sequence() -> None:
+    """A staked, penalty-clear position builds exactly the gauge withdraw."""
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            gauge_earned_units=5 * 10**18,
+            gauge_rewards_units=45 * 10**17,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[9], signature_verdicts=[True]),
+    )
+
+    report = executor.dry_run_unstake("FIXc", 77, bytes(Account.create().key))
+
+    roles = tuple(transaction.role for transaction in report.transactions)
+    assert roles == (LpExecutionRole.GAUGE_WITHDRAW,)
+    assert report.transactions[0].nonce == 9
+    assert all(transaction.signature_verified for transaction in report.transactions)
+    assert report.accrued_aero_earned_units == 5 * 10**18
+    assert report.accrued_aero_checkpoint_units == 45 * 10**17
+    deposit_at = int(BASE_NOW.timestamp()) - PENALTY_DEPOSIT_AGE_SECONDS
+    assert report.penalty.penalty_rate_bps == PENALTY_RATE_BPS
+    assert report.penalty.min_stake_seconds == PENALTY_MIN_STAKE_SECONDS
+    assert report.penalty.deposit_timestamp == deposit_at
+    assert report.penalty.window_clears_at_timestamp == deposit_at + PENALTY_MIN_STAKE_SECONDS
+    assert report.penalty.remaining_seconds == 0
+    assert any("penalty window clear" in cap for cap in report.caps_enforced)
+    assert rpc_script.broadcasts == []
+    assert decode_inner(rpc_script.estimate_requests[0]) == bytes.fromhex(
+        build_gauge_withdraw_calldata(77)[2:]
+    )
+
+
+def test_dry_run_unstake_refuses_an_unstaked_position() -> None:
+    """A position the Safe itself holds has nothing staked to unstake."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS}, position_words=make_position_words()
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_unstake("FIXc", 77, bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.POSITION_NOT_STAKED
+
+
+def test_dry_run_unstake_refuses_inside_the_penalty_window() -> None:
+    """A live early-exit window with accrued emissions refuses the claim."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            gauge_earned_units=10**18,
+            deposit_age_seconds=100,
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_unstake("FIXc", 77, bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.WITHIN_PENALTY_WINDOW
+    clears_at = int(BASE_NOW.timestamp()) - 100 + PENALTY_MIN_STAKE_SECONDS
+    assert str(clears_at) in str(raised.value)
+
+
+def test_dry_run_unstake_proceeds_inside_the_window_when_nothing_accrued() -> None:
+    """An open window with zero accrued emissions forfeits nothing."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            gauge_earned_units=0,
+            deposit_age_seconds=100,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[9], signature_verdicts=[True]),
+    )
+
+    report = executor.dry_run_unstake("FIXc", 77, bytes(Account.create().key))
+
+    assert report.penalty.remaining_seconds == 200
+    assert tuple(transaction.role for transaction in report.transactions) == (
+        LpExecutionRole.GAUGE_WITHDRAW,
+    )
+
+
+def test_dry_run_unstake_refuses_when_penalty_reads_revert() -> None:
+    """Unreadable penalty state refuses the unstake rather than guessing."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            penalty_reads_revert=True,
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_unstake("FIXc", 77, bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.PENALTY_STATE_UNREADABLE
+
+
+def test_exit_side_actions_refuse_an_unknown_token() -> None:
+    """A token id the NFPM does not know refuses every exit-side action."""
+    executor, _, _ = make_lp_executor()
+
+    for action in (
+        lambda: executor.dry_run_unstake("FIXc", 77, bytes(Account.create().key)),
+        lambda: executor.dry_run_exit("FIXc", 77, bytes(Account.create().key)),
+        lambda: executor.dry_run_collect("FIXc", 77, bytes(Account.create().key)),
+        lambda: executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC),
+    ):
+        with pytest.raises(LpExecutionRefusalError) as raised:
+            action()
+        assert raised.value.code is LpExecutionRefusalCode.POSITION_UNKNOWN
+
+
+def test_exit_side_actions_refuse_a_foreign_owner() -> None:
+    """A position owned outside the Safe-and-gauge pair refuses management."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: OVERRIDE_SAFE_ADDRESS},
+            position_words=make_position_words(),
+        )
+    )
+
+    for action in (
+        lambda: executor.dry_run_unstake("FIXc", 77, bytes(Account.create().key)),
+        lambda: executor.dry_run_exit("FIXc", 77, bytes(Account.create().key)),
+        lambda: executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC),
+    ):
+        with pytest.raises(LpExecutionRefusalError) as raised:
+            action()
+        assert raised.value.code is LpExecutionRefusalCode.POSITION_NOT_OWNED
+
+
+# ---------------------------------------------------------------------------
+# Withdraw dry-run composition
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_withdraw_builds_the_decrease_and_collect() -> None:
+    """An owned in-range position decreases fully then collects the fees."""
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS}, position_words=make_position_words()
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True, True]),
+    )
+
+    report = executor.dry_run_exit("FIXc", 77, bytes(Account.create().key))
+
+    roles = tuple(transaction.role for transaction in report.transactions)
+    assert roles == (LpExecutionRole.NFPM_DECREASE, LpExecutionRole.NFPM_COLLECT)
+    assert [transaction.nonce for transaction in report.transactions] == [4, 5]
+    assert report.range_state.value == "in_range"
+    expected_amount0, expected_amount1 = expected_exit_amounts()
+    min0, min1 = expected_exit_minima()
+    assert report.amount0_units == expected_amount0
+    assert report.amount1_units == expected_amount1
+    assert report.amount0_min_units == min0
+    assert report.amount1_min_units == min1
+    assert report.fees_owed0_units == 10
+    assert report.fees_owed1_units == 11
+    assert rpc_script.broadcasts == []
+    decrease_inner = decode_inner(rpc_script.estimate_requests[0])
+    assert decrease_inner == bytes.fromhex(
+        build_lp_decrease_liquidity_calldata(
+            LpDecreaseLiquidityParams(
+                token_id=77,
+                liquidity=12_345,
+                amount0_min_units=min0,
+                amount1_min_units=min1,
+                deadline=fixture_deadline(),
+            )
+        )[2:]
+    )
+    collect_inner = decode_inner(rpc_script.estimate_requests[1])
+    assert collect_inner == bytes.fromhex(
+        build_lp_collect_calldata(
+            LpCollectParams(
+                token_id=77,
+                recipient_address=SAFE_ADDRESS,
+                amount0_max_units=MAX_UINT128,
+                amount1_max_units=MAX_UINT128,
+            )
+        )[2:]
+    )
+
+
+def test_dry_run_withdraw_refuses_a_staked_position() -> None:
+    """The gauge's custody of the NFT blocks every NFPM-side operation."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS}, position_words=make_position_words()
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_exit("FIXc", 77, bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.POSITION_STAKED
+
+
+def test_dry_run_withdraw_refuses_an_emptied_position() -> None:
+    """No liquidity and no checkpointed fees leaves nothing to withdraw."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_exit("FIXc", 77, bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.POSITION_EMPTY
+
+
+def test_dry_run_withdraw_skips_the_decrease_when_only_fees_remain() -> None:
+    """An emptied-but-fee-bearing position collapses to the bare collect."""
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            position_words=make_position_words(liquidity=0, fees_owed0=5, fees_owed1=7),
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True]),
+    )
+
+    report = executor.dry_run_exit("FIXc", 77, bytes(Account.create().key))
+
+    roles = tuple(transaction.role for transaction in report.transactions)
+    assert roles == (LpExecutionRole.NFPM_COLLECT,)
+    assert report.fees_owed0_units == 5
+    assert report.fees_owed1_units == 7
+    assert rpc_script.estimate_requests != []
+
+
+# ---------------------------------------------------------------------------
+# Collect dry-run composition
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_collect_on_a_staked_position_claims_through_the_gauge() -> None:
+    """A staked position claims emissions through the per-token getReward."""
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            gauge_earned_units=25 * 10**17,
+            gauge_rewards_units=24 * 10**17,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True]),
+    )
+
+    report = executor.dry_run_collect("FIXc", 77, bytes(Account.create().key))
+
+    roles = tuple(transaction.role for transaction in report.transactions)
+    assert roles == (LpExecutionRole.GAUGE_GET_REWARD,)
+    assert report.staked is True
+    assert report.accrued_aero_earned_units == 25 * 10**17
+    assert report.accrued_aero_checkpoint_units == 24 * 10**17
+    assert report.fees_owed0_units == 0
+    assert report.fees_owed1_units == 0
+    assert rpc_script.broadcasts == []
+    assert decode_inner(rpc_script.estimate_requests[0]) == bytes.fromhex(
+        build_gauge_get_reward_calldata(77)[2:]
+    )
+
+
+def test_dry_run_collect_on_an_unstaked_position_sweeps_the_nfpm() -> None:
+    """An unstaked position sweeps its checkpointed fees through collect."""
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS}, position_words=make_position_words()
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True]),
+    )
+
+    report = executor.dry_run_collect("FIXc", 77, bytes(Account.create().key))
+
+    roles = tuple(transaction.role for transaction in report.transactions)
+    assert roles == (LpExecutionRole.NFPM_COLLECT,)
+    assert report.staked is False
+    assert report.accrued_aero_earned_units == 0
+    assert report.penalty is None
+    assert report.fees_owed0_units == 10
+    assert report.fees_owed1_units == 11
+    assert rpc_script.estimate_requests != []
+
+
+def test_dry_run_collect_refuses_inside_the_penalty_window() -> None:
+    """A staked claim inside a live window with emissions at stake refuses."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            gauge_earned_units=10**18,
+            deposit_age_seconds=100,
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_collect("FIXc", 77, bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.WITHIN_PENALTY_WINDOW
+
+
+# ---------------------------------------------------------------------------
+# Recenter dry-run composition
+# ---------------------------------------------------------------------------
+
+
+# A liquidity of one times ten to the tenth recycles to roughly five and a
+# half USDC, comfortably under every pilot cap while flooring both sides.
+RECENTER_LIQUIDITY = 10**10
+
+
+def expected_recycled_budget() -> Decimal:
+    """Compute the budget the default recenter fixture recycles."""
+    amount0, amount1 = expected_exit_amounts(RECENTER_LIQUIDITY)
+    price = price_usdc_per_stock(LP_SQRT_RATIO, False, STOCK_DECIMALS, 6)
+    return +(
+        (amount1 + Decimal(11)) * Decimal(10) ** -STOCK_DECIMALS * price
+        + (amount0 + Decimal(10)) * Decimal(10) ** -6
+    )
+
+
+def test_dry_run_recenter_staked_builds_the_full_cycle() -> None:
+    """A staked position recycles through unstake, exit, burn, and remint."""
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+            router_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_usdc_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_stock_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            operator_approved=True,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[2], signature_verdicts=[True] * 5),
+    )
+
+    report = executor.dry_run_recenter(
+        "FIXc", 77, MINT_WIDTH_SPACINGS, None, bytes(Account.create().key)
+    )
+
+    roles = tuple(transaction.role for transaction in report.transactions)
+    assert roles == (
+        LpExecutionRole.GAUGE_WITHDRAW,
+        LpExecutionRole.NFPM_DECREASE,
+        LpExecutionRole.NFPM_COLLECT,
+        LpExecutionRole.NFPM_BURN,
+        LpExecutionRole.MINT,
+    )
+    assert [transaction.nonce for transaction in report.transactions] == [2, 3, 4, 5, 6]
+    assert all(transaction.signature_verified for transaction in report.transactions)
+    assert report.staked is True
+    assert report.plan.budget_usdc == expected_recycled_budget()
+    assert report.plan.balancing_swap.required is False
+    assert report.plan.position_range.tick_lower == LP_RANGE_LOWER
+    assert report.plan.position_range.tick_upper == LP_RANGE_UPPER
+    amount0, amount1 = expected_exit_amounts(RECENTER_LIQUIDITY)
+    assert report.projected_usdc_units == int(
+        (Decimal(FIXTURE_SAFE_USDC_UNITS) + amount0 + Decimal(10)).to_integral_value(
+            rounding=ROUND_FLOOR
+        )
+    )
+    assert report.projected_stock_units == int(
+        (amount1 + Decimal(11)).to_integral_value(rounding=ROUND_FLOOR)
+    )
+    assert "stake command" in report.restake_followup
+    assert "no next-id view" in report.restake_followup
+    assert rpc_script.broadcasts == []
+    inner_calls = [decode_inner(request) for request in rpc_script.estimate_requests]
+    min0, min1 = expected_exit_minima(RECENTER_LIQUIDITY)
+    assert inner_calls[0] == bytes.fromhex(build_gauge_withdraw_calldata(77)[2:])
+    assert inner_calls[1] == bytes.fromhex(
+        build_lp_decrease_liquidity_calldata(
+            LpDecreaseLiquidityParams(
+                token_id=77,
+                liquidity=RECENTER_LIQUIDITY,
+                amount0_min_units=min0,
+                amount1_min_units=min1,
+                deadline=fixture_deadline(),
+            )
+        )[2:]
+    )
+    assert inner_calls[2] == bytes.fromhex(
+        build_lp_collect_calldata(
+            LpCollectParams(
+                token_id=77,
+                recipient_address=SAFE_ADDRESS,
+                amount0_max_units=MAX_UINT128,
+                amount1_max_units=MAX_UINT128,
+            )
+        )[2:]
+    )
+    assert inner_calls[3] == bytes.fromhex(build_lp_burn_calldata(77)[2:])
+
+
+def test_dry_run_recenter_unstaked_skips_the_withdraw() -> None:
+    """An unstaked position recenters through a bare exit, burn, and remint."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            nfpm_held_positions=1,
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+            router_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_usdc_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_stock_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            operator_approved=True,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[2], signature_verdicts=[True] * 4),
+    )
+
+    report = executor.dry_run_recenter(
+        "FIXc", 77, MINT_WIDTH_SPACINGS, None, bytes(Account.create().key)
+    )
+
+    roles = tuple(transaction.role for transaction in report.transactions)
+    assert roles == (
+        LpExecutionRole.NFPM_DECREASE,
+        LpExecutionRole.NFPM_COLLECT,
+        LpExecutionRole.NFPM_BURN,
+        LpExecutionRole.MINT,
+    )
+    assert report.staked is False
+
+
+def test_dry_run_recenter_with_an_explicit_budget_swaps_the_shortfall() -> None:
+    """A larger explicit budget composes the swap and approvals mid-sequence."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[2], signature_verdicts=[True] * 10),
+    )
+
+    report = executor.dry_run_recenter(
+        "FIXc", 77, MINT_WIDTH_SPACINGS, Decimal("12"), bytes(Account.create().key)
+    )
+
+    roles = tuple(transaction.role for transaction in report.transactions)
+    assert roles == (
+        LpExecutionRole.GAUGE_WITHDRAW,
+        LpExecutionRole.NFPM_DECREASE,
+        LpExecutionRole.NFPM_COLLECT,
+        LpExecutionRole.NFPM_BURN,
+        LpExecutionRole.ROUTER_ALLOWANCE,
+        LpExecutionRole.BALANCING_SWAP,
+        LpExecutionRole.NFPM_USDC_ALLOWANCE,
+        LpExecutionRole.NFPM_STOCK_ALLOWANCE,
+        LpExecutionRole.MINT,
+        LpExecutionRole.NFPM_GAUGE_APPROVAL,
+    )
+    assert report.plan.budget_usdc == Decimal("12")
+    assert report.plan.balancing_swap.required is True
+    assert report.plan.balancing_swap.tranche_count == 1
+
+
+def test_dry_run_recenter_refuses_without_an_explicit_width() -> None:
+    """The recenter needs an explicit width until the solver path lands."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            nfpm_held_positions=1,
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_recenter("FIXc", 77, None, None, bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.DERIVED_WIDTH_UNAVAILABLE
+
+
+def test_dry_run_recenter_refuses_extra_held_positions() -> None:
+    """Untracked NFTs beside the recentered one refuse the total cap."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            nfpm_held_positions=2,
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_recenter(
+            "FIXc", 77, MINT_WIDTH_SPACINGS, None, bytes(Account.create().key)
+        )
+
+    assert raised.value.code is LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS
+
+
+def test_dry_run_recenter_surfaces_planner_cap_refusals() -> None:
+    """A recenter budget above the per-pool cap refuses through the planner."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            nfpm_held_positions=1,
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+        )
+    )
+
+    with pytest.raises(LpPlanRefusalError) as raised:
+        executor.dry_run_recenter(
+            "FIXc", 77, MINT_WIDTH_SPACINGS, Decimal("60"), bytes(Account.create().key)
+        )
+
+    assert raised.value.code.value == "budget_above_pool_cap"
+
+
+# ---------------------------------------------------------------------------
+# Position status
+# ---------------------------------------------------------------------------
+
+
+def test_position_status_reports_a_staked_position_read_only() -> None:
+    """A staked position reports value, emissions, and window without signing."""
+    executor, rpc_script, safe_script = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            gauge_earned_units=3 * 10**18,
+            gauge_rewards_units=2 * 10**18,
+        )
+    )
+
+    report = executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC)
+
+    assert report.token_owner_address == GAUGE_ADDRESS
+    assert report.staked is True
+    assert report.range_state.value == "in_range"
+    assert report.snapshot_block == 123
+    amount0, amount1 = expected_exit_amounts()
+    assert report.amount0_units == amount0
+    assert report.amount1_units == amount1
+    price = price_usdc_per_stock(LP_SQRT_RATIO, False, STOCK_DECIMALS, 6)
+    assert report.token0_value_usdc == +(amount0 * Decimal(10) ** -6)
+    assert report.token1_value_usdc == +(amount1 * Decimal(10) ** -STOCK_DECIMALS * price)
+    assert report.position_value_usdc == +(report.token0_value_usdc + report.token1_value_usdc)
+    assert report.accrued_aero_earned_units == 3 * 10**18
+    assert report.accrued_aero_checkpoint_units == 2 * 10**18
+    assert report.penalty is not None
+    assert report.penalty.remaining_seconds == 0
+    # The pool-level quote mirrors the rehearsal convention, labeled pre-fix.
+    emissions_per_second = 4_494_371_922_759_724
+    annual_reward_usd = (
+        Decimal(emissions_per_second)
+        * FIXTURE_AERO_PRICE_USDC
+        * Decimal(31_536_000)
+        / Decimal(10) ** 18
+    )
+    staked_tvl = +(Decimal(250_000_000) * Decimal(10) ** -6 + Decimal(3) * price)
+    assert report.quoted_emissions_apr == +(annual_reward_usd / staked_tvl)
+    assert "PRE-FIX" in report.apr_diagnostic
+    assert report.unrealized_pnl_usdc is None
+    assert "entry cost unknown" in report.pnl_diagnostic
+    # Status is read-only: nothing was signed, estimated, or broadcast. The
+    # Safe script's queues still hold every answer they were built with.
+    assert rpc_script.estimate_requests == []
+    assert rpc_script.broadcasts == []
+    assert safe_script.nonce_reads == [4]
+    assert safe_script.signature_verdicts == [True] * 5
+
+
+def test_position_status_with_an_entry_cost_reports_the_pnl() -> None:
+    """A supplied entry cost basis yields the unrealized P&L."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS}, position_words=make_position_words()
+        )
+    )
+
+    report = executor.position_status(
+        "FIXc", 77, FIXTURE_AERO_PRICE_USDC, entry_cost_usdc=Decimal("0.001")
+    )
+
+    assert report.entry_cost_usdc == Decimal("0.001")
+    assert report.unrealized_pnl_usdc == +(report.position_value_usdc - Decimal("0.001"))
+    assert report.accrued_aero_earned_units is None
+    assert report.penalty is None
+    assert any("unstaked" in line for line in report.diagnostics)
+
+
+def test_position_status_quotes_no_apr_without_emissions() -> None:
+    """A silent gauge reports no quote rather than a zero APR."""
+    executor, _, _ = make_lp_executor(
+        sources=FakeSources(
+            discovery=make_discovery(
+                pools=(make_candidate(emissions_per_second=0, emissions_token_address=None),)
+            )
+        ),
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS}, position_words=make_position_words()
+        ),
+    )
+
+    report = executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC)
+
+    assert report.quoted_emissions_apr is None
+    assert "no quoted emissions APR" in report.apr_diagnostic
 
 
 # ---------------------------------------------------------------------------
@@ -997,6 +1758,137 @@ def test_stake_dry_run_appends_its_audit_chain(tmp_path: Path) -> None:
     assert planned["token_id"] == 77
     assert planned["token_owner_address"] is None
     assert planned["gauge_operator_approved"] is False
+
+
+def test_unstake_dry_run_appends_its_audit_chain(tmp_path: Path) -> None:
+    """One unstake dry run appends its plan then the built withdraw."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, _, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            gauge_earned_units=5 * 10**18,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[9], signature_verdicts=[True]),
+    )
+
+    executor.dry_run_unstake("FIXc", 77, bytes(Account.create().key))
+
+    store = AuditStore(audit_path)
+    records = store.read_records(100)
+    assert [record.event_type for record in records] == [
+        AuditEventType.LP_UNSTAKE_PLANNED,
+        AuditEventType.LP_TRANSACTION_BUILT,
+    ]
+    planned = json.loads(records[0].payload_json)
+    assert planned["token_id"] == 77
+    assert planned["accrued_aero_earned_units"] == 5 * 10**18
+    assert planned["penalty_rate_bps"] == PENALTY_RATE_BPS
+    assert planned["penalty_remaining_seconds"] == 0
+    assert json.loads(records[1].payload_json)["role"] == "gauge_withdraw"
+    assert store.verify_chain().status.value == "verified"
+
+
+def test_recenter_dry_run_appends_its_audit_chain(tmp_path: Path) -> None:
+    """One recenter dry run appends the mint plan, batch plan, then builds."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, _, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+            router_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_usdc_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_stock_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            operator_approved=True,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[2], signature_verdicts=[True] * 5),
+    )
+
+    executor.dry_run_recenter("FIXc", 77, MINT_WIDTH_SPACINGS, None, bytes(Account.create().key))
+
+    store = AuditStore(audit_path)
+    records = store.read_records(100)
+    assert [record.event_type for record in records] == [
+        AuditEventType.LP_MINT_PLANNED,
+        AuditEventType.LP_RECENTER_PLANNED,
+        *([AuditEventType.LP_TRANSACTION_BUILT] * 5),
+    ]
+    planned = json.loads(records[1].payload_json)
+    assert planned["token_id"] == 77
+    assert planned["staked"] is True
+    assert Decimal(planned["budget_usdc"]) == expected_recycled_budget()
+    assert planned["tick_lower"] == LP_RANGE_LOWER
+    assert planned["tick_upper"] == LP_RANGE_UPPER
+    assert "stake command" in planned["restake_followup"]
+    built_roles = [json.loads(record.payload_json)["role"] for record in records[2:]]
+    assert built_roles == [
+        "gauge_withdraw",
+        "nfpm_decrease_liquidity",
+        "nfpm_collect",
+        "nfpm_burn",
+        "mint",
+    ]
+
+
+def test_status_appends_its_read_only_event(tmp_path: Path) -> None:
+    """One status observation appends exactly its reported event."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, _, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS}, position_words=make_position_words()
+        ),
+    )
+
+    executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC)
+
+    store = AuditStore(audit_path)
+    records = store.read_records(100)
+    assert [record.event_type for record in records] == [AuditEventType.LP_STATUS_REPORTED]
+    payload = json.loads(records[0].payload_json)
+    assert payload["symbol"] == "FIXc"
+    assert payload["staked"] is True
+    assert payload["aero_price_assumption_usdc"] == "1"
+    assert payload["quoted_emissions_apr"] is not None
+
+
+def test_exit_side_refusals_append_their_catalog_codes(tmp_path: Path) -> None:
+    """Each exit-side refusal audits its own action and catalog code."""
+    audit_path = tmp_path / "audit.sqlite3"
+    staked_executor, _, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS}, position_words=make_position_words()
+        ),
+    )
+    unstaked_executor, _, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS}, position_words=make_position_words()
+        ),
+    )
+
+    with pytest.raises(LpExecutionRefusalError):
+        staked_executor.dry_run_exit("FIXc", 77, bytes(Account.create().key))
+    with pytest.raises(LpExecutionRefusalError):
+        unstaked_executor.dry_run_unstake("FIXc", 77, bytes(Account.create().key))
+    with pytest.raises(LpExecutionRefusalError):
+        unstaked_executor.position_status("FIXc", 88, FIXTURE_AERO_PRICE_USDC)
+
+    store = AuditStore(audit_path)
+    records = store.read_records(100)
+    assert [record.event_type for record in records] == [AuditEventType.LP_REFUSED] * 3
+    pairs = [
+        (json.loads(record.payload_json)["action"], json.loads(record.payload_json)["code"])
+        for record in records
+    ]
+    assert pairs == [
+        ("withdraw", "position_staked"),
+        ("unstake", "position_not_staked"),
+        ("status", "position_unknown"),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +2006,237 @@ def test_cli_dry_run_stake_prints_the_pre_mint_diagnostics(
     assert "[gauge_deposit]" in output
 
 
+def test_cli_dry_run_unstake_prints_the_penalty_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The unstake dry-run prints the window state and the withdraw step."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            gauge_earned_units=5 * 10**18,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[9], signature_verdicts=[True]),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "dry-run",
+                "unstake",
+                "--symbol",
+                "FIXc",
+                "--token-id",
+                "77",
+                "--ephemeral-key",
+            ]
+        )
+
+    assert exit_code == EXIT_OK
+    output = capsys.readouterr().out
+    assert "penalty window clear" in output
+    assert "[gauge_withdraw]" in output
+    assert "auto-claims the accrued emissions" in output
+
+
+def test_cli_dry_run_withdraw_prints_the_json_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The withdraw dry-run prints its complete typed model with --json."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS}, position_words=make_position_words()
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True, True]),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "dry-run",
+                "withdraw",
+                "--symbol",
+                "FIXc",
+                "--token-id",
+                "77",
+                "--ephemeral-key",
+                "--json",
+            ]
+        )
+
+    assert exit_code == EXIT_OK
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["mode"] == "dry_run"
+    assert [t["role"] for t in printed["transactions"]] == [
+        "nfpm_decrease_liquidity",
+        "nfpm_collect",
+    ]
+    assert printed["range_state"] == "in_range"
+
+
+def test_cli_dry_run_collect_prints_the_claim_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The collect dry-run names the gauge claim path for a staked token."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            gauge_earned_units=25 * 10**17,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True]),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "dry-run",
+                "collect",
+                "--symbol",
+                "FIXc",
+                "--token-id",
+                "77",
+                "--ephemeral-key",
+            ]
+        )
+
+    assert exit_code == EXIT_OK
+    output = capsys.readouterr().out
+    assert "claim path gauge getReward" in output
+    assert "[gauge_get_reward]" in output
+
+
+def test_cli_dry_run_recenter_prints_the_restake_followup(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The recenter dry-run prints the batch and its restake follow-up."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+            router_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_usdc_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_stock_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            operator_approved=True,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[2], signature_verdicts=[True] * 5),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "dry-run",
+                "recenter",
+                "--symbol",
+                "FIXc",
+                "--token-id",
+                "77",
+                "--width-ticks",
+                "1",
+                "--ephemeral-key",
+            ]
+        )
+
+    assert exit_code == EXIT_OK
+    output = capsys.readouterr().out
+    assert "[gauge_withdraw]" in output
+    assert "[nfpm_burn]" in output
+    assert "[mint]" in output
+    assert "restake follow-up: the restake completes by running the stake command" in output
+
+
+def test_cli_status_prints_the_pre_fix_apr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The status command quotes the pre-fix APR without any key material."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            gauge_earned_units=3 * 10**18,
+        )
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "status",
+                "--symbol",
+                "FIXc",
+                "--token-id",
+                "77",
+                "--aero-price",
+                "1",
+                "--entry-cost",
+                "0.001",
+            ]
+        )
+
+    assert exit_code == EXIT_OK
+    output = capsys.readouterr().out
+    assert "quoted emissions APR" in output
+    assert "PRE-FIX APR INPUT" in output
+    assert "unrealized P&L" in output
+    assert "staked in the gauge" in output
+
+
+def test_cli_unstake_refusal_exits_two(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """An unknown token on the unstake path exits two with its code."""
+    executor, _, _ = make_lp_executor()
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "dry-run",
+                "unstake",
+                "--symbol",
+                "FIXc",
+                "--token-id",
+                "77",
+                "--ephemeral-key",
+            ]
+        )
+
+    assert exit_code == EXIT_REFUSED
+    assert "refused [position_unknown]" in capsys.readouterr().err
+
+
 def test_cli_refusal_exits_two_with_the_catalog_code(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1193,19 +2316,38 @@ def test_cli_never_attempts_a_broadcast_under_any_subcommand(
     tmp_path: Path,
 ) -> None:
     """Every wired subcommand path runs over a transport that fails on sends."""
-    executor, rpc_script, _ = make_lp_executor(
-        safe_script=SafeRpcScript(nonce_reads=[4, 6], signature_verdicts=[True] * 7)
+    staked_executor, staked_rpc, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+            gauge_earned_units=5 * 10**18,
+            router_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_usdc_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_stock_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            operator_approved=True,
+        ),
+        # One nonce read per dry run: mint, stake, unstake, collect, recenter;
+        # plan and status never reach the preflight chain.
+        safe_script=SafeRpcScript(
+            nonce_reads=[4, 6, 7, 8, 9],
+            signature_verdicts=[True] * (5 + 2 + 1 + 1 + 5),
+        ),
     )
-    with (
-        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
-        patch("aero_bot.lp_executor.AuditStore"),
-        patch("aero_bot.lp_executor.LiveExecutionSources"),
-        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
-        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
-        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
-    ):
-        for arguments in (
+    owned_executor, owned_rpc, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            nfpm_held_positions=1,
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True, True]),
+    )
+    for executor, arguments in (
+        (
+            staked_executor,
             ["plan", "mint", "--symbol", "FIXc", "--amount", "7", "--width-ticks", "1"],
+        ),
+        (
+            staked_executor,
             [
                 "dry-run",
                 "mint",
@@ -1217,10 +2359,53 @@ def test_cli_never_attempts_a_broadcast_under_any_subcommand(
                 "1",
                 "--ephemeral-key",
             ],
+        ),
+        (
+            staked_executor,
             ["dry-run", "stake", "--symbol", "FIXc", "--token-id", "77", "--ephemeral-key"],
+        ),
+        (
+            staked_executor,
+            ["dry-run", "unstake", "--symbol", "FIXc", "--token-id", "77", "--ephemeral-key"],
+        ),
+        (
+            owned_executor,
+            ["dry-run", "withdraw", "--symbol", "FIXc", "--token-id", "77", "--ephemeral-key"],
+        ),
+        (
+            staked_executor,
+            ["dry-run", "collect", "--symbol", "FIXc", "--token-id", "77", "--ephemeral-key"],
+        ),
+        (
+            staked_executor,
+            [
+                "dry-run",
+                "recenter",
+                "--symbol",
+                "FIXc",
+                "--token-id",
+                "77",
+                "--width-ticks",
+                "1",
+                "--ephemeral-key",
+            ],
+        ),
+        (
+            staked_executor,
+            ["status", "--symbol", "FIXc", "--token-id", "77", "--aero-price", "1"],
+        ),
+    ):
+        with (
+            patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+            patch("aero_bot.lp_executor.AuditStore"),
+            patch("aero_bot.lp_executor.LiveExecutionSources"),
+            patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+            patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+            patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
         ):
             assert main(arguments) == EXIT_OK
-    assert rpc_script.broadcasts == []
+    assert staked_rpc.broadcasts == []
+    assert owned_rpc.broadcasts == []
 
 
 def test_malformed_reads_surface_as_unavailability() -> None:

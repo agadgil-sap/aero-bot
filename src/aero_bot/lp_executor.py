@@ -15,10 +15,18 @@ Safe lacks stock inventory, exact ERC20 approvals to the pool's own
 NonfungiblePositionManager (the NFPM itself executes the mint's
 ``transferFrom`` pull through its callback, verified from Aerodrome's
 LiquidityManagement source), and the twelve-field Slipstream mint. A stake
-composes the NFPM operator approval for the gauge and the gauge deposit. Each
-transaction is signed over its EIP-712 SafeTx hash, proven read-only against
-the live Safe with ``checkSignatures``, gas-estimated, and audited; nothing is
-broadcast by anything in this module's current surface.
+composes the NFPM operator approval for the gauge and the gauge deposit. The
+exit side completes the lifecycle: an unstake reads the gauge's earned and
+checkpointed emissions plus the factory's penalty window before the gauge
+withdraw (which auto-sweeps fees and auto-claims emissions), a withdraw
+decreases the position's full liquidity and collects its checkpointed fees
+through the NFPM, a collect routes through the gauge's ``getReward`` while
+staked and the NFPM's ``collect`` when not, a recenter recycles one position
+into a fresh mint in a single audited batch with the restake as a documented
+follow-up command, and a status observes one position completely read-only.
+Each transaction is signed over its EIP-712 SafeTx hash, proven read-only
+against the live Safe with ``checkSignatures``, gas-estimated, and audited;
+nothing is broadcast by anything in this module's current surface.
 
 Everything the module audits, prints, or reports about the key it uses is the
 relaying EOA's public address and the Safe-side hashes; key bytes arrive as
@@ -41,6 +49,7 @@ from eth_utils.crypto import keccak
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from aero_bot.audit import AuditEventType, AuditStore
+from aero_bot.concentrated import SECONDS_PER_YEAR, PositionRangeState
 from aero_bot.config import Settings
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
 from aero_bot.executor import (
@@ -67,15 +76,30 @@ from aero_bot.executor import (
 )
 from aero_bot.keychain import KeychainKeySource
 from aero_bot.lp_calldata import (
+    MAX_UINT128,
+    LpCollectParams,
+    LpDecreaseLiquidityParams,
     LpMintParams,
     LpPositionView,
     build_gauge_deposit_calldata,
+    build_gauge_deposit_timestamp_read_calldata,
+    build_gauge_earned_read_calldata,
+    build_gauge_gauge_factory_read_calldata,
+    build_gauge_get_reward_calldata,
+    build_gauge_min_stake_times_read_calldata,
+    build_gauge_penalty_rate_read_calldata,
+    build_gauge_rewards_read_calldata,
+    build_gauge_withdraw_calldata,
+    build_lp_burn_calldata,
+    build_lp_collect_calldata,
+    build_lp_decrease_liquidity_calldata,
     build_lp_mint_calldata,
     build_lp_positions_read_calldata,
     build_set_approval_for_all_calldata,
     decode_lp_positions_view,
 )
 from aero_bot.lp_plan import (
+    DEFAULT_MINT_SLIPPAGE_TOLERANCE,
     QUOTE_TOKEN_DECIMALS,
     LpExecutionPolicy,
     LpMintPlan,
@@ -85,6 +109,8 @@ from aero_bot.lp_plan import (
     SafeInventory,
     WidthSource,
     plan_mint_entry,
+    position_amounts_at_sqrt_ratio,
+    position_range_state,
 )
 from aero_bot.registry import B20AssetListing, RegistryStatus
 from aero_bot.safe_tx import (
@@ -104,6 +130,8 @@ ERC721_OWNER_OF_SELECTOR = "6352211e"
 ERC721_IS_APPROVED_FOR_ALL_SELECTOR = "e985e9c5"
 # The LP deadline sits eight minutes past its build time, mirroring the swap.
 LP_DEADLINE_SECONDS = 8 * 60
+# AERO is a standard eighteen-decimal ERC20; the emissions valuation scales by it.
+AERO_DECIMALS = 18
 # Timing metrics round to whole milliseconds.
 TIMING_PRECISION = Decimal("0.001")
 # CLI exit codes: zero on success, one on failures, two on refusals.
@@ -152,6 +180,22 @@ class LpExecutionRefusalCode(StrEnum):
     GAS_PRICE_ABOVE_CAP = "gas_price_above_cap"
     # The Safe's ETH balance sits below the documented floor.
     SAFE_ETH_BELOW_FLOOR = "safe_eth_below_floor"
+    # The named position NFT does not exist on the pool's NFPM.
+    POSITION_UNKNOWN = "position_unknown"
+    # The position NFT is owned by an address that is neither the Safe nor
+    # this pool's gauge.
+    POSITION_NOT_OWNED = "position_not_owned"
+    # An NFPM-side operation was requested while the gauge holds the NFT.
+    POSITION_STAKED = "position_staked"
+    # A gauge-side operation was requested while the Safe itself holds the NFT.
+    POSITION_NOT_STAKED = "position_not_staked"
+    # A withdraw was requested on a position holding no liquidity and no fees.
+    POSITION_EMPTY = "position_empty"
+    # A claim or withdrawal would land inside the early-exit penalty window.
+    WITHIN_PENALTY_WINDOW = "within_penalty_window"
+    # The penalty window could not be resolved from live reads, so any claim
+    # or withdrawal is refused rather than guessed at.
+    PENALTY_STATE_UNREADABLE = "penalty_state_unreadable"
 
 
 class LpExecutionRole(StrEnum):
@@ -171,6 +215,16 @@ class LpExecutionRole(StrEnum):
     NFPM_GAUGE_APPROVAL = "nfpm_gauge_approval"
     # The CLGauge deposit staking one position NFT.
     GAUGE_DEPOSIT = "gauge_deposit"
+    # The CLGauge withdraw unstaking one position NFT.
+    GAUGE_WITHDRAW = "gauge_withdraw"
+    # The NFPM liquidity decrease returning amounts to the position.
+    NFPM_DECREASE = "nfpm_decrease_liquidity"
+    # The NFPM collect sweeping fees and leftovers to the Safe.
+    NFPM_COLLECT = "nfpm_collect"
+    # The NFPM burn clearing one emptied position NFT.
+    NFPM_BURN = "nfpm_burn"
+    # The CLGauge per-token emissions claim.
+    GAUGE_GET_REWARD = "gauge_get_reward"
 
 
 class LpSafeExecutionPolicy(BaseModel):
@@ -332,6 +386,319 @@ class LpStakeDryRunReport(BaseModel):
     build_duration_ms: Annotated[Decimal, Field(ge=0)]
 
 
+class LpPenaltyWindow(BaseModel):
+    """Carry the resolved early-exit penalty window of one staked position."""
+
+    # Frozen strict fields preserve one coherent penalty observation.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The factory's penalty in basis points; 10000 means total forfeiture.
+    penalty_rate_bps: Annotated[int, Field(ge=0)]
+    # The pool's minimum stake time in seconds.
+    min_stake_seconds: Annotated[int, Field(ge=0)]
+    # The unix timestamp of the position's most recent deposit.
+    deposit_timestamp: Annotated[int, Field(ge=0)]
+    # The unix timestamp at which the window clears.
+    window_clears_at_timestamp: Annotated[int, Field(ge=0)]
+    # Seconds still inside the window, zero once it has cleared.
+    remaining_seconds: Annotated[int, Field(ge=0)]
+
+
+class LpUnstakeDryRunReport(BaseModel):
+    """Report one complete LP unstake build-and-validate attempt."""
+
+    # Frozen strict fields preserve one coherent dry-run outcome.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode marker makes the no-broadcast guarantee auditable.
+    mode: Literal[ExecutionMode.DRY_RUN] = ExecutionMode.DRY_RUN
+    # The registry-matched stock symbol identifying the pool.
+    symbol: str
+    # The pool whose position is being unstaked.
+    pool_address: EvmAddress
+    # The pool's own NonfungiblePositionManager.
+    nfpm_address: EvmAddress
+    # The pool's live CLGauge the withdraw targets.
+    gauge_address: EvmAddress
+    # The position NFT being unstaked.
+    token_id: Annotated[int, Field(ge=0)]
+    # The live twelve-word position view.
+    position: LpPositionView
+    # The live accrued emissions the withdraw auto-claims, in raw AERO units.
+    accrued_aero_earned_units: Annotated[int, Field(ge=0)]
+    # The checkpointed claimable emissions, in raw AERO units.
+    accrued_aero_checkpoint_units: Annotated[int, Field(ge=0)]
+    # The resolved early-exit penalty window.
+    penalty: LpPenaltyWindow
+    # The Safe every built transaction targets.
+    safe_address: EvmAddress
+    # The public address of the EOA whose key signed the build.
+    relayer_address: EvmAddress
+    # Whether the signing key was generated for this dry run only.
+    ephemeral_key: bool
+    # The Base gas price observed before building.
+    gas_price_wei: Annotated[int, Field(ge=0)]
+    # The Safe ETH balance observed before building.
+    safe_eth_wei: Annotated[int, Field(ge=0)]
+    # Every built transaction in execution order.
+    transactions: Annotated[tuple[BuiltLpTransaction, ...], Field(min_length=1)]
+    # Every cap checked before signing, in enforced order.
+    caps_enforced: Annotated[tuple[str, ...], Field(min_length=1)]
+    # Wall-clock duration of the build phase in milliseconds.
+    build_duration_ms: Decimal
+    # Human-readable evidence lines covering the unstake.
+    diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
+class LpExitDryRunReport(BaseModel):
+    """Report one complete LP withdraw build-and-validate attempt.
+
+    The withdraw action is the unstaked exit: decreaseLiquidity of the
+    position's entire live liquidity followed by collect, returning both
+    tokens and every checkpointed fee to the Safe.
+    """
+
+    # Frozen strict fields preserve one coherent dry-run outcome.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode marker makes the no-broadcast guarantee auditable.
+    mode: Literal[ExecutionMode.DRY_RUN] = ExecutionMode.DRY_RUN
+    # The registry-matched stock symbol identifying the pool.
+    symbol: str
+    # The pool whose position is being exited.
+    pool_address: EvmAddress
+    # The pool's own NonfungiblePositionManager.
+    nfpm_address: EvmAddress
+    # The pool's live CLGauge the position must not be staked in.
+    gauge_address: EvmAddress
+    # The position NFT being exited.
+    token_id: Annotated[int, Field(ge=0)]
+    # The live twelve-word position view.
+    position: LpPositionView
+    # Where the snapshot price sits relative to the position range.
+    range_state: PositionRangeState
+    # The expected raw token-zero amount the full decrease returns.
+    amount0_units: Decimal
+    # The expected raw token-one amount the full decrease returns.
+    amount1_units: Decimal
+    # The minimum accepted token-zero output after slippage.
+    amount0_min_units: Annotated[int, Field(ge=0)]
+    # The minimum accepted token-one output after slippage.
+    amount1_min_units: Annotated[int, Field(ge=0)]
+    # The checkpointed token-zero fees the collect sweeps.
+    fees_owed0_units: Annotated[int, Field(ge=0)]
+    # The checkpointed token-one fees the collect sweeps.
+    fees_owed1_units: Annotated[int, Field(ge=0)]
+    # The Safe every built transaction targets.
+    safe_address: EvmAddress
+    # The public address of the EOA whose key signed the build.
+    relayer_address: EvmAddress
+    # Whether the signing key was generated for this dry run only.
+    ephemeral_key: bool
+    # The Base gas price observed before building.
+    gas_price_wei: Annotated[int, Field(ge=0)]
+    # The Safe ETH balance observed before building.
+    safe_eth_wei: Annotated[int, Field(ge=0)]
+    # Every built transaction in execution order.
+    transactions: Annotated[tuple[BuiltLpTransaction, ...], Field(min_length=1)]
+    # Every cap checked before signing, in enforced order.
+    caps_enforced: Annotated[tuple[str, ...], Field(min_length=1)]
+    # Wall-clock duration of the build phase in milliseconds.
+    build_duration_ms: Decimal
+    # Human-readable evidence lines covering the exit.
+    diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
+class LpCollectDryRunReport(BaseModel):
+    """Report one complete LP collect build-and-validate attempt.
+
+    The claim path follows ownership: a staked position claims emissions
+    through the gauge's per-token getReward, and an unstaked position sweeps
+    checkpointed fees through the NFPM's collect.
+    """
+
+    # Frozen strict fields preserve one coherent dry-run outcome.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode marker makes the no-broadcast guarantee auditable.
+    mode: Literal[ExecutionMode.DRY_RUN] = ExecutionMode.DRY_RUN
+    # The registry-matched stock symbol identifying the pool.
+    symbol: str
+    # The pool whose position is being collected.
+    pool_address: EvmAddress
+    # The pool's own NonfungiblePositionManager.
+    nfpm_address: EvmAddress
+    # The pool's live CLGauge when the claim path is the gauge.
+    gauge_address: EvmAddress
+    # The position NFT being collected.
+    token_id: Annotated[int, Field(ge=0)]
+    # The live twelve-word position view.
+    position: LpPositionView
+    # Whether the gauge holds the NFT and the claim path is getReward.
+    staked: bool
+    # The live accrued emissions when staked, else zero.
+    accrued_aero_earned_units: Annotated[int, Field(ge=0)] = 0
+    # The checkpointed claimable emissions when staked, else zero.
+    accrued_aero_checkpoint_units: Annotated[int, Field(ge=0)] = 0
+    # The resolved penalty window when staked, else None.
+    penalty: LpPenaltyWindow | None = None
+    # The checkpointed token-zero fees when unstaked, else zero.
+    fees_owed0_units: Annotated[int, Field(ge=0)] = 0
+    # The checkpointed token-one fees when unstaked, else zero.
+    fees_owed1_units: Annotated[int, Field(ge=0)] = 0
+    # The Safe every built transaction targets.
+    safe_address: EvmAddress
+    # The public address of the EOA whose key signed the build.
+    relayer_address: EvmAddress
+    # Whether the signing key was generated for this dry run only.
+    ephemeral_key: bool
+    # The Base gas price observed before building.
+    gas_price_wei: Annotated[int, Field(ge=0)]
+    # The Safe ETH balance observed before building.
+    safe_eth_wei: Annotated[int, Field(ge=0)]
+    # Every built transaction in execution order.
+    transactions: Annotated[tuple[BuiltLpTransaction, ...], Field(min_length=1)]
+    # Every cap checked before signing, in enforced order.
+    caps_enforced: Annotated[tuple[str, ...], Field(min_length=1)]
+    # Wall-clock duration of the build phase in milliseconds.
+    build_duration_ms: Decimal
+    # Human-readable evidence lines covering the collect.
+    diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
+class LpRecenterDryRunReport(BaseModel):
+    """Report one complete LP recenter build-and-validate attempt.
+
+    The recenter is the full management cycle as one audited batch: unstake
+    when staked, exit and burn the old position, recycle the returned
+    inventory into a fresh capped mint at the requested width, and stage the
+    gauge approval for the restake follow-up.
+    """
+
+    # Frozen strict fields preserve one coherent dry-run outcome.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode marker makes the no-broadcast guarantee auditable.
+    mode: Literal[ExecutionMode.DRY_RUN] = ExecutionMode.DRY_RUN
+    # The registry-matched stock symbol identifying the pool.
+    symbol: str
+    # The pool whose position is being recentered.
+    pool_address: EvmAddress
+    # The pool's own NonfungiblePositionManager.
+    nfpm_address: EvmAddress
+    # The pool's live CLGauge.
+    gauge_address: EvmAddress
+    # The old position NFT being exited and burned.
+    token_id: Annotated[int, Field(ge=0)]
+    # The live twelve-word view of the old position.
+    position: LpPositionView
+    # Whether the batch opens with a gauge withdraw.
+    staked: bool
+    # Where the snapshot price sits relative to the old range.
+    range_state: PositionRangeState
+    # The expected raw token-zero amount the full decrease returns.
+    amount0_units: Decimal
+    # The expected raw token-one amount the full decrease returns.
+    amount1_units: Decimal
+    # The checkpointed fees the exit collect sweeps, token zero.
+    fees_owed0_units: Annotated[int, Field(ge=0)]
+    # The checkpointed fees the exit collect sweeps, token one.
+    fees_owed1_units: Annotated[int, Field(ge=0)]
+    # The Safe's projected post-exit USDC balance in raw units.
+    projected_usdc_units: Annotated[int, Field(ge=0)]
+    # The Safe's projected post-exit stock balance in raw units.
+    projected_stock_units: Annotated[int, Field(ge=0)]
+    # The capped mint plan the recycled inventory funds.
+    plan: LpMintPlan
+    # How the restake completes once the fresh mint confirms.
+    restake_followup: str
+    # The Safe every built transaction targets.
+    safe_address: EvmAddress
+    # The public address of the EOA whose key signed the build.
+    relayer_address: EvmAddress
+    # Whether the signing key was generated for this dry run only.
+    ephemeral_key: bool
+    # The Base gas price observed before building.
+    gas_price_wei: Annotated[int, Field(ge=0)]
+    # The Safe ETH balance observed before building.
+    safe_eth_wei: Annotated[int, Field(ge=0)]
+    # Every built transaction in execution order.
+    transactions: Annotated[tuple[BuiltLpTransaction, ...], Field(min_length=1)]
+    # Every cap checked before signing, in enforced order.
+    caps_enforced: Annotated[tuple[str, ...], Field(min_length=1)]
+    # Wall-clock duration of the build phase in milliseconds.
+    build_duration_ms: Decimal
+
+
+class LpPositionStatusReport(BaseModel):
+    """Report one read-only LP position observation; nothing is signed."""
+
+    # Frozen strict fields preserve one coherent observation.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The registry-matched stock symbol identifying the pool.
+    symbol: str
+    # The pool holding the position.
+    pool_address: EvmAddress
+    # The pool's own NonfungiblePositionManager.
+    nfpm_address: EvmAddress
+    # The pool's live CLGauge.
+    gauge_address: EvmAddress
+    # The position NFT being reported on.
+    token_id: Annotated[int, Field(ge=0)]
+    # The live ownerOf answer.
+    token_owner_address: EvmAddress
+    # Whether the gauge holds the NFT.
+    staked: bool
+    # The live twelve-word position view.
+    position: LpPositionView
+    # Where the snapshot tick sits relative to the position range.
+    range_state: PositionRangeState
+    # The snapshot's current pool tick.
+    current_tick: int
+    # The position's raw token-zero composition at the snapshot price.
+    amount0_units: Decimal
+    # The position's raw token-one composition at the snapshot price.
+    amount1_units: Decimal
+    # The composition's USDC value on the token-zero side.
+    token0_value_usdc: Decimal
+    # The composition's USDC value on the token-one side.
+    token1_value_usdc: Decimal
+    # The composition's total USDC value.
+    position_value_usdc: Decimal
+    # The checkpointed token-zero fees waiting to be collected.
+    fees_owed0_units: Annotated[int, Field(ge=0)]
+    # The checkpointed token-one fees waiting to be collected.
+    fees_owed1_units: Annotated[int, Field(ge=0)]
+    # The live accrued emissions when staked, else None.
+    accrued_aero_earned_units: Annotated[int, Field(ge=0)] | None = None
+    # The checkpointed claimable emissions when staked, else None.
+    accrued_aero_checkpoint_units: Annotated[int, Field(ge=0)] | None = None
+    # The resolved penalty window when staked, else None.
+    penalty: LpPenaltyWindow | None = None
+    # The quoted emissions APR as a decimal fraction, None when the inputs
+    # are absent; labeled pre-fix until the APR convention fix lands.
+    quoted_emissions_apr: Decimal | None = None
+    # How the quoted APR was derived and labeled.
+    apr_diagnostic: str = ""
+    # The AERO price assumption the quote used, in USDC.
+    aero_price_assumption_usdc: Decimal
+    # The entry cost basis when one was supplied, else None.
+    entry_cost_usdc: Decimal | None = None
+    # The unrealized profit against the entry cost when computable.
+    unrealized_pnl_usdc: Decimal | None = None
+    # Why the P&L is absent, empty when computed.
+    pnl_diagnostic: str = ""
+    # The Sugar snapshot block anchoring every derived number.
+    snapshot_block: Annotated[int, Field(ge=0)]
+    # When the underlying snapshot completed.
+    observed_at: datetime
+    # Every gate checked before the observation, in enforced order.
+    caps_enforced: Annotated[tuple[str, ...], Field(min_length=1)]
+    # Human-readable evidence lines covering the observation.
+    diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
 class LpMintPlannedPayload(BaseModel):
     """Persist one accepted mint plan's public numbers on the audit chain."""
 
@@ -395,6 +762,156 @@ class LpStakePlannedPayload(BaseModel):
     token_owner_address: EvmAddress | None
     # Whether the NFPM already carries the gauge operator approval.
     gauge_operator_approved: bool
+
+
+class LpUnstakePlannedPayload(BaseModel):
+    """Persist one unstake plan's public evidence on the audit chain."""
+
+    # Frozen strict fields keep the audited plan immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode of the attempt this plan belongs to.
+    mode: ExecutionMode
+    # The registry-matched stock symbol.
+    symbol: str
+    # The pool contract address.
+    pool_address: EvmAddress
+    # The pool's own NonfungiblePositionManager.
+    nfpm_address: EvmAddress
+    # The pool's live CLGauge.
+    gauge_address: EvmAddress
+    # The position NFT being unstaked.
+    token_id: Annotated[int, Field(ge=0)]
+    # The live accrued emissions the withdraw auto-claims, raw AERO units.
+    accrued_aero_earned_units: Annotated[int, Field(ge=0)]
+    # The checkpointed claimable emissions, raw AERO units.
+    accrued_aero_checkpoint_units: Annotated[int, Field(ge=0)]
+    # The penalty rate in basis points at plan time.
+    penalty_rate_bps: Annotated[int, Field(ge=0)]
+    # Seconds still inside the penalty window at plan time.
+    penalty_remaining_seconds: Annotated[int, Field(ge=0)]
+
+
+class LpExitPlannedPayload(BaseModel):
+    """Persist one withdraw plan's public evidence on the audit chain."""
+
+    # Frozen strict fields keep the audited plan immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode of the attempt this plan belongs to.
+    mode: ExecutionMode
+    # The registry-matched stock symbol.
+    symbol: str
+    # The pool contract address.
+    pool_address: EvmAddress
+    # The pool's own NonfungiblePositionManager.
+    nfpm_address: EvmAddress
+    # The pool's live CLGauge the exited position is not staked in.
+    gauge_address: EvmAddress
+    # The position NFT being exited.
+    token_id: Annotated[int, Field(ge=0)]
+    # Where the snapshot price sat relative to the exited range.
+    range_state: PositionRangeState
+    # The expected raw token-zero decrease output.
+    amount0_units: Decimal
+    # The expected raw token-one decrease output.
+    amount1_units: Decimal
+    # The minimum accepted token-zero output after slippage.
+    amount0_min_units: Annotated[int, Field(ge=0)]
+    # The minimum accepted token-one output after slippage.
+    amount1_min_units: Annotated[int, Field(ge=0)]
+    # The checkpointed token-zero fees the collect sweeps.
+    fees_owed0_units: Annotated[int, Field(ge=0)]
+    # The checkpointed token-one fees the collect sweeps.
+    fees_owed1_units: Annotated[int, Field(ge=0)]
+
+
+class LpCollectPlannedPayload(BaseModel):
+    """Persist one collect plan's public evidence on the audit chain."""
+
+    # Frozen strict fields keep the audited plan immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode of the attempt this plan belongs to.
+    mode: ExecutionMode
+    # The registry-matched stock symbol.
+    symbol: str
+    # The pool contract address.
+    pool_address: EvmAddress
+    # The pool's own NonfungiblePositionManager.
+    nfpm_address: EvmAddress
+    # The pool's live CLGauge when the claim path is the gauge.
+    gauge_address: EvmAddress
+    # The position NFT being collected.
+    token_id: Annotated[int, Field(ge=0)]
+    # Whether the claim runs through the gauge's getReward.
+    staked: bool
+    # The live accrued emissions when staked, raw AERO units, else zero.
+    accrued_aero_earned_units: Annotated[int, Field(ge=0)] = 0
+    # The checkpointed emissions when staked, raw AERO units, else zero.
+    accrued_aero_checkpoint_units: Annotated[int, Field(ge=0)] = 0
+    # The checkpointed token-zero fees when unstaked, else zero.
+    fees_owed0_units: Annotated[int, Field(ge=0)] = 0
+    # The checkpointed token-one fees when unstaked, else zero.
+    fees_owed1_units: Annotated[int, Field(ge=0)] = 0
+
+
+class LpRecenterPlannedPayload(BaseModel):
+    """Persist one recenter batch plan's public evidence on the audit chain."""
+
+    # Frozen strict fields keep the audited plan immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode of the attempt this plan belongs to.
+    mode: ExecutionMode
+    # The registry-matched stock symbol.
+    symbol: str
+    # The pool contract address.
+    pool_address: EvmAddress
+    # The pool's own NonfungiblePositionManager.
+    nfpm_address: EvmAddress
+    # The pool's live CLGauge.
+    gauge_address: EvmAddress
+    # The old position NFT being exited and burned.
+    token_id: Annotated[int, Field(ge=0)]
+    # Whether the batch opens with a gauge withdraw.
+    staked: bool
+    # The USDC budget the recycled inventory funds.
+    budget_usdc: Decimal
+    # The projected post-exit USDC balance in raw units.
+    projected_usdc_units: Annotated[int, Field(ge=0)]
+    # The projected post-exit stock balance in raw units.
+    projected_stock_units: Annotated[int, Field(ge=0)]
+    # The fresh range's inclusive lower boundary.
+    tick_lower: int
+    # The fresh range's exclusive upper boundary.
+    tick_upper: int
+    # How the restake completes once the fresh mint confirms.
+    restake_followup: str
+
+
+class LpStatusReportedPayload(BaseModel):
+    """Persist one read-only position report's public numbers."""
+
+    # Frozen strict fields keep the audited observation immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode marker: status never builds or signs anything.
+    mode: ExecutionMode
+    # The registry-matched stock symbol.
+    symbol: str
+    # The pool contract address.
+    pool_address: EvmAddress
+    # The position NFT being reported on.
+    token_id: Annotated[int, Field(ge=0)]
+    # Whether the gauge holds the NFT.
+    staked: bool
+    # The position's total USDC value at the snapshot price.
+    position_value_usdc: Decimal
+    # The quoted emissions APR as a decimal fraction, None when unavailable.
+    quoted_emissions_apr: Decimal | None
+    # The AERO price assumption the quote used, in USDC.
+    aero_price_assumption_usdc: Decimal
 
 
 class LpTransactionBuiltPayload(BaseModel):
@@ -490,6 +1007,46 @@ class _LpMintContext:
         self.inventory = inventory
         self.width_spacings = width_spacings
         self.caps = caps
+
+
+class _LpPositionContext:
+    """Carry one resolved position attempt's observation and live ownership."""
+
+    def __init__(
+        self,
+        listing: B20AssetListing,
+        observation: LpPoolObservation,
+        position: LpPositionView,
+        owner: str,
+        safe_address: str,
+        caps: list[str],
+    ) -> None:
+        """Bind the resolved position context fields.
+
+        Args:
+            listing: The registry listing the symbol resolved to.
+            observation: The block-pinned pool observation.
+            position: The live twelve-word position view.
+            owner: The live ownerOf answer, normalized.
+            safe_address: The Safe whose positions this executor manages.
+            caps: The enforced-cap labels accumulated so far.
+        """
+        self.listing = listing
+        self.observation = observation
+        self.position = position
+        self.owner = owner
+        self.safe_address = normalize_evm_address(safe_address)
+        self.caps = caps
+
+    @property
+    def staked(self) -> bool:
+        """Return whether the pool's gauge holds this position NFT."""
+        return self.owner == self.observation.gauge_address
+
+    @property
+    def owned(self) -> bool:
+        """Return whether the Safe itself holds this position NFT."""
+        return self.owner == self.safe_address
 
 
 class LpLifecycleExecutor:
@@ -621,6 +1178,173 @@ class LpLifecycleExecutor:
             return self._dry_run_stake(symbol, token_id, key_bytes, ephemeral_key)
         except LpExecutionRefusalError as error:
             self._record_refusal("stake", ExecutionMode.DRY_RUN, error, symbol)
+            raise
+
+    def dry_run_unstake(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> LpUnstakeDryRunReport:
+        """Fully build and validate one unstake sequence without broadcasting.
+
+        The unstake requires the gauge to hold the NFT, reports the accrued
+        emissions the withdraw auto-claims, and refuses whenever the claim
+        would land inside the factory's early-exit penalty window with
+        emissions at stake.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            token_id: The staked position NFT being unstaked.
+            key_bytes: Exactly 32 raw signing-key bytes used for this build.
+            ephemeral_key: Whether the key was generated for this dry run.
+
+        Returns:
+            The complete dry-run report; nothing was broadcast.
+
+        Raises:
+            LpExecutionRefusalError: If any execution-layer gate refuses.
+        """
+        try:
+            return self._dry_run_unstake(symbol, token_id, key_bytes, ephemeral_key)
+        except LpExecutionRefusalError as error:
+            self._record_refusal("unstake", ExecutionMode.DRY_RUN, error, symbol)
+            raise
+
+    def dry_run_exit(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> LpExitDryRunReport:
+        """Fully build and validate one withdraw sequence without broadcasting.
+
+        The withdraw is the unstaked exit: the position's entire live
+        liquidity is decreased and both tokens plus every checkpointed fee
+        are collected back to the Safe.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            token_id: The unstaked position NFT being exited.
+            key_bytes: Exactly 32 raw signing-key bytes used for this build.
+            ephemeral_key: Whether the key was generated for this dry run.
+
+        Returns:
+            The complete dry-run report; nothing was broadcast.
+
+        Raises:
+            LpExecutionRefusalError: If any execution-layer gate refuses.
+        """
+        try:
+            return self._dry_run_exit(symbol, token_id, key_bytes, ephemeral_key)
+        except LpExecutionRefusalError as error:
+            self._record_refusal("withdraw", ExecutionMode.DRY_RUN, error, symbol)
+            raise
+
+    def dry_run_collect(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> LpCollectDryRunReport:
+        """Fully build and validate one collect sequence without broadcasting.
+
+        The claim path follows ownership: a staked position claims accrued
+        emissions through the gauge's per-token getReward (refusing inside
+        the penalty window), and an unstaked position sweeps checkpointed
+        fees through the NFPM's collect.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            token_id: The position NFT being collected.
+            key_bytes: Exactly 32 raw signing-key bytes used for this build.
+            ephemeral_key: Whether the key was generated for this dry run.
+
+        Returns:
+            The complete dry-run report; nothing was broadcast.
+
+        Raises:
+            LpExecutionRefusalError: If any execution-layer gate refuses.
+        """
+        try:
+            return self._dry_run_collect(symbol, token_id, key_bytes, ephemeral_key)
+        except LpExecutionRefusalError as error:
+            self._record_refusal("collect", ExecutionMode.DRY_RUN, error, symbol)
+            raise
+
+    def dry_run_recenter(
+        self,
+        symbol: str,
+        token_id: int,
+        width_spacings: int | None,
+        budget_usdc: Decimal | None,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> LpRecenterDryRunReport:
+        """Fully build and validate one recenter batch without broadcasting.
+
+        The recenter is the full management cycle as one audited sequence:
+        unstake when staked, decrease and collect the old position, burn its
+        emptied NFT, recycle the returned inventory into a fresh capped mint
+        at the requested width, and stage the gauge operator approval for
+        the restake follow-up.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            token_id: The old position NFT being recentered.
+            width_spacings: The explicit half width in tick spacings per side.
+            budget_usdc: The new mint's USDC budget; None recycles the old
+                position's snapshot value.
+            key_bytes: Exactly 32 raw signing-key bytes used for this build.
+            ephemeral_key: Whether the key was generated for this dry run.
+
+        Returns:
+            The complete dry-run report; nothing was broadcast.
+
+        Raises:
+            LpExecutionRefusalError: If any execution-layer gate refuses.
+            LpPlanRefusalError: If any planning cap refuses.
+        """
+        try:
+            return self._dry_run_recenter(
+                symbol, token_id, width_spacings, budget_usdc, key_bytes, ephemeral_key
+            )
+        except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+            self._record_refusal("recenter", ExecutionMode.DRY_RUN, error, symbol)
+            raise
+
+    def position_status(
+        self,
+        symbol: str,
+        token_id: int,
+        aero_price_usdc: Decimal,
+        entry_cost_usdc: Decimal | None = None,
+    ) -> LpPositionStatusReport:
+        """Observe one position read-only; nothing is built or signed.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            token_id: The position NFT being reported on.
+            aero_price_usdc: The AERO price assumption in USDC the quoted
+                emissions APR uses; labeled pre-fix until the convention fix
+                lands and a live read replaces the assumption.
+            entry_cost_usdc: The optional entry cost basis in USDC for the
+                unrealized P&L; absent means unknown.
+
+        Returns:
+            The complete read-only position report.
+
+        Raises:
+            LpExecutionRefusalError: If any registry, discovery, snapshot,
+                or position-resolution gate refuses.
+        """
+        try:
+            return self._position_status(symbol, token_id, aero_price_usdc, entry_cost_usdc)
+        except LpExecutionRefusalError as error:
+            self._record_refusal("status", ExecutionMode.DRY_RUN, error, symbol)
             raise
 
     def _dry_run_mint(
@@ -920,6 +1644,999 @@ class LpLifecycleExecutor:
             build_duration_ms=self._milliseconds_since(build_started),
         )
 
+    def _dry_run_unstake(
+        self, symbol: str, token_id: int, key_bytes: bytes, ephemeral_key: bool
+    ) -> LpUnstakeDryRunReport:
+        """Build, sign, validate, and estimate the complete unstake sequence."""
+        build_started = self._timer()
+        context = self._resolve_position(symbol, token_id)
+        if not context.staked:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.POSITION_NOT_STAKED,
+                f"token {token_id} is held by {context.owner}, not the pool's gauge, so "
+                "nothing is staked to unstake; verify the token id and pool symbol",
+            )
+        observation = context.observation
+        accrued_earned = self._read_gauge_reward_word(
+            observation.gauge_address,
+            build_gauge_earned_read_calldata(self._safe_address, token_id),
+            "earned(address,uint256)",
+        )
+        accrued_checkpoint = self._read_gauge_reward_word(
+            observation.gauge_address,
+            build_gauge_rewards_read_calldata(token_id),
+            "rewards(uint256)",
+        )
+        penalty = self._read_penalty_window(observation, token_id)
+        self._require_penalty_clear(penalty, accrued_earned)
+        caps = list(context.caps)
+        caps.append(
+            f"penalty window clear with {penalty.remaining_seconds}s margin at "
+            f"{penalty.penalty_rate_bps} bps"
+        )
+        gas_price, safe_eth, live_nonce = self._preflight(caps)
+        steps = [
+            _LpStepSpec(
+                role=LpExecutionRole.GAUGE_WITHDRAW,
+                to_address=observation.gauge_address,
+                inner_calldata=build_gauge_withdraw_calldata(token_id),
+                description=(
+                    f"unstake token {token_id}; the withdraw also sweeps pending fees and "
+                    "auto-claims the accrued emissions"
+                ),
+            )
+        ]
+        self._record_unstake_plan(
+            ExecutionMode.DRY_RUN,
+            context.listing.symbol,
+            observation,
+            token_id,
+            accrued_earned,
+            accrued_checkpoint,
+            penalty,
+        )
+        transactions = self._build_steps(steps, live_nonce, key_bytes, "unstake")
+        return LpUnstakeDryRunReport(
+            symbol=context.listing.symbol,
+            pool_address=observation.pool_address,
+            nfpm_address=observation.nfpm_address,
+            gauge_address=observation.gauge_address,
+            token_id=token_id,
+            position=context.position,
+            accrued_aero_earned_units=accrued_earned,
+            accrued_aero_checkpoint_units=accrued_checkpoint,
+            penalty=penalty,
+            safe_address=self._safe_address,
+            relayer_address=normalize_evm_address(Account.from_key(key_bytes).address),
+            ephemeral_key=ephemeral_key,
+            gas_price_wei=gas_price,
+            safe_eth_wei=safe_eth,
+            transactions=transactions,
+            caps_enforced=tuple(caps),
+            build_duration_ms=self._milliseconds_since(build_started),
+            diagnostics=(
+                (
+                    f"earned reports {accrued_earned} raw AERO live and {accrued_checkpoint} "
+                    "raw AERO checkpointed; the withdraw claims the live amount"
+                ),
+                (
+                    f"the penalty window clears at "
+                    f"{penalty.window_clears_at_timestamp} "
+                    f"({penalty.remaining_seconds}s remaining at "
+                    f"{penalty.penalty_rate_bps} bps)"
+                ),
+            ),
+        )
+
+    def _dry_run_exit(
+        self, symbol: str, token_id: int, key_bytes: bytes, ephemeral_key: bool
+    ) -> LpExitDryRunReport:
+        """Build, sign, validate, and estimate the complete withdraw sequence."""
+        build_started = self._timer()
+        context = self._resolve_position(symbol, token_id)
+        if context.staked:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.POSITION_STAKED,
+                f"token {token_id} is staked in the gauge, which holds the NFT and blocks "
+                "every NFPM-side operation; unstake first, then withdraw",
+            )
+        position = context.position
+        observation = context.observation
+        amount0, amount1 = self._exit_amounts(observation, position)
+        tolerance = DEFAULT_MINT_SLIPPAGE_TOLERANCE
+        amount0_min = int((amount0 * (Decimal(1) - tolerance)).to_integral_value(ROUND_FLOOR))
+        amount1_min = int((amount1 * (Decimal(1) - tolerance)).to_integral_value(ROUND_FLOOR))
+        if position.liquidity == 0 and (
+            position.tokens_owed0_units == 0 and position.tokens_owed1_units == 0
+        ):
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.POSITION_EMPTY,
+                f"token {token_id} holds no liquidity and no checkpointed fees, so there is "
+                "nothing to withdraw; recenter to burn and remint it, or burn it directly "
+                "once an execute path exists",
+            )
+        range_state = position_range_state(
+            position.tick_lower, position.tick_upper, observation.current_tick
+        )
+        caps = list(context.caps)
+        caps.append(f"exit minima floored at the {tolerance} slippage tolerance")
+        gas_price, safe_eth, live_nonce = self._preflight(caps)
+        deadline = int(self._now().timestamp()) + LP_DEADLINE_SECONDS
+        steps: list[_LpStepSpec] = []
+        if position.liquidity > 0:
+            steps.append(
+                _LpStepSpec(
+                    role=LpExecutionRole.NFPM_DECREASE,
+                    to_address=observation.nfpm_address,
+                    inner_calldata=build_lp_decrease_liquidity_calldata(
+                        LpDecreaseLiquidityParams(
+                            token_id=token_id,
+                            liquidity=position.liquidity,
+                            amount0_min_units=amount0_min,
+                            amount1_min_units=amount1_min,
+                            deadline=deadline,
+                        )
+                    ),
+                    description=(
+                        f"decrease token {token_id} by its full {position.liquidity} liquidity "
+                        f"for at least {amount0_min} + {amount1_min} raw units"
+                    ),
+                )
+            )
+        steps.append(
+            _LpStepSpec(
+                role=LpExecutionRole.NFPM_COLLECT,
+                to_address=observation.nfpm_address,
+                inner_calldata=build_lp_collect_calldata(
+                    LpCollectParams(
+                        token_id=token_id,
+                        recipient_address=self._safe_address,
+                        amount0_max_units=MAX_UINT128,
+                        amount1_max_units=MAX_UINT128,
+                    )
+                ),
+                description=(
+                    f"collect every fee and leftover on token {token_id} to the Safe "
+                    f"(checkpointed {position.tokens_owed0_units} + "
+                    f"{position.tokens_owed1_units} raw units)"
+                ),
+            )
+        )
+        self._record_exit_plan(
+            ExecutionMode.DRY_RUN,
+            context.listing.symbol,
+            observation,
+            token_id,
+            range_state,
+            amount0,
+            amount1,
+            amount0_min,
+            amount1_min,
+            position.tokens_owed0_units,
+            position.tokens_owed1_units,
+        )
+        transactions = self._build_steps(steps, live_nonce, key_bytes, "withdraw")
+        diagnostics = [
+            (
+                f"the full decrease returns {amount0} + {amount1} raw units at the snapshot "
+                f"price ({range_state.value})"
+            ),
+            (
+                f"the collect sweeps the checkpointed fees "
+                f"{position.tokens_owed0_units} + {position.tokens_owed1_units} raw units "
+                "plus the decrease's outputs"
+            ),
+        ]
+        if range_state is not PositionRangeState.IN_RANGE:
+            side = "token zero" if range_state is PositionRangeState.BELOW_RANGE else "token one"
+            diagnostics.append(
+                f"the position is entirely {side} because the price has left the range"
+            )
+        return LpExitDryRunReport(
+            symbol=context.listing.symbol,
+            pool_address=observation.pool_address,
+            nfpm_address=observation.nfpm_address,
+            gauge_address=observation.gauge_address,
+            token_id=token_id,
+            position=position,
+            range_state=range_state,
+            amount0_units=amount0,
+            amount1_units=amount1,
+            amount0_min_units=amount0_min,
+            amount1_min_units=amount1_min,
+            fees_owed0_units=position.tokens_owed0_units,
+            fees_owed1_units=position.tokens_owed1_units,
+            safe_address=self._safe_address,
+            relayer_address=normalize_evm_address(Account.from_key(key_bytes).address),
+            ephemeral_key=ephemeral_key,
+            gas_price_wei=gas_price,
+            safe_eth_wei=safe_eth,
+            transactions=transactions,
+            caps_enforced=tuple(caps),
+            build_duration_ms=self._milliseconds_since(build_started),
+            diagnostics=tuple(diagnostics),
+        )
+
+    def _dry_run_collect(
+        self, symbol: str, token_id: int, key_bytes: bytes, ephemeral_key: bool
+    ) -> LpCollectDryRunReport:
+        """Build, sign, validate, and estimate the complete collect sequence."""
+        build_started = self._timer()
+        context = self._resolve_position(symbol, token_id)
+        position = context.position
+        observation = context.observation
+        accrued_earned = 0
+        accrued_checkpoint = 0
+        penalty: LpPenaltyWindow | None = None
+        caps = list(context.caps)
+        if context.staked:
+            accrued_earned = self._read_gauge_reward_word(
+                observation.gauge_address,
+                build_gauge_earned_read_calldata(self._safe_address, token_id),
+                "earned(address,uint256)",
+            )
+            accrued_checkpoint = self._read_gauge_reward_word(
+                observation.gauge_address,
+                build_gauge_rewards_read_calldata(token_id),
+                "rewards(uint256)",
+            )
+            penalty = self._read_penalty_window(observation, token_id)
+            self._require_penalty_clear(penalty, accrued_earned)
+            caps.append(
+                f"penalty window clear with {penalty.remaining_seconds}s margin at "
+                f"{penalty.penalty_rate_bps} bps"
+            )
+        gas_price, safe_eth, live_nonce = self._preflight(caps)
+        if context.staked:
+            steps = [
+                _LpStepSpec(
+                    role=LpExecutionRole.GAUGE_GET_REWARD,
+                    to_address=observation.gauge_address,
+                    inner_calldata=build_gauge_get_reward_calldata(token_id),
+                    description=(
+                        f"claim token {token_id}'s accrued emissions, "
+                        f"{accrued_earned} raw AERO by the live earned view"
+                    ),
+                )
+            ]
+            diagnostics = [
+                (
+                    f"earned reports {accrued_earned} raw AERO live and {accrued_checkpoint} "
+                    "raw AERO checkpointed; the claim pays the live amount"
+                ),
+                (
+                    "checkpointed position fees do not flow through getReward; they sweep on "
+                    "the gauge's next deposit or withdraw"
+                ),
+            ]
+        else:
+            steps = [
+                _LpStepSpec(
+                    role=LpExecutionRole.NFPM_COLLECT,
+                    to_address=observation.nfpm_address,
+                    inner_calldata=build_lp_collect_calldata(
+                        LpCollectParams(
+                            token_id=token_id,
+                            recipient_address=self._safe_address,
+                            amount0_max_units=MAX_UINT128,
+                            amount1_max_units=MAX_UINT128,
+                        )
+                    ),
+                    description=(
+                        f"collect every fee and leftover on token {token_id} to the Safe "
+                        f"(checkpointed {position.tokens_owed0_units} + "
+                        f"{position.tokens_owed1_units} raw units)"
+                    ),
+                )
+            ]
+            diagnostics = [
+                (
+                    f"the unstaked collect sweeps the checkpointed fees "
+                    f"{position.tokens_owed0_units} + {position.tokens_owed1_units} raw units"
+                )
+            ]
+        self._record_collect_plan(
+            ExecutionMode.DRY_RUN,
+            context.listing.symbol,
+            observation,
+            token_id,
+            context.staked,
+            accrued_earned,
+            accrued_checkpoint,
+            position.tokens_owed0_units,
+            position.tokens_owed1_units,
+        )
+        transactions = self._build_steps(steps, live_nonce, key_bytes, "collect")
+        return LpCollectDryRunReport(
+            symbol=context.listing.symbol,
+            pool_address=observation.pool_address,
+            nfpm_address=observation.nfpm_address,
+            gauge_address=observation.gauge_address,
+            token_id=token_id,
+            position=position,
+            staked=context.staked,
+            accrued_aero_earned_units=accrued_earned,
+            accrued_aero_checkpoint_units=accrued_checkpoint,
+            penalty=penalty,
+            fees_owed0_units=position.tokens_owed0_units if not context.staked else 0,
+            fees_owed1_units=position.tokens_owed1_units if not context.staked else 0,
+            safe_address=self._safe_address,
+            relayer_address=normalize_evm_address(Account.from_key(key_bytes).address),
+            ephemeral_key=ephemeral_key,
+            gas_price_wei=gas_price,
+            safe_eth_wei=safe_eth,
+            transactions=transactions,
+            caps_enforced=tuple(caps),
+            build_duration_ms=self._milliseconds_since(build_started),
+            diagnostics=tuple(diagnostics),
+        )
+
+    def _dry_run_recenter(
+        self,
+        symbol: str,
+        token_id: int,
+        width_spacings: int | None,
+        budget_usdc: Decimal | None,
+        key_bytes: bytes,
+        ephemeral_key: bool,
+    ) -> LpRecenterDryRunReport:
+        """Build, sign, validate, and estimate the complete recenter batch."""
+        build_started = self._timer()
+        context = self._resolve_position(symbol, token_id)
+        if width_spacings is None:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.DERIVED_WIDTH_UNAVAILABLE,
+                "no --width-ticks override was supplied and the solver-derived width path is "
+                "not wired yet (its emissions-APR input is known understated until the APR "
+                "convention fix lands); pass an explicit half width in tick spacings per side",
+            )
+        position = context.position
+        observation = context.observation
+        held_positions = self._read_word(
+            observation.nfpm_address,
+            self._erc20_balance_calldata(self._safe_address),
+            "NFPM balanceOf()",
+        )
+        allowed_held = 0 if context.staked else 1
+        if held_positions > allowed_held:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS,
+                f"the Safe holds {held_positions} position NFT(s) on this NFPM beyond the one "
+                "being recentered, and no live position-value read exists yet, so the total "
+                "pilot exposure cap cannot be evaluated honestly; refuse until that read lands",
+            )
+        accrued_earned = 0
+        if context.staked:
+            accrued_earned = self._read_gauge_reward_word(
+                observation.gauge_address,
+                build_gauge_earned_read_calldata(self._safe_address, token_id),
+                "earned(address,uint256)",
+            )
+            penalty = self._read_penalty_window(observation, token_id)
+            self._require_penalty_clear(penalty, accrued_earned)
+        amount0, amount1 = self._exit_amounts(observation, position)
+        range_state = position_range_state(
+            position.tick_lower, position.tick_upper, observation.current_tick
+        )
+        projected_usdc, projected_stock = self._projected_inventory(
+            observation, position, amount0, amount1
+        )
+        price = observation.price_usdc_per_stock
+        # The recycled budget values the decrease outputs plus the checkpointed
+        # fees, on each side of the pair, at the snapshot price.
+        stock_units_out = (amount0 if observation.stock_is_token0 else amount1) + Decimal(
+            position.tokens_owed0_units
+            if observation.stock_is_token0
+            else position.tokens_owed1_units
+        )
+        usdc_units_out = (amount1 if observation.stock_is_token0 else amount0) + Decimal(
+            position.tokens_owed1_units
+            if observation.stock_is_token0
+            else position.tokens_owed0_units
+        )
+        recycled_budget = (
+            budget_usdc
+            if budget_usdc is not None
+            else +(
+                stock_units_out * Decimal(10) ** -observation.stock_decimals * price
+                + usdc_units_out * Decimal(10) ** -observation.quote_decimals
+            )
+        )
+        inventory = SafeInventory(
+            usdc_units=projected_usdc,
+            stock_units=projected_stock,
+        )
+        directive = MintDirective(
+            budget_usdc=recycled_budget,
+            half_width_spacings=width_spacings,
+            width_source=WidthSource.EXPLICIT_OVERRIDE,
+        )
+        plan = plan_mint_entry(self._plan_policy, observation, directive, inventory)
+        self._record_mint_plan(ExecutionMode.DRY_RUN, plan)
+        if plan.balancing_swap.required and plan.balancing_swap.tranche_count > 1:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.MULTI_TRANCHE_SWAP_UNSUPPORTED,
+                f"the recenter's balancing swap plans {plan.balancing_swap.tranche_count} "
+                "tranches and this execution surface runs only a single tranche; lower the "
+                "budget or wait for calmer conditions so the modeled impact stays under the "
+                "tranche threshold",
+            )
+        caps = list(context.caps)
+        caps.append(
+            "recenter recycles only the exited position's inventory; any other held NFT refuses"
+        )
+        caps.extend(plan.caps_enforced)
+        gas_price, safe_eth, live_nonce = self._preflight(caps)
+        stock_token = (
+            observation.token0_address
+            if observation.stock_is_token0
+            else observation.token1_address
+        )
+        router_allowance = self._rpc.fetch_erc20_allowance(
+            BASE_USDC_ADDRESS, self._safe_address, self._policy.router_address
+        )
+        nfpm_usdc_allowance = self._rpc.fetch_erc20_allowance(
+            BASE_USDC_ADDRESS, self._safe_address, observation.nfpm_address
+        )
+        nfpm_stock_allowance = self._rpc.fetch_erc20_allowance(
+            stock_token, self._safe_address, observation.nfpm_address
+        )
+        operator_approved = (
+            self._read_word(
+                observation.nfpm_address,
+                self._erc721_is_approved_for_all_calldata(
+                    self._safe_address, observation.gauge_address
+                ),
+                "isApprovedForAll()",
+            )
+            == 1
+        )
+        deadline = int(self._now().timestamp()) + LP_DEADLINE_SECONDS
+        steps: list[_LpStepSpec] = []
+        if context.staked:
+            steps.append(
+                _LpStepSpec(
+                    role=LpExecutionRole.GAUGE_WITHDRAW,
+                    to_address=observation.gauge_address,
+                    inner_calldata=build_gauge_withdraw_calldata(token_id),
+                    description=(
+                        f"unstake token {token_id}; the withdraw sweeps its fees and claims "
+                        f"its {accrued_earned} raw AERO of accrued emissions"
+                    ),
+                )
+            )
+        if position.liquidity > 0:
+            tolerance = DEFAULT_MINT_SLIPPAGE_TOLERANCE
+            amount0_min = int((amount0 * (Decimal(1) - tolerance)).to_integral_value(ROUND_FLOOR))
+            amount1_min = int((amount1 * (Decimal(1) - tolerance)).to_integral_value(ROUND_FLOOR))
+            steps.append(
+                _LpStepSpec(
+                    role=LpExecutionRole.NFPM_DECREASE,
+                    to_address=observation.nfpm_address,
+                    inner_calldata=build_lp_decrease_liquidity_calldata(
+                        LpDecreaseLiquidityParams(
+                            token_id=token_id,
+                            liquidity=position.liquidity,
+                            amount0_min_units=amount0_min,
+                            amount1_min_units=amount1_min,
+                            deadline=deadline,
+                        )
+                    ),
+                    description=(
+                        f"decrease token {token_id} by its full {position.liquidity} liquidity "
+                        f"for at least {amount0_min} + {amount1_min} raw units"
+                    ),
+                )
+            )
+        if (
+            position.liquidity > 0
+            or position.tokens_owed0_units > 0
+            or position.tokens_owed1_units > 0
+        ):
+            steps.append(
+                _LpStepSpec(
+                    role=LpExecutionRole.NFPM_COLLECT,
+                    to_address=observation.nfpm_address,
+                    inner_calldata=build_lp_collect_calldata(
+                        LpCollectParams(
+                            token_id=token_id,
+                            recipient_address=self._safe_address,
+                            amount0_max_units=MAX_UINT128,
+                            amount1_max_units=MAX_UINT128,
+                        )
+                    ),
+                    description=(
+                        f"collect every fee and leftover on token {token_id} to the Safe "
+                        f"(checkpointed {position.tokens_owed0_units} + "
+                        f"{position.tokens_owed1_units} raw units)"
+                    ),
+                )
+            )
+        steps.append(
+            _LpStepSpec(
+                role=LpExecutionRole.NFPM_BURN,
+                to_address=observation.nfpm_address,
+                inner_calldata=build_lp_burn_calldata(token_id),
+                description=f"burn the emptied position NFT {token_id}",
+            )
+        )
+        mint_context = _LpMintContext(context.listing, observation, inventory, width_spacings, caps)
+        steps.extend(
+            self._compose_mint_steps(
+                mint_context,
+                plan,
+                router_allowance,
+                nfpm_usdc_allowance,
+                nfpm_stock_allowance,
+                deadline,
+            )
+        )
+        if not operator_approved:
+            steps.append(
+                _LpStepSpec(
+                    role=LpExecutionRole.NFPM_GAUGE_APPROVAL,
+                    to_address=observation.nfpm_address,
+                    inner_calldata=build_set_approval_for_all_calldata(
+                        observation.gauge_address, True
+                    ),
+                    description=(
+                        f"approve gauge {observation.gauge_address} as NFPM operator for the "
+                        "restake follow-up"
+                    ),
+                )
+            )
+        restake_followup = (
+            "the restake completes by running the stake command with the fresh mint's "
+            "confirmed token id; the NFPM exposes no next-id view (nextTokenId() reverts, "
+            "verified live), so the deposit cannot be bound into this pre-execution batch"
+        )
+        self._record_recenter_plan(
+            ExecutionMode.DRY_RUN,
+            context.listing.symbol,
+            observation,
+            token_id,
+            context.staked,
+            recycled_budget,
+            projected_usdc,
+            projected_stock,
+            plan,
+            restake_followup,
+        )
+        transactions = self._build_steps(steps, live_nonce, key_bytes, "recenter")
+        return LpRecenterDryRunReport(
+            symbol=context.listing.symbol,
+            pool_address=observation.pool_address,
+            nfpm_address=observation.nfpm_address,
+            gauge_address=observation.gauge_address,
+            token_id=token_id,
+            position=position,
+            staked=context.staked,
+            range_state=range_state,
+            amount0_units=amount0,
+            amount1_units=amount1,
+            fees_owed0_units=position.tokens_owed0_units,
+            fees_owed1_units=position.tokens_owed1_units,
+            projected_usdc_units=projected_usdc,
+            projected_stock_units=projected_stock,
+            plan=plan,
+            restake_followup=restake_followup,
+            safe_address=self._safe_address,
+            relayer_address=normalize_evm_address(Account.from_key(key_bytes).address),
+            ephemeral_key=ephemeral_key,
+            gas_price_wei=gas_price,
+            safe_eth_wei=safe_eth,
+            transactions=transactions,
+            caps_enforced=tuple(caps),
+            build_duration_ms=self._milliseconds_since(build_started),
+        )
+
+    def _position_status(
+        self,
+        symbol: str,
+        token_id: int,
+        aero_price_usdc: Decimal,
+        entry_cost_usdc: Decimal | None,
+    ) -> LpPositionStatusReport:
+        """Observe one position read-only and quote its emissions APR."""
+        context = self._resolve_position(symbol, token_id)
+        position = context.position
+        observation = context.observation
+        amount0, amount1 = self._exit_amounts(observation, position)
+        range_state = position_range_state(
+            position.tick_lower, position.tick_upper, observation.current_tick
+        )
+        price = observation.price_usdc_per_stock
+        token0_scale = (
+            Decimal(10) ** -observation.stock_decimals
+            if observation.stock_is_token0
+            else Decimal(10) ** -observation.quote_decimals
+        )
+        token1_scale = (
+            Decimal(10) ** -observation.quote_decimals
+            if observation.stock_is_token0
+            else Decimal(10) ** -observation.stock_decimals
+        )
+        token0_price = price if observation.stock_is_token0 else Decimal(1)
+        token1_price = Decimal(1) if observation.stock_is_token0 else price
+        token0_value = +(amount0 * token0_scale * token0_price)
+        token1_value = +(amount1 * token1_scale * token1_price)
+        position_value = +(token0_value + token1_value)
+        accrued_earned: int | None = None
+        accrued_checkpoint: int | None = None
+        penalty: LpPenaltyWindow | None = None
+        diagnostics: list[str] = []
+        if context.staked:
+            accrued_earned = self._read_gauge_reward_word(
+                observation.gauge_address,
+                build_gauge_earned_read_calldata(self._safe_address, token_id),
+                "earned(address,uint256)",
+            )
+            accrued_checkpoint = self._read_gauge_reward_word(
+                observation.gauge_address,
+                build_gauge_rewards_read_calldata(token_id),
+                "rewards(uint256)",
+            )
+            penalty = self._read_penalty_window(observation, token_id)
+            diagnostics.append(
+                f"staked; earned reports {accrued_earned} raw AERO live and "
+                f"{accrued_checkpoint} raw AERO checkpointed"
+            )
+            if penalty.remaining_seconds > 0 and penalty.penalty_rate_bps > 0:
+                diagnostics.append(
+                    f"inside the early-exit penalty window for {penalty.remaining_seconds}s "
+                    f"more at {penalty.penalty_rate_bps} bps; claiming or unstaking now "
+                    "forfeits that share of accrued emissions"
+                )
+        else:
+            diagnostics.append("unstaked; the Safe itself holds the position NFT")
+        quoted_apr, apr_diagnostic = self._quote_emissions_apr(observation, aero_price_usdc)
+        unrealized_pnl: Decimal | None = None
+        pnl_diagnostic = ""
+        if entry_cost_usdc is not None:
+            unrealized_pnl = +(position_value - entry_cost_usdc)
+            pnl_diagnostic = (
+                f"position value {position_value} USDC against the supplied entry cost "
+                f"{entry_cost_usdc} USDC"
+            )
+        else:
+            pnl_diagnostic = (
+                "entry cost unknown: no --entry-cost was supplied and no executed-mint record "
+                "links this token id to a cost basis yet"
+            )
+        diagnostics.append(
+            f"composition {amount0} + {amount1} raw units worth {position_value} USDC at the "
+            f"snapshot price {price} USDC per stock ({range_state.value})"
+        )
+        caps = list(context.caps)
+        caps.append("read-only observation; nothing was built or signed")
+        self._record_status(
+            context.listing.symbol,
+            observation,
+            token_id,
+            context.staked,
+            position_value,
+            quoted_apr,
+            aero_price_usdc,
+        )
+        return LpPositionStatusReport(
+            symbol=context.listing.symbol,
+            pool_address=observation.pool_address,
+            nfpm_address=observation.nfpm_address,
+            gauge_address=observation.gauge_address,
+            token_id=token_id,
+            token_owner_address=context.owner,
+            staked=context.staked,
+            position=position,
+            range_state=range_state,
+            current_tick=observation.current_tick,
+            amount0_units=amount0,
+            amount1_units=amount1,
+            token0_value_usdc=token0_value,
+            token1_value_usdc=token1_value,
+            position_value_usdc=position_value,
+            fees_owed0_units=position.tokens_owed0_units,
+            fees_owed1_units=position.tokens_owed1_units,
+            accrued_aero_earned_units=accrued_earned,
+            accrued_aero_checkpoint_units=accrued_checkpoint,
+            penalty=penalty,
+            quoted_emissions_apr=quoted_apr,
+            apr_diagnostic=apr_diagnostic,
+            aero_price_assumption_usdc=aero_price_usdc,
+            entry_cost_usdc=entry_cost_usdc,
+            unrealized_pnl_usdc=unrealized_pnl,
+            pnl_diagnostic=pnl_diagnostic,
+            snapshot_block=observation.snapshot_block,
+            observed_at=observation.observed_at,
+            caps_enforced=tuple(caps),
+            diagnostics=tuple(diagnostics),
+        )
+
+    def _resolve_position(self, symbol: str, token_id: int) -> _LpPositionContext:
+        """Resolve one position to its observation, view, and live ownership.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            token_id: The position NFT being resolved.
+
+        Returns:
+            The resolved position context with every gate label so far.
+
+        Raises:
+            LpExecutionRefusalError: If the token does not exist on the
+                pool's NFPM or is owned outside the Safe-and-gauge pair.
+        """
+        listing, observation, caps = self._observe_pool(symbol)
+        try:
+            position = decode_lp_positions_view(
+                self._rpc.eth_call(
+                    observation.nfpm_address, build_lp_positions_read_calldata(token_id)
+                )
+            )
+        except (ExecutorRpcRevertError, ValueError) as error:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.POSITION_UNKNOWN,
+                f"token {token_id} has no position on NFPM {observation.nfpm_address} "
+                f"({error}); verify the token id and pool symbol",
+            ) from error
+        try:
+            owner = normalize_evm_address(
+                self._read_address(
+                    observation.nfpm_address,
+                    self._erc721_owner_of_calldata(token_id),
+                    "ownerOf()",
+                )
+            )
+        except ExecutorRpcRevertError as error:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.POSITION_UNKNOWN,
+                f"token {token_id} reverted ownerOf on NFPM {observation.nfpm_address} "
+                f"({error}); the id is unknown or burned",
+            ) from error
+        if owner != self._safe_address and owner != observation.gauge_address:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.POSITION_NOT_OWNED,
+                f"token {token_id} is owned by {owner}, which is neither this Safe nor the "
+                f"pool's gauge {observation.gauge_address}; this executor manages only its "
+                "own positions",
+            )
+        caps.append(
+            f"position {token_id} resolved "
+            + ("staked in the gauge" if owner == observation.gauge_address else "in the Safe")
+        )
+        return _LpPositionContext(listing, observation, position, owner, self._safe_address, caps)
+
+    def _read_gauge_reward_word(self, gauge_address: str, calldata: str, source: str) -> int:
+        """Read one gauge reward word, refusing fail-closed when it reverts.
+
+        Args:
+            gauge_address: The CLGauge being read.
+            calldata: Complete 0x-prefixed read payload.
+            source: Human label naming the read in diagnostics.
+
+        Returns:
+            The decoded unsigned integer.
+
+        Raises:
+            LpExecutionRefusalError: If the read reverts, because the
+                emissions at stake cannot be established honestly.
+        """
+        try:
+            return self._read_word(gauge_address, calldata, source)
+        except ExecutorRpcRevertError as error:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.PENALTY_STATE_UNREADABLE,
+                f"the gauge read {source} reverted ({error}); the accrued emissions and "
+                "penalty exposure cannot be established, so the attempt is refused rather "
+                "than guessed at",
+            ) from error
+
+    def _read_penalty_window(
+        self, observation: LpPoolObservation, token_id: int
+    ) -> LpPenaltyWindow:
+        """Resolve one staked position's exact early-exit penalty window.
+
+        The gauge dates every deposit, and the factory owns both the penalty
+        rate and the pool's minimum stake time, so three reads resolve the
+        window exactly: ``depositTimestamp(tokenId) + minStakeTimes(pool)``
+        against the injected clock.
+
+        Args:
+            observation: The pool observation naming the gauge and pool.
+            token_id: The staked position NFT being dated.
+
+        Returns:
+            The resolved penalty window.
+
+        Raises:
+            LpExecutionRefusalError: If any penalty read reverts, because a
+                claim's forfeiture exposure cannot be established.
+        """
+        try:
+            gauge_factory = self._read_address(
+                observation.gauge_address,
+                build_gauge_gauge_factory_read_calldata(),
+                "gaugeFactory()",
+            )
+            penalty_rate_bps = self._read_word(
+                gauge_factory,
+                build_gauge_penalty_rate_read_calldata(),
+                "penaltyRate()",
+            )
+            min_stake_seconds = self._read_word(
+                gauge_factory,
+                build_gauge_min_stake_times_read_calldata(observation.pool_address),
+                "minStakeTimes(address)",
+            )
+            deposit_timestamp = self._read_word(
+                observation.gauge_address,
+                build_gauge_deposit_timestamp_read_calldata(token_id),
+                "depositTimestamp(uint256)",
+            )
+        except ExecutorRpcRevertError as error:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.PENALTY_STATE_UNREADABLE,
+                f"a penalty-window read reverted ({error}); the early-exit forfeiture "
+                "exposure cannot be established, so the claim or withdrawal is refused "
+                "rather than guessed at",
+            ) from error
+        clears_at = deposit_timestamp + min_stake_seconds
+        remaining = max(0, clears_at - int(self._now().timestamp()))
+        return LpPenaltyWindow(
+            penalty_rate_bps=penalty_rate_bps,
+            min_stake_seconds=min_stake_seconds,
+            deposit_timestamp=deposit_timestamp,
+            window_clears_at_timestamp=clears_at,
+            remaining_seconds=remaining,
+        )
+
+    def _require_penalty_clear(self, penalty: LpPenaltyWindow, accrued_earned: int) -> None:
+        """Refuse any claim that would forfeit emissions inside the window.
+
+        Args:
+            penalty: The resolved early-exit penalty window.
+            accrued_earned: The live accrued emissions at stake, raw units.
+
+        Raises:
+            LpExecutionRefusalError: When the window is open, the rate is
+                positive, and accrued emissions would be forfeited.
+        """
+        if penalty.remaining_seconds > 0 and penalty.penalty_rate_bps > 0 and accrued_earned > 0:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.WITHIN_PENALTY_WINDOW,
+                f"the early-exit penalty window is open for {penalty.remaining_seconds} more "
+                f"seconds at {penalty.penalty_rate_bps} bps, and {accrued_earned} raw AERO "
+                f"of accrued emissions would be forfeited; wait until unix "
+                f"{penalty.window_clears_at_timestamp} and retry",
+            )
+
+    def _exit_amounts(
+        self, observation: LpPoolObservation, position: LpPositionView
+    ) -> tuple[Decimal, Decimal]:
+        """Compute both sides' amounts a full decrease returns at the snapshot.
+
+        Args:
+            observation: The block-pinned pool observation.
+            position: The live twelve-word position view.
+
+        Returns:
+            The raw token-zero and token-one amounts.
+        """
+        return position_amounts_at_sqrt_ratio(
+            observation.sqrt_ratio,
+            position.tick_lower,
+            position.tick_upper,
+            Decimal(position.liquidity),
+        )
+
+    def _projected_inventory(
+        self,
+        observation: LpPoolObservation,
+        position: LpPositionView,
+        amount0: Decimal,
+        amount1: Decimal,
+    ) -> tuple[int, int]:
+        """Project the Safe's post-exit inventory for one recenter.
+
+        The exit has not executed at build time, so the projection adds the
+        full decrease outputs and checkpointed fees to the live balances the
+        same sequence will have augmented when the mint lands.
+
+        Args:
+            observation: The block-pinned pool observation.
+            position: The live twelve-word position view.
+            amount0: The expected raw token-zero decrease output.
+            amount1: The expected raw token-one decrease output.
+
+        Returns:
+            The projected raw USDC and stock balances.
+        """
+        usdc_side = amount1 if observation.stock_is_token0 else amount0
+        stock_side = amount0 if observation.stock_is_token0 else amount1
+        usdc_fees = Decimal(
+            position.tokens_owed1_units
+            if observation.stock_is_token0
+            else position.tokens_owed0_units
+        )
+        stock_fees = Decimal(
+            position.tokens_owed0_units
+            if observation.stock_is_token0
+            else position.tokens_owed1_units
+        )
+        live_usdc = self._rpc.fetch_token_balance(BASE_USDC_ADDRESS, self._safe_address)
+        stock_token = (
+            observation.token0_address
+            if observation.stock_is_token0
+            else observation.token1_address
+        )
+        live_stock = self._rpc.fetch_token_balance(stock_token, self._safe_address)
+        projected_usdc = int(
+            (Decimal(live_usdc) + usdc_side + usdc_fees).to_integral_value(ROUND_FLOOR)
+        )
+        projected_stock = int(
+            (Decimal(live_stock) + stock_side + stock_fees).to_integral_value(ROUND_FLOOR)
+        )
+        return projected_usdc, projected_stock
+
+    def _quote_emissions_apr(
+        self, observation: LpPoolObservation, aero_price_usdc: Decimal
+    ) -> tuple[Decimal | None, str]:
+        """Quote the pool's emissions APR under the current bot convention.
+
+        This is the same annual-reward-value-over-staked-value convention the
+        rehearsal reconstruction uses, computed over the Sugar snapshot's
+        staked reserves at the supplied AERO price. The input is explicitly
+        labeled pre-fix: the emissions-APR convention deliverable has not
+        landed, and Aerodrome's own displayed numbers are known to differ.
+
+        Args:
+            observation: The block-pinned pool observation.
+            aero_price_usdc: The AERO price assumption in USDC.
+
+        Returns:
+            The quoted APR as a decimal fraction, or None with its diagnostic
+            when the inputs are absent.
+        """
+        staked0 = observation.staked_reserve0_units
+        staked1 = observation.staked_reserve1_units
+        if (
+            observation.emissions_per_second_units <= 0
+            or (staked0 <= 0 and staked1 <= 0)
+            or aero_price_usdc <= 0
+        ):
+            return None, (
+                "no quoted emissions APR: the snapshot carries no emissions rate or staked "
+                "reserves to quote against"
+            )
+        price = observation.price_usdc_per_stock
+        token0_scale = (
+            Decimal(10) ** -observation.stock_decimals
+            if observation.stock_is_token0
+            else Decimal(10) ** -observation.quote_decimals
+        )
+        token1_scale = (
+            Decimal(10) ** -observation.quote_decimals
+            if observation.stock_is_token0
+            else Decimal(10) ** -observation.stock_decimals
+        )
+        token0_price = price if observation.stock_is_token0 else Decimal(1)
+        token1_price = Decimal(1) if observation.stock_is_token0 else price
+        staked_tvl = +(
+            Decimal(staked0) * token0_scale * token0_price
+            + Decimal(staked1) * token1_scale * token1_price
+        )
+        annual_reward_usd = (
+            Decimal(observation.emissions_per_second_units)
+            * aero_price_usdc
+            * SECONDS_PER_YEAR
+            / Decimal(10) ** AERO_DECIMALS
+        )
+        return +(annual_reward_usd / staked_tvl), (
+            f"annual reward value {annual_reward_usd} USDC over the snapshot's "
+            f"{staked_tvl} USDC of staked reserves at the assumed AERO price "
+            f"{aero_price_usdc}; PRE-FIX APR INPUT: the emissions-APR convention fix has "
+            "not landed and Aerodrome's own displayed numbers use a different base"
+        )
+
     def _resolve_mint_context(self, symbol: str, width_spacings: int | None) -> _LpMintContext:
         """Resolve one mint to its observation, inventory, and shared gates.
 
@@ -1080,6 +2797,11 @@ class LpLifecycleExecutor:
             sqrt_ratio=pool.sqrt_ratio,
             pool_active_liquidity=pool.pool_active_liquidity,
             usdc_reserve_units=pool.reserve1 if stock_is_token0 else pool.reserve0,
+            emissions_per_second_units=pool.emissions_per_second,
+            emissions_token_address=pool.emissions_token_address,
+            gauge_liquidity_units=pool.gauge_liquidity,
+            staked_reserve0_units=pool.staked0,
+            staked_reserve1_units=pool.staked1,
             snapshot_block=discovery.snapshot_block,
             observed_at=observed_at,
         )
@@ -1362,6 +3084,170 @@ class LpLifecycleExecutor:
             self._now(),
         )
 
+    def _record_unstake_plan(
+        self,
+        mode: ExecutionMode,
+        symbol: str,
+        observation: LpPoolObservation,
+        token_id: int,
+        accrued_earned: int,
+        accrued_checkpoint: int,
+        penalty: LpPenaltyWindow,
+    ) -> None:
+        """Append the unstake plan audit event when a sink is configured."""
+        if self._audit_sink is None:
+            return
+        self._audit_sink.append(
+            AuditEventType.LP_UNSTAKE_PLANNED,
+            LpUnstakePlannedPayload(
+                mode=mode,
+                symbol=symbol,
+                pool_address=observation.pool_address,
+                nfpm_address=observation.nfpm_address,
+                gauge_address=observation.gauge_address,
+                token_id=token_id,
+                accrued_aero_earned_units=accrued_earned,
+                accrued_aero_checkpoint_units=accrued_checkpoint,
+                penalty_rate_bps=penalty.penalty_rate_bps,
+                penalty_remaining_seconds=penalty.remaining_seconds,
+            ),
+            self._now(),
+        )
+
+    def _record_exit_plan(
+        self,
+        mode: ExecutionMode,
+        symbol: str,
+        observation: LpPoolObservation,
+        token_id: int,
+        range_state: PositionRangeState,
+        amount0: Decimal,
+        amount1: Decimal,
+        amount0_min: int,
+        amount1_min: int,
+        fees_owed0: int,
+        fees_owed1: int,
+    ) -> None:
+        """Append the withdraw plan audit event when a sink is configured."""
+        if self._audit_sink is None:
+            return
+        self._audit_sink.append(
+            AuditEventType.LP_EXIT_PLANNED,
+            LpExitPlannedPayload(
+                mode=mode,
+                symbol=symbol,
+                pool_address=observation.pool_address,
+                nfpm_address=observation.nfpm_address,
+                gauge_address=observation.gauge_address,
+                token_id=token_id,
+                range_state=range_state,
+                amount0_units=amount0,
+                amount1_units=amount1,
+                amount0_min_units=amount0_min,
+                amount1_min_units=amount1_min,
+                fees_owed0_units=fees_owed0,
+                fees_owed1_units=fees_owed1,
+            ),
+            self._now(),
+        )
+
+    def _record_collect_plan(
+        self,
+        mode: ExecutionMode,
+        symbol: str,
+        observation: LpPoolObservation,
+        token_id: int,
+        staked: bool,
+        accrued_earned: int,
+        accrued_checkpoint: int,
+        fees_owed0: int,
+        fees_owed1: int,
+    ) -> None:
+        """Append the collect plan audit event when a sink is configured."""
+        if self._audit_sink is None:
+            return
+        self._audit_sink.append(
+            AuditEventType.LP_COLLECT_PLANNED,
+            LpCollectPlannedPayload(
+                mode=mode,
+                symbol=symbol,
+                pool_address=observation.pool_address,
+                nfpm_address=observation.nfpm_address,
+                gauge_address=observation.gauge_address,
+                token_id=token_id,
+                staked=staked,
+                accrued_aero_earned_units=accrued_earned,
+                accrued_aero_checkpoint_units=accrued_checkpoint,
+                fees_owed0_units=fees_owed0 if not staked else 0,
+                fees_owed1_units=fees_owed1 if not staked else 0,
+            ),
+            self._now(),
+        )
+
+    def _record_recenter_plan(
+        self,
+        mode: ExecutionMode,
+        symbol: str,
+        observation: LpPoolObservation,
+        token_id: int,
+        staked: bool,
+        budget_usdc: Decimal,
+        projected_usdc_units: int,
+        projected_stock_units: int,
+        plan: LpMintPlan,
+        restake_followup: str,
+    ) -> None:
+        """Append the recenter plan audit event when a sink is configured."""
+        if self._audit_sink is None:
+            return
+        self._audit_sink.append(
+            AuditEventType.LP_RECENTER_PLANNED,
+            LpRecenterPlannedPayload(
+                mode=mode,
+                symbol=symbol,
+                pool_address=observation.pool_address,
+                nfpm_address=observation.nfpm_address,
+                gauge_address=observation.gauge_address,
+                token_id=token_id,
+                staked=staked,
+                budget_usdc=budget_usdc,
+                projected_usdc_units=projected_usdc_units,
+                projected_stock_units=projected_stock_units,
+                tick_lower=plan.position_range.tick_lower,
+                tick_upper=plan.position_range.tick_upper,
+                restake_followup=restake_followup,
+            ),
+            self._now(),
+        )
+
+    def _record_status(
+        self,
+        symbol: str,
+        observation: LpPoolObservation,
+        token_id: int,
+        staked: bool,
+        position_value_usdc: Decimal,
+        quoted_emissions_apr: Decimal | None,
+        aero_price_usdc: Decimal,
+    ) -> None:
+        """Append the position status audit event when a sink is configured."""
+        if self._audit_sink is None:
+            return
+        self._audit_sink.append(
+            AuditEventType.LP_STATUS_REPORTED,
+            LpStatusReportedPayload(
+                mode=ExecutionMode.DRY_RUN,
+                symbol=symbol,
+                pool_address=observation.pool_address,
+                token_id=token_id,
+                staked=staked,
+                position_value_usdc=position_value_usdc,
+                quoted_emissions_apr=quoted_emissions_apr,
+                aero_price_assumption_usdc=aero_price_usdc,
+            ),
+            self._now(),
+        )
+
     def _record_build(
         self,
         mode: ExecutionMode,
@@ -1530,6 +3416,124 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
             "the Keychain key; the signature check will honestly report rejection."
         ),
     )
+    dry_run_unstake_parser = dry_run_subparsers.add_parser(
+        "unstake",
+        help="Build and validate the unstake sequence; nothing is broadcast.",
+    )
+    _add_lp_symbol_arguments(dry_run_unstake_parser)
+    dry_run_unstake_parser.add_argument(
+        "--token-id",
+        type=int,
+        required=True,
+        help="Staked position NFT to unstake; refused when the gauge does not hold it.",
+    )
+    dry_run_unstake_parser.add_argument(
+        "--ephemeral-key",
+        action="store_true",
+        help=(
+            "Sign the dry run with a freshly generated throwaway key instead of "
+            "the Keychain key; the signature check will honestly report rejection."
+        ),
+    )
+    dry_run_withdraw_parser = dry_run_subparsers.add_parser(
+        "withdraw",
+        help="Build and validate the full withdraw sequence; nothing is broadcast.",
+    )
+    _add_lp_symbol_arguments(dry_run_withdraw_parser)
+    dry_run_withdraw_parser.add_argument(
+        "--token-id",
+        type=int,
+        required=True,
+        help="Unstaked position NFT to decrease fully and collect out.",
+    )
+    dry_run_withdraw_parser.add_argument(
+        "--ephemeral-key",
+        action="store_true",
+        help=(
+            "Sign the dry run with a freshly generated throwaway key instead of "
+            "the Keychain key; the signature check will honestly report rejection."
+        ),
+    )
+    dry_run_collect_parser = dry_run_subparsers.add_parser(
+        "collect",
+        help="Build and validate the claim sequence; nothing is broadcast.",
+    )
+    _add_lp_symbol_arguments(dry_run_collect_parser)
+    dry_run_collect_parser.add_argument(
+        "--token-id",
+        type=int,
+        required=True,
+        help=("Position NFT to collect: gauge getReward when staked, NFPM collect when not."),
+    )
+    dry_run_collect_parser.add_argument(
+        "--ephemeral-key",
+        action="store_true",
+        help=(
+            "Sign the dry run with a freshly generated throwaway key instead of "
+            "the Keychain key; the signature check will honestly report rejection."
+        ),
+    )
+    dry_run_recenter_parser = dry_run_subparsers.add_parser(
+        "recenter",
+        help="Build and validate the full recenter batch; nothing is broadcast.",
+    )
+    _add_lp_symbol_arguments(dry_run_recenter_parser)
+    dry_run_recenter_parser.add_argument(
+        "--token-id",
+        type=int,
+        required=True,
+        help="Old position NFT to exit, burn, and recycle into the fresh mint.",
+    )
+    dry_run_recenter_parser.add_argument(
+        "--width-ticks",
+        type=int,
+        default=None,
+        help=(
+            "Half width in tick spacings per side for the fresh range; required until "
+            "the solver-derived width path lands."
+        ),
+    )
+    dry_run_recenter_parser.add_argument(
+        "--amount",
+        type=Decimal,
+        default=None,
+        help=("USDC budget for the fresh mint; omit to recycle the old position's snapshot value."),
+    )
+    dry_run_recenter_parser.add_argument(
+        "--ephemeral-key",
+        action="store_true",
+        help=(
+            "Sign the dry run with a freshly generated throwaway key instead of "
+            "the Keychain key; the signature check will honestly report rejection."
+        ),
+    )
+    status_parser = subparsers.add_parser(
+        "status",
+        help="Observe one position read-only; nothing is built or signed.",
+    )
+    _add_lp_symbol_arguments(status_parser)
+    status_parser.add_argument(
+        "--token-id",
+        type=int,
+        required=True,
+        help="Position NFT to report on, wherever its current owner holds it.",
+    )
+    status_parser.add_argument(
+        "--aero-price",
+        type=Decimal,
+        required=True,
+        help=(
+            "AERO price assumption in USDC for the quoted emissions APR; the quote "
+            "is labeled pre-fix until the APR convention fix lands and a live read "
+            "replaces the assumption."
+        ),
+    )
+    status_parser.add_argument(
+        "--entry-cost",
+        type=Decimal,
+        default=None,
+        help="Optional entry cost basis in USDC for the unrealized P&L.",
+    )
     return parser
 
 
@@ -1643,6 +3647,196 @@ def _print_stake_dry_run(report: LpStakeDryRunReport) -> None:
     print(f"build took {report.build_duration_ms} ms")
 
 
+def _print_penalty(penalty: LpPenaltyWindow) -> None:
+    """Print one resolved penalty window's human summary.
+
+    Args:
+        penalty: The penalty window being reported.
+    """
+    state = "OPEN" if penalty.remaining_seconds > 0 else "clear"
+    print(
+        f"penalty window {state}: rate {penalty.penalty_rate_bps} bps, min stake "
+        f"{penalty.min_stake_seconds}s, deposited at unix {penalty.deposit_timestamp}, "
+        f"clears at unix {penalty.window_clears_at_timestamp} "
+        f"({penalty.remaining_seconds}s remaining)"
+    )
+
+
+def _print_unstake_dry_run(report: LpUnstakeDryRunReport) -> None:
+    """Print one unstake dry-run report's human summary.
+
+    Args:
+        report: The dry-run report being printed.
+    """
+    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    print(
+        f"{report.symbol} pool {report.pool_address}, gauge {report.gauge_address}, "
+        f"token {report.token_id}"
+    )
+    print(
+        f"position liquidity {report.position.liquidity}, fees "
+        f"{report.position.tokens_owed0_units} + {report.position.tokens_owed1_units} raw units"
+    )
+    print(
+        f"accrued AERO: {report.accrued_aero_earned_units} raw live, "
+        f"{report.accrued_aero_checkpoint_units} raw checkpointed (the withdraw claims the live)"
+    )
+    _print_penalty(report.penalty)
+    print(
+        f"safe {report.safe_address}, relayer {report.relayer_address} ({key_note} key, "
+        "nothing broadcast)"
+    )
+    print(f"gas price {report.gas_price_wei} wei, Safe ETH {report.safe_eth_wei} wei")
+    for transaction in report.transactions:
+        _print_built_lp(f"[{transaction.role.value}]", transaction)
+    for line in report.diagnostics:
+        print(f"note: {line}")
+    print(f"build took {report.build_duration_ms} ms")
+
+
+def _print_exit_dry_run(report: LpExitDryRunReport) -> None:
+    """Print one withdraw dry-run report's human summary.
+
+    Args:
+        report: The dry-run report being printed.
+    """
+    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    print(
+        f"{report.symbol} pool {report.pool_address}, NFPM {report.nfpm_address}, "
+        f"token {report.token_id} ({report.range_state.value})"
+    )
+    print(
+        f"full decrease returns {report.amount0_units} + {report.amount1_units} raw units, "
+        f"minima {report.amount0_min_units} + {report.amount1_min_units}"
+    )
+    print(
+        f"checkpointed fees {report.fees_owed0_units} + {report.fees_owed1_units} raw units "
+        "sweep on the collect"
+    )
+    print(
+        f"safe {report.safe_address}, relayer {report.relayer_address} ({key_note} key, "
+        "nothing broadcast)"
+    )
+    print(f"gas price {report.gas_price_wei} wei, Safe ETH {report.safe_eth_wei} wei")
+    for transaction in report.transactions:
+        _print_built_lp(f"[{transaction.role.value}]", transaction)
+    for line in report.diagnostics:
+        print(f"note: {line}")
+    print(f"build took {report.build_duration_ms} ms")
+
+
+def _print_collect_dry_run(report: LpCollectDryRunReport) -> None:
+    """Print one collect dry-run report's human summary.
+
+    Args:
+        report: The dry-run report being printed.
+    """
+    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    path = "gauge getReward" if report.staked else "NFPM collect"
+    print(f"{report.symbol} pool {report.pool_address}, token {report.token_id}, claim path {path}")
+    if report.staked:
+        print(
+            f"accrued AERO: {report.accrued_aero_earned_units} raw live, "
+            f"{report.accrued_aero_checkpoint_units} raw checkpointed"
+        )
+        penalty = report.penalty
+        if penalty is not None:
+            _print_penalty(penalty)
+    else:
+        print(f"checkpointed fees {report.fees_owed0_units} + {report.fees_owed1_units} raw units")
+    print(
+        f"safe {report.safe_address}, relayer {report.relayer_address} ({key_note} key, "
+        "nothing broadcast)"
+    )
+    print(f"gas price {report.gas_price_wei} wei, Safe ETH {report.safe_eth_wei} wei")
+    for transaction in report.transactions:
+        _print_built_lp(f"[{transaction.role.value}]", transaction)
+    for line in report.diagnostics:
+        print(f"note: {line}")
+    print(f"build took {report.build_duration_ms} ms")
+
+
+def _print_recenter_dry_run(report: LpRecenterDryRunReport) -> None:
+    """Print one recenter dry-run report's human summary.
+
+    Args:
+        report: The dry-run report being printed.
+    """
+    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    print(
+        f"{report.symbol} pool {report.pool_address}, token {report.token_id} "
+        f"({'staked' if report.staked else 'unstaked'}, {report.range_state.value})"
+    )
+    print(
+        f"full decrease returns {report.amount0_units} + {report.amount1_units} raw units; "
+        f"checkpointed fees {report.fees_owed0_units} + {report.fees_owed1_units} raw units"
+    )
+    print(
+        f"projected post-exit inventory: {report.projected_usdc_units} raw USDC + "
+        f"{report.projected_stock_units} raw stock"
+    )
+    _print_lp_plan(report.plan)
+    print(f"restake follow-up: {report.restake_followup}")
+    print(
+        f"safe {report.safe_address}, relayer {report.relayer_address} ({key_note} key, "
+        "nothing broadcast)"
+    )
+    print(f"gas price {report.gas_price_wei} wei, Safe ETH {report.safe_eth_wei} wei")
+    for transaction in report.transactions:
+        _print_built_lp(f"[{transaction.role.value}]", transaction)
+    print(f"build took {report.build_duration_ms} ms")
+
+
+def _print_position_status(report: LpPositionStatusReport) -> None:
+    """Print one read-only position report's human summary.
+
+    Args:
+        report: The position report being printed.
+    """
+    custody = "staked in the gauge" if report.staked else "held by the Safe"
+    print(
+        f"{report.symbol} pool {report.pool_address}, NFPM {report.nfpm_address}, "
+        f"gauge {report.gauge_address}, token {report.token_id} ({custody})"
+    )
+    print(
+        f"owner {report.token_owner_address}, snapshot block {report.snapshot_block}, "
+        f"current tick {report.current_tick} ({report.range_state.value})"
+    )
+    print(
+        f"composition {report.amount0_units} + {report.amount1_units} raw units valued "
+        f"{report.token0_value_usdc} + {report.token1_value_usdc} = "
+        f"{report.position_value_usdc} USDC"
+    )
+    print(f"checkpointed fees {report.fees_owed0_units} + {report.fees_owed1_units} raw units")
+    if report.accrued_aero_earned_units is not None:
+        print(
+            f"accrued AERO: {report.accrued_aero_earned_units} raw live, "
+            f"{report.accrued_aero_checkpoint_units} raw checkpointed"
+        )
+        penalty = report.penalty
+        if penalty is not None:
+            _print_penalty(penalty)
+    if report.quoted_emissions_apr is not None:
+        print(
+            f"quoted emissions APR {report.quoted_emissions_apr:.6f} "
+            f"({report.quoted_emissions_apr * Decimal(100):.4f}%) at assumed AERO "
+            f"{report.aero_price_assumption_usdc} USDC"
+        )
+    else:
+        print("no quoted emissions APR: the inputs are absent")
+    if report.apr_diagnostic:
+        print(f"apr note: {report.apr_diagnostic}")
+    if report.unrealized_pnl_usdc is not None:
+        print(
+            f"unrealized P&L {report.unrealized_pnl_usdc} USDC against entry cost "
+            f"{report.entry_cost_usdc} USDC"
+        )
+    else:
+        print(f"no P&L: {report.pnl_diagnostic}")
+    for line in report.diagnostics:
+        print(f"note: {line}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one manual LP lifecycle command.
 
@@ -1730,6 +3924,99 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(stake_report.model_dump_json(indent=2))
             else:
                 _print_stake_dry_run(stake_report)
+            return EXIT_OK
+        if arguments.command == "dry-run" and arguments.lifecycle == "unstake":
+            if arguments.token_id < 0:
+                parser.error("--token-id must be non-negative")
+            if arguments.ephemeral_key:
+                key_bytes = bytes(Account.create().key)
+                ephemeral = True
+            else:
+                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                ephemeral = False
+            unstake_report = executor.dry_run_unstake(
+                arguments.symbol, arguments.token_id, key_bytes, ephemeral_key=ephemeral
+            )
+            if arguments.json:
+                print(unstake_report.model_dump_json(indent=2))
+            else:
+                _print_unstake_dry_run(unstake_report)
+            return EXIT_OK
+        if arguments.command == "dry-run" and arguments.lifecycle == "withdraw":
+            if arguments.token_id < 0:
+                parser.error("--token-id must be non-negative")
+            if arguments.ephemeral_key:
+                key_bytes = bytes(Account.create().key)
+                ephemeral = True
+            else:
+                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                ephemeral = False
+            exit_report = executor.dry_run_exit(
+                arguments.symbol, arguments.token_id, key_bytes, ephemeral_key=ephemeral
+            )
+            if arguments.json:
+                print(exit_report.model_dump_json(indent=2))
+            else:
+                _print_exit_dry_run(exit_report)
+            return EXIT_OK
+        if arguments.command == "dry-run" and arguments.lifecycle == "collect":
+            if arguments.token_id < 0:
+                parser.error("--token-id must be non-negative")
+            if arguments.ephemeral_key:
+                key_bytes = bytes(Account.create().key)
+                ephemeral = True
+            else:
+                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                ephemeral = False
+            collect_report = executor.dry_run_collect(
+                arguments.symbol, arguments.token_id, key_bytes, ephemeral_key=ephemeral
+            )
+            if arguments.json:
+                print(collect_report.model_dump_json(indent=2))
+            else:
+                _print_collect_dry_run(collect_report)
+            return EXIT_OK
+        if arguments.command == "dry-run" and arguments.lifecycle == "recenter":
+            if arguments.token_id < 0:
+                parser.error("--token-id must be non-negative")
+            if arguments.amount is not None and arguments.amount <= 0:
+                parser.error("--amount must be positive")
+            if arguments.ephemeral_key:
+                key_bytes = bytes(Account.create().key)
+                ephemeral = True
+            else:
+                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                ephemeral = False
+            recenter_report = executor.dry_run_recenter(
+                arguments.symbol,
+                arguments.token_id,
+                arguments.width_ticks,
+                arguments.amount,
+                key_bytes,
+                ephemeral_key=ephemeral,
+            )
+            if arguments.json:
+                print(recenter_report.model_dump_json(indent=2))
+            else:
+                _print_recenter_dry_run(recenter_report)
+            return EXIT_OK
+        if arguments.command == "status":
+            if arguments.token_id < 0:
+                parser.error("--token-id must be non-negative")
+            if arguments.aero_price <= 0:
+                parser.error("--aero-price must be positive")
+            if arguments.entry_cost is not None and arguments.entry_cost < 0:
+                parser.error("--entry-cost must be non-negative")
+            status_report = executor.position_status(
+                arguments.symbol,
+                arguments.token_id,
+                arguments.aero_price,
+                entry_cost_usdc=arguments.entry_cost,
+            )
+            if arguments.json:
+                print(status_report.model_dump_json(indent=2))
+            else:
+                _print_position_status(status_report)
             return EXIT_OK
         parser.error(f"unknown command combination {arguments.command}/{arguments.lifecycle}")
         return EXIT_FAILURE

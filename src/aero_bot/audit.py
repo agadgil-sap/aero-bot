@@ -92,6 +92,19 @@ class AuditEventType(StrEnum):
     LP_MINT_PLANNED = "lp_mint_planned"
     # LP stake planned captures one stake plan with its live ownership evidence.
     LP_STAKE_PLANNED = "lp_stake_planned"
+    # LP unstake planned captures one unstake plan with its emissions and
+    # penalty-window evidence.
+    LP_UNSTAKE_PLANNED = "lp_unstake_planned"
+    # LP exit planned captures one decrease-and-collect exit plan with its
+    # expected amounts and minima.
+    LP_EXIT_PLANNED = "lp_exit_planned"
+    # LP collect planned captures one fee or emissions claim plan with its
+    # claimable amounts.
+    LP_COLLECT_PLANNED = "lp_collect_planned"
+    # LP recenter planned captures one full management-cycle batch plan.
+    LP_RECENTER_PLANNED = "lp_recenter_planned"
+    # LP status reported captures one read-only position report.
+    LP_STATUS_REPORTED = "lp_status_reported"
     # LP transaction built captures one fully built and signed LP Safe
     # transaction, validated read-only before any broadcast.
     LP_TRANSACTION_BUILT = "lp_transaction_built"

@@ -27,6 +27,7 @@ from typing import Annotated, Self
 
 from pydantic import BaseModel, Field, model_validator
 
+from aero_bot.concentrated import PositionRangeState
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, NonNegativeDecimal
 from aero_bot.history import price_usdc_per_stock
 from aero_bot.lp_calldata import INT24_MAX, INT24_MIN
@@ -242,6 +243,17 @@ class LpPoolObservation(BaseModel):
     pool_active_liquidity: Annotated[int, Field(gt=0)]
     # The pool's USDC-side reserve in raw units, the swap impact base.
     usdc_reserve_units: Annotated[int, Field(gt=0)]
+    # The gauge's raw per-second AERO reward rate from the same snapshot;
+    # zero when the gauge is not emitting.
+    emissions_per_second_units: Annotated[int, Field(ge=0)] = 0
+    # The emissions token address, absent when the gauge is not emitting.
+    emissions_token_address: EvmAddress | None = None
+    # The gauge's raw staked liquidity from the same snapshot.
+    gauge_liquidity_units: Annotated[int, Field(ge=0)] = 0
+    # The raw staked token-zero balance held in gauge positions.
+    staked_reserve0_units: Annotated[int, Field(ge=0)] = 0
+    # The raw staked token-one balance held in gauge positions.
+    staked_reserve1_units: Annotated[int, Field(ge=0)] = 0
     # The block every field of this observation was pinned to.
     snapshot_block: Annotated[int, Field(ge=0)]
     # When the snapshot completed, timezone-aware.
@@ -443,6 +455,82 @@ def position_amounts_for_liquidity(
             raise ValueError(
                 "the current price must sit strictly inside the range for a two-sided position"
             )
+        amount0 = liquidity * X96_SCALE * (sqrt_upper - sqrt_current) / (sqrt_current * sqrt_upper)
+        amount1 = liquidity * (sqrt_current - sqrt_lower) / X96_SCALE
+        return +amount0, +amount1
+
+
+def position_range_state(tick_lower: int, tick_upper: int, current_tick: int) -> PositionRangeState:
+    """Classify one pool tick against a position range by tick comparison.
+
+    Classification is exact in tick space under the range's inclusive-lower
+    and exclusive-upper semantics, so a snapshot tick that has left the range
+    reports honestly even when the raw square-root price rounds near a
+    boundary.
+
+    Args:
+        tick_lower: The range's inclusive lower tick.
+        tick_upper: The range's exclusive upper tick.
+        current_tick: The snapshot's current pool tick.
+
+    Returns:
+        Below-range, in-range, or above-range.
+
+    Raises:
+        ValueError: If the range boundaries are inverted.
+    """
+    if tick_lower >= tick_upper:
+        raise ValueError("tick_lower must be below tick_upper")
+    if current_tick < tick_lower:
+        return PositionRangeState.BELOW_RANGE
+    if current_tick < tick_upper:
+        return PositionRangeState.IN_RANGE
+    return PositionRangeState.ABOVE_RANGE
+
+
+def position_amounts_at_sqrt_ratio(
+    sqrt_ratio: int,
+    tick_lower: int,
+    tick_upper: int,
+    liquidity: Decimal,
+) -> tuple[Decimal, Decimal]:
+    """Compute both sides' raw amounts for one liquidity at any price.
+
+    Unlike :func:`position_amounts_for_liquidity`, the current price may sit
+    outside the range: below it the position is entirely token zero, above it
+    entirely token one, mirroring the branch geometry of the concentrated
+    analyzer in normalized price space. This is the exact math an exit or
+    status read needs for a position the market may have moved past.
+
+    Args:
+        sqrt_ratio: The pool's positive raw sqrtPriceX96.
+        tick_lower: The range's inclusive lower tick.
+        tick_upper: The range's exclusive upper tick.
+        liquidity: The positive raw liquidity amount L.
+
+    Returns:
+        The raw token-zero and token-one amounts held at the current price.
+
+    Raises:
+        ValueError: If any argument is malformed.
+    """
+    if sqrt_ratio <= 0:
+        raise ValueError("sqrt_ratio must be positive")
+    if liquidity < 0:
+        raise ValueError("liquidity must not be negative")
+    if tick_lower >= tick_upper:
+        raise ValueError("tick_lower must be below tick_upper")
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        sqrt_lower = _sqrt_price_at_tick(tick_lower)
+        sqrt_upper = _sqrt_price_at_tick(tick_upper)
+        sqrt_current = Decimal(sqrt_ratio)
+        if sqrt_current <= sqrt_lower:
+            amount0 = liquidity * X96_SCALE * (sqrt_upper - sqrt_lower) / (sqrt_lower * sqrt_upper)
+            return +amount0, Decimal(0)
+        if sqrt_current >= sqrt_upper:
+            amount1 = liquidity * (sqrt_upper - sqrt_lower) / X96_SCALE
+            return Decimal(0), +amount1
         amount0 = liquidity * X96_SCALE * (sqrt_upper - sqrt_current) / (sqrt_current * sqrt_upper)
         amount1 = liquidity * (sqrt_current - sqrt_lower) / X96_SCALE
         return +amount0, +amount1

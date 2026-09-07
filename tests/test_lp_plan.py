@@ -6,6 +6,7 @@ from decimal import Decimal, localcontext
 
 import pytest
 
+from aero_bot.concentrated import PositionRangeState
 from aero_bot.domain import normalize_evm_address
 from aero_bot.lp_calldata import (
     LP_MINT_SELECTOR,
@@ -28,7 +29,9 @@ from aero_bot.lp_plan import (
     plan_balancing_swap,
     plan_mint_composition,
     plan_mint_entry,
+    position_amounts_at_sqrt_ratio,
     position_amounts_for_liquidity,
+    position_range_state,
 )
 from aero_bot.ranging import TICK_PRICE_RATIO
 
@@ -269,6 +272,119 @@ def test_position_amounts_refuse_an_out_of_range_price() -> None:
             pass
         else:
             raise AssertionError("an out-of-range price did not refuse")
+
+
+def test_position_range_state_classifies_every_tick_region() -> None:
+    """Tick comparison over inclusive-lower and exclusive-upper semantics."""
+    classifications = {
+        -11681: PositionRangeState.BELOW_RANGE,
+        -11680: PositionRangeState.IN_RANGE,
+        -11671: PositionRangeState.IN_RANGE,
+        -11670: PositionRangeState.ABOVE_RANGE,
+        -11669: PositionRangeState.ABOVE_RANGE,
+    }
+    for tick, expected in classifications.items():
+        assert position_range_state(-11680, -11670, tick) is expected
+
+
+def test_position_range_state_refuses_an_inverted_range() -> None:
+    """A lower bound at or above the upper bound refuses classification."""
+    with pytest.raises(ValueError, match="tick_lower must be below tick_upper"):
+        position_range_state(-11670, -11680, -11675)
+    with pytest.raises(ValueError, match="tick_lower must be below tick_upper"):
+        position_range_state(-11670, -11670, -11670)
+
+
+def test_position_amounts_at_sqrt_ratio_agree_inside_the_range() -> None:
+    """A strictly inside price matches the two-sided entry formula exactly."""
+    liquidity = Decimal(135_048_209_692)
+    sqrt_ratio = sqrt_ratio_at_tick(-11660)
+    assert position_amounts_at_sqrt_ratio(sqrt_ratio, -11680, -11650, liquidity) == (
+        position_amounts_for_liquidity(sqrt_ratio, -11680, -11650, liquidity)
+    )
+
+
+def test_position_amounts_at_sqrt_ratio_go_one_sided_outside_the_range() -> None:
+    """A price past either bound collapses the position to its single side."""
+    liquidity = Decimal(10**18)
+    below0, below1 = position_amounts_at_sqrt_ratio(
+        sqrt_ratio_at_tick(-11690), -11680, -11650, liquidity
+    )
+    assert below1 == 0
+    # The whole below-range position is token zero across the full band.
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        sqrt_lower = (TICK_PRICE_RATIO**-11680).sqrt() * X96_SCALE
+        sqrt_upper = (TICK_PRICE_RATIO**-11650).sqrt() * X96_SCALE
+        expected_below0 = (
+            liquidity * X96_SCALE * (sqrt_upper - sqrt_lower) / (sqrt_lower * sqrt_upper)
+        )
+    assert abs(below0 - expected_below0) / expected_below0 < Decimal("1e-45")
+
+    above0, above1 = position_amounts_at_sqrt_ratio(
+        sqrt_ratio_at_tick(-11640), -11680, -11650, liquidity
+    )
+    assert above0 == 0
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        sqrt_lower = (TICK_PRICE_RATIO**-11680).sqrt() * X96_SCALE
+        sqrt_upper = (TICK_PRICE_RATIO**-11650).sqrt() * X96_SCALE
+        expected_above1 = liquidity * (sqrt_upper - sqrt_lower) / X96_SCALE
+    assert abs(above1 - expected_above1) / expected_above1 < Decimal("1e-45")
+
+
+def test_position_amounts_at_sqrt_ratio_are_continuous_at_the_boundaries() -> None:
+    """Approaching either bound from both sides converges on the boundary."""
+    liquidity = Decimal(987_654_321_098_765)
+    sqrt_lower = sqrt_ratio_at_tick(-11680)
+    sqrt_upper = sqrt_ratio_at_tick(-11650)
+    boundary0, boundary1 = position_amounts_at_sqrt_ratio(sqrt_lower, -11680, -11650, liquidity)
+    inside0, inside1 = position_amounts_at_sqrt_ratio(sqrt_lower + 1, -11680, -11650, liquidity)
+    far_below0, _ = position_amounts_at_sqrt_ratio(sqrt_lower - 1, -11680, -11650, liquidity)
+    # The token-zero amount changes only infinitesimally across the boundary,
+    # while the token-one amount leaves zero continuously from inside. The
+    # raw bound prices sit near 4e28, so one integer step bounds the relative
+    # movement near 1e-26; any real discontinuity would be orders larger.
+    assert abs(boundary0 - inside0) / boundary0 < Decimal("1e-24")
+    assert abs(boundary0 - far_below0) / boundary0 < Decimal("1e-24")
+    assert boundary1 == 0
+    assert inside1 / boundary0 < Decimal("1e-24")
+
+    # One above the upper tick's truncated sqrt sits at or beyond the exact
+    # bound, mirroring the out-of-range refusal convention.
+    at_upper = sqrt_upper + 1
+    top0, top1 = position_amounts_at_sqrt_ratio(at_upper, -11680, -11650, liquidity)
+    upper_inside0, upper_inside1 = position_amounts_at_sqrt_ratio(
+        at_upper - 1, -11680, -11650, liquidity
+    )
+    _, far_above1 = position_amounts_at_sqrt_ratio(at_upper + 1, -11680, -11650, liquidity)
+    assert abs(top1 - upper_inside1) / top1 < Decimal("1e-24")
+    assert abs(top1 - far_above1) / top1 < Decimal("1e-24")
+    assert top0 == 0
+    assert upper_inside0 / top1 < Decimal("1e-24")
+
+
+def test_position_amounts_at_sqrt_ratio_accept_zero_liquidity() -> None:
+    """An emptied position's amounts read zero on both sides everywhere."""
+    for sqrt_ratio in (
+        sqrt_ratio_at_tick(-11690),
+        sqrt_ratio_at_tick(-11660),
+        sqrt_ratio_at_tick(-11640),
+    ):
+        assert position_amounts_at_sqrt_ratio(sqrt_ratio, -11680, -11650, Decimal(0)) == (
+            Decimal(0),
+            Decimal(0),
+        )
+
+
+def test_position_amounts_at_sqrt_ratio_refuse_malformed_arguments() -> None:
+    """Non-positive prices, negative liquidity, and inverted ranges refuse."""
+    with pytest.raises(ValueError, match="sqrt_ratio must be positive"):
+        position_amounts_at_sqrt_ratio(0, -11680, -11650, Decimal(1))
+    with pytest.raises(ValueError, match="liquidity must not be negative"):
+        position_amounts_at_sqrt_ratio(sqrt_ratio_at_tick(-11660), -11680, -11650, Decimal(-1))
+    with pytest.raises(ValueError, match="tick_lower must be below tick_upper"):
+        position_amounts_at_sqrt_ratio(sqrt_ratio_at_tick(-11660), -11650, -11680, Decimal(1))
 
 
 def test_mint_composition_splits_the_budget_into_both_sides() -> None:

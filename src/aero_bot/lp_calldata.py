@@ -66,6 +66,14 @@ GAUGE_GET_REWARD_SELECTOR = "1c4b774b"
 GAUGE_EARNED_SELECTOR = "3e491d47"
 # keccak256("rewards(uint256)")[0:4], the checkpointed claimable emissions read.
 GAUGE_REWARDS_SELECTOR = "f301af42"
+# keccak256("gaugeFactory()")[0:4], the gauge's own factory read.
+GAUGE_GAUGE_FACTORY_SELECTOR = "0d52333c"
+# keccak256("penaltyRate()")[0:4], the factory's early-exit penalty in bps.
+GAUGE_PENALTY_RATE_SELECTOR = "d6b7494f"
+# keccak256("minStakeTimes(address)")[0:4], the factory's per-pool minimum.
+GAUGE_MIN_STAKE_TIMES_SELECTOR = "e782453b"
+# keccak256("depositTimestamp(uint256)")[0:4], the stake-age anchor per token.
+GAUGE_DEPOSIT_TIMESTAMP_SELECTOR = "4ede8c85"
 # Every ABI word encoded or decoded by this module is exactly 32 bytes.
 WORD_BYTES = 32
 # Solidity int24 spans this signed range; every tick argument must fit it.
@@ -542,3 +550,66 @@ def build_gauge_rewards_read_calldata(token_id: int) -> str:
     if token_id < 0:
         raise ValueError("token_id must be non-negative")
     return _selector_and_words(GAUGE_REWARDS_SELECTOR, _word(token_id))
+
+
+def build_gauge_gauge_factory_read_calldata() -> str:
+    """ABI-encode the gauge's own factory read.
+
+    The early-exit penalty state lives on the gauge factory, not the gauge:
+    ``penaltyRate()`` and ``minStakeTimes(pool)`` are factory views, so the
+    executor first resolves this address from the gauge itself. Live on the
+    AAPLc gauge: ``gaugeFactory()`` returns
+    ``0x385293cae378c813f16f0c1334d774adddf56abb``.
+
+    Returns:
+        Complete 0x-prefixed calldata for the gauge's gaugeFactory view.
+    """
+    return f"0x{GAUGE_GAUGE_FACTORY_SELECTOR}"
+
+
+def build_gauge_penalty_rate_read_calldata() -> str:
+    """ABI-encode the factory's early-exit penalty-rate read.
+
+    Live on the AAPLc gauge's factory the rate is 10000 bps, so any claim or
+    withdrawal before the pool's minimum stake time forfeits every accrued
+    emission of that stake.
+
+    Returns:
+        Complete 0x-prefixed calldata for the factory's penaltyRate view.
+    """
+    return f"0x{GAUGE_PENALTY_RATE_SELECTOR}"
+
+
+def build_gauge_min_stake_times_read_calldata(pool_address: str) -> str:
+    """ABI-encode the factory's per-pool minimum-stake-time read.
+
+    Args:
+        pool_address: The Slipstream pool whose override is read; pools
+            without an explicit override fall back to the factory default.
+
+    Returns:
+        Complete 0x-prefixed calldata for the factory's minStakeTimes view.
+    """
+    return _selector_and_words(GAUGE_MIN_STAKE_TIMES_SELECTOR, _address_word(pool_address))
+
+
+def build_gauge_deposit_timestamp_read_calldata(token_id: int) -> str:
+    """ABI-encode the per-token stake-age anchor read.
+
+    The gauge records ``block.timestamp`` at every deposit, and the penalty
+    window closes exactly at ``depositTimestamp(tokenId) +
+    minStakeTimes(pool)``, so this read plus the factory views resolve the
+    window exactly rather than heuristically.
+
+    Args:
+        token_id: The staked position NFT whose deposit is dated.
+
+    Returns:
+        Complete 0x-prefixed calldata for the gauge's depositTimestamp view.
+
+    Raises:
+        ValueError: If the token id is negative.
+    """
+    if token_id < 0:
+        raise ValueError("token_id must be non-negative")
+    return _selector_and_words(GAUGE_DEPOSIT_TIMESTAMP_SELECTOR, _word(token_id))
