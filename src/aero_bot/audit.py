@@ -78,6 +78,16 @@ class AuditEventType(StrEnum):
     TRANSACTION_PLAN = "transaction_plan"
     # Transaction simulation captures read-only eth_call evidence.
     TRANSACTION_SIMULATION = "transaction_simulation"
+    # Execution quote captures one capped swap attempt's live quote.
+    EXECUTION_QUOTE = "execution_quote"
+    # Execution built captures one fully built and signed Safe transaction.
+    EXECUTION_BUILT = "execution_built"
+    # Execution sent captures one broadcast submission of a Safe transaction.
+    EXECUTION_SENT = "execution_sent"
+    # Execution confirmed captures one included transaction with status one.
+    EXECUTION_CONFIRMED = "execution_confirmed"
+    # Execution failed captures one included transaction that reverted on-chain.
+    EXECUTION_FAILED = "execution_failed"
     # System state captures startup, migration, and diagnostic events without secrets.
     SYSTEM_STATE = "system_state"
 

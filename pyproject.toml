@@ -17,6 +17,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 # Runtime dependencies are bounded to compatible major versions.
 dependencies = [
+  "eth-account>=0.13,<1",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "pydantic-settings>=2.10,<3",
@@ -37,6 +38,8 @@ dev = [
 aero-bot = "aero_bot.__main__:main"
 # The rehearsal command replays the policy over reconstructed onchain history.
 aero-bot-rehearse = "aero_bot.rehearse:main"
+# The swap command manually executes one hard-capped Safe swap on Base.
+aero-bot-swap = "aero_bot.executor:main"
 
 [tool.hatch.build.targets.wheel]
 # The wheel contains only the application package under the src layout.

@@ -1,8 +1,8 @@
 # Aero Bot
 
-Aero Bot is a local, wallet-free Aerodrome LP analysis application for Base.
+Aero Bot is a local Aerodrome LP analysis application for Base with one narrow, manually triggered execution path.
 The current foundation exposes a loopback-only FastAPI dashboard and health endpoint.
-It never requests a private key and has no transaction broadcast capability.
+The API and dashboard never request a private key and cannot sign or broadcast anything; the only signing and broadcast path is the `aero-bot-swap` command's explicitly confirmed, hard-capped Safe swaps documented in [the execution guide](docs/execution.md).
 
 ## Install and run on macOS
 
@@ -29,10 +29,10 @@ uv run pytest --cov
 
 ## Security boundary
 
-This release is analysis and simulation software only.
+This release is analysis and simulation software plus one manually triggered execution path.
 Do not place wallet seed phrases, private keys, signing material, or other secrets in this repository or its environment files.
 The only venue enabled by the product is Aerodrome on Base.
-Transaction signing and broadcasting are intentionally absent.
+Transaction signing and broadcasting exist only inside the `aero-bot-swap` command behind its explicit `execute --confirm-broadcast` invocation, with every hard cap enforced in code before anything is signed; the API and dashboard remain structurally unable to sign or broadcast, and no loop, scheduler, or policy trigger can reach the execution path.
 
 ## Official B20 identities
 
@@ -97,8 +97,31 @@ See [the rehearsal command documentation](docs/rehearsal.md) for the full pipeli
 
 The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.
 The default policy is emergency-halted with empty transaction allowlists and no simulation backend.
-Wallet onboarding, private-key input, signing, and broadcasting remain structurally unavailable through both the API and dashboard.
+Wallet onboarding, private-key input, signing, and broadcasting remain structurally unavailable through both the API and dashboard; the only signing path is the explicitly confirmed swap command below.
 See [the transaction simulation boundary](docs/transaction-simulation.md) for exact allowance and backend evidence rules.
+
+## Safe transaction layer
+
+The Safe transaction layer builds `execTransaction` payloads for the canary Safe on Base: it computes the EIP-712 SafeTx hash, signs it with an owner key through the audited `eth-account` library, ABI-encodes the calldata with the zero gas-parameter shape of every reference transaction, and proves the signature read-only against the live contract through `checkNSignatures`.
+Two contract facts are verified live rather than assumed: this Safe hashes with the minimal EIP-712 domain carrying only the chain ID and verifying contract, and its nonce getter is `nonce()` while `getNonce()` reverts.
+The layer never sources key material itself - raw key bytes arrive as an argument, sign exactly one hash, and are never stored, logged, or persisted - and every produced signature must pass a local recovery round trip before it leaves the module.
+The computed hashes reproduce every Safe Transaction Service record for this Safe, and the read-only RPC backend carries the same bounded retries and fail-closed decoding as the discovery layer.
+
+## Keychain signing-key source
+
+The macOS Keychain is the only key source in the application: the keychain module reads the bot owner's key at runtime through `/usr/bin/security find-generic-password` with the service and account names taken from `AERO_BOT_KEYCHAIN_SERVICE` (default `aero-bot`) and `AERO_BOT_KEYCHAIN_ACCOUNT` (default `bot-key`).
+The absolute tool path prevents PATH substitution, every failure is a clean actionable error that quotes at most a bounded stderr tail and never the secret, and nothing about the key is ever logged, cached, or persisted - the module derives and reports only the public address.
+A missing item, an empty secret, a non-hex secret, and the all-zero placeholder each fail closed with distinct diagnostics.
+
+## Capped manual swap execution
+
+The `aero-bot-swap` command is the application's only signing and broadcast path: a manual one-shot CLI for hard-capped USDC-to-B20 stock swaps through the canary Safe on Base.
+The `quote` subcommand prices through live Sugar discovery, the default `dry-run` builds, signs, and validates the Safe transactions without broadcasting anything, and broadcasting exists only behind `execute --confirm-broadcast`.
+Every cap is enforced in code before anything is signed: swaps default to at most 1 USDC (validator ceiling 5), the standing USDC allowance is the bounded 20-USDC number and never infinite, the router whitelist is exactly the reference swap's universal router, tokens are USDC plus the official registry only, pools come from live discovery, gas above 1 gwei or a Safe below its ETH floor refuses, and quotes older than two minutes are stale.
+The swap calldata reproduces the Safe's executed reference transaction byte for byte, delivery transactions are bounded type-2 EOA transactions paid by the relaying key, and the live `checkNSignatures` verdict gates every broadcast.
+Every attempt appends its quote, build, broadcast, and receipt evidence to the immutable audit chain with no key material anywhere.
+There is no loop, scheduler, watcher, or policy wiring anywhere in the execution path.
+See [the execution guide](docs/execution.md) for the cap table, Keychain setup, the canary procedure, the refusal catalog, and the live read-only verification transcript.
 
 ## Concentrated-liquidity analysis
 
@@ -130,4 +153,5 @@ Every risk response is persisted with its validated input, active policy, and ex
 Every policy decision is persisted with its injected observation, threaded state, locked parameters, event calendar, and exact decision before it is returned.
 Every exact-allowance planning response is persisted with its public request, active policy, and exact result before it is returned.
 Every read-only simulation response is persisted with its submitted unsigned plan, active revalidation policy, and complete result before it is returned.
+Every capped swap attempt persists its quote, each fully built Safe transaction, each broadcast submission, and each inclusion receipt before the command reports, with no key material in any event.
 See [the audit log design](docs/audit-log.md) for guarantees, limitations, and integration status.
