@@ -64,6 +64,13 @@ Positive reward yield must identify the official AERO token contract.
 Fee APY and AERO emissions APY remain separate inputs, and the displayed daily screen adds fee APY to fifty-percent-haircut emissions APY because a staked in-range position earns both streams.
 This secondary-source screen is not eligible for execution until onchain pool identity, oracle, exit-depth, concentrated-liquidity, IL, and adverse-selection checks also pass.
 
+## Rehearsal history reconstruction
+
+The rehearsal harness reconstructs each accepted pool's exact historical price path from onchain evidence alone.
+Every Slipstream pool emits one `Swap` event per swap carrying the post-swap square-root price, so read-only `eth_getLogs` filtering by the event topic recovers the path without any keyed service.
+Block windows are located from timestamps through a bounded binary search over block headers, and every swap keeps its own block's exact header timestamp rather than an interpolated estimate.
+The reconstruction is read-only, bounded, and fail-closed: rate-limited reads retry with exponential backoff, oversized or truncated log windows abort, and malformed evidence never yields a price point.
+
 ## Wallet-free transaction planning
 
 The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.
