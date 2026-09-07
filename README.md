@@ -88,6 +88,7 @@ The `/api/risk/evaluate` endpoint exposes complete hold or eligible evidence wit
 
 The v1 policy engine is pure decision code: observations, the event calendar, and the locked parameters are injected, and every decision returns a typed immutable action plus the successor state.
 Entry requires the pool's raw AERO emissions APR of at least 150 percent per staked liquidity, positions span a tick-grid-aligned plus-or-minus 0.3 percent range, upside recenters wait 15 minutes out of range, the downside stop and emissions dilution exits burn and swap all inventory back to USDC with a 15-minute re-entry cooldown, event windows hold flat in USDC, and a 5 percent same-day equity loss halts new entries until the next day.
+A dislocation monitor compares the keyless reference quote against the pool at every observation with asymmetric 0.15 percent actions (sell on a stale-high AMM, burn and hold through a stale-low AMM until convergence or a 5-minute timeout), non-urgent actions defer behind a gas sense-check gate (0.5 gwei or 5 percent of expected daily gross yield), and every swap carries a tranche-split execution plan that keeps modeled impact at or below 0.05 percent per tranche against the hard 0.1 percent ceiling.
 See [the policy engine design](docs/policy-engine.md) for the complete locked parameters, decision precedence, and event-window sources.
 
 ## Immutable local audit storage

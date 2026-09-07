@@ -38,6 +38,15 @@ TICK_PRICE_RATIO = Decimal("1.0001")
 WEEKEND_WEEKDAY_START = 5
 # The v1 starting equity for the rehearsal harness and default state.
 STARTING_EQUITY_USDC = Decimal("200")
+# Gas prices are observed in gwei and converted with the exact one-billion scale.
+GWEI_PER_ETH = Decimal(1_000_000_000)
+# A fixed 365-day year matches the risk engine's annualization convention.
+DAYS_PER_YEAR = Decimal(365)
+# USDC has exactly six decimal places, so tranche sizes quantize to this unit.
+USDC_QUANTUM = Decimal("0.000001")
+# A runaway guard bounds tranche lists exactly like the discovery pagination:
+# a position that outgrew its pool this far cannot tranche its way out anyway.
+MAX_SWAP_TRANCHES = 1_000
 
 
 class EventKind(StrEnum):
@@ -237,6 +246,62 @@ class AlignedPriceRange(BaseModel):
         return self
 
 
+class SwapDirection(StrEnum):
+    """Identify the two execution directions a policy swap can take."""
+
+    # Buy stock spends USDC into the pool to acquire stock inventory.
+    BUY_STOCK = "buy_stock"
+    # Sell stock converts stock inventory back into USDC.
+    SELL_STOCK = "sell_stock"
+
+
+class SwapTranche(BaseModel):
+    """Represent one executable slice of a modeled policy swap."""
+
+    # Frozen strict fields keep each tranche exactly as the audit will record it.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # Tranche size is the US-dollar value executed in this slice.
+    usd_size: Annotated[Decimal, Field(gt=0)]
+    # Modeled impact is this tranche's price-impact fraction against the observed
+    # depth; None means the depth was zero and the impact could not be bounded.
+    # The linear model can exceed one whole price unit when a swap outgrows the
+    # entire observed depth, which the ledger must surface rather than hide.
+    modeled_impact_fraction: NonNegativeDecimal | None
+
+
+class SwapPlan(BaseModel):
+    """Model one policy swap against the pool's observed executable depth."""
+
+    # Frozen strict fields preserve the execution plan the ledger will replay.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # Direction identifies whether the swap buys or sells the stock token.
+    direction: SwapDirection
+    # Total size is the whole US-dollar value the swap must convert.
+    total_usd: Annotated[Decimal, Field(gt=0)]
+    # Route depth is the executable US-dollar depth the swap is routed through;
+    # v1 has one venue per stock, so deepest-path routing is the pool itself.
+    route_depth_usd: NonNegativeDecimal
+    # Tranches are the ordered slices, one executed per observation interval.
+    tranches: Annotated[tuple[SwapTranche, ...], Field(min_length=1)]
+    # Worst tranche impact summarizes the plan against the locked ceiling; None
+    # means zero depth left the impact unmodeled and labeled as an assumption.
+    max_modeled_impact_fraction: NonNegativeDecimal | None
+
+    @model_validator(mode="after")
+    def require_tranche_sizes_cover_the_total(self) -> Self:
+        """Reject tranche lists that do not add up to the plan's total size."""
+        with localcontext() as decimal_context:
+            # High precision keeps exactly-split high-digit tranche lists from
+            # failing this check through default-context rounding.
+            decimal_context.prec = MATH_PRECISION
+            tranche_total = sum((tranche.usd_size for tranche in self.tranches), Decimal(0))
+        if tranche_total != self.total_usd:
+            raise ValueError("tranche sizes must sum to the plan total")
+        return self
+
+
 class PolicyParameters(BaseModel):
     """Lock the v1 emissions-farming parameters as one immutable decision input."""
 
@@ -266,6 +331,38 @@ class PolicyParameters(BaseModel):
     daily_loss_halt_fraction: Decimal = Decimal("0.05")
     # The underlying reference quote blocks entries when older than this bound.
     reference_max_age_seconds: Annotated[int, Field(ge=0)] = 300
+    # While a position is open, a reference older than this bound triggers a
+    # defensive exit; it is deliberately looser than the entry bound so a brief
+    # quote outage never forces an immediate exit.
+    reference_open_position_max_age_seconds: Annotated[int, Field(ge=0)] = 900
+    # Dislocation actions fire when the AMM and reference prices differ by at
+    # least 0.15 percent in either direction.
+    dislocation_threshold_fraction: Decimal = Decimal("0.0015")
+    # Stock tokens held after a stale-low burn are sold at market once this
+    # convergence timeout elapses without the AMM converging to the reference.
+    convergence_timeout: timedelta = timedelta(minutes=5)
+    # Every swap must keep its modeled price impact at or below 0.1 percent.
+    swap_impact_ceiling_fraction: Decimal = Decimal("0.001")
+    # A swap whose single-shot impact would exceed 0.05 percent is split into
+    # smaller tranches, one executed per observation interval.
+    swap_impact_tranche_fraction: Decimal = Decimal("0.0005")
+    # Non-urgent actions are deferred while the L2 gas price exceeds 0.5 gwei.
+    gas_price_ceiling_gwei: Decimal = Decimal("0.5")
+    # Non-urgent actions are deferred while the estimated batch cost exceeds
+    # five percent of the position's expected daily gross yield.
+    gas_cost_max_gross_yield_fraction: Decimal = Decimal("0.05")
+    # Every batch pays roughly one hundred thousand gas of Safe proxy overhead.
+    safe_overhead_gas_per_batch: Annotated[int, Field(ge=0)] = 100_000
+    # An entry batch swaps, mints, and stakes (approvals included).
+    enter_batch_gas_units: Annotated[int, Field(ge=1)] = 650_000
+    # A recenter batch burns, swaps, re-mints, and re-stakes.
+    recenter_batch_gas_units: Annotated[int, Field(ge=1)] = 550_000
+    # An exit batch burns, unstakes, and swaps the inventory back to USDC.
+    exit_batch_gas_units: Annotated[int, Field(ge=1)] = 350_000
+    # Selling held inventory after a stale-low burn is a single swap batch.
+    inventory_sell_gas_units: Annotated[int, Field(ge=1)] = 180_000
+    # The ETH price is a documented configurable assumption, not a live quote.
+    eth_price_assumption_usd: Decimal = Decimal("3000")
 
     @model_validator(mode="after")
     def require_unit_fractions(self) -> Self:
@@ -280,6 +377,27 @@ class PolicyParameters(BaseModel):
             raise ValueError("max_position_depth_fraction must be in (0, 1]")
         if not Decimal(0) < self.daily_loss_halt_fraction < Decimal(1):
             raise ValueError("daily_loss_halt_fraction must be between zero and one")
+        if not Decimal(0) < self.dislocation_threshold_fraction < Decimal(1):
+            raise ValueError("dislocation_threshold_fraction must be between zero and one")
+        if not Decimal(0) < self.swap_impact_tranche_fraction <= self.swap_impact_ceiling_fraction:
+            raise ValueError(
+                "swap_impact_tranche_fraction must be in (0, swap_impact_ceiling_fraction]"
+            )
+        if not Decimal(0) < self.swap_impact_ceiling_fraction < Decimal(1):
+            raise ValueError("swap_impact_ceiling_fraction must be between zero and one")
+        if self.gas_price_ceiling_gwei <= 0:
+            raise ValueError("gas_price_ceiling_gwei must be positive")
+        if not Decimal(0) < self.gas_cost_max_gross_yield_fraction < Decimal(1):
+            raise ValueError("gas_cost_max_gross_yield_fraction must be between zero and one")
+        if self.eth_price_assumption_usd <= 0:
+            raise ValueError("eth_price_assumption_usd must be positive")
+        if self.convergence_timeout <= timedelta(0):
+            raise ValueError("convergence_timeout must be positive")
+        if self.reference_open_position_max_age_seconds < self.reference_max_age_seconds:
+            raise ValueError(
+                "reference_open_position_max_age_seconds must not be tighter than "
+                "reference_max_age_seconds"
+            )
         return self
 
 
@@ -300,6 +418,9 @@ class PolicyObservation(BaseModel):
     # Raw emissions APR is the pool's AERO emissions APR per staked liquidity
     # before any haircut, in the same convention Aerodrome displays.
     emissions_apr: NonNegativeDecimal
+    # Fee APR annualizes the pool's gross swap fees; it feeds the expected
+    # daily gross yield the gas sense-check gate compares batch costs against.
+    fee_apr: NonNegativeDecimal = Decimal("0")
     # Pool depth is the executable US-dollar depth used by the position gate.
     pool_depth_usd: NonNegativeDecimal
     # Equity is the caller's current marked total portfolio value in USDC.
@@ -312,6 +433,9 @@ class PolicyObservation(BaseModel):
     oracle_stale: bool = False
     # A paused B20 registry is a condition-driven flat event per policy.
     registry_paused: bool = False
+    # The current Base L2 gas price in gwei; None means the reading is
+    # unavailable and the gas gate defers every non-urgent action fail-closed.
+    gas_price_gwei: NonNegativeDecimal | None = None
 
     @model_validator(mode="after")
     def require_aware_observation_time(self) -> Self:
@@ -350,6 +474,29 @@ class PolicyPosition(BaseModel):
         return self
 
 
+class HeldInventory(BaseModel):
+    """Track stock tokens held outside the pool after a stale-low burn."""
+
+    # Frozen strict fields keep one coherent mid-unwind inventory snapshot.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The pool the burned position lived in and the tokens will be sold into.
+    pool_address: EvmAddress
+    # The stock token whose quantity is held unsold.
+    token_address: EvmAddress
+    # Stock quantity is the token-unit inventory carried out of the burn.
+    stock_quantity: Annotated[Decimal, Field(gt=0)]
+    # Held-since anchors the convergence timeout of the hold.
+    held_since: datetime
+
+    @model_validator(mode="after")
+    def require_aware_held_since(self) -> Self:
+        """Reject naive held-since instants for the same reason as observations."""
+        if self.held_since.tzinfo is None:
+            raise ValueError("held_since must be timezone-aware")
+        return self
+
+
 class PolicyState(BaseModel):
     """Carry every engine-owned fact between observations of one replay session."""
 
@@ -364,6 +511,8 @@ class PolicyState(BaseModel):
     halted_day: date | None = None
     # The open position, or None while the policy is flat in USDC.
     position: PolicyPosition | None = None
+    # Stock tokens held unsold after a stale-low burn, awaiting convergence.
+    held_inventory: HeldInventory | None = None
     # Re-entry stays blocked until this instant after stop or dilution exits.
     reentry_blocked_until: datetime | None = None
 
@@ -383,6 +532,18 @@ class PolicyActionKind(StrEnum):
     DILUTION_EXIT = "dilution_exit"
     # Event exit burns and swaps all inventory back to USDC for an event window.
     EVENT_EXIT = "event_exit"
+    # Dislocation exit burns and swaps all inventory back to USDC while the
+    # AMM still prices the stock above the real market (stale-high).
+    DISLOCATION_EXIT = "dislocation_exit"
+    # Stale-low burn burns the position and holds the stock tokens unsold
+    # because the pool prices them below the real market.
+    STALE_LOW_BURN = "stale_low_burn"
+    # Defensive exit burns and swaps all inventory back to USDC when the
+    # reference quote went stale beyond the open-position bound.
+    DEFENSIVE_EXIT = "defensive_exit"
+    # Sell inventory swaps held stock tokens back to USDC on convergence,
+    # timeout, or a forced flat window.
+    SELL_INVENTORY = "sell_inventory"
 
 
 class PolicyReason(StrEnum):
@@ -418,6 +579,25 @@ class PolicyReason(StrEnum):
     # A scheduled or condition-driven event window arrived while a position
     # was open.
     EVENT_EXIT_TRIGGERED = "event_exit_triggered"
+    # The reference quote went missing or stale beyond the open-position bound.
+    REFERENCE_STALE_DEFENSIVE_EXIT = "reference_stale_defensive_exit"
+    # The AMM price rose beyond the dislocation threshold above the reference.
+    DISLOCATION_STALE_HIGH_TRIGGERED = "dislocation_stale_high_triggered"
+    # The AMM price fell beyond the dislocation threshold below the reference.
+    DISLOCATION_STALE_LOW_TRIGGERED = "dislocation_stale_low_triggered"
+    # Held stock tokens are sold because the AMM converged to the reference.
+    INVENTORY_CONVERGENCE_REACHED = "inventory_convergence_reached"
+    # Held stock tokens are sold at market because the convergence timeout hit.
+    INVENTORY_CONVERGENCE_TIMEOUT = "inventory_convergence_timeout"
+    # Held stock tokens are sold because a flat window requires being in USDC.
+    INVENTORY_FLAT_WINDOW_SELL = "inventory_flat_window_sell"
+    # Held stock tokens wait for convergence inside the timeout bound.
+    HOLDING_INVENTORY_AWAITING_CONVERGENCE = "holding_inventory_awaiting_convergence"
+    # New entries stay blocked while stock tokens from a stale-low burn are
+    # still held unsold.
+    INVENTORY_UNWIND_PENDING = "inventory_unwind_pending"
+    # A non-urgent entry or recenter is deferred by the gas sense-check gate.
+    GAS_GATE_DEFERRED = "gas_gate_deferred"
 
 
 class PolicyDecision(BaseModel):
@@ -436,6 +616,15 @@ class PolicyDecision(BaseModel):
     price_range: AlignedPriceRange | None = None
     # Size is the committed USDC value present for enter actions.
     size_usd: NonNegativeDecimal | None = None
+    # Swap plan models every swap the action performs against observed depth
+    # with tranche splitting; absent when the action performs no swap.
+    swap_plan: SwapPlan | None = None
+    # Estimated batch gas units include the Safe proxy overhead per batch.
+    estimated_gas_units: Annotated[int, Field(ge=0)] | None = None
+    # Estimated batch cost applies the documented ETH price assumption; None
+    # when the gas price reading is unavailable, which never blocks a safety
+    # exit because gap risk dominates an unknown gas cost.
+    estimated_gas_cost_usd: NonNegativeDecimal | None = None
 
 
 class PolicyOutcome(BaseModel):
@@ -487,9 +676,11 @@ class PolicyEngine:
     def decide(self, state: PolicyState, observation: PolicyObservation) -> PolicyOutcome:
         """Decide one observation against the current engine state.
 
-        Decision precedence is fixed: safety exits first (downside stop, then
-        emissions dilution, then event windows), then position maintenance
-        (upside recenter wait), then the ordered entry gates.
+        Decision precedence is fixed: held stock inventory from a stale-low
+        burn is unwound first, then safety exits (reference-stale defensive
+        exit, dislocation monitor, downside stop, emissions dilution, event
+        windows), then position maintenance (upside recenter wait behind the
+        gas gate), then the ordered entry gates behind the same gas gate.
 
         Args:
             state: Engine state threaded from the previous decision.
@@ -513,6 +704,10 @@ class PolicyEngine:
         else:
             flat_description = None
 
+        # Held inventory is a mid-unwind safety posture and resolves before any
+        # new exposure; the engine never holds inventory and a position at once.
+        if working_state.held_inventory is not None:
+            return self._decide_holding_inventory(working_state, observation, flat_description)
         if working_state.position is not None:
             return self._decide_with_position(working_state, observation, flat_description)
         return self._decide_flat(working_state, observation, flat_description)
@@ -630,87 +825,115 @@ class PolicyEngine:
         position = state.position
         if position is None:  # pragma: no cover - guarded by the caller
             raise ValueError("position branch requires an open position")
+        # A reference missing or stale beyond the open-position bound leaves the
+        # dislocation monitor blind, so the position exits defensively.
+        if self._reference_beyond_open_bound(observation):
+            return self._safety_exit(
+                state,
+                observation,
+                PolicyActionKind.DEFENSIVE_EXIT,
+                PolicyReason.REFERENCE_STALE_DEFENSIVE_EXIT,
+                (
+                    "The underlying reference quote is missing or older than the "
+                    f"{self._parameters.reference_open_position_max_age_seconds}-second "
+                    "open-position bound; exiting defensively while blind to dislocation.",
+                    "Exit path burns the position and swaps all inventory back to USDC.",
+                ),
+                with_cooldown=False,
+            )
+        # The dislocation monitor is evaluated before every AMM-anchored rule
+        # because the reference market is treated as the true price.
+        dislocation = self._dislocation_outcome(state, observation)
+        if dislocation is not None:
+            return dislocation
         # The stop level sits 0.5 percent below the aligned lower range edge.
         stop_level = position.price_range.lower_price * (
             Decimal(1) - self._parameters.stop_buffer_fraction
         )
         # Safety exits are evaluated in fixed order and are never deferred.
         if observation.amm_price_usdc <= stop_level:
-            diagnostics: tuple[str, ...] = (
-                f"Pool price {observation.amm_price_usdc} reached the stop level "
-                f"{stop_level} at 0.5 percent below the lower range edge "
-                f"{position.price_range.lower_price}.",
-                "Exit path burns the position and swaps all inventory back to USDC.",
-            )
-            next_state = state.model_copy(
-                update={
-                    "position": None,
-                    "reentry_blocked_until": (
-                        observation.observed_at + self._parameters.reentry_cooldown
-                    ),
-                }
-            )
-            return PolicyOutcome(
-                decision=PolicyDecision(
-                    action=PolicyActionKind.STOP_OUT,
-                    reason=PolicyReason.DOWNSIDE_STOP_TRIGGERED,
-                    diagnostics=diagnostics,
+            return self._safety_exit(
+                state,
+                observation,
+                PolicyActionKind.STOP_OUT,
+                PolicyReason.DOWNSIDE_STOP_TRIGGERED,
+                (
+                    f"Pool price {observation.amm_price_usdc} reached the stop level "
+                    f"{stop_level} at 0.5 percent below the lower range edge "
+                    f"{position.price_range.lower_price}.",
+                    "Exit path burns the position and swaps all inventory back to USDC.",
                 ),
-                next_state=next_state,
+                with_cooldown=True,
             )
         # Other LPs adding sticky staked liquidity persistently lowers the
         # emissions APR per unit of staked liquidity, so the gate is re-checked
         # at every observation while open.
         if observation.emissions_apr < self._parameters.min_entry_emissions_apr:
-            diagnostics = (
-                f"Raw emissions APR {observation.emissions_apr} fell below the entry "
-                f"threshold {self._parameters.min_entry_emissions_apr} while open.",
-                "Exit path burns the position and swaps all inventory back to USDC.",
-            )
-            next_state = state.model_copy(
-                update={
-                    "position": None,
-                    "reentry_blocked_until": (
-                        observation.observed_at + self._parameters.reentry_cooldown
-                    ),
-                }
-            )
-            return PolicyOutcome(
-                decision=PolicyDecision(
-                    action=PolicyActionKind.DILUTION_EXIT,
-                    reason=PolicyReason.DILUTION_EXIT_TRIGGERED,
-                    diagnostics=diagnostics,
+            return self._safety_exit(
+                state,
+                observation,
+                PolicyActionKind.DILUTION_EXIT,
+                PolicyReason.DILUTION_EXIT_TRIGGERED,
+                (
+                    f"Raw emissions APR {observation.emissions_apr} fell below the entry "
+                    f"threshold {self._parameters.min_entry_emissions_apr} while open.",
+                    "Exit path burns the position and swaps all inventory back to USDC.",
                 ),
-                next_state=next_state,
+                with_cooldown=True,
             )
         # Event windows require being flat in USDC while they are active.
         if flat_description is not None:
-            diagnostics = (
-                flat_description,
-                "Exit path burns the position and swaps all inventory back to USDC.",
-            )
-            next_state = state.model_copy(update={"position": None})
-            return PolicyOutcome(
-                decision=PolicyDecision(
-                    action=PolicyActionKind.EVENT_EXIT,
-                    reason=PolicyReason.EVENT_EXIT_TRIGGERED,
-                    diagnostics=diagnostics,
+            return self._safety_exit(
+                state,
+                observation,
+                PolicyActionKind.EVENT_EXIT,
+                PolicyReason.EVENT_EXIT_TRIGGERED,
+                (
+                    flat_description,
+                    "Exit path burns the position and swaps all inventory back to USDC.",
                 ),
-                next_state=next_state,
+                with_cooldown=False,
             )
         # Upside out-of-range starts a time-based wait before any recenter.
         if observation.amm_price_usdc >= position.price_range.upper_price:
             wait_anchor = position.out_of_range_since or observation.observed_at
             waited = observation.observed_at - wait_anchor
             if waited >= self._parameters.recenter_wait:
+                # The gas sense-check gate defers non-urgent recenters.
+                deferred, defer_diagnostics = self._gas_gate_blocks(
+                    observation,
+                    self._parameters.recenter_batch_gas_units,
+                    position.committed_usd,
+                )
+                if deferred:
+                    # The anchor persists so the elapsed wait stays elapsed and
+                    # the recenter retries on a cheaper observation.
+                    waiting_position = position.model_copy(
+                        update={"out_of_range_since": wait_anchor}
+                    )
+                    return self._hold(
+                        state.model_copy(update={"position": waiting_position}),
+                        PolicyReason.GAS_GATE_DEFERRED,
+                        defer_diagnostics,
+                    )
                 # The recenter range is rebuilt around the current pool price.
                 new_range = self.build_aligned_range(observation.amm_price_usdc)
+                gas_units, gas_cost_usd = self._batch_gas(
+                    observation, self._parameters.recenter_batch_gas_units
+                )
+                # Above the range the burned position is all USDC, so the
+                # re-mint buys roughly half of it back into stock.
+                swap_plan = self._swap_plan(
+                    SwapDirection.BUY_STOCK,
+                    position.committed_usd / Decimal(2),
+                    observation.pool_depth_usd,
+                )
                 diagnostics = (
                     f"Upside out-of-range wait of {waited} elapsed the locked "
                     f"recenter wait {self._parameters.recenter_wait}.",
                     f"New range {new_range.lower_price}..{new_range.upper_price} "
                     f"USDC per stock around pool price {observation.amm_price_usdc}.",
-                )
+                ) + self._gas_diagnostics(gas_units, gas_cost_usd)
                 next_position = position.model_copy(
                     update={
                         "price_range": new_range,
@@ -725,6 +948,9 @@ class PolicyEngine:
                         reason=PolicyReason.RECENTER_WAIT_ELAPSED,
                         diagnostics=diagnostics,
                         price_range=new_range,
+                        swap_plan=swap_plan,
+                        estimated_gas_units=gas_units,
+                        estimated_gas_cost_usd=gas_cost_usd,
                     ),
                     next_state=next_state,
                 )
@@ -773,6 +999,479 @@ class PolicyEngine:
                 diagnostics=diagnostics,
             ),
             next_state=next_state,
+        )
+
+    def _decide_holding_inventory(
+        self,
+        state: PolicyState,
+        observation: PolicyObservation,
+        flat_description: str | None,
+    ) -> PolicyOutcome:
+        """Resolve stock tokens held unsold after a stale-low burn.
+
+        Args:
+            state: Day-rolled state carrying the held inventory.
+            observation: The current injected observation.
+            flat_description: Description of the active window or flat condition.
+
+        Returns:
+            The inventory decision and successor state.
+        """
+        # The held inventory is the only fact this branch resolves.
+        inventory = state.held_inventory
+        if inventory is None:  # pragma: no cover - guarded by the caller
+            raise ValueError("inventory branch requires held stock tokens")
+        # A fresh reference allows a convergence judgment; without one only the
+        # timeout bound or a flat window can release the held tokens.
+        reference = observation.reference_price_usdc
+        converged = (
+            reference is not None
+            and not self._reference_stale(observation)
+            and observation.amm_price_usdc
+            >= reference * (Decimal(1) - self._parameters.dislocation_threshold_fraction)
+        )
+        timed_out = (
+            observation.observed_at - inventory.held_since >= self._parameters.convergence_timeout
+        )
+        if flat_description is not None:
+            reason = PolicyReason.INVENTORY_FLAT_WINDOW_SELL
+            trigger: tuple[str, ...] = (
+                flat_description,
+                "Held stock tokens are sold at market because the window requires USDC.",
+            )
+        elif timed_out:
+            reason = PolicyReason.INVENTORY_CONVERGENCE_TIMEOUT
+            trigger = (
+                f"Held since {inventory.held_since} without convergence past the "
+                f"{self._parameters.convergence_timeout} timeout; selling at market "
+                "as the safety bound.",
+            )
+        elif converged:
+            reason = PolicyReason.INVENTORY_CONVERGENCE_REACHED
+            trigger = (
+                f"Pool price {observation.amm_price_usdc} converged to within "
+                f"{self._parameters.dislocation_threshold_fraction} of the reference "
+                f"{reference}.",
+            )
+        else:
+            return self._hold(
+                state,
+                PolicyReason.HOLDING_INVENTORY_AWAITING_CONVERGENCE,
+                (
+                    f"Holding {inventory.stock_quantity} stock tokens unsold; pool "
+                    f"price {observation.amm_price_usdc} remains below the convergence "
+                    "band around the reference.",
+                ),
+            )
+        # All three sell paths share one swap-into-USDC execution model.
+        swap_plan = self._swap_plan(
+            SwapDirection.SELL_STOCK,
+            inventory.stock_quantity * observation.amm_price_usdc,
+            observation.pool_depth_usd,
+        )
+        gas_units, gas_cost_usd = self._batch_gas(
+            observation, self._parameters.inventory_sell_gas_units
+        )
+        next_state = state.model_copy(update={"held_inventory": None})
+        return PolicyOutcome(
+            decision=PolicyDecision(
+                action=PolicyActionKind.SELL_INVENTORY,
+                reason=reason,
+                diagnostics=trigger + self._gas_diagnostics(gas_units, gas_cost_usd),
+                swap_plan=swap_plan,
+                estimated_gas_units=gas_units,
+                estimated_gas_cost_usd=gas_cost_usd,
+            ),
+            next_state=next_state,
+        )
+
+    def _dislocation_outcome(
+        self,
+        state: PolicyState,
+        observation: PolicyObservation,
+    ) -> PolicyOutcome | None:
+        """Evaluate the underlying dislocation monitor against one open position.
+
+        Comparisons require a reference at least as fresh as the entry bound;
+        between that bound and the open-position bound the position rides the
+        ordinary lifecycle without dislocation actions.
+
+        Args:
+            state: Day-rolled state carrying the open position.
+            observation: The current injected observation.
+
+        Returns:
+            A stale-high or stale-low outcome, or None when no dislocation fires.
+
+        Raises:
+            ValueError: If the state carries no open position.
+        """
+        reference = observation.reference_price_usdc
+        if reference is None or self._reference_stale(observation):
+            return None
+        position = state.position
+        if position is None:  # pragma: no cover - guarded by the caller
+            raise ValueError("dislocation monitor requires an open position")
+        threshold = self._parameters.dislocation_threshold_fraction
+        if observation.amm_price_usdc >= reference * (Decimal(1) + threshold):
+            # Stale-high includes the crash-anticipation case where the real
+            # market shows a large imminent loss Aerodrome has not reflected;
+            # selling on the AMM captures the better-than-real price.
+            return self._safety_exit(
+                state,
+                observation,
+                PolicyActionKind.DISLOCATION_EXIT,
+                PolicyReason.DISLOCATION_STALE_HIGH_TRIGGERED,
+                (
+                    f"Pool price {observation.amm_price_usdc} is at least "
+                    f"{threshold} above the reference {reference}.",
+                    "Selling on the AMM while it still prices the stock above the "
+                    "real market; never deferred by the gas gate.",
+                ),
+                with_cooldown=False,
+            )
+        if observation.amm_price_usdc <= reference * (Decimal(1) - threshold):
+            # Stale-low: selling into the pool realizes the wrong price, so the
+            # position burns and the stock tokens wait outside the pool.
+            stock_quantity = self._stock_quantity(position, observation.amm_price_usdc)
+            gas_units, gas_cost_usd = self._batch_gas(
+                observation, self._parameters.exit_batch_gas_units
+            )
+            if stock_quantity <= 0:
+                # An above-range composition is already all USDC, so the burn
+                # completes the exit without any inventory to hold.
+                next_state = state.model_copy(update={"position": None})
+                return PolicyOutcome(
+                    decision=PolicyDecision(
+                        action=PolicyActionKind.STALE_LOW_BURN,
+                        reason=PolicyReason.DISLOCATION_STALE_LOW_TRIGGERED,
+                        diagnostics=(
+                            f"Pool price {observation.amm_price_usdc} is at least "
+                            f"{threshold} below the reference {reference}.",
+                            "The position is entirely USDC above its range, so the "
+                            "burn completes the exit with no stock inventory to hold.",
+                        )
+                        + self._gas_diagnostics(gas_units, gas_cost_usd),
+                        estimated_gas_units=gas_units,
+                        estimated_gas_cost_usd=gas_cost_usd,
+                    ),
+                    next_state=next_state,
+                )
+            held_inventory = HeldInventory(
+                pool_address=position.pool_address,
+                token_address=position.token_address,
+                stock_quantity=stock_quantity,
+                held_since=observation.observed_at,
+            )
+            next_state = state.model_copy(
+                update={"position": None, "held_inventory": held_inventory}
+            )
+            return PolicyOutcome(
+                decision=PolicyDecision(
+                    action=PolicyActionKind.STALE_LOW_BURN,
+                    reason=PolicyReason.DISLOCATION_STALE_LOW_TRIGGERED,
+                    diagnostics=(
+                        f"Pool price {observation.amm_price_usdc} is at least "
+                        f"{threshold} below the reference {reference}.",
+                        "Burning and holding the stock tokens unsold because selling "
+                        "into the stale-low pool realizes the wrong price; the "
+                        "reference market is treated as the true price.",
+                    )
+                    + self._gas_diagnostics(gas_units, gas_cost_usd),
+                    estimated_gas_units=gas_units,
+                    estimated_gas_cost_usd=gas_cost_usd,
+                ),
+                next_state=next_state,
+            )
+        return None
+
+    def _safety_exit(
+        self,
+        state: PolicyState,
+        observation: PolicyObservation,
+        action: PolicyActionKind,
+        reason: PolicyReason,
+        diagnostics: tuple[str, ...],
+        with_cooldown: bool,
+    ) -> PolicyOutcome:
+        """Build one burn-and-swap-to-USDC safety exit with execution models.
+
+        Args:
+            state: Day-rolled state carrying the open position.
+            observation: The current injected observation.
+            action: Exit action kind to emit.
+            reason: Stable trigger reason for the exit.
+            diagnostics: Trigger evidence; gas evidence is appended.
+            with_cooldown: Whether the exit arms the re-entry cooldown.
+
+        Returns:
+            The exit decision plus the successor flat state.
+
+        Raises:
+            ValueError: If the state carries no open position.
+        """
+        position = state.position
+        if position is None:  # pragma: no cover - guarded by the caller
+            raise ValueError("safety exit requires an open position")
+        # The composition rule turns the position into its stock quantity.
+        stock_quantity = self._stock_quantity(position, observation.amm_price_usdc)
+        # Only a positive stock inventory needs a swap back to USDC.
+        swap_plan = (
+            None
+            if stock_quantity <= 0
+            else self._swap_plan(
+                SwapDirection.SELL_STOCK,
+                stock_quantity * observation.amm_price_usdc,
+                observation.pool_depth_usd,
+            )
+        )
+        gas_units, gas_cost_usd = self._batch_gas(
+            observation, self._parameters.exit_batch_gas_units
+        )
+        next_state = state.model_copy(
+            update={
+                "position": None,
+                "reentry_blocked_until": (
+                    observation.observed_at + self._parameters.reentry_cooldown
+                    if with_cooldown
+                    else None
+                ),
+            }
+        )
+        return PolicyOutcome(
+            decision=PolicyDecision(
+                action=action,
+                reason=reason,
+                diagnostics=diagnostics + self._gas_diagnostics(gas_units, gas_cost_usd),
+                swap_plan=swap_plan,
+                estimated_gas_units=gas_units,
+                estimated_gas_cost_usd=gas_cost_usd,
+            ),
+            next_state=next_state,
+        )
+
+    def _stock_quantity(self, position: PolicyPosition, amm_price: Decimal) -> Decimal:
+        """Calculate the position's stock inventory at one pool price.
+
+        The v3-style composition is exact for a range entered at its geometric
+        center, which is how the engine builds every range: liquidity follows
+        from the committed value at the center, and the stock side spans the
+        evaluated-to-upper square-root-price band.
+
+        Args:
+            position: Open position with its aligned range and committed value.
+            amm_price: Positive pool price in USDC per stock.
+
+        Returns:
+            The stock token quantity held at this price; zero above the range.
+        """
+        with localcontext() as decimal_context:
+            # Local precision isolates deterministic composition math from settings.
+            decimal_context.prec = MATH_PRECISION
+            lower = position.price_range.lower_price
+            upper = position.price_range.upper_price
+            sqrt_lower = lower.sqrt()
+            sqrt_upper = upper.sqrt()
+            # The center root is where the value splits evenly between assets.
+            sqrt_center = (sqrt_lower * sqrt_upper).sqrt()
+            # Committed value at the center implies the position's liquidity.
+            liquidity = position.committed_usd / (Decimal(2) * (sqrt_center - sqrt_lower))
+            sqrt_price = amm_price.sqrt()
+            if amm_price <= lower:
+                # Below the range the position is entirely stock tokens.
+                stock_quantity = liquidity * (Decimal(1) / sqrt_lower - Decimal(1) / sqrt_upper)
+            elif amm_price < upper:
+                # In range the stock side covers the current-to-upper band.
+                stock_quantity = liquidity * (Decimal(1) / sqrt_price - Decimal(1) / sqrt_upper)
+            else:
+                # Above the range the position is entirely USDC.
+                stock_quantity = Decimal(0)
+            return +stock_quantity
+
+    def _swap_plan(
+        self,
+        direction: SwapDirection,
+        total_usd: Decimal,
+        route_depth_usd: Decimal,
+    ) -> SwapPlan:
+        """Model one swap against observed depth with tranche splitting.
+
+        The impact model is deliberately simple and conservative: a swap of one
+        percent of the executable depth is treated as one percent of price
+        impact, so tranches split no later than a curve model would require.
+
+        Args:
+            direction: Side of the pool the swap executes on.
+            total_usd: Positive whole US-dollar value to convert.
+            route_depth_usd: Observed executable depth of the swap route.
+
+        Returns:
+            The tranche-split plan; one whole-size tranche when depth is zero
+            or too small to split, with unmodeled or ceiling-breaking impact.
+        """
+        with localcontext() as decimal_context:
+            # Local precision keeps tranche arithmetic deterministic.
+            decimal_context.prec = MATH_PRECISION
+            max_tranche_usd = route_depth_usd * self._parameters.swap_impact_tranche_fraction
+            # The tranche count keeps every slice at or below the split bound,
+            # so the whole plan sits well under the hard impact ceiling.
+            tranche_count = (
+                int((total_usd / max_tranche_usd).to_integral_value(rounding=ROUND_CEILING))
+                if max_tranche_usd > 0
+                else 0
+            )
+            # Tranche sizes floor to USDC's six decimals so slices stay exactly
+            # representable; a nonpositive or runaway count means the observed
+            # depth cannot support splitting, so the whole swap models as one
+            # tranche whose impact speaks for itself against the ceiling.
+            tranche_size = (
+                (total_usd / Decimal(tranche_count)).quantize(USDC_QUANTUM, rounding=ROUND_FLOOR)
+                if tranche_count > 0
+                else Decimal(0)
+            )
+            if tranche_count > MAX_SWAP_TRANCHES or tranche_size <= 0:
+                fallback_impact = None if route_depth_usd <= 0 else total_usd / route_depth_usd
+                return SwapPlan(
+                    direction=direction,
+                    total_usd=total_usd,
+                    route_depth_usd=route_depth_usd,
+                    tranches=(
+                        SwapTranche(usd_size=total_usd, modeled_impact_fraction=fallback_impact),
+                    ),
+                    max_modeled_impact_fraction=fallback_impact,
+                )
+            # The final tranche absorbs the flooring remainder exactly so the
+            # tranche sizes sum to the plan total.
+            tranche_sizes = [tranche_size] * (tranche_count - 1) + [
+                total_usd - tranche_size * Decimal(tranche_count - 1)
+            ]
+            tranche_impacts = [size / route_depth_usd for size in tranche_sizes]
+            return SwapPlan(
+                direction=direction,
+                total_usd=total_usd,
+                route_depth_usd=route_depth_usd,
+                tranches=tuple(
+                    SwapTranche(usd_size=size, modeled_impact_fraction=impact)
+                    for size, impact in zip(tranche_sizes, tranche_impacts, strict=True)
+                ),
+                max_modeled_impact_fraction=max(tranche_impacts),
+            )
+
+    def _batch_gas(
+        self,
+        observation: PolicyObservation,
+        action_gas_units: int,
+    ) -> tuple[int, Decimal | None]:
+        """Estimate one batch's gas units and US-dollar cost.
+
+        Args:
+            observation: The current injected observation.
+            action_gas_units: Protocol-side gas estimate for the batch body.
+
+        Returns:
+            Total units including Safe proxy overhead, and the USD cost under
+            the documented ETH price assumption; the cost is None when the gas
+            price reading is unavailable.
+        """
+        total_units = action_gas_units + self._parameters.safe_overhead_gas_per_batch
+        if observation.gas_price_gwei is None:
+            # An unavailable reading leaves the cost unknown; safety exits still
+            # proceed because gap risk dominates an unknown gas cost.
+            return total_units, None
+        cost_usd = (
+            Decimal(total_units)
+            * observation.gas_price_gwei
+            / GWEI_PER_ETH
+            * self._parameters.eth_price_assumption_usd
+        )
+        return total_units, cost_usd
+
+    def _gas_gate_blocks(
+        self,
+        observation: PolicyObservation,
+        action_gas_units: int,
+        position_value_usd: Decimal,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Evaluate the gas sense-check gate for one non-urgent action.
+
+        Args:
+            observation: The current injected observation.
+            action_gas_units: Protocol-side gas estimate for the batch body.
+            position_value_usd: Position value whose expected daily gross yield
+                anchors the cost comparison.
+
+        Returns:
+            True with deferral evidence when the action must wait, else False
+            with empty diagnostics.
+        """
+        gas_price = observation.gas_price_gwei
+        if gas_price is None:
+            # Fail closed: an unreadable gas price defers non-urgent actions.
+            return True, (
+                "Base gas price reading is unavailable; deferring the non-urgent "
+                "action fail-closed.",
+            )
+        if gas_price > self._parameters.gas_price_ceiling_gwei:
+            return True, (
+                f"L2 gas price {gas_price} gwei exceeds the "
+                f"{self._parameters.gas_price_ceiling_gwei} gwei ceiling.",
+            )
+        total_units = action_gas_units + self._parameters.safe_overhead_gas_per_batch
+        cost_usd = (
+            Decimal(total_units)
+            * gas_price
+            / GWEI_PER_ETH
+            * self._parameters.eth_price_assumption_usd
+        )
+        # Expected daily gross yield credits raw emissions plus fees on top.
+        expected_daily_gross_yield = (
+            position_value_usd * (observation.emissions_apr + observation.fee_apr) / DAYS_PER_YEAR
+        )
+        if cost_usd > self._parameters.gas_cost_max_gross_yield_fraction * (
+            expected_daily_gross_yield
+        ):
+            return True, (
+                f"Estimated batch cost {cost_usd} USDC exceeds "
+                f"{self._parameters.gas_cost_max_gross_yield_fraction} of the expected "
+                f"daily gross yield {expected_daily_gross_yield} USDC.",
+            )
+        return False, ()
+
+    def _gas_diagnostics(
+        self,
+        gas_units: int,
+        gas_cost_usd: Decimal | None,
+    ) -> tuple[str, ...]:
+        """Describe one batch's gas evidence for a decision's diagnostics.
+
+        Args:
+            gas_units: Estimated total batch gas units.
+            gas_cost_usd: Estimated batch cost, or None when unknown.
+
+        Returns:
+            A one-line gas evidence tuple.
+        """
+        if gas_cost_usd is None:
+            return (f"Estimated batch gas {gas_units} units at an unavailable gas price.",)
+        return (
+            f"Estimated batch gas {gas_units} units at {gas_cost_usd} USDC under the "
+            f"{self._parameters.eth_price_assumption_usd} USDC-per-ETH assumption.",
+        )
+
+    def _reference_beyond_open_bound(self, observation: PolicyObservation) -> bool:
+        """Check the fail-closed defensive-exit staleness bound while open.
+
+        Args:
+            observation: The current injected observation.
+
+        Returns:
+            True when the reference is missing or older than the open-position
+            bound.
+        """
+        if observation.reference_price_usdc is None or observation.reference_age_seconds is None:
+            return True
+        return observation.reference_age_seconds > (
+            self._parameters.reference_open_position_max_age_seconds
         )
 
     def _decide_flat(
@@ -855,8 +1554,22 @@ class PolicyEngine:
                     "positive position size.",
                 ),
             )
+        # The gas sense-check gate defers non-urgent entries fail-closed.
+        deferred, defer_diagnostics = self._gas_gate_blocks(
+            observation, self._parameters.enter_batch_gas_units, size_usd
+        )
+        if deferred:
+            return self._hold(hold_state, PolicyReason.GAS_GATE_DEFERRED, defer_diagnostics)
         # The entry range is built around the observed pool price.
         entry_range = self.build_aligned_range(observation.amm_price_usdc)
+        gas_units, gas_cost_usd = self._batch_gas(
+            observation, self._parameters.enter_batch_gas_units
+        )
+        # Minting at the range center needs roughly half the committed value in
+        # stock, so the entry swap buys that half with USDC.
+        swap_plan = self._swap_plan(
+            SwapDirection.BUY_STOCK, size_usd / Decimal(2), observation.pool_depth_usd
+        )
         position = PolicyPosition(
             pool_address=observation.pool_address,
             token_address=observation.token_address,
@@ -876,9 +1589,13 @@ class PolicyEngine:
                     f"Range {entry_range.lower_price}..{entry_range.upper_price} "
                     f"USDC per stock around pool price {observation.amm_price_usdc} "
                     f"aligned to tick spacing {self._parameters.tick_spacing}.",
-                ),
+                )
+                + self._gas_diagnostics(gas_units, gas_cost_usd),
                 price_range=entry_range,
                 size_usd=size_usd,
+                swap_plan=swap_plan,
+                estimated_gas_units=gas_units,
+                estimated_gas_cost_usd=gas_cost_usd,
             ),
             next_state=next_state,
         )

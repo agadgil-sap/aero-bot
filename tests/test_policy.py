@@ -1,6 +1,6 @@
 """Behavior tests for the pure emissions-farming policy decision engine."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -10,6 +10,7 @@ from aero_bot.policy import (
     NEW_YORK,
     AlignedPriceRange,
     EventCalendar,
+    HeldInventory,
     PolicyActionKind,
     PolicyEngine,
     PolicyObservation,
@@ -18,6 +19,9 @@ from aero_bot.policy import (
     PolicyReason,
     PolicyState,
     ScheduledEvent,
+    SwapDirection,
+    SwapPlan,
+    SwapTranche,
     evaluate_event_window,
     load_event_calendar,
     parse_event_calendar,
@@ -49,12 +53,16 @@ def base_observation(**overrides: object) -> PolicyObservation:
         "token_address": TOKEN_ADDRESS,
         "amm_price_usdc": Decimal("200"),
         "emissions_apr": Decimal("1.5"),
+        "fee_apr": Decimal("0.5"),
         "pool_depth_usd": Decimal("10000"),
         "equity_usd": Decimal("200"),
-        "reference_price_usdc": Decimal("200"),
         "reference_age_seconds": 10,
+        "gas_price_gwei": Decimal("0.002"),
     }
     values.update(overrides)
+    # The reference defaults to the AMM price so price-move tests observe a
+    # coherent market; dislocation tests override the reference explicitly.
+    values.setdefault("reference_price_usdc", values["amm_price_usdc"])
     return PolicyObservation.model_validate(values)
 
 
@@ -208,6 +216,19 @@ class TestLockedParameters:
         assert parameters.max_position_depth_fraction == Decimal("0.01")
         assert parameters.daily_loss_halt_fraction == Decimal("0.05")
         assert parameters.reference_max_age_seconds == 300
+        assert parameters.reference_open_position_max_age_seconds == 900
+        assert parameters.dislocation_threshold_fraction == Decimal("0.0015")
+        assert parameters.convergence_timeout.total_seconds() == 5 * 60
+        assert parameters.swap_impact_ceiling_fraction == Decimal("0.001")
+        assert parameters.swap_impact_tranche_fraction == Decimal("0.0005")
+        assert parameters.gas_price_ceiling_gwei == Decimal("0.5")
+        assert parameters.gas_cost_max_gross_yield_fraction == Decimal("0.05")
+        assert parameters.safe_overhead_gas_per_batch == 100_000
+        assert parameters.enter_batch_gas_units == 650_000
+        assert parameters.recenter_batch_gas_units == 550_000
+        assert parameters.exit_batch_gas_units == 350_000
+        assert parameters.inventory_sell_gas_units == 180_000
+        assert parameters.eth_price_assumption_usd == Decimal("3000")
 
     def test_out_of_range_fraction_parameters_are_rejected(self) -> None:
         """Fraction parameters outside their meaningful intervals fail closed."""
@@ -227,6 +248,22 @@ class TestLockedParameters:
             PolicyParameters(daily_loss_halt_fraction=Decimal("0"))
         with pytest.raises(ValidationError):
             PolicyParameters(daily_loss_halt_fraction=Decimal("1"))
+        with pytest.raises(ValidationError):
+            PolicyParameters(dislocation_threshold_fraction=Decimal("1.5"))
+        with pytest.raises(ValidationError):
+            PolicyParameters(swap_impact_tranche_fraction=Decimal("0.002"))
+        with pytest.raises(ValidationError):
+            PolicyParameters(swap_impact_ceiling_fraction=Decimal("1"))
+        with pytest.raises(ValidationError):
+            PolicyParameters(gas_price_ceiling_gwei=Decimal("0"))
+        with pytest.raises(ValidationError):
+            PolicyParameters(gas_cost_max_gross_yield_fraction=Decimal("1"))
+        with pytest.raises(ValidationError):
+            PolicyParameters(eth_price_assumption_usd=Decimal("0"))
+        with pytest.raises(ValidationError):
+            PolicyParameters(convergence_timeout=timedelta(0))
+        with pytest.raises(ValidationError):
+            PolicyParameters(reference_open_position_max_age_seconds=60)
 
 
 class TestRangeConstruction:
@@ -342,18 +379,45 @@ class TestPositionLifecycle:
         assert outcome.decision.reason is PolicyReason.OPEN_IN_RANGE
         assert outcome.next_state.position is not None
 
-    def test_reference_gate_applies_only_to_entries(self) -> None:
-        """While open, a missing reference does not by itself force an exit."""
+    def test_reference_bounds_while_open_ride_then_exit_defensively(self) -> None:
+        """While open, a merely-old reference rides but a missing or beyond-bound one exits."""
         engine, state = entered_session()
-        outcome = engine.decide(
+        older_than_entry_bound = engine.decide(
             state,
             base_observation(
                 observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                reference_age_seconds=400,
+            ),
+        )
+        assert older_than_entry_bound.decision.reason is PolicyReason.OPEN_IN_RANGE
+        at_open_bound = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                reference_age_seconds=900,
+            ),
+        )
+        assert at_open_bound.decision.reason is PolicyReason.OPEN_IN_RANGE
+        beyond_open_bound = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                reference_age_seconds=901,
+            ),
+        )
+        assert beyond_open_bound.decision.action is PolicyActionKind.DEFENSIVE_EXIT
+        assert beyond_open_bound.decision.reason is PolicyReason.REFERENCE_STALE_DEFENSIVE_EXIT
+        assert beyond_open_bound.next_state.position is None
+        assert beyond_open_bound.next_state.reentry_blocked_until is None
+        missing = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 2, tzinfo=NEW_YORK),
                 reference_price_usdc=None,
                 reference_age_seconds=None,
             ),
         )
-        assert outcome.decision.reason is PolicyReason.OPEN_IN_RANGE
+        assert missing.decision.action is PolicyActionKind.DEFENSIVE_EXIT
 
     def test_below_edge_above_stop_holds(self) -> None:
         """A price below the range edge but above the stop level holds for recovery."""
@@ -656,3 +720,498 @@ class TestEnginePurity:
             ),
         )
         assert recentred.decision.action is PolicyActionKind.RECENTER
+
+
+class TestGasSenseCheckGate:
+    """Gas sense-check deferral behavior for non-urgent actions."""
+
+    def test_entry_deferred_without_a_gas_price_reading(self) -> None:
+        """An unavailable gas price defers the entry fail-closed."""
+        outcome = PolicyEngine().decide(PolicyState(), base_observation(gas_price_gwei=None))
+        assert outcome.decision.action is PolicyActionKind.HOLD
+        assert outcome.decision.reason is PolicyReason.GAS_GATE_DEFERRED
+        assert "unavailable" in outcome.decision.diagnostics[0]
+
+    def test_entry_deferred_above_the_gas_price_ceiling(self) -> None:
+        """A gas price above 0.5 gwei defers the entry."""
+        outcome = PolicyEngine().decide(
+            PolicyState(), base_observation(gas_price_gwei=Decimal("0.6"))
+        )
+        assert outcome.decision.action is PolicyActionKind.HOLD
+        assert outcome.decision.reason is PolicyReason.GAS_GATE_DEFERRED
+        assert "ceiling" in outcome.decision.diagnostics[0]
+
+    def test_entry_deferred_when_batch_cost_exceeds_yield_share(self) -> None:
+        """A cheap-but-costly batch defers the entry against the yield bound."""
+        # At 0.005 gwei the 750k-unit entry batch costs 0.01125 USDC, above
+        # five percent of the 40-USDC position's 0.21918 expected daily yield.
+        outcome = PolicyEngine().decide(
+            PolicyState(), base_observation(gas_price_gwei=Decimal("0.005"))
+        )
+        assert outcome.decision.action is PolicyActionKind.HOLD
+        assert outcome.decision.reason is PolicyReason.GAS_GATE_DEFERRED
+        assert "gross yield" in outcome.decision.diagnostics[0]
+
+    def test_entry_at_exactly_the_gas_ceiling_passes_with_real_yield(self) -> None:
+        """A large position's yield absorbs the ceiling-bound gas cost."""
+        outcome = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(
+                gas_price_gwei=Decimal("0.5"),
+                equity_usd=Decimal("1000000"),
+                pool_depth_usd=Decimal("100000000"),
+            ),
+        )
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        assert outcome.decision.size_usd == Decimal("200000")
+
+    def test_recenter_deferred_by_gas_then_fires_on_a_cheap_observation(self) -> None:
+        """A gas spike defers the elapsed recenter without resetting its wait."""
+        engine, state = entered_session()
+        upper = entered_position_for(state).price_range.upper_price
+        above_price = upper * Decimal("1.01")
+        waiting = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+            ),
+        )
+        assert waiting.decision.reason is PolicyReason.OPEN_ABOVE_RANGE_WAITING
+        deferred = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 21, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+                gas_price_gwei=Decimal("0.5"),
+            ),
+        )
+        assert deferred.decision.action is PolicyActionKind.HOLD
+        assert deferred.decision.reason is PolicyReason.GAS_GATE_DEFERRED
+        position = deferred.next_state.position
+        assert position is not None
+        assert position.out_of_range_since == datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK)
+        recentred = engine.decide(
+            deferred.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 22, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+            ),
+        )
+        assert recentred.decision.action is PolicyActionKind.RECENTER
+
+    def test_safety_exits_are_never_deferred_by_gas(self) -> None:
+        """A downside stop fires at an absurd gas price with its cost attached."""
+        engine, state = entered_session()
+        stopped = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=stop_level_for(state),
+                gas_price_gwei=Decimal("50"),
+            ),
+        )
+        assert stopped.decision.action is PolicyActionKind.STOP_OUT
+        assert stopped.decision.estimated_gas_units == 450_000
+        assert stopped.decision.estimated_gas_cost_usd == Decimal("67.5")
+
+    def test_safety_exit_without_a_gas_reading_reports_an_unknown_cost(self) -> None:
+        """A stop-out with no gas reading still exits with units and no cost."""
+        engine, state = entered_session()
+        stopped = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=stop_level_for(state),
+                gas_price_gwei=None,
+            ),
+        )
+        assert stopped.decision.action is PolicyActionKind.STOP_OUT
+        assert stopped.decision.estimated_gas_units == 450_000
+        assert stopped.decision.estimated_gas_cost_usd is None
+        assert "unavailable" in stopped.decision.diagnostics[-1]
+
+    def test_gas_estimate_uses_the_configurable_eth_assumption(self) -> None:
+        """Doubling the ETH price assumption doubles the modeled batch cost."""
+        engine = PolicyEngine(parameters=PolicyParameters(eth_price_assumption_usd=Decimal("6000")))
+        outcome = engine.decide(PolicyState(), base_observation())
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        assert outcome.decision.estimated_gas_units == 750_000
+        assert outcome.decision.estimated_gas_cost_usd == Decimal("0.009")
+
+
+class TestSwapExecutionModeling:
+    """Per-swap execution-quality modeling and tranche splitting."""
+
+    def test_entry_swap_buys_half_the_position_split_at_the_tranche_bound(self) -> None:
+        """The entry rebalance buys size over two and splits at 0.05 percent impact."""
+        outcome = PolicyEngine().decide(PolicyState(), base_observation())
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        plan = outcome.decision.swap_plan
+        assert plan is not None
+        assert plan.direction is SwapDirection.BUY_STOCK
+        assert plan.total_usd == Decimal("20")
+        # The 10k-depth pool allows a 5-USDC max tranche, so 20 USDC splits in four.
+        assert len(plan.tranches) == 4
+        assert all(tranche.usd_size == Decimal("5") for tranche in plan.tranches)
+        assert plan.max_modeled_impact_fraction == Decimal("0.0005")
+
+    def test_tranche_remainder_sums_exactly_to_the_plan_total(self) -> None:
+        """A non-terminating split floors every leading tranche to six decimals."""
+        # Depth 5800 gives a 2.9 max tranche, so the 20-USDC entry swap needs
+        # seven tranches and 20/7 floors to 2.857142 with the last absorbing.
+        outcome = PolicyEngine().decide(
+            PolicyState(), base_observation(pool_depth_usd=Decimal("5800"))
+        )
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        plan = outcome.decision.swap_plan
+        assert plan is not None
+        assert len(plan.tranches) == 7
+        assert plan.tranches[0].usd_size == Decimal("2.857142")
+        assert plan.tranches[-1].usd_size == Decimal("2.857148")
+        assert sum((tranche.usd_size for tranche in plan.tranches), Decimal(0)) == Decimal("20")
+        assert plan.max_modeled_impact_fraction is not None
+        assert plan.max_modeled_impact_fraction <= Decimal("0.0005")
+
+    def test_a_small_swap_against_deep_liquidity_is_one_tranche(self) -> None:
+        """A swap under the split bound stays whole with a tiny modeled impact."""
+        outcome = PolicyEngine().decide(
+            PolicyState(), base_observation(pool_depth_usd=Decimal("1000000"))
+        )
+        plan = outcome.decision.swap_plan
+        assert plan is not None
+        assert len(plan.tranches) == 1
+        assert plan.tranches[0].usd_size == Decimal("20")
+        assert plan.max_modeled_impact_fraction == Decimal("0.00002")
+
+    def test_recenter_swap_buys_half_the_committed_value_back(self) -> None:
+        """The above-range all-USDC position buys half its value back into stock."""
+        engine, state = entered_session()
+        upper = entered_position_for(state).price_range.upper_price
+        above_price = upper * Decimal("1.01")
+        waiting = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+            ),
+        )
+        recentred = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 21, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+            ),
+        )
+        assert recentred.decision.action is PolicyActionKind.RECENTER
+        plan = recentred.decision.swap_plan
+        assert plan is not None
+        assert plan.direction is SwapDirection.BUY_STOCK
+        assert plan.total_usd == Decimal("20")
+
+    def test_stop_out_sells_the_full_stock_inventory_below_range(self) -> None:
+        """Below the range the composition is all stock, swapped near committed value."""
+        engine, state = entered_session()
+        stopped = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=stop_level_for(state),
+            ),
+        )
+        assert stopped.decision.action is PolicyActionKind.STOP_OUT
+        plan = stopped.decision.swap_plan
+        assert plan is not None
+        assert plan.direction is SwapDirection.SELL_STOCK
+        assert Decimal("39") < plan.total_usd < Decimal("40")
+
+    def test_in_range_exit_sells_the_stock_half_of_the_position(self) -> None:
+        """A dilution exit in range only swaps the stock half of the composition."""
+        engine, state = entered_session()
+        diluted = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                emissions_apr=Decimal("1.49"),
+            ),
+        )
+        assert diluted.decision.action is PolicyActionKind.DILUTION_EXIT
+        plan = diluted.decision.swap_plan
+        assert plan is not None
+        assert plan.direction is SwapDirection.SELL_STOCK
+        assert Decimal("19") < plan.total_usd < Decimal("22")
+
+    def test_zero_depth_exit_models_one_unmodeled_tranche(self) -> None:
+        """A vanished depth still exits safely with the impact labeled unmodeled."""
+        engine, state = entered_session()
+        stopped = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=stop_level_for(state),
+                pool_depth_usd=Decimal("0"),
+            ),
+        )
+        assert stopped.decision.action is PolicyActionKind.STOP_OUT
+        plan = stopped.decision.swap_plan
+        assert plan is not None
+        assert len(plan.tranches) == 1
+        assert plan.tranches[0].modeled_impact_fraction is None
+        assert plan.max_modeled_impact_fraction is None
+
+    def test_swap_plan_rejects_mismatched_tranche_sums(self) -> None:
+        """A tranche list that does not sum to the plan total fails validation."""
+        with pytest.raises(ValidationError):
+            SwapPlan(
+                direction=SwapDirection.SELL_STOCK,
+                total_usd=Decimal("10"),
+                route_depth_usd=Decimal("10000"),
+                tranches=(
+                    SwapTranche(usd_size=Decimal("4"), modeled_impact_fraction=Decimal("0")),
+                ),
+                max_modeled_impact_fraction=Decimal("0"),
+            )
+        with pytest.raises(ValidationError):
+            SwapTranche(usd_size=Decimal("0"), modeled_impact_fraction=Decimal("0"))
+
+
+class TestDislocationMonitor:
+    """Underlying dislocation monitor and held-inventory lifecycle behavior."""
+
+    def test_stale_high_amm_exits_by_selling_on_the_pool(self) -> None:
+        """An AMM at least 0.15 percent above the reference sells immediately."""
+        engine, state = entered_session()
+        outcome = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("200.5"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        assert outcome.decision.action is PolicyActionKind.DISLOCATION_EXIT
+        assert outcome.decision.reason is PolicyReason.DISLOCATION_STALE_HIGH_TRIGGERED
+        assert outcome.next_state.position is None
+        assert outcome.next_state.held_inventory is None
+        assert outcome.next_state.reentry_blocked_until is None
+        plan = outcome.decision.swap_plan
+        assert plan is not None
+        assert plan.direction is SwapDirection.SELL_STOCK
+
+    def test_dislocation_boundaries_trigger_at_exactly_the_threshold(self) -> None:
+        """A deviation of exactly 0.15 percent in either direction fires."""
+        engine, state = entered_session()
+        at_upper_boundary = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("200.3"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        assert at_upper_boundary.decision.action is PolicyActionKind.DISLOCATION_EXIT
+        at_lower_boundary = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.7"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        assert at_lower_boundary.decision.action is PolicyActionKind.STALE_LOW_BURN
+        inside_band = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.8"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        assert inside_band.decision.reason is PolicyReason.OPEN_IN_RANGE
+
+    def test_stale_low_burn_holds_tokens_with_no_swap_and_no_cooldown(self) -> None:
+        """A stale-low AMM burns and carries the stock tokens out of the pool."""
+        engine, state = entered_session()
+        burned = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.6"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        assert burned.decision.action is PolicyActionKind.STALE_LOW_BURN
+        assert burned.decision.reason is PolicyReason.DISLOCATION_STALE_LOW_TRIGGERED
+        assert burned.decision.swap_plan is None
+        assert burned.next_state.position is None
+        assert burned.next_state.reentry_blocked_until is None
+        inventory = burned.next_state.held_inventory
+        assert inventory is not None
+        assert inventory.stock_quantity > 0
+        assert inventory.held_since == datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK)
+        assert inventory.token_address == TOKEN_ADDRESS
+
+    def test_stale_low_above_range_closes_flat_with_no_inventory(self) -> None:
+        """An all-USDC position burning stale-low simply ends flat."""
+        engine, state = entered_session()
+        upper = entered_position_for(state).price_range.upper_price
+        outcome = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=upper * Decimal("1.001"),
+                reference_price_usdc=Decimal("202"),
+            ),
+        )
+        assert outcome.decision.action is PolicyActionKind.STALE_LOW_BURN
+        assert outcome.next_state.position is None
+        assert outcome.next_state.held_inventory is None
+
+    def test_dislocation_precedence_beats_the_downside_stop(self) -> None:
+        """A dislocated reference overrides the AMM-anchored stop in both directions."""
+        engine, state = entered_session()
+        stop_price = stop_level_for(state)
+        stale_high = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=stop_price,
+                reference_price_usdc=stop_price * Decimal("0.998"),
+            ),
+        )
+        # The crash-anticipation case: the real market fell further than the AMM,
+        # so the position sells on the AMM while it still prices above reality.
+        assert stale_high.decision.action is PolicyActionKind.DISLOCATION_EXIT
+        stale_low = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=stop_price,
+                reference_price_usdc=stop_price * Decimal("1.002"),
+            ),
+        )
+        # The pool fell below the real market, so the stop's market sell would
+        # realize the wrong price; the burn holds the tokens instead.
+        assert stale_low.decision.action is PolicyActionKind.STALE_LOW_BURN
+
+    def test_convergence_sell_releases_held_tokens_without_cooldown(self) -> None:
+        """Held tokens sell once the AMM converges, and re-entry follows freely."""
+        engine, state = entered_session()
+        burned = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.6"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        converged = engine.decide(
+            burned.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 3, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.75"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        assert converged.decision.action is PolicyActionKind.SELL_INVENTORY
+        assert converged.decision.reason is PolicyReason.INVENTORY_CONVERGENCE_REACHED
+        assert converged.next_state.held_inventory is None
+        assert converged.next_state.reentry_blocked_until is None
+        plan = converged.decision.swap_plan
+        assert plan is not None
+        assert plan.direction is SwapDirection.SELL_STOCK
+        assert plan.total_usd > 0
+        reentered = engine.decide(
+            converged.next_state,
+            base_observation(observed_at=datetime(2026, 8, 19, 11, 4, tzinfo=NEW_YORK)),
+        )
+        assert reentered.decision.action is PolicyActionKind.ENTER
+
+    def test_convergence_timeout_sells_at_market_as_the_safety_bound(self) -> None:
+        """Tokens still held five minutes after the burn sell at market."""
+        engine, state = entered_session()
+        burned = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.6"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        at_timeout = engine.decide(
+            burned.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 6, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.6"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        assert at_timeout.decision.action is PolicyActionKind.SELL_INVENTORY
+        assert at_timeout.decision.reason is PolicyReason.INVENTORY_CONVERGENCE_TIMEOUT
+        assert at_timeout.next_state.held_inventory is None
+
+    def test_stale_reference_while_holding_waits_for_the_timeout(self) -> None:
+        """Without a fresh reference no convergence judgment is possible."""
+        engine, state = entered_session()
+        burned = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.6"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        still_holding = engine.decide(
+            burned.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 3, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.75"),
+                reference_price_usdc=Decimal("200"),
+                reference_age_seconds=400,
+            ),
+        )
+        assert still_holding.decision.action is PolicyActionKind.HOLD
+        assert still_holding.decision.reason is PolicyReason.HOLDING_INVENTORY_AWAITING_CONVERGENCE
+        timed_out = engine.decide(
+            still_holding.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 7, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.75"),
+                reference_price_usdc=Decimal("200"),
+                reference_age_seconds=400,
+            ),
+        )
+        assert timed_out.decision.action is PolicyActionKind.SELL_INVENTORY
+        assert timed_out.decision.reason is PolicyReason.INVENTORY_CONVERGENCE_TIMEOUT
+
+    def test_flat_window_while_holding_sells_the_inventory(self) -> None:
+        """A condition-driven flat event forces held tokens back into USDC."""
+        engine, state = entered_session()
+        burned = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.6"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        forced = engine.decide(
+            burned.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 2, tzinfo=NEW_YORK),
+                oracle_stale=True,
+            ),
+        )
+        assert forced.decision.action is PolicyActionKind.SELL_INVENTORY
+        assert forced.decision.reason is PolicyReason.INVENTORY_FLAT_WINDOW_SELL
+        assert forced.next_state.held_inventory is None
+
+    def test_naive_held_since_is_rejected(self) -> None:
+        """Held inventory with a naive timestamp fails closed at construction."""
+        with pytest.raises(ValidationError):
+            HeldInventory(
+                pool_address=POOL_ADDRESS,
+                token_address=TOKEN_ADDRESS,
+                stock_quantity=Decimal("0.15"),
+                held_since=datetime(2026, 8, 19, 11, 1),
+            )
