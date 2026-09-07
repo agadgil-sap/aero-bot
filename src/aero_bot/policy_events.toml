@@ -1,0 +1,14 @@
+# Bundled scheduled-event configuration for the emissions-farming policy engine.
+#
+# The file starts empty by design.
+# Add one [[event]] table per scheduled earnings or ex-dividend date.
+# Each event opens a flat window from 60 minutes before to 30 minutes after
+# the scheduled instant, in addition to the automatic US equity market open
+# (09:30) and close (16:00) America/New_York windows on weekday trading days.
+# Naive timestamps are interpreted as America/New_York local time.
+#
+# [[event]]
+# kind = "earnings"                   # or "ex_dividend"
+# scheduled_at = "2026-09-10T16:00:00"
+# token_address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # optional;
+#                                    # omit to apply the window to every pool

@@ -75,6 +75,8 @@ ignore = ["D104"]
 "tests/**/*.py" = ["S101", "S104"]
 # Risk fixtures use public contract addresses that security lint misclassifies as secrets.
 "tests/test_risk.py" = ["S105", "S106"]
+# Policy fixtures use public contract addresses that security lint misclassifies as secrets.
+"tests/test_policy.py" = ["S105", "S106"]
 
 [tool.ruff.lint.pydocstyle]
 # Google-style docstrings are readable in source and generated documentation.

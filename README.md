@@ -84,6 +84,12 @@ The deterministic risk engine models Aerodrome compensation additively.
 A staked in-range position earns swap fees and AERO emissions at the same time, so the engine adds retained fee APR to haircut emission APR before subtracting impermanent-loss and adverse-selection costs.
 The `/api/risk/evaluate` endpoint exposes complete hold or eligible evidence without enabling a transaction.
 
+## Emissions-farming policy engine
+
+The v1 policy engine is pure decision code: observations, the event calendar, and the locked parameters are injected, and every decision returns a typed immutable action plus the successor state.
+Entry requires the pool's raw AERO emissions APR of at least 150 percent per staked liquidity, positions span a tick-grid-aligned plus-or-minus 0.3 percent range, upside recenters wait 15 minutes out of range, the downside stop and emissions dilution exits burn and swap all inventory back to USDC with a 15-minute re-entry cooldown, event windows hold flat in USDC, and a 5 percent same-day equity loss halts new entries until the next day.
+See [the policy engine design](docs/policy-engine.md) for the complete locked parameters, decision precedence, and event-window sources.
+
 ## Immutable local audit storage
 
 The local persistence boundary uses a versioned SQLite database with append-only triggers, canonical model payloads, contiguous sequences, and a verifiable SHA-256 hash chain.
