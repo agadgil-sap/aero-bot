@@ -86,6 +86,13 @@ Because the underlying reference market cannot be reconstructed keylessly minute
 The ledger carries final equity, P&L, exposure time, accrued fees and emissions, total swap-impact and gas drag, per-action-kind counts cross-checked against the recorded action list, and every documented approximation as explicit assumption labels.
 The replay is pure: all economic inputs are injected, so the module performs no I/O and unit tests drive it entirely from synthetic paths.
 
+## Rehearsal command
+
+The `aero-bot-rehearse` command wires the discovery, reconstruction, and replay modules into one read-only run against Base and writes every per-pool P&L ledger into a single JSON report.
+It accepts a lookback window, the AERO and gas price assumptions, an optional pool filter, and the synthetic stress switch, and exits zero only when every selected pool produced a ledger.
+A pool whose reads fail is recorded as a fail-closed failure with its diagnostic while the remaining pools continue.
+See [the rehearsal command documentation](docs/rehearsal.md) for the full pipeline, runtime bounds, and every documented approximation.
+
 ## Wallet-free transaction planning
 
 The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.

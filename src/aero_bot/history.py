@@ -15,6 +15,7 @@ labeled constant-anchor APR instead of fabricating a series.
 """
 
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
@@ -84,6 +85,13 @@ DEFAULT_MAX_BLOCK_HEADER_LOOKUPS = 4_096
 MAX_TOTAL_SWAP_EVENTS = 50_000
 # A runaway guard bounds one gauge's decoded stake events the same way.
 MAX_TOTAL_GAUGE_STAKE_EVENTS = 50_000
+# Base's public endpoint serves at most ten JSON-RPC calls per batch request,
+# verified live; larger batches fail with error -32014 "maximum 10 calls in
+# 1 batch", so the batched header reader never exceeds this cap.
+MAX_HEADER_BATCH_SIZE = 10
+# keccak256("decimals()")[0:4], the ubiquitous standard ERC20 metadata
+# selector shared by every token in this protocol.
+ERC20_DECIMALS_SELECTOR = "0x313ce567"
 # AERO distributes 18-decimal rewards exactly like the rest of the protocol.
 AERO_DECIMALS = 18
 # A fixed 365-day year matches the policy engine's annualization convention.
@@ -839,6 +847,7 @@ class EventHistoryRpcBackend:
         log_window_blocks: int = DEFAULT_LOG_WINDOW_BLOCKS,
         max_logs_per_window: int = DEFAULT_MAX_LOGS_PER_WINDOW,
         max_block_header_lookups: int = DEFAULT_MAX_BLOCK_HEADER_LOOKUPS,
+        header_batch_size: int = 1,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -854,11 +863,14 @@ class EventHistoryRpcBackend:
             max_logs_per_window: Log count at which one window fails closed.
             max_block_header_lookups: Unique block headers one reconstruction
                 may fetch before failing closed.
+            header_batch_size: Block-header reads grouped into one JSON-RPC
+                batch request; one preserves the unbatched wire shape and the
+                public-endpoint cap bounds the maximum.
             transport: Optional injected HTTP transport for deterministic tests.
             sleep: Injected delay function used for backoff and politeness waits.
 
         Raises:
-            ValueError: If any bound is non-positive.
+            ValueError: If any bound is non-positive or out of its documented range.
         """
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -874,6 +886,8 @@ class EventHistoryRpcBackend:
             raise ValueError("max_logs_per_window must be positive")
         if max_block_header_lookups <= 0:
             raise ValueError("max_block_header_lookups must be positive")
+        if not 1 <= header_batch_size <= MAX_HEADER_BATCH_SIZE:
+            raise ValueError(f"header_batch_size must be between one and {MAX_HEADER_BATCH_SIZE}")
         self._rpc_url = rpc_url
         self._timeout_seconds = timeout_seconds
         self._max_attempts = max_attempts
@@ -882,9 +896,54 @@ class EventHistoryRpcBackend:
         self._log_window_blocks = log_window_blocks
         self._max_logs_per_window = max_logs_per_window
         self._max_block_header_lookups = max_block_header_lookups
+        self._header_batch_size = header_batch_size
         # An injected transport keeps unit tests completely off the network.
         self._transport = transport
         self._sleep = sleep
+
+    def read_erc20_decimals(self, token_address: str) -> int:
+        """Read one ERC20 token's decimal count through a read-only eth_call.
+
+        Neither the B20 registry nor the Sugar Lp struct records per-token
+        decimals, so the price conversion's decimal scales are read directly
+        from each token contract exactly once per token per run.
+
+        Args:
+            token_address: ERC20 contract whose decimals() is read.
+
+        Returns:
+            The token's decimal count.
+
+        Raises:
+            HistoryUnavailableError: If the call cannot complete with bounded
+                retries or the response is malformed.
+        """
+        normalized_token = normalize_evm_address(token_address)
+        with httpx.Client(
+            timeout=self._timeout_seconds,
+            transport=self._transport,
+            follow_redirects=False,
+            headers={"User-Agent": "aero-bot/0.1 read-only-token-metadata"},
+        ) as client:
+            result = self._rpc_call(
+                client,
+                "eth_call",
+                [{"to": normalized_token, "data": ERC20_DECIMALS_SELECTOR}, "latest"],
+            )
+        if not isinstance(result, str) or not result.startswith("0x"):
+            raise HistoryUnavailableError("decimals() call did not return a 0x-prefixed string")
+        try:
+            data_bytes = bytes.fromhex(result[2:])
+        except ValueError as error:
+            raise HistoryUnavailableError("decimals() call returned invalid hexadecimal") from error
+        if len(data_bytes) != WORD_BYTES:
+            raise HistoryUnavailableError("decimals() call must return exactly one ABI word")
+        decimals = int.from_bytes(data_bytes, "big")
+        if decimals > MAX_TOKEN_DECIMALS:
+            raise HistoryUnavailableError(
+                f"decimals() returned {decimals}, above the documented bound"
+            )
+        return decimals
 
     def fetch_price_path(
         self,
@@ -944,8 +1003,7 @@ class EventHistoryRpcBackend:
             # Every event block needs its header once; the cache deduplicates and
             # the cumulative lookup bound inside the reader fails closed.
             unique_blocks = {record.block_number for record in records}
-            for block_number in sorted(unique_blocks):
-                self._block_header(client, block_number, headers)
+            self._prefetch_block_headers(client, sorted(unique_blocks), headers)
             return build_price_path(
                 pool_address=normalized_pool,
                 token_address=token_address,
@@ -1053,8 +1111,7 @@ class EventHistoryRpcBackend:
             # Every event block needs its header once; the cache deduplicates and
             # the cumulative lookup bound inside the reader fails closed.
             unique_blocks = {record.block_number for record in records}
-            for block_number in sorted(unique_blocks):
-                self._block_header(client, block_number, headers)
+            self._prefetch_block_headers(client, sorted(unique_blocks), headers)
             # The opening step carries the window-start header timestamp.
             window_start_header = self._block_header(client, start_block, headers)
             try:
@@ -1169,6 +1226,158 @@ class EventHistoryRpcBackend:
         headers[block_number] = header
         return header
 
+    def _prefetch_block_headers(
+        self,
+        client: httpx.Client,
+        numbers: Sequence[int],
+        headers: dict[int, BlockHeader],
+    ) -> None:
+        """Fill the shared header cache for every missing block number.
+
+        A batch size above one groups the header reads into bounded JSON-RPC
+        batch requests, which keeps multi-week reconstructions feasible
+        against the public endpoint while every timestamp stays an exact
+        block-header read rather than an interpolation.
+
+        Args:
+            client: The bounded read-only HTTP client.
+            numbers: Block numbers requiring headers; duplicates are deduplicated.
+            headers: Cache shared across one reconstruction.
+
+        Raises:
+            HistoryUnavailableError: If the cumulative lookup bound would be
+                exceeded or any batch read fails or is malformed.
+        """
+        if self._header_batch_size == 1:
+            # The unbatched path preserves the one-request-per-header wire shape.
+            for block_number in numbers:
+                self._block_header(client, block_number, headers)
+            return
+        missing = [number for number in dict.fromkeys(numbers) if number not in headers]
+        if len(headers) + len(missing) > self._max_block_header_lookups:
+            raise HistoryUnavailableError(
+                f"Block header lookups exceeded the {self._max_block_header_lookups} bound."
+            )
+        for chunk_start in range(0, len(missing), self._header_batch_size):
+            chunk = missing[chunk_start : chunk_start + self._header_batch_size]
+            # One politeness delay separates batch requests on the shared RPC.
+            self._sleep(self._page_delay_seconds)
+            results = self._rpc_batch_call(
+                client,
+                [("eth_getBlockByNumber", [hex(block_number), False]) for block_number in chunk],
+            )
+            for block_number, result in zip(chunk, results, strict=True):
+                try:
+                    header = _block_header_from_result(result)
+                except ValueError as error:
+                    raise HistoryUnavailableError(
+                        f"Block {block_number} header was malformed: {error}"
+                    ) from error
+                if header.number != block_number:
+                    raise HistoryUnavailableError(
+                        f"Block header read for {block_number} returned block {header.number}"
+                    )
+                headers[block_number] = header
+
+    def _rpc_batch_call(
+        self,
+        client: httpx.Client,
+        requests: Sequence[tuple[str, list[object]]],
+    ) -> list[object]:
+        """Perform one JSON-RPC batch of read-only requests with retry and backoff.
+
+        Args:
+            client: The bounded read-only HTTP client.
+            requests: (method, params) pairs restricted to read-only calls.
+
+        Returns:
+            The successful JSON-RPC results aligned with the request order.
+
+        Raises:
+            HistoryUnavailableError: If the batch keeps failing after bounded
+                retries, is not answered by exactly one response per request
+                with matching ids, or reports a non-transient error.
+        """
+        payload = [
+            {"jsonrpc": "2.0", "id": index + 1, "method": method, "params": params}
+            for index, (method, params) in enumerate(requests)
+        ]
+        failure = "no attempt was made"
+        for attempt in range(self._max_attempts):
+            if attempt > 0:
+                # Exponential backoff absorbs public-endpoint rate limiting.
+                self._sleep(BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+            try:
+                response = client.post(self._rpc_url, json=payload)
+            except httpx.TransportError as error:
+                failure = f"transport error: {error}"
+                continue
+            if response.status_code == 429 or response.status_code >= 500:
+                failure = f"HTTP status {response.status_code}"
+                continue
+            response_size = len(response.content)
+            if response_size > self._max_response_bytes:
+                raise HistoryUnavailableError(
+                    f"RPC batch response contained {response_size} bytes, above the "
+                    "configured limit"
+                )
+            if response.status_code != 200:
+                raise HistoryUnavailableError(
+                    f"RPC batch request failed with unexpected HTTP status {response.status_code}"
+                )
+            try:
+                body = cast(object, response.json())
+            except ValueError as error:
+                raise HistoryUnavailableError("RPC batch response was not valid JSON") from error
+            if not isinstance(body, list) or len(body) != len(requests):
+                served = len(body) if isinstance(body, list) else "a non-list body"
+                # A non-list body is the endpoint's own batch rejection (for
+                # example the maximum-calls-per-batch error), which retrying
+                # cannot fix, so it fails closed immediately.
+                raise HistoryUnavailableError(
+                    f"RPC batch response held {served} entries for {len(requests)} requests."
+                )
+            entries_by_id: dict[int, dict[str, object]] = {}
+            for entry in body:
+                entry_id = entry.get("id") if isinstance(entry, dict) else None
+                if not isinstance(entry, dict) or not isinstance(entry_id, int):
+                    raise HistoryUnavailableError(
+                        "RPC batch response held an entry without an integer id"
+                    )
+                entries_by_id[entry_id] = entry
+            if set(entries_by_id) != set(range(1, len(requests) + 1)):
+                raise HistoryUnavailableError(
+                    "RPC batch response ids did not cover every request exactly once"
+                )
+            results: list[object] = []
+            retriable: str | None = None
+            for index, (method, _) in enumerate(requests):
+                entry = entries_by_id[index + 1]
+                if "result" in entry:
+                    results.append(entry["result"])
+                    continue
+                error_body = entry.get("error")
+                if not isinstance(error_body, dict):
+                    raise HistoryUnavailableError(
+                        f"RPC batch entry for {method} had neither result nor error"
+                    )
+                error_code = error_body.get("code")
+                error_message = str(error_body.get("message", ""))
+                # Base's public endpoint reports rate limiting as a retriable error.
+                if error_code == RATE_LIMIT_ERROR_CODE or "rate limit" in error_message.lower():
+                    retriable = f"rate-limited {method} entry: {error_message}"
+                    break
+                raise HistoryUnavailableError(
+                    f"RPC error {error_code} on batched {method}: {error_message}"
+                )
+            if retriable is not None:
+                failure = retriable
+                continue
+            return results
+        raise HistoryUnavailableError(
+            f"RPC batch failed after {self._max_attempts} attempts: {failure}"
+        )
+
     def _first_block_at_or_after(
         self,
         client: httpx.Client,
@@ -1256,7 +1465,14 @@ class EventHistoryRpcBackend:
         total_event_bound: int,
         label: str,
     ) -> tuple[LogRecordT, ...]:
-        """Page one contract's logs through bounded eth_getLogs windows.
+        """Page one contract's logs through bounded, refinable eth_getLogs windows.
+
+        The range first pages through consecutive windows of the configured
+        block span. A window whose answer reaches the log bound is presumed
+        truncated, because a capped answer is indistinguishable from a
+        complete one at that count, so the window splits in half until every
+        half answers below the bound; only a single-block window still at the
+        bound fails closed because no further split can rule truncation out.
 
         Args:
             client: The bounded read-only HTTP client.
@@ -1272,13 +1488,17 @@ class EventHistoryRpcBackend:
             Every decoded event ordered by block number then log index.
 
         Raises:
-            HistoryUnavailableError: If a window read fails, hits its log
-                bound, or returns malformed event data.
+            HistoryUnavailableError: If a window read fails, a single-block
+                window still reaches its log bound, or any decoded event data
+                is malformed.
         """
         records: list[LogRecordT] = []
-        window_start = start_block
-        while True:
-            window_end = min(window_start + self._log_window_blocks - 1, end_block)
+        pending: deque[tuple[int, int]] = deque(
+            (window_start, min(window_start + self._log_window_blocks - 1, end_block))
+            for window_start in range(start_block, end_block + 1, self._log_window_blocks)
+        )
+        while pending:
+            window_start, window_end = pending.popleft()
             result = self._rpc_call(
                 client,
                 "eth_getLogs",
@@ -1294,35 +1514,41 @@ class EventHistoryRpcBackend:
             if not isinstance(result, list):
                 raise HistoryUnavailableError("eth_getLogs result was not a list")
             if len(result) >= self._max_logs_per_window:
-                raise HistoryUnavailableError(
-                    f"eth_getLogs window {window_start}..{window_end} returned "
-                    f"{len(result)} logs at or above the "
-                    f"{self._max_logs_per_window} window bound."
-                )
-            for log in result:
-                try:
-                    record = decode_one(log)
-                except ValueError as error:
+                if window_end > window_start:
+                    # A busy window splits in half rather than trusting an
+                    # answer that may have been capped by the endpoint.
+                    middle = (window_start + window_end) // 2
+                    pending.appendleft((middle + 1, window_end))
+                    pending.appendleft((window_start, middle))
+                else:
                     raise HistoryUnavailableError(
-                        f"eth_getLogs window {window_start}..{window_end} held a "
-                        f"malformed {label} log: {error}"
-                    ) from error
-                # The response address must match the requested contract filter.
-                if isinstance(log, dict) and str(log.get("address", "")).lower() != address:
-                    raise HistoryUnavailableError(
-                        f"eth_getLogs window {window_start}..{window_end} returned a "
-                        "log from another contract."
+                        f"eth_getLogs single-block window {window_start} returned "
+                        f"{len(result)} logs at or above the "
+                        f"{self._max_logs_per_window} window bound."
                     )
-                records.append(record)
-            if len(records) > total_event_bound:
-                raise HistoryUnavailableError(
-                    f"Contract {address} exceeded {total_event_bound} decoded {label} events."
-                )
-            if window_end >= end_block:
-                break
-            window_start = window_end + 1
-            # A politeness delay separates window reads on the shared RPC.
-            self._sleep(self._page_delay_seconds)
+            else:
+                for log in result:
+                    try:
+                        record = decode_one(log)
+                    except ValueError as error:
+                        raise HistoryUnavailableError(
+                            f"eth_getLogs window {window_start}..{window_end} held a "
+                            f"malformed {label} log: {error}"
+                        ) from error
+                    # The response address must match the requested contract filter.
+                    if isinstance(log, dict) and str(log.get("address", "")).lower() != address:
+                        raise HistoryUnavailableError(
+                            f"eth_getLogs window {window_start}..{window_end} returned a "
+                            "log from another contract."
+                        )
+                    records.append(record)
+                if len(records) > total_event_bound:
+                    raise HistoryUnavailableError(
+                        f"Contract {address} exceeded {total_event_bound} decoded {label} events."
+                    )
+            if pending:
+                # A politeness delay separates window reads on the shared RPC.
+                self._sleep(self._page_delay_seconds)
         return tuple(sorted(records, key=lambda item: (item.block_number, item.log_index)))
 
     def _rpc_call(self, client: httpx.Client, method: str, params: list[object]) -> object:

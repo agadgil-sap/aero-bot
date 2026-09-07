@@ -422,6 +422,7 @@ class LpSugarRpcBackend:
         return PoolDiscoveryBatch(
             source=f"lp-sugar:{self._sugar_address}@block:{block_number}",
             observed_at=datetime.now(UTC),
+            snapshot_block=block_number,
             candidates=candidates,
             enumerated_pool_count=len(records),
         )

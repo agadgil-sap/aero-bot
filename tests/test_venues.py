@@ -61,6 +61,7 @@ class FixtureBackend:
         return PoolDiscoveryBatch(
             source="fixture:block-123",
             observed_at=datetime(2026, 9, 6, 10, 30, tzinfo=UTC),
+            snapshot_block=123,
             candidates=self._candidates,
             enumerated_pool_count=22_674,
         )
@@ -147,6 +148,8 @@ def test_adapter_accepts_validated_official_pair() -> None:
     assert result.status is PoolDiscoveryStatus.VERIFIED
     assert result.pools == (valid_candidate(),)
     assert result.observed_at == datetime(2026, 9, 6, 10, 30, tzinfo=UTC)
+    # The snapshot block survives validation so downstream anchors stay pinned.
+    assert result.snapshot_block == 123
     assert len(backend.calls) == 1
     assert backend.calls[0][0] == frozenset({B20_ADDRESS})
     assert backend.calls[0][1] == BASE_USDC_ADDRESS.lower()

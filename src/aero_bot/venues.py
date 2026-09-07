@@ -184,7 +184,9 @@ class PoolDiscoveryBatch(BaseModel):
     source: str
     # Observed time records when the backend completed its reads.
     observed_at: datetime
-    # Candidates remain untrusted until the Aerodrome adapter validates them.
+    # The block every page of the batch was pinned to, anchoring the snapshot.
+    snapshot_block: Annotated[int, Field(ge=0)]
+    # Candidates remain untrusted until the Aerodrome venue adapter validates them.
     candidates: tuple[PoolCandidate, ...]
     # Enumerated count records the complete inventory size before pair scoping.
     enumerated_pool_count: Annotated[int, Field(ge=0)]
@@ -204,6 +206,8 @@ class PoolDiscoveryResult(BaseModel):
     source: str
     # Observed time is absent when no onchain observation occurred.
     observed_at: datetime | None
+    # The block the backend snapshot was pinned to; absent without an observation.
+    snapshot_block: Annotated[int, Field(ge=0)] | None = None
     # Pools are empty unless the entire discovery batch passes validation.
     pools: tuple[PoolCandidate, ...]
     # Diagnostics provide ordered evidence for acceptance, rejection, or unavailability.
@@ -451,6 +455,7 @@ class AerodromeVenueAdapter:
                 status=PoolDiscoveryStatus.REJECTED,
                 source=batch.source,
                 observed_at=batch.observed_at,
+                snapshot_block=batch.snapshot_block,
                 pools=(),
                 diagnostics=tuple(integrity_diagnostics),
             )
@@ -465,6 +470,7 @@ class AerodromeVenueAdapter:
             status=PoolDiscoveryStatus.VERIFIED,
             source=batch.source,
             observed_at=batch.observed_at,
+            snapshot_block=batch.snapshot_block,
             pools=tuple(accepted_pools),
             diagnostics=(summary, *exclusion_diagnostics),
         )

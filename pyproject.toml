@@ -35,6 +35,8 @@ dev = [
 [project.scripts]
 # The local command starts the loopback-only ASGI server.
 aero-bot = "aero_bot.__main__:main"
+# The rehearsal command replays the policy over reconstructed onchain history.
+aero-bot-rehearse = "aero_bot.rehearse:main"
 
 [tool.hatch.build.targets.wheel]
 # The wheel contains only the application package under the src layout.

@@ -12,10 +12,12 @@ import pytest
 from pydantic import ValidationError
 
 from aero_bot.history import (
+    ERC20_DECIMALS_SELECTOR,
     GAUGE_DEPOSIT_TOPIC0,
     GAUGE_STAKE_TOPIC_COUNT,
     GAUGE_STAKE_TOPICS_LAYOUT,
     GAUGE_WITHDRAW_TOPIC0,
+    MAX_HEADER_BATCH_SIZE,
     REHEARSAL_LOOKBACK,
     SWAP_DATA_LAYOUT,
     SWAP_EVENT_TOPIC0,
@@ -170,6 +172,10 @@ class FixtureRpcTransport(httpx.MockTransport):
         latest_block: int = FIXTURE_LATEST_BLOCK,
         result_overrides: dict[str, object] | None = None,
         failure_mode: str | None = None,
+        erc20_decimals: dict[str, str] | None = None,
+        batch_result_override: object | None = None,
+        batch_entry_failures_before_success: int = 0,
+        batch_failure_mode: str | None = None,
     ) -> None:
         """Configure the fixture endpoint with optional transient failures.
 
@@ -182,15 +188,30 @@ class FixtureRpcTransport(httpx.MockTransport):
             failure_mode: Optional transport-level failure served on every call,
                 one of transport_error, http_429, http_500, http_404, not_json,
                 empty_body, or fatal_rpc_error.
+            erc20_decimals: Raw decimals() result words by token address;
+                unmapped tokens are served malformed evidence.
+            batch_result_override: Raw body served verbatim for every JSON-RPC
+                batch request, used to exercise batch response handling.
+            batch_entry_failures_before_success: Rate-limited first entries
+                served on batch responses before clean success.
+            batch_failure_mode: Optional transport-level failure served only on
+                batch requests, one of transport_error, http_429, http_500,
+                http_404, not_json, or oversized.
         """
-        # Request counting lets tests assert dedup and retry behavior exactly.
-        self.calls: list[dict[str, Any]] = []
+        # Request counting lets tests assert dedup and retry behavior exactly;
+        # batch payloads are lists of the same single-request shapes.
+        self.calls: list[dict[str, Any] | list[dict[str, Any]]] = []
+        self.batch_calls: list[list[dict[str, Any]]] = []
         self.header_calls_by_block: dict[int, int] = {}
         self._logs = logs or []
         self._remaining_failures = failures_before_success
         self._latest_block = latest_block
         self._result_overrides = result_overrides or {}
         self._failure_mode = failure_mode
+        self._erc20_decimals = erc20_decimals or {}
+        self._batch_result_override = batch_result_override
+        self._batch_entry_failures = batch_entry_failures_before_success
+        self._batch_failure_mode = batch_failure_mode
         super().__init__(self._handle)
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
@@ -230,18 +251,63 @@ class FixtureRpcTransport(httpx.MockTransport):
                     "error": {"code": -32016, "message": "over rate limit"},
                 },
             )
-        method = payload["method"]
+        if isinstance(payload, list):
+            return self._handle_batch(payload)
+        return self._result(self._serve_result(payload["method"], payload["params"]))
+
+    def _handle_batch(self, entries: list[dict[str, Any]]) -> httpx.Response:
+        """Serve one JSON-RPC batch by dispatching each entry in place."""
+        self.batch_calls.append(entries)
+        if self._batch_failure_mode == "transport_error":
+            raise httpx.ConnectError("fixture transport refused the connection")
+        if self._batch_failure_mode == "http_429":
+            return httpx.Response(429, json={})
+        if self._batch_failure_mode == "http_500":
+            return httpx.Response(500, json={})
+        if self._batch_failure_mode == "http_404":
+            return httpx.Response(404, json={})
+        if self._batch_failure_mode == "not_json":
+            return httpx.Response(200, content=b"<html>not json</html>")
+        if self._batch_failure_mode == "oversized":
+            return httpx.Response(200, content=b"x" * 4096)
+        if self._batch_result_override is not None:
+            return httpx.Response(200, json=self._batch_result_override)
+        responses: list[dict[str, Any]] = [
+            {
+                "jsonrpc": "2.0",
+                "id": entry["id"],
+                "result": self._serve_result(entry["method"], entry["params"]),
+            }
+            for entry in entries
+        ]
+        if self._batch_entry_failures > 0:
+            self._batch_entry_failures -= 1
+            # One rate-limited entry forces the whole batch to be retried.
+            responses[0] = {
+                "jsonrpc": "2.0",
+                "id": entries[0]["id"],
+                "error": {"code": -32016, "message": "over rate limit"},
+            }
+        return httpx.Response(200, json=responses)
+
+    def _serve_result(self, method: str, params: object) -> object:
+        """Dispatch one read-only method against the fixture evidence."""
         if method in self._result_overrides:
-            return self._result(self._result_overrides[method])
+            return self._result_overrides[method]
         if method == "eth_blockNumber":
-            return self._result(hex(self._latest_block))
+            return hex(self._latest_block)
         if method == "eth_getBlockByNumber":
-            return self._handle_block_header(payload["params"][0])
+            assert isinstance(params, list)
+            return self._block_header_result(params[0])
         if method == "eth_getLogs":
-            return self._handle_logs(payload["params"][0])
+            assert isinstance(params, list)
+            return self._logs_result(params[0])
+        if method == "eth_call":
+            assert isinstance(params, list)
+            return self._call_result(params[0])
         raise AssertionError(f"unexpected RPC method {method}")
 
-    def _handle_block_header(self, block_hex: str) -> httpx.Response:
+    def _block_header_result(self, block_hex: str) -> dict[str, str]:
         """Serve one block header under the fixture cadence."""
         block_number = int(block_hex, 16)
         self.header_calls_by_block[block_number] = (
@@ -250,25 +316,40 @@ class FixtureRpcTransport(httpx.MockTransport):
         # Enormous probe positions clamp to the cadence range so synthetic
         # search spaces stay representable as timestamps.
         cadence_block = min(block_number, FIXTURE_LATEST_BLOCK)
-        return self._result(
-            {
-                "number": hex(block_number),
-                "timestamp": hex(int(fixture_block_timestamp(cadence_block).timestamp())),
-            }
-        )
+        return {
+            "number": hex(block_number),
+            "timestamp": hex(int(fixture_block_timestamp(cadence_block).timestamp())),
+        }
 
-    def _handle_logs(self, query: dict[str, Any]) -> httpx.Response:
+    def _logs_result(self, query: dict[str, Any]) -> list[dict[str, Any]]:
         """Serve the fixture logs inside one queried block window."""
         from_block = int(query["fromBlock"], 16)
         to_block = int(query["toBlock"], 16)
-        matching = [
-            log for log in self._logs if from_block <= int(log["blockNumber"], 16) <= to_block
-        ]
-        return self._result(matching)
+        return [log for log in self._logs if from_block <= int(log["blockNumber"], 16) <= to_block]
+
+    def _call_result(self, call: object) -> str:
+        """Serve one eth_call as the configured ERC20 decimals read."""
+        assert isinstance(call, dict)
+        decimals_word = self._erc20_decimals.get(str(call.get("to", "")).lower())
+        if decimals_word is None:
+            # An unmapped token is served malformed evidence for fail-closed tests.
+            return "0x"
+        return decimals_word
 
     def _result(self, result: object) -> httpx.Response:
         """Wrap one value as a successful JSON-RPC response."""
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    def single_calls(self, method: str) -> list[dict[str, Any]]:
+        """Return every unbatched request carrying one method name.
+
+        Args:
+            method: JSON-RPC method name the requests must carry.
+
+        Returns:
+            The recorded single-request payloads for that method.
+        """
+        return [call for call in self.calls if isinstance(call, dict) and call["method"] == method]
 
 
 def no_sleep(_seconds: float) -> None:
@@ -552,19 +633,44 @@ def test_fetch_price_path_retries_rate_limited_reads() -> None:
     path = fetch_path(fixture_backend(transport))
 
     assert path.points == ()
-    block_number_calls = [call for call in transport.calls if call["method"] == "eth_blockNumber"]
-    assert len(block_number_calls) == 3
+    assert len(transport.single_calls("eth_blockNumber")) == 3
 
 
 def test_fetch_price_path_fails_closed_at_window_log_bound() -> None:
-    """A window returning at least the configured log bound fails closed."""
-    transport = FixtureRpcTransport(logs=[swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96)])
+    """A single block at the log bound fails closed because no split can rule truncation out."""
+    transport = FixtureRpcTransport(logs=[swap_log(996, 0, 1 << 96), swap_log(996, 1, 1 << 96)])
     fixture = EventHistoryRpcBackend(
         transport=transport, sleep=no_sleep, page_delay_seconds=0.0, max_logs_per_window=2
     )
 
-    with pytest.raises(HistoryUnavailableError, match="window bound"):
+    with pytest.raises(HistoryUnavailableError, match="single-block window 996"):
         fetch_path(fixture)
+
+
+def test_fetch_price_path_refines_busy_windows_instead_of_dropping_them() -> None:
+    """Windows at the log bound split in half until every half answers below it."""
+    transport = FixtureRpcTransport(
+        logs=[
+            swap_log(995, 0, 1 << 95),
+            swap_log(998, 0, 1 << 96),
+            swap_log(999, 0, 1 << 97),
+        ]
+    )
+    fixture = EventHistoryRpcBackend(
+        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, max_logs_per_window=2
+    )
+
+    path = fetch_path(fixture)
+
+    # Every swap survives refinement, ordered exactly as mined.
+    assert [point.block_number for point in path.points] == [995, 998, 999]
+    # The initial window reached the bound, so the run split it into halves.
+    queries = [
+        (int(call["params"][0]["fromBlock"], 16), int(call["params"][0]["toBlock"], 16))
+        for call in transport.single_calls("eth_getLogs")
+    ]
+    assert (995, 997) in queries
+    assert (998, 1000) in queries
 
 
 def test_fetch_price_path_fails_closed_on_malformed_logs() -> None:
@@ -779,8 +885,7 @@ def test_fetch_price_path_pages_across_multiple_windows() -> None:
 
     assert [point.block_number for point in path.points] == [996, 998]
     # The tiny two-block windows cover 995..1000 across three reads.
-    log_queries = [call for call in transport.calls if call["method"] == "eth_getLogs"]
-    assert len(log_queries) == 3
+    assert len(transport.single_calls("eth_getLogs")) == 3
 
 
 def test_fetch_price_path_fails_closed_on_transport_failures() -> None:
@@ -1176,7 +1281,7 @@ def test_fetch_emissions_apr_history_reconstructs_exact_steps() -> None:
     assert history.steps[1].timestamp == fixture_block_timestamp(996)
     assert history.steps[1].log_index == 3
     # The anchored fetch never reads the chain head.
-    assert all(call["method"] != "eth_blockNumber" for call in transport.calls)
+    assert not transport.single_calls("eth_blockNumber")
     # Every distinct block header was read exactly once across search and events.
     assert set(transport.header_calls_by_block.values()) == {1}
 
@@ -1209,14 +1314,29 @@ def test_fetch_emissions_apr_history_fails_closed_on_foreign_gauge_logs() -> Non
 
 
 def test_fetch_emissions_apr_history_fails_closed_at_window_log_bound() -> None:
-    """A window returning at least the configured log bound fails closed."""
-    transport = FixtureRpcTransport(logs=[gauge_log(996, 0, 100), gauge_log(997, 0, 100)])
+    """A single block at the log bound fails closed because no split can rule truncation out."""
+    transport = FixtureRpcTransport(logs=[gauge_log(996, 0, 100), gauge_log(996, 1, 100)])
     fixture = EventHistoryRpcBackend(
         transport=transport, sleep=no_sleep, page_delay_seconds=0.0, max_logs_per_window=2
     )
 
-    with pytest.raises(HistoryUnavailableError, match="window bound"):
+    with pytest.raises(HistoryUnavailableError, match="single-block window 996"):
         fetch_emissions(fixture)
+
+
+def test_fetch_emissions_apr_history_refines_busy_windows() -> None:
+    """Stake events spanning blocks survive a bounded window's refinement."""
+    transport = FixtureRpcTransport(
+        logs=[gauge_log(996, 0, 300, is_deposit=False), gauge_log(998, 0, 800, is_deposit=True)]
+    )
+    fixture = EventHistoryRpcBackend(
+        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, max_logs_per_window=2
+    )
+
+    history = fetch_emissions(fixture)
+
+    # Both stake events fold into the series exactly as mined.
+    assert [step.gauge_liquidity for step in history.steps] == [1_500, 1_200, 2_000]
 
 
 def test_fetch_emissions_apr_history_falls_back_on_contradictory_events() -> None:
@@ -1252,8 +1372,7 @@ def test_fetch_emissions_apr_history_pages_across_multiple_windows() -> None:
 
     assert [step.gauge_liquidity for step in history.steps] == [1_500, 1_200, 2_000]
     # The tiny two-block windows cover 995..1000 across three reads.
-    log_queries = [call for call in transport.calls if call["method"] == "eth_getLogs"]
-    assert len(log_queries) == 3
+    assert len(transport.single_calls("eth_getLogs")) == 3
 
 
 def test_fetch_emissions_apr_history_rejects_invalid_inputs() -> None:
@@ -1327,3 +1446,295 @@ def test_bundled_slipstream_gauge_abi_matches_decoder_layout() -> None:
         # Every parameter is indexed in the order the decoder expects.
         assert indexed == [(name, abi_type, True) for name, abi_type in GAUGE_STAKE_TOPICS_LAYOUT]
         assert len(indexed) + 1 == GAUGE_STAKE_TOPIC_COUNT
+
+
+def test_backend_rejects_out_of_range_header_batch_size() -> None:
+    """The header batch size must stay inside the public endpoint's cap."""
+    with pytest.raises(ValueError, match="header_batch_size"):
+        EventHistoryRpcBackend(header_batch_size=0)
+    with pytest.raises(ValueError, match="header_batch_size"):
+        EventHistoryRpcBackend(header_batch_size=MAX_HEADER_BATCH_SIZE + 1)
+
+
+def test_read_erc20_decimals_serves_one_exact_word() -> None:
+    """The decimals read targets the token with the standard selector."""
+    # B20 tokens carry eight decimals and native USDC carries six.
+    transport = FixtureRpcTransport(
+        erc20_decimals={
+            B20_ADDRESS: "0x" + encode_word(8).hex(),
+            QUOTE_ADDRESS: "0x" + encode_word(6).hex(),
+        }
+    )
+    backend = fixture_backend(transport)
+
+    assert backend.read_erc20_decimals(B20_ADDRESS) == 8
+    # A mixed-case spelling normalizes to the same token before the call.
+    assert backend.read_erc20_decimals("0xB20000000000000000000078EE7CE2FE4908108C") == 8
+    assert backend.read_erc20_decimals(QUOTE_ADDRESS) == 6
+    # Both calls send one read-only eth_call to the token contract.
+    for call in transport.calls:
+        assert isinstance(call, dict)
+        assert call["method"] == "eth_call"
+        assert call["params"][0]["data"] == ERC20_DECIMALS_SELECTOR
+        assert call["params"][1] == "latest"
+
+
+def test_read_erc20_decimals_fails_closed_on_malformed_evidence() -> None:
+    """Malformed, absent, and out-of-bound decimals answers never reach the math."""
+    # An unmapped token is served a non-word answer and a mapped one overflows.
+    transport = FixtureRpcTransport(erc20_decimals={B20_ADDRESS: "0x" + encode_word(2**40).hex()})
+    backend = fixture_backend(transport)
+
+    with pytest.raises(HistoryUnavailableError, match="exactly one ABI word"):
+        backend.read_erc20_decimals(QUOTE_ADDRESS)
+    with pytest.raises(HistoryUnavailableError, match="above the documented bound"):
+        backend.read_erc20_decimals(B20_ADDRESS)
+
+
+def test_batched_header_prefetch_groups_header_reads() -> None:
+    """Event-window headers are prefetched through bounded batch requests."""
+    logs = [swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96), swap_log(998, 0, 1 << 96)]
+    transport = FixtureRpcTransport(logs=logs)
+    backend = EventHistoryRpcBackend(
+        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, header_batch_size=2
+    )
+
+    path = fetch_path(backend)
+
+    assert [point.block_number for point in path.points] == [996, 997, 998]
+    # Every event block was served exactly once despite the grouped requests.
+    assert transport.header_calls_by_block[996] == 1
+    assert transport.header_calls_by_block[997] == 1
+    assert transport.header_calls_by_block[998] == 1
+    # Each batch carries at most the configured header reads.
+    assert transport.batch_calls
+    assert all(len(batch) <= 2 for batch in transport.batch_calls)
+    assert all(
+        entry["method"] == "eth_getBlockByNumber"
+        for batch in transport.batch_calls
+        for entry in batch
+    )
+
+
+def test_batched_prefetch_matches_the_unbatched_path() -> None:
+    """Batching changes only the wire shape, never the reconstructed evidence."""
+    logs = [
+        swap_log(995, 0, 1 << 96),
+        swap_log(996, 1, 1 << 96),
+        swap_log(998, 0, 1 << 96),
+    ]
+    unbatched = fetch_path(
+        EventHistoryRpcBackend(
+            transport=FixtureRpcTransport(logs=logs), sleep=no_sleep, page_delay_seconds=0.0
+        )
+    )
+    batched = fetch_path(
+        EventHistoryRpcBackend(
+            transport=FixtureRpcTransport(logs=logs),
+            sleep=no_sleep,
+            page_delay_seconds=0.0,
+            header_batch_size=MAX_HEADER_BATCH_SIZE,
+        )
+    )
+
+    assert batched.points == unbatched.points
+    assert batched.from_block == unbatched.from_block
+    assert batched.to_block == unbatched.to_block
+
+
+def test_batched_prefetch_retries_rate_limited_entries() -> None:
+    """One rate-limited batch entry retries the whole batch before failing."""
+    # Blocks 996, 998, and 999 are never binary-search probes, so all three
+    # arrive through the batched prefetch path.
+    logs = [swap_log(996, 0, 1 << 96), swap_log(998, 0, 1 << 96), swap_log(999, 0, 1 << 96)]
+    transport = FixtureRpcTransport(logs=logs, batch_entry_failures_before_success=1)
+    backend = EventHistoryRpcBackend(
+        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, header_batch_size=2
+    )
+
+    path = fetch_path(backend)
+
+    assert len(path.points) == 3
+    # The first batch was served one rate-limited entry and retried in full,
+    # then the remaining header completed the window.
+    assert len(transport.batch_calls) == 3
+    assert transport.batch_calls[0] == transport.batch_calls[1]
+
+
+def test_batched_prefetch_fails_closed_on_count_mismatch() -> None:
+    """A truncated batch response never reaches the header cache."""
+    logs = [swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96), swap_log(998, 0, 1 << 96)]
+    transport = FixtureRpcTransport(
+        logs=logs,
+        batch_result_override=[
+            {"jsonrpc": "2.0", "id": 1, "result": {"number": "0x3e4", "timestamp": "0x2"}}
+        ],
+    )
+    backend = EventHistoryRpcBackend(
+        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, header_batch_size=2
+    )
+
+    with pytest.raises(HistoryUnavailableError, match="held 1 entries for 2 requests"):
+        fetch_path(backend)
+
+
+def test_batched_prefetch_fails_closed_on_endpoint_batch_rejection() -> None:
+    """A non-list batch body is the endpoint's own rejection and fails closed."""
+    logs = [swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96), swap_log(998, 0, 1 << 96)]
+    transport = FixtureRpcTransport(
+        logs=logs,
+        batch_result_override={
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32014, "message": "maximum 10 calls in 1 batch"},
+        },
+    )
+    backend = EventHistoryRpcBackend(
+        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, header_batch_size=2
+    )
+
+    with pytest.raises(HistoryUnavailableError, match="a non-list body"):
+        fetch_path(backend)
+
+
+def test_batched_prefetch_fails_closed_on_id_substitution() -> None:
+    """Batch entries answering ids the run never sent are rejected."""
+    logs = [swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96), swap_log(998, 0, 1 << 96)]
+    transport = FixtureRpcTransport(
+        logs=logs,
+        batch_result_override=[
+            {"jsonrpc": "2.0", "id": 1, "result": {"number": "0x3e4", "timestamp": "0x2"}},
+            {"jsonrpc": "2.0", "id": 7, "result": {"number": "0x3e5", "timestamp": "0x2"}},
+        ],
+    )
+    backend = EventHistoryRpcBackend(
+        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, header_batch_size=2
+    )
+
+    with pytest.raises(HistoryUnavailableError, match="did not cover every request"):
+        fetch_path(backend)
+
+
+def test_batched_prefetch_fails_closed_on_mismatched_header_numbers() -> None:
+    """A batch entry answering a different block never reaches the cache."""
+    logs = [swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96), swap_log(998, 0, 1 << 96)]
+    transport = FixtureRpcTransport(
+        logs=logs,
+        batch_result_override=[
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"number": hex(996), "timestamp": hex(1_756_000_000)},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"number": hex(990), "timestamp": hex(1_756_000_000)},
+            },
+        ],
+    )
+    backend = EventHistoryRpcBackend(
+        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, header_batch_size=2
+    )
+
+    with pytest.raises(HistoryUnavailableError, match="returned block 990"):
+        fetch_path(backend)
+
+
+def test_batched_prefetch_fails_closed_after_exhausted_retries() -> None:
+    """Persistent entry rate limiting exhausts the bounded batch retries."""
+    logs = [swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96), swap_log(998, 0, 1 << 96)]
+    transport = FixtureRpcTransport(logs=logs, batch_entry_failures_before_success=99)
+    backend = EventHistoryRpcBackend(
+        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, header_batch_size=2
+    )
+
+    with pytest.raises(HistoryUnavailableError, match="failed after 5 attempts"):
+        fetch_path(backend)
+
+
+@pytest.mark.parametrize(
+    ("mode", "pattern"),
+    [
+        ("transport_error", "transport error"),
+        ("http_429", "failed after 5 attempts: HTTP status 429"),
+        ("http_500", "HTTP status 500"),
+        ("http_404", "unexpected HTTP status 404"),
+        ("not_json", "not valid JSON"),
+    ],
+)
+def test_batched_prefetch_fails_closed_on_transport_failures(mode: str, pattern: str) -> None:
+    """Transport-level batch failures fail the reconstruction closed."""
+    logs = [swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96), swap_log(998, 0, 1 << 96)]
+    transport = FixtureRpcTransport(logs=logs, batch_failure_mode=mode)
+    backend = EventHistoryRpcBackend(
+        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, header_batch_size=2
+    )
+
+    with pytest.raises(HistoryUnavailableError, match=pattern):
+        fetch_path(backend)
+
+
+def test_batched_prefetch_fails_closed_on_oversized_responses() -> None:
+    """A batch response above the configured byte bound fails closed."""
+    logs = [swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96), swap_log(998, 0, 1 << 96)]
+    transport = FixtureRpcTransport(logs=logs, batch_failure_mode="oversized")
+    backend = EventHistoryRpcBackend(
+        transport=transport,
+        sleep=no_sleep,
+        page_delay_seconds=0.0,
+        max_response_bytes=16,
+        header_batch_size=2,
+    )
+
+    with pytest.raises(HistoryUnavailableError, match="above the configured limit"):
+        fetch_path(backend)
+
+
+@pytest.mark.parametrize(
+    ("entries", "pattern"),
+    [
+        # A non-dict entry carries no integer id to match any request.
+        (["not-an-entry", {"jsonrpc": "2.0", "id": 2, "result": {}}], "integer id"),
+        # A string id echoes nothing the run sent as an integer.
+        (
+            [
+                {"jsonrpc": "2.0", "id": "1", "result": {}},
+                {"jsonrpc": "2.0", "id": 2, "result": {}},
+            ],
+            "integer id",
+        ),
+        # An entry with neither a result nor an error body is unusable.
+        (
+            [
+                {"jsonrpc": "2.0", "id": 1},
+                {"jsonrpc": "2.0", "id": 2, "result": {"number": hex(997), "timestamp": "0x1"}},
+            ],
+            "neither result nor error",
+        ),
+        # A non-rate-limit entry error fails immediately without retries.
+        (
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32601, "message": "method not found"},
+                },
+                {"jsonrpc": "2.0", "id": 2, "result": {"number": hex(997), "timestamp": "0x1"}},
+            ],
+            "RPC error -32601 on batched eth_getBlockByNumber",
+        ),
+    ],
+)
+def test_batched_prefetch_fails_closed_on_malformed_entries(
+    entries: list[object], pattern: str
+) -> None:
+    """Malformed batch entries never reach the header cache."""
+    logs = [swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96), swap_log(998, 0, 1 << 96)]
+    transport = FixtureRpcTransport(logs=logs, batch_result_override=entries)
+    backend = EventHistoryRpcBackend(
+        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, header_batch_size=2
+    )
+
+    with pytest.raises(HistoryUnavailableError, match=pattern):
+        fetch_path(backend)
