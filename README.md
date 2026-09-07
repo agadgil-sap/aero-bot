@@ -66,10 +66,16 @@ This secondary-source screen is not eligible for execution until onchain pool id
 
 ## Rehearsal history reconstruction
 
-The rehearsal harness reconstructs each accepted pool's exact historical price path from onchain evidence alone.
+The rehearsal harness reconstructs each accepted pool's exact historical price path and emissions-APR series from onchain evidence alone.
 Every Slipstream pool emits one `Swap` event per swap carrying the post-swap square-root price, so read-only `eth_getLogs` filtering by the event topic recovers the path without any keyed service.
 Block windows are located from timestamps through a bounded binary search over block headers, and every swap keeps its own block's exact header timestamp rather than an interpolated estimate.
 The reconstruction is read-only, bounded, and fail-closed: rate-limited reads retry with exponential backoff, oversized or truncated log windows abort, and malformed evidence never yields a price point.
+
+Each pool's emissions APR is reconstructed the same way from its CLGauge `Deposit` and `Withdraw` events.
+Staked liquidity is anchored at the block-pinned Sugar snapshot and walked backward through the window's net stake events, so historical dilution and concentration appear as mined whenever the stake events explain the anchor, and the reconstruction never reads the chain head.
+Staked positions can also change liquidity through the position manager while the gauge holds them, which stake events do not carry, so a fold that contradicts the anchor is never fabricated into a series: the fetch falls back to a window-long constant APR at the anchor's exact level, labeled `constant_anchor_apr` on the series itself.
+Three approximations are documented per series: the gauge's AERO reward rate is held constant across the window because Aerodrome resets it only at weekly epochs, staked value scales linearly with staked liquidity at the frozen per-unit anchor value because other LPs' range shapes are private, and the constant fallback holds the anchor level across the window when the event fold cannot close.
+The AERO price behind every APR is an explicit assumption carried on the series itself.
 
 ## Wallet-free transaction planning
 

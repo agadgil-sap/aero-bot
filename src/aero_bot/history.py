@@ -1,29 +1,42 @@
-"""Read-only onchain Swap-event price-path reconstruction for the rehearsal harness.
+"""Read-only onchain event-history reconstruction for the rehearsal harness.
 
+Two histories are reconstructed from raw logs without any keyed service:
 Slipstream pools emit one ``Swap`` event per swap carrying the post-swap
 ``sqrtPriceX96`` and ``tick``, so filtering a pool's logs by the event topic
-reconstructs its exact historical price path without any keyed service. Block
-ranges are located from timestamps through a bounded binary search over block
-headers, and every swap's timestamp comes from its own block header, keeping
-the reconstructed path exact rather than interpolated.
+reconstructs its exact historical price path, and Slipstream gauges emit
+``Deposit`` and ``Withdraw`` events whose indexed liquidity deltas fold into
+the emissions-APR series the dilution gate replays against. Block ranges are
+located from timestamps through a bounded binary search over block headers,
+and every event's timestamp comes from its own block header, keeping the
+reconstructed series exact rather than interpolated. Because staked positions
+can also change liquidity through the position manager while the gauge holds
+them, a stake-event fold that contradicts its anchor falls back to a clearly
+labeled constant-anchor APR instead of fabricating a series.
 """
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
-from typing import Annotated, Self, cast
+from typing import Annotated, Literal, Protocol, Self, TypeVar, cast
 
 import httpx
 from pydantic import BaseModel, Field, model_validator
 
-from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
+from aero_bot.domain import (
+    IMMUTABLE_MODEL_CONFIG,
+    EvmAddress,
+    NonNegativeDecimal,
+    normalize_evm_address,
+)
 from aero_bot.sugar import DEFAULT_BASE_RPC_URL
 
 # Aerodrome's official Slipstream repository publishes the concentrated-pool contracts.
 SLIPSTREAM_POOL_SOURCE_URL = "https://github.com/aerodrome-finance/slipstream"
 # The vendored Swap-event ABI fragment is bundled beside this module.
 SLIPSTREAM_POOL_ABI_RESOURCE = "slipstream_pool_abi.json"
+# The vendored CLGauge event ABI fragment is bundled beside this module.
+SLIPSTREAM_GAUGE_ABI_RESOURCE = "slipstream_gauge_abi.json"
 # The canonical v3-style Swap signature emitted by every Slipstream pool.
 SWAP_EVENT_SIGNATURE = "Swap(address,address,int256,int256,uint160,uint128,int24)"
 # keccak256(SWAP_EVENT_SIGNATURE), computed independently and verified against
@@ -39,6 +52,23 @@ SWAP_DATA_LAYOUT: tuple[tuple[str, str], ...] = (
 )
 # One Swap log carries topic0, the indexed sender, and the indexed recipient.
 SWAP_TOPIC_COUNT = 3
+# The canonical CLGauge staking events; every parameter is indexed, so each
+# log's data section is empty and the liquidity delta lives in the last topic.
+GAUGE_DEPOSIT_EVENT_SIGNATURE = "Deposit(address,uint256,uint128)"
+# keccak256(GAUGE_DEPOSIT_EVENT_SIGNATURE), computed independently and matched
+# against the live AAPLc/USDC gauge where it dominates every other topic.
+GAUGE_DEPOSIT_TOPIC0 = "0x1c8ab8c7f45390d58f58f1d655213a82cca5d12179761a87c16f098813b8f211"
+GAUGE_WITHDRAW_EVENT_SIGNATURE = "Withdraw(address,uint256,uint128)"
+# keccak256(GAUGE_WITHDRAW_EVENT_SIGNATURE), verified against the same gauge.
+GAUGE_WITHDRAW_TOPIC0 = "0x8903a5b5d08a841e7f68438387f1da20c84dea756379ed37e633ff3854b99b84"
+# topic0 plus the indexed user, token id, and liquidity fill all four slots.
+GAUGE_STAKE_TOPIC_COUNT = 4
+# The indexed topic layout mirrors the vendored gauge event fragments exactly.
+GAUGE_STAKE_TOPICS_LAYOUT: tuple[tuple[str, str], ...] = (
+    ("user", "address"),
+    ("tokenId", "uint256"),
+    ("liquidityToStake", "uint128"),
+)
 # The rehearsed history window is roughly the last three weeks.
 REHEARSAL_LOOKBACK = timedelta(days=21)
 # One eth_getLogs window spans at most this many blocks; public endpoints
@@ -52,6 +82,12 @@ DEFAULT_MAX_LOGS_PER_WINDOW = 1_000
 DEFAULT_MAX_BLOCK_HEADER_LOOKUPS = 4_096
 # A runaway guard bounds one pool's total decoded events like discovery pagination.
 MAX_TOTAL_SWAP_EVENTS = 50_000
+# A runaway guard bounds one gauge's decoded stake events the same way.
+MAX_TOTAL_GAUGE_STAKE_EVENTS = 50_000
+# AERO distributes 18-decimal rewards exactly like the rest of the protocol.
+AERO_DECIMALS = 18
+# A fixed 365-day year matches the policy engine's annualization convention.
+SECONDS_PER_YEAR = 365 * 24 * 60 * 60
 # The binary search over block timestamps cannot outwalk this many probes.
 MAX_BINARY_SEARCH_PROBES = 128
 # Twenty seconds bounds a failed request without blocking the rehearsal forever.
@@ -128,6 +164,23 @@ class PoolPricePoint(BaseModel):
         return self
 
 
+class GaugeStakeEventRecord(BaseModel):
+    """Represent one decoded CLGauge Deposit or Withdraw log before resolution."""
+
+    # Frozen strict fields preserve the exact onchain event after decoding.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The block the stake event was mined in locates the event on the chain.
+    block_number: Annotated[int, Field(ge=0)]
+    # The log index orders multiple stake events inside one block deterministically.
+    log_index: Annotated[int, Field(ge=0)]
+    # True for Deposit, which adds staked liquidity, and False for Withdraw.
+    is_deposit: bool
+    # The indexed liquidity delta; zero occurs when a withdraw follows an
+    # earlier decreaseStakedLiquidity that already removed everything.
+    liquidity: Annotated[int, Field(ge=0)]
+
+
 class PoolPricePath(BaseModel):
     """Collect one pool's reconstructed swap-driven price path with provenance."""
 
@@ -163,7 +216,92 @@ class PoolPricePath(BaseModel):
         return self
 
 
-class SwapHistoryUnavailableError(RuntimeError):
+class EmissionsAprPoint(BaseModel):
+    """Represent one step of a pool's reconstructed emissions-APR series."""
+
+    # Frozen strict fields keep each reconstructed step immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The instant this step's liquidity and APR took effect.
+    timestamp: datetime
+    # Onchain ordering evidence is absent only on the window-opening step.
+    block_number: Annotated[int, Field(ge=0)] | None = None
+    log_index: Annotated[int, Field(ge=0)] | None = None
+    # Gauge staked liquidity in effect from this instant onward.
+    gauge_liquidity: Annotated[int, Field(ge=0)]
+    # Raw AERO emissions APR per staked liquidity in Aerodrome's display
+    # convention, derived under this module's documented assumptions.
+    emissions_apr: NonNegativeDecimal
+
+    @model_validator(mode="after")
+    def require_complete_ordering_evidence(self) -> Self:
+        """Reject naive timestamps and half-present onchain ordering evidence."""
+        if self.timestamp.tzinfo is None:
+            raise ValueError("timestamp must be timezone-aware")
+        if (self.block_number is None) != (self.log_index is None):
+            raise ValueError("block_number and log_index must be present together")
+        return self
+
+
+class EmissionsAprHistory(BaseModel):
+    """Collect one pool's reconstructed emissions-APR series with provenance."""
+
+    # Frozen strict fields keep one reconstruction stable for a whole replay.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The Slipstream pool whose gauge emissions the series describes.
+    pool_address: EvmAddress
+    # The CLGauge whose Deposit and Withdraw events were reconstructed.
+    gauge_address: EvmAddress
+    # The first block included in the reconstruction window.
+    from_block: Annotated[int, Field(ge=0)]
+    # The last block included in the reconstruction window.
+    to_block: Annotated[int, Field(ge=0)]
+    # The Sugar snapshot block that reported the anchor state; it pins the
+    # window's end so the backward liquidity fold closes exactly.
+    anchor_block: Annotated[int, Field(ge=0)]
+    # The instant the reconstruction was performed, for ledger provenance.
+    observed_at: datetime
+    # Staked gauge liquidity at the anchor block, exactly as Sugar reported.
+    anchor_gauge_liquidity: Annotated[int, Field(gt=0)]
+    # Staked value in USDC at the anchor, valued under this module's convention.
+    anchor_staked_tvl_usd: Annotated[Decimal, Field(gt=0)]
+    # The gauge's raw AERO reward rate per second, held constant across the
+    # window because Aerodrome resets it only at weekly epochs.
+    emissions_per_second: Annotated[int, Field(ge=0)]
+    # The documented AERO price assumption behind every APR in this series.
+    aero_price_assumption_usd: Annotated[Decimal, Field(gt=0)]
+    # The reconstruction method behind this series: event_fold stake events
+    # closed on the anchor exactly, while constant_anchor_apr fell back to the
+    # documented anchor-level APR because the events contradicted the anchor
+    # (staked positions can also change liquidity through the position
+    # manager while the gauge holds them, which stake events do not carry).
+    reconstruction_mode: Literal["event_fold", "constant_anchor_apr"]
+    # Event-fold liquidity before the window's first stake event; under the
+    # constant fallback it equals the anchor because no level was derivable.
+    starting_gauge_liquidity: Annotated[int, Field(ge=0)]
+    # Steps ordered by time, opening with the window-start liquidity step.
+    steps: Annotated[tuple[EmissionsAprPoint, ...], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def require_ordered_window(self) -> Self:
+        """Reject inverted windows, a displaced anchor, or unordered steps."""
+        if self.from_block > self.to_block:
+            raise ValueError("from_block must not exceed to_block")
+        if not self.from_block <= self.anchor_block <= self.to_block:
+            raise ValueError("anchor_block must lie inside the window")
+        if self.observed_at.tzinfo is None:
+            raise ValueError("observed_at must be timezone-aware")
+        if self.reconstruction_mode == "constant_anchor_apr" and len(self.steps) != 1:
+            raise ValueError("the constant-anchor fallback must hold exactly one step")
+        timestamps = [step.timestamp for step in self.steps]
+        # The pairwise zip is intentionally one element shorter on the right.
+        if any(later < earlier for earlier, later in zip(timestamps, timestamps[1:], strict=False)):
+            raise ValueError("steps must be ordered by non-decreasing timestamp")
+        return self
+
+
+class HistoryUnavailableError(RuntimeError):
     """Signal that a read-only history reconstruction could not complete."""
 
 
@@ -213,6 +351,55 @@ def decode_swap_log(log: object) -> SwapEventRecord:
         sqrt_ratio=sqrt_ratio,
         liquidity=liquidity,
         tick=tick,
+    )
+
+
+def decode_gauge_stake_log(log: object) -> GaugeStakeEventRecord:
+    """Decode and validate one raw eth_getLogs entry as a CLGauge stake event.
+
+    Args:
+        log: One JSON-RPC log object with address, topics, data, and block fields.
+
+    Returns:
+        The immutable decoded event carrying its liquidity direction and delta.
+
+    Raises:
+        ValueError: If the log is not a well-formed non-removed Deposit or
+            Withdraw event.
+    """
+    if not isinstance(log, dict):
+        raise ValueError("Gauge stake log entry was not a JSON object")
+    if log.get("removed") is True:
+        # A reorged log is corrupt evidence for a historical reconstruction.
+        raise ValueError("Gauge stake log was removed by a reorg")
+    topics = log.get("topics")
+    if not isinstance(topics, list) or len(topics) != GAUGE_STAKE_TOPIC_COUNT:
+        raise ValueError("Gauge stake log must carry exactly four topics")
+    topic0 = topics[0]
+    if not isinstance(topic0, str):
+        raise ValueError("Gauge stake log topic0 was not a string")
+    normalized_topic0 = topic0.lower()
+    if normalized_topic0 == GAUGE_DEPOSIT_TOPIC0:
+        is_deposit = True
+    elif normalized_topic0 == GAUGE_WITHDRAW_TOPIC0:
+        is_deposit = False
+    else:
+        raise ValueError("Gauge stake log topic0 does not match a CLGauge stake event")
+    if log.get("data") != "0x":
+        # Every parameter is indexed, so any data word means a different event.
+        raise ValueError("Gauge stake log data must be empty because every parameter is indexed")
+    # The user and token-id topics are validated for well-formedness even though
+    # the liquidity fold needs only the final indexed liquidity delta.
+    _parse_hex_field(topics[1], "user topic")
+    _parse_hex_field(topics[2], "token id topic")
+    liquidity = _parse_hex_field(topics[3], "liquidity topic")
+    block_number = _parse_hex_field(log.get("blockNumber"), "blockNumber")
+    log_index = _parse_hex_field(log.get("logIndex"), "logIndex")
+    return GaugeStakeEventRecord(
+        block_number=block_number,
+        log_index=log_index,
+        is_deposit=is_deposit,
+        liquidity=liquidity,
     )
 
 
@@ -335,6 +522,218 @@ def build_price_path(
     )
 
 
+def staked_tvl_usd(
+    staked_usdc_raw: int,
+    usdc_decimals: int,
+    staked_stock_raw: int,
+    stock_decimals: int,
+    stock_price_usdc: Decimal,
+) -> Decimal:
+    """Value one pool's gauge-staked balances in USDC at the observed price.
+
+    The venue's own read layer reports both staked balances, so valuing them
+    at the pool's observed price anchors the emissions-APR convention.
+
+    Args:
+        staked_usdc_raw: Raw staked USDC token units from the Sugar record.
+        usdc_decimals: USDC token decimal count.
+        staked_stock_raw: Raw staked stock token units from the Sugar record.
+        stock_decimals: Stock token decimal count.
+        stock_price_usdc: Observed pool price in USDC per one stock token.
+
+    Returns:
+        The exact staked value in USDC.
+
+    Raises:
+        ValueError: If any decimal count is out of range or the price is not
+            positive.
+    """
+    if not 0 <= usdc_decimals <= MAX_TOKEN_DECIMALS:
+        raise ValueError("usdc_decimals is out of the documented range")
+    if not 0 <= stock_decimals <= MAX_TOKEN_DECIMALS:
+        raise ValueError("stock_decimals is out of the documented range")
+    if stock_price_usdc <= 0:
+        raise ValueError("stock_price_usdc must be positive")
+    with localcontext() as decimal_context:
+        # Local precision isolates deterministic valuation math from settings.
+        decimal_context.prec = MATH_PRECISION
+        staked_usdc = Decimal(staked_usdc_raw) / Decimal(10) ** usdc_decimals
+        staked_stock = Decimal(staked_stock_raw) / Decimal(10) ** stock_decimals
+        return +(staked_usdc + staked_stock * stock_price_usdc)
+
+
+def _emissions_apr(
+    gauge_liquidity: int,
+    anchor_gauge_liquidity: int,
+    anchor_staked_tvl_usd: Decimal,
+    emissions_per_second: int,
+    aero_price_assumption_usd: Decimal,
+) -> Decimal:
+    """Annualize one gauge's reward stream over its staked value.
+
+    Two documented approximations hold: the gauge's anchor reward rate is
+    constant across the window because Aerodrome resets it only at weekly
+    epochs, and staked value scales linearly with staked liquidity at the
+    frozen per-unit anchor value because other LPs' range shapes are private.
+
+    Args:
+        gauge_liquidity: Reconstructed staked liquidity for this step.
+        anchor_gauge_liquidity: Staked liquidity at the anchor block.
+        anchor_staked_tvl_usd: Staked value in USDC at the anchor block.
+        emissions_per_second: Raw AERO reward rate per second.
+        aero_price_assumption_usd: Documented AERO price assumption in USDC.
+
+    Returns:
+        The raw emissions APR as a decimal fraction in Aerodrome's display
+        convention (1.5 means 150 percent APR).
+
+    Raises:
+        ValueError: If the step's staked liquidity leaves the APR undefined.
+    """
+    if gauge_liquidity <= 0:
+        # With no staked liquidity sharing them, emissions are unbounded per
+        # unit and the APR has no meaningful value for the replay.
+        raise ValueError("emissions APR is undefined for a gauge with zero staked liquidity")
+    with localcontext() as decimal_context:
+        # Local precision isolates deterministic APR math from settings.
+        decimal_context.prec = MATH_PRECISION
+        # Annual reward value under the constant-rate assumption.
+        annual_reward_usd = (
+            Decimal(emissions_per_second)
+            * aero_price_assumption_usd
+            * Decimal(SECONDS_PER_YEAR)
+            / Decimal(10) ** AERO_DECIMALS
+        )
+        # Staked value scales linearly with liquidity at the frozen anchor value.
+        staked_tvl = (
+            anchor_staked_tvl_usd * Decimal(gauge_liquidity) / Decimal(anchor_gauge_liquidity)
+        )
+        return +(annual_reward_usd / staked_tvl)
+
+
+def build_emissions_apr_history(
+    pool_address: str,
+    gauge_address: str,
+    from_block: int,
+    to_block: int,
+    anchor_block: int,
+    observed_at: datetime,
+    window_start_timestamp: datetime,
+    anchor_gauge_liquidity: int,
+    anchor_staked_tvl_usd: Decimal,
+    emissions_per_second: int,
+    aero_price_assumption_usd: Decimal,
+    records: tuple[GaugeStakeEventRecord, ...],
+    timestamps_by_block: Mapping[int, datetime],
+) -> EmissionsAprHistory:
+    """Fold stake events backward from the anchor into an emissions-APR series.
+
+    The gauge's staked liquidity is anchored exactly at the Sugar snapshot
+    block and walked backward by the window's net stake events, so every
+    historical dilution and concentration appears exactly as mined. Each step
+    converts liquidity into the raw emissions APR under this module's two
+    documented approximations: the constant reward rate and the frozen
+    per-liquidity anchor value.
+
+    Args:
+        pool_address: Slipstream pool whose gauge the series describes.
+        gauge_address: CLGauge whose stake events were reconstructed.
+        from_block: First block of the reconstruction window.
+        to_block: Last block of the reconstruction window.
+        anchor_block: Block whose Sugar snapshot reported the anchor state.
+        observed_at: Aware instant the reconstruction was performed.
+        window_start_timestamp: Aware header timestamp of the first block.
+        anchor_gauge_liquidity: Positive staked liquidity at the anchor block.
+        anchor_staked_tvl_usd: Positive staked value in USDC at the anchor block.
+        emissions_per_second: Raw AERO reward rate per second at the anchor.
+        aero_price_assumption_usd: Documented AERO price assumption in USDC.
+        records: Decoded stake events from the window.
+        timestamps_by_block: Aware block-header timestamps for every record block.
+
+    Returns:
+        The immutable stepwise emissions-APR series ordered by time.
+
+    Raises:
+        ValueError: If any anchor input is non-positive, any event block lacks
+            a timestamp, the events contradict the anchor by driving staked
+            liquidity negative or to an APR-undefined zero, or any step is
+            invalid.
+    """
+    if anchor_gauge_liquidity <= 0:
+        raise ValueError("anchor_gauge_liquidity must be positive")
+    if anchor_staked_tvl_usd <= 0:
+        raise ValueError("anchor_staked_tvl_usd must be positive")
+    if aero_price_assumption_usd <= 0:
+        raise ValueError("aero_price_assumption_usd must be positive")
+    ordered = sorted(records, key=lambda item: (item.block_number, item.log_index))
+    # Net stake events move liquidity from its window-start level to the anchor.
+    net_change = sum(
+        (record.liquidity if record.is_deposit else -record.liquidity for record in ordered),
+        start=0,
+    )
+    starting_liquidity = anchor_gauge_liquidity - net_change
+    if starting_liquidity < 0:
+        raise ValueError(
+            "Gauge stake events contradict the anchor: staked liquidity is "
+            "negative before the window, so the anchor or event evidence is "
+            "incomplete."
+        )
+    steps = [
+        EmissionsAprPoint(
+            timestamp=window_start_timestamp,
+            gauge_liquidity=starting_liquidity,
+            emissions_apr=_emissions_apr(
+                starting_liquidity,
+                anchor_gauge_liquidity,
+                anchor_staked_tvl_usd,
+                emissions_per_second,
+                aero_price_assumption_usd,
+            ),
+        )
+    ]
+    liquidity = starting_liquidity
+    for record in ordered:
+        liquidity += record.liquidity if record.is_deposit else -record.liquidity
+        if liquidity < 0:
+            raise ValueError(
+                "Gauge stake events contradict the anchor: staked liquidity "
+                f"went negative at block {record.block_number}."
+            )
+        timestamp = timestamps_by_block.get(record.block_number)
+        if timestamp is None:
+            raise ValueError(f"block {record.block_number} lacks a header timestamp")
+        steps.append(
+            EmissionsAprPoint(
+                timestamp=timestamp,
+                block_number=record.block_number,
+                log_index=record.log_index,
+                gauge_liquidity=liquidity,
+                emissions_apr=_emissions_apr(
+                    liquidity,
+                    anchor_gauge_liquidity,
+                    anchor_staked_tvl_usd,
+                    emissions_per_second,
+                    aero_price_assumption_usd,
+                ),
+            )
+        )
+    return EmissionsAprHistory(
+        pool_address=normalize_evm_address(pool_address),
+        gauge_address=normalize_evm_address(gauge_address),
+        from_block=from_block,
+        to_block=to_block,
+        anchor_block=anchor_block,
+        observed_at=observed_at,
+        anchor_gauge_liquidity=anchor_gauge_liquidity,
+        anchor_staked_tvl_usd=anchor_staked_tvl_usd,
+        emissions_per_second=emissions_per_second,
+        aero_price_assumption_usd=aero_price_assumption_usd,
+        reconstruction_mode="event_fold",
+        starting_gauge_liquidity=starting_liquidity,
+        steps=tuple(steps),
+    )
+
+
 class BlockHeader(BaseModel):
     """Represent one block's number and timestamp from a header read."""
 
@@ -369,11 +768,11 @@ def _parse_hex_field(value: object, field_name: str) -> int:
         ValueError: If the field is missing or malformed.
     """
     if not isinstance(value, str) or not value.startswith("0x"):
-        raise ValueError(f"Swap log field {field_name} was not a 0x-prefixed hex string")
+        raise ValueError(f"Log field {field_name} was not a 0x-prefixed hex string")
     try:
         return int(value, 16)
     except ValueError as error:
-        raise ValueError(f"Swap log field {field_name} was not valid hexadecimal") from error
+        raise ValueError(f"Log field {field_name} was not valid hexadecimal") from error
 
 
 def _block_header_from_result(result: object) -> BlockHeader:
@@ -398,8 +797,20 @@ def _block_header_from_result(result: object) -> BlockHeader:
     )
 
 
-class SwapHistoryRpcBackend:
-    """Reconstruct pool price paths through read-only eth_getLogs and header reads."""
+class OrderedLogRecord(Protocol):
+    """Expose the onchain ordering evidence every decoded log record carries."""
+
+    # The block number and log index order decoded events exactly as mined.
+    block_number: int
+    log_index: int
+
+
+# The shared windowed-log collector is generic over the decoded record type.
+LogRecordT = TypeVar("LogRecordT", bound=OrderedLogRecord)
+
+
+class EventHistoryRpcBackend:
+    """Reconstruct onchain event histories through read-only logs and header reads."""
 
     def __init__(
         self,
@@ -488,7 +899,7 @@ class SwapHistoryRpcBackend:
             The immutable ordered price path, empty when the pool saw no swaps.
 
         Raises:
-            SwapHistoryUnavailableError: If any read cannot complete with
+            HistoryUnavailableError: If any read cannot complete with
                 bounded retries, any response violates its bounds, or any
                 decoded evidence is malformed.
         """
@@ -534,6 +945,151 @@ class SwapHistoryRpcBackend:
                 },
             )
 
+    def fetch_emissions_apr_history(
+        self,
+        pool_address: str,
+        gauge_address: str,
+        anchor_block: int,
+        anchor_gauge_liquidity: int,
+        anchor_staked_tvl_usd: Decimal,
+        emissions_per_second: int,
+        aero_price_assumption_usd: Decimal,
+        lookback: timedelta = REHEARSAL_LOOKBACK,
+    ) -> EmissionsAprHistory:
+        """Reconstruct one pool's emissions-APR series over a lookback window.
+
+        The window is anchored at the Sugar snapshot block rather than the
+        chain head, so the backward liquidity fold closes on the snapshot's
+        gauge liquidity whenever the stake events explain it. The gauge's
+        Deposit and Withdraw logs are paged through bounded eth_getLogs
+        windows and each event's timestamp comes from its own block header.
+        No chain-head read is ever made, so a replay run against a pinned
+        snapshot is fully reproducible.
+
+        Staked positions can also change liquidity through the position
+        manager while the gauge holds them, which stake events do not carry,
+        so on the live B20 gauges the fold routinely contradicts the anchor.
+        A contradicting fold is not fabricated into a series: the fetch falls
+        back to the documented constant-anchor APR, one window-long step at
+        the anchor's liquidity level, labeled constant_anchor_apr.
+
+        Args:
+            pool_address: Slipstream pool the gauge belongs to.
+            gauge_address: CLGauge whose staked liquidity is reconstructed.
+            anchor_block: Sugar snapshot block that reported the anchor state.
+            anchor_gauge_liquidity: Gauge staked liquidity at the anchor block.
+            anchor_staked_tvl_usd: Staked value in USDC at the anchor block.
+            emissions_per_second: Raw AERO reward rate per second at the anchor.
+            aero_price_assumption_usd: Documented AERO price assumption.
+            lookback: How far back from the anchor block to reconstruct.
+
+        Returns:
+            The immutable stepwise emissions-APR series labeled event_fold
+            when the stake events close on the anchor exactly, otherwise the
+            documented constant_anchor_apr fallback.
+
+        Raises:
+            ValueError: If any anchor input is non-positive or the lookback
+                is not positive.
+            HistoryUnavailableError: If any read cannot complete with bounded
+                retries, any response violates its bounds, or any decoded
+                evidence is malformed.
+        """
+        if lookback <= timedelta(0):
+            raise ValueError("lookback must be positive")
+        if anchor_block < 0:
+            raise ValueError("anchor_block must be non-negative")
+        if anchor_gauge_liquidity <= 0:
+            raise ValueError("anchor_gauge_liquidity must be positive")
+        if anchor_staked_tvl_usd <= 0:
+            raise ValueError("anchor_staked_tvl_usd must be positive")
+        if emissions_per_second < 0:
+            raise ValueError("emissions_per_second must be non-negative")
+        if aero_price_assumption_usd <= 0:
+            raise ValueError("aero_price_assumption_usd must be positive")
+        normalized_pool = normalize_evm_address(pool_address)
+        normalized_gauge = normalize_evm_address(gauge_address)
+        with httpx.Client(
+            timeout=self._timeout_seconds,
+            transport=self._transport,
+            follow_redirects=False,
+            headers={"User-Agent": "aero-bot/0.1 read-only-gauge-history"},
+        ) as client:
+            # One header cache serves the anchor read, the search, and the events.
+            headers: dict[int, BlockHeader] = {}
+            anchor_header = self._block_header(client, anchor_block, headers)
+            # The window opens at the first block at or after the target instant.
+            target_timestamp = anchor_header.timestamp - lookback
+            start_block = self._first_block_at_or_after(
+                client, target_timestamp, anchor_block, headers
+            )
+            records = self._collect_windowed_logs(
+                client,
+                normalized_gauge,
+                start_block,
+                anchor_block,
+                [[GAUGE_DEPOSIT_TOPIC0, GAUGE_WITHDRAW_TOPIC0]],
+                decode_gauge_stake_log,
+                MAX_TOTAL_GAUGE_STAKE_EVENTS,
+                "gauge stake",
+            )
+            # Every event block needs its header once; the cache deduplicates and
+            # the cumulative lookup bound inside the reader fails closed.
+            unique_blocks = {record.block_number for record in records}
+            for block_number in sorted(unique_blocks):
+                self._block_header(client, block_number, headers)
+            # The opening step carries the window-start header timestamp.
+            window_start_header = self._block_header(client, start_block, headers)
+            try:
+                return build_emissions_apr_history(
+                    pool_address=normalized_pool,
+                    gauge_address=normalized_gauge,
+                    from_block=start_block,
+                    to_block=anchor_block,
+                    anchor_block=anchor_block,
+                    observed_at=datetime.now(UTC),
+                    window_start_timestamp=window_start_header.timestamp,
+                    anchor_gauge_liquidity=anchor_gauge_liquidity,
+                    anchor_staked_tvl_usd=anchor_staked_tvl_usd,
+                    emissions_per_second=emissions_per_second,
+                    aero_price_assumption_usd=aero_price_assumption_usd,
+                    records=records,
+                    timestamps_by_block={
+                        number: header.timestamp for number, header in headers.items()
+                    },
+                )
+            except ValueError:
+                # The pure builder's remaining failure paths are exactly the
+                # anchor contradictions (negative or zero staked liquidity),
+                # which live gauges hit through position-manager rebalances.
+                return EmissionsAprHistory(
+                    pool_address=normalized_pool,
+                    gauge_address=normalized_gauge,
+                    from_block=start_block,
+                    to_block=anchor_block,
+                    anchor_block=anchor_block,
+                    observed_at=datetime.now(UTC),
+                    anchor_gauge_liquidity=anchor_gauge_liquidity,
+                    anchor_staked_tvl_usd=anchor_staked_tvl_usd,
+                    emissions_per_second=emissions_per_second,
+                    aero_price_assumption_usd=aero_price_assumption_usd,
+                    reconstruction_mode="constant_anchor_apr",
+                    starting_gauge_liquidity=anchor_gauge_liquidity,
+                    steps=(
+                        EmissionsAprPoint(
+                            timestamp=window_start_header.timestamp,
+                            gauge_liquidity=anchor_gauge_liquidity,
+                            emissions_apr=_emissions_apr(
+                                anchor_gauge_liquidity,
+                                anchor_gauge_liquidity,
+                                anchor_staked_tvl_usd,
+                                emissions_per_second,
+                                aero_price_assumption_usd,
+                            ),
+                        ),
+                    ),
+                )
+
     def _latest_block_number(self, client: httpx.Client) -> int:
         """Read the chain head block number.
 
@@ -544,15 +1100,15 @@ class SwapHistoryRpcBackend:
             The latest mined block number.
 
         Raises:
-            SwapHistoryUnavailableError: If the read fails or returns garbage.
+            HistoryUnavailableError: If the read fails or returns garbage.
         """
         result = self._rpc_call(client, "eth_blockNumber", [])
         if not isinstance(result, str):
-            raise SwapHistoryUnavailableError("block number read did not return a string")
+            raise HistoryUnavailableError("block number read did not return a string")
         try:
             return int(result, 16)
         except ValueError as error:
-            raise SwapHistoryUnavailableError("block number read returned invalid hex") from error
+            raise HistoryUnavailableError("block number read returned invalid hex") from error
 
     def _block_header(
         self,
@@ -571,13 +1127,13 @@ class SwapHistoryRpcBackend:
             The immutable block header.
 
         Raises:
-            SwapHistoryUnavailableError: If the header read fails or is malformed.
+            HistoryUnavailableError: If the header read fails or is malformed.
         """
         cached = headers.get(block_number)
         if cached is not None:
             return cached
         if len(headers) >= self._max_block_header_lookups:
-            raise SwapHistoryUnavailableError(
+            raise HistoryUnavailableError(
                 f"Block header lookups exceeded the {self._max_block_header_lookups} bound."
             )
         # The politeness delay also applies to header reads on the shared RPC.
@@ -586,11 +1142,11 @@ class SwapHistoryRpcBackend:
         try:
             header = _block_header_from_result(result)
         except ValueError as error:
-            raise SwapHistoryUnavailableError(
+            raise HistoryUnavailableError(
                 f"Block {block_number} header was malformed: {error}"
             ) from error
         if header.number != block_number:
-            raise SwapHistoryUnavailableError(
+            raise HistoryUnavailableError(
                 f"Block header read for {block_number} returned block {header.number}"
             )
         headers[block_number] = header
@@ -600,7 +1156,7 @@ class SwapHistoryRpcBackend:
         self,
         client: httpx.Client,
         target_timestamp: datetime,
-        latest_number: int,
+        head_block: int,
         headers: dict[int, BlockHeader],
     ) -> int:
         """Binary-search the first block whose timestamp reaches a target.
@@ -611,23 +1167,24 @@ class SwapHistoryRpcBackend:
         Args:
             client: The bounded read-only HTTP client.
             target_timestamp: Earliest timestamp the window may start from.
-            latest_number: Chain head block number closing the search space.
+            head_block: Block number closing the search space, either the chain
+                head or an anchor snapshot block.
             headers: Cache shared across one reconstruction.
 
         Returns:
             The smallest block number whose timestamp is at or after the target.
 
         Raises:
-            SwapHistoryUnavailableError: If the search exceeds its probe bound
+            HistoryUnavailableError: If the search exceeds its probe bound
                 or block timestamps are not monotone.
         """
         low = 0
-        high = latest_number
+        high = head_block
         probes = 0
         while low < high:
             probes += 1
             if probes > MAX_BINARY_SEARCH_PROBES:
-                raise SwapHistoryUnavailableError(
+                raise HistoryUnavailableError(
                     "Block-timestamp binary search exceeded its probe bound."
                 )
             middle = (low + high) // 2
@@ -657,10 +1214,51 @@ class SwapHistoryRpcBackend:
             Every decoded Swap event ordered by block number then log index.
 
         Raises:
-            SwapHistoryUnavailableError: If a window read fails, hits its log
+            HistoryUnavailableError: If a window read fails, hits its log
                 bound, or returns malformed event data.
         """
-        records: list[SwapEventRecord] = []
+        return self._collect_windowed_logs(
+            client,
+            pool_address,
+            start_block,
+            end_block,
+            [SWAP_EVENT_TOPIC0],
+            decode_swap_log,
+            MAX_TOTAL_SWAP_EVENTS,
+            "Swap",
+        )
+
+    def _collect_windowed_logs(
+        self,
+        client: httpx.Client,
+        address: str,
+        start_block: int,
+        end_block: int,
+        topics: Sequence[object],
+        decode_one: Callable[[object], LogRecordT],
+        total_event_bound: int,
+        label: str,
+    ) -> tuple[LogRecordT, ...]:
+        """Page one contract's logs through bounded eth_getLogs windows.
+
+        Args:
+            client: The bounded read-only HTTP client.
+            address: Normalized contract address filter every log must match.
+            start_block: First block of the reconstruction window.
+            end_block: Last block of the reconstruction window.
+            topics: Topic filter matching the events being reconstructed.
+            decode_one: Strict decoder turning one raw log into its record.
+            total_event_bound: Runaway guard on the total decoded event count.
+            label: Event label used in the fail-closed diagnostics.
+
+        Returns:
+            Every decoded event ordered by block number then log index.
+
+        Raises:
+            HistoryUnavailableError: If a window read fails, hits its log
+                bound, or returns malformed event data.
+        """
+        records: list[LogRecordT] = []
         window_start = start_block
         while True:
             window_end = min(window_start + self._log_window_blocks - 1, end_block)
@@ -671,37 +1269,37 @@ class SwapHistoryRpcBackend:
                     {
                         "fromBlock": hex(window_start),
                         "toBlock": hex(window_end),
-                        "address": pool_address,
-                        "topics": [SWAP_EVENT_TOPIC0],
+                        "address": address,
+                        "topics": list(topics),
                     }
                 ],
             )
             if not isinstance(result, list):
-                raise SwapHistoryUnavailableError("eth_getLogs result was not a list")
+                raise HistoryUnavailableError("eth_getLogs result was not a list")
             if len(result) >= self._max_logs_per_window:
-                raise SwapHistoryUnavailableError(
+                raise HistoryUnavailableError(
                     f"eth_getLogs window {window_start}..{window_end} returned "
                     f"{len(result)} logs at or above the "
                     f"{self._max_logs_per_window} window bound."
                 )
             for log in result:
                 try:
-                    record = decode_swap_log(log)
+                    record = decode_one(log)
                 except ValueError as error:
-                    raise SwapHistoryUnavailableError(
+                    raise HistoryUnavailableError(
                         f"eth_getLogs window {window_start}..{window_end} held a "
-                        f"malformed Swap log: {error}"
+                        f"malformed {label} log: {error}"
                     ) from error
-                # The response address must match the requested pool filter.
-                if isinstance(log, dict) and str(log.get("address", "")).lower() != pool_address:
-                    raise SwapHistoryUnavailableError(
+                # The response address must match the requested contract filter.
+                if isinstance(log, dict) and str(log.get("address", "")).lower() != address:
+                    raise HistoryUnavailableError(
                         f"eth_getLogs window {window_start}..{window_end} returned a "
-                        "log from another pool."
+                        "log from another contract."
                     )
                 records.append(record)
-            if len(records) > MAX_TOTAL_SWAP_EVENTS:
-                raise SwapHistoryUnavailableError(
-                    f"Pool {pool_address} exceeded {MAX_TOTAL_SWAP_EVENTS} decoded swap events."
+            if len(records) > total_event_bound:
+                raise HistoryUnavailableError(
+                    f"Contract {address} exceeded {total_event_bound} decoded {label} events."
                 )
             if window_end >= end_block:
                 break
@@ -722,7 +1320,7 @@ class SwapHistoryRpcBackend:
             The successful JSON-RPC result value.
 
         Raises:
-            SwapHistoryUnavailableError: If the request keeps failing after
+            HistoryUnavailableError: If the request keeps failing after
                 bounded retries or reports a non-transient error.
         """
         payload = {"jsonrpc": "2.0", "id": JSON_RPC_ID, "method": method, "params": params}
@@ -741,29 +1339,29 @@ class SwapHistoryRpcBackend:
                 continue
             response_size = len(response.content)
             if response_size > self._max_response_bytes:
-                raise SwapHistoryUnavailableError(
+                raise HistoryUnavailableError(
                     f"RPC response contained {response_size} bytes, above the configured limit"
                 )
             if response.status_code != 200:
-                raise SwapHistoryUnavailableError(
+                raise HistoryUnavailableError(
                     f"RPC request failed with unexpected HTTP status {response.status_code}"
                 )
             try:
                 body = cast(object, response.json())
             except ValueError as error:
-                raise SwapHistoryUnavailableError("RPC response was not valid JSON") from error
+                raise HistoryUnavailableError("RPC response was not valid JSON") from error
             if not isinstance(body, dict) or "result" not in body:
                 error_body = body.get("error") if isinstance(body, dict) else None
                 if not isinstance(error_body, dict):
-                    raise SwapHistoryUnavailableError("RPC response had neither result nor error")
+                    raise HistoryUnavailableError("RPC response had neither result nor error")
                 error_code = error_body.get("code")
                 error_message = str(error_body.get("message", ""))
                 # Base's public endpoint reports rate limiting as a retriable error.
                 if error_code == RATE_LIMIT_ERROR_CODE or "rate limit" in error_message.lower():
                     failure = f"RPC error {error_code}: {error_message}"
                     continue
-                raise SwapHistoryUnavailableError(f"RPC error {error_code}: {error_message}")
+                raise HistoryUnavailableError(f"RPC error {error_code}: {error_message}")
             return cast(object, body["result"])
-        raise SwapHistoryUnavailableError(
+        raise HistoryUnavailableError(
             f"RPC {method} failed after {self._max_attempts} attempts: {failure}"
         )
