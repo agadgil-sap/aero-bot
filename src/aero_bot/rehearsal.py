@@ -17,6 +17,7 @@ assumption-label list.
 """
 
 from bisect import bisect_right
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 from enum import StrEnum
@@ -44,6 +45,12 @@ from aero_bot.policy import (
     SwapPlan,
     load_event_calendar,
 )
+from aero_bot.ranging import (
+    MICROSECONDS_PER_SECOND,
+    SECONDS_PER_DAY,
+    RangingEvidence,
+    WidthSolveMode,
+)
 
 # High internal precision keeps replay accounting deterministic across platforms.
 MATH_PRECISION = 60
@@ -60,6 +67,19 @@ DEFAULT_GAS_PRICE_ASSUMPTION_GWEI = Decimal("0.001")
 PPM_SCALE = Decimal(1_000_000)
 # Basis points scale impact fractions for the per-swap ledger view.
 BPS_SCALE = Decimal(10_000)
+# Live ranging evidence spans the trailing day of reconstructed swaps, so the
+# width solver sees the pool's recent fee flow and realized volatility rather
+# than figures averaged over the whole replay window.
+RANGING_EVIDENCE_WINDOW = timedelta(hours=24)
+
+
+class WidthSelectionMode(StrEnum):
+    """Select how every entry and recenter range width is chosen in a replay."""
+
+    # Widths derive from the target net daily yield solver over live evidence.
+    DERIVED_FROM_TARGET = "derived_from_target"
+    # Widths sit at the locked ceiling, the v1 fixed-width policy baseline.
+    FIXED_CEILING_BASELINE = "fixed_ceiling_baseline"
 
 
 class ReferenceQuote(BaseModel):
@@ -210,6 +230,11 @@ class RehearsalActionRecord(BaseModel):
     # Batch gas evidence mirrors the decision's estimates.
     estimated_gas_units: int | None = None
     estimated_gas_cost_usd: NonNegativeDecimal | None = None
+    # Width-solve evidence for enter and recenter actions: how the half width
+    # resolved and which tick-aligned width was committed.
+    width_mode: WidthSolveMode | None = None
+    half_width_ticks: Annotated[int, Field(ge=1)] | None = None
+    half_width_fraction: Decimal | None = None
     # Replay books after applying the action, for auditing the fold.
     cash_after_usd: Decimal
     equity_after_usd: Decimal
@@ -319,6 +344,8 @@ class PoolRehearsalLedger(BaseModel):
     emissions_reconstruction_mode: Literal["event_fold", "constant_anchor_apr"]
     # The reference path mode the replay consumed.
     reference_mode: Literal["amm_equals_reference", "synthetic_stress"]
+    # How every entry and recenter range width was chosen in this replay.
+    width_selection: WidthSelectionMode = WidthSelectionMode.DERIVED_FROM_TARGET
     # The assumptions the replay ran under, verbatim.
     assumptions: RehearsalAssumptions
     # Human-readable labels for every documented approximation in force.
@@ -518,6 +545,95 @@ def swap_usd_notional(
     return max(stock_value, quote_value)
 
 
+def trailing_ranging_evidence(
+    points: Sequence[PoolPricePoint],
+    squared_log_returns: Sequence[Decimal],
+    notionals_usd: Sequence[Decimal],
+    window_start: int,
+    index: int,
+    gauge_liquidity_raw: int,
+    anchor_gauge_liquidity: int,
+    anchor_staked_tvl_usd: Decimal,
+    pool_fee_ppm: int,
+    stock_decimals: int,
+    quote_decimals: int,
+) -> RangingEvidence:
+    """Assemble the live ranging observables as of one replay observation.
+
+    Fee evidence and realized volatility span the trailing evidence window
+    ending at the observation, carried with the window's exact observed span.
+    The realized volatility equals the ranging module's estimator applied to
+    the retained sub-path bit for bit, because the squared returns are summed
+    in observation order inside the same precision context. Staked value
+    follows the history module's frozen per-liquidity-unit anchor convention,
+    so the solve's concentration ratio matches the emissions series the replay
+    already consumes.
+
+    Args:
+        points: The replay's whole ordered price path.
+        squared_log_returns: Squared log return between consecutive points,
+            one entry per consecutive pair in observation order.
+        notionals_usd: Each point's swapped notional in USDC.
+        window_start: First retained point index, the earliest observation
+            inside the trailing evidence window.
+        index: The observation the evidence is assembled for.
+        gauge_liquidity_raw: Gauge staked liquidity in effect at this instant.
+        anchor_gauge_liquidity: Staked liquidity at the anchor block.
+        anchor_staked_tvl_usd: Staked value in USDC at the anchor block.
+        pool_fee_ppm: The pool's staked fee tier in parts per million.
+        stock_decimals: Decimal count of the stock token.
+        quote_decimals: Decimal count of the USDC quote token.
+
+    Returns:
+        The ranging evidence the observation carries for the width solve.
+
+    Raises:
+        ValueError: If the window bounds or per-point arrays disagree with
+            the path, or the anchor liquidity is not positive.
+    """
+    if len(squared_log_returns) != max(len(points) - 1, 0):
+        raise ValueError("squared_log_returns must carry one entry per consecutive pair")
+    if len(notionals_usd) != len(points):
+        raise ValueError("notionals_usd must carry one entry per point")
+    if not 0 <= window_start <= index < len(points):
+        raise ValueError("window bounds must address an ordered observation prefix")
+    if anchor_gauge_liquidity <= 0:
+        raise ValueError("anchor_gauge_liquidity must be positive")
+    current = points[index]
+    window_seconds = int((current.timestamp - points[window_start].timestamp).total_seconds())
+    realized_volatility: Decimal | None = None
+    with localcontext() as decimal_context:
+        # Local precision keeps the evidence assembly deterministic.
+        decimal_context.prec = MATH_PRECISION
+        if index > window_start:
+            # The retained sub-path's consecutive pairs are exactly the
+            # squared-return slice, summed in order like the ranging module's
+            # whole-path estimator.
+            squared_return_sum = sum(squared_log_returns[window_start:index], start=Decimal(0))
+            span_micros = (current.timestamp - points[window_start].timestamp) // timedelta(
+                microseconds=1
+            )
+            span_days = Decimal(span_micros) / MICROSECONDS_PER_SECOND / Decimal(SECONDS_PER_DAY)
+            realized_volatility = +(squared_return_sum / span_days).sqrt()
+        # Staked value scales linearly with staked liquidity at the frozen
+        # per-unit anchor value, the emissions series' documented convention.
+        staked_tvl_usd = (
+            anchor_staked_tvl_usd * Decimal(gauge_liquidity_raw) / Decimal(anchor_gauge_liquidity)
+        )
+        fee_notional = sum(notionals_usd[window_start : index + 1], start=Decimal(0))
+    return RangingEvidence(
+        gauge_liquidity_raw=gauge_liquidity_raw,
+        staked_tvl_usd=staked_tvl_usd,
+        active_liquidity_raw=current.liquidity,
+        fee_window_seconds=window_seconds,
+        fee_window_notional_usd=fee_notional,
+        pool_fee_ppm=pool_fee_ppm,
+        realized_daily_volatility=realized_volatility,
+        stock_decimals=stock_decimals,
+        quote_decimals=quote_decimals,
+    )
+
+
 def _position_liquidity_raw(
     position: PolicyPosition,
     stock_decimals: int,
@@ -627,6 +743,7 @@ def replay_pool(
     symbol: str,
     assumptions: RehearsalAssumptions,
     schedule: SyntheticDislocationSchedule | None = None,
+    width_selection: WidthSelectionMode = WidthSelectionMode.DERIVED_FROM_TARGET,
     engine: PolicyEngine | None = None,
 ) -> PoolRehearsalLedger:
     """Replay the locked policy over one pool's reconstructed histories.
@@ -638,12 +755,20 @@ def replay_pool(
     swap credits fees pro rata to active pool liquidity while the position is
     open and in range at the post-swap price.
 
+    Derived-width replays attach live ranging evidence to every observation,
+    so each entry and recenter solves its tick-aligned half width against the
+    target net daily yield; the observation opening the window carries no
+    volatility evidence yet and fails toward the labeled ceiling. Baseline
+    replays attach no evidence, reproducing the v1 fixed ceiling-width policy.
+
     Args:
         price_path: The pool's reconstructed swap-driven price path.
         emissions_history: The pool's reconstructed emissions-APR series.
         symbol: The pool symbol as discovered, carried for readable output.
         assumptions: The documented configurable assumptions for this replay.
         schedule: Optional synthetic dislocation overlay for the reference.
+        width_selection: Whether widths derive from the target-yield solver
+            or sit at the locked ceiling as the v1 baseline.
         engine: Optional engine override; defaults to the locked parameters
             with the bundled operator event calendar.
 
@@ -667,6 +792,28 @@ def replay_pool(
     )
     reference_quotes = build_reference_quotes(price_path, schedule)
     quote_timestamps = [quote.timestamp for quote in reference_quotes]
+    points = price_path.points
+    # Per-point ranging evidence inputs are computed once: each squared log
+    # return mirrors the ranging module's estimator exactly, and each swap's
+    # notional feeds the trailing fee window.
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        squared_log_returns = tuple(
+            (later.price_usdc / earlier.price_usdc).ln() ** Decimal(2)
+            # The pairwise zip is intentionally one element shorter on the right.
+            for earlier, later in zip(points, points[1:], strict=False)
+        )
+    swap_notionals_usd = tuple(
+        swap_usd_notional(
+            point,
+            price_path.token_is_token0,
+            price_path.token_decimals,
+            price_path.quote_decimals,
+        )
+        for point in points
+    )
+    # The trailing evidence window's first retained point index only advances.
+    evidence_window_start = 0
     # Replay books: USDC cash, accrued aggregates, and the engine's own state.
     cash = assumptions.starting_equity_usd
     state = PolicyState(day_start_equity_usd=assumptions.starting_equity_usd)
@@ -680,7 +827,7 @@ def replay_pool(
     previous_point: PoolPricePoint | None = None
     previous_step: EmissionsAprPoint | None = None
 
-    for point in price_path.points:
+    for observation_index, point in enumerate(points):
         observed_at = point.timestamp
         price = point.price_usdc
         if previous_point is not None and previous_step is not None:
@@ -717,6 +864,28 @@ def replay_pool(
                     cash += accrued_units * assumptions.aero_price_assumption_usd
         # The gauge step and reference quote in effect at this observation.
         step = _step_as_of(emissions_history.steps, observed_at)
+        ranging_evidence: RangingEvidence | None = None
+        if width_selection is WidthSelectionMode.DERIVED_FROM_TARGET:
+            # The trailing evidence window opens at the first observation
+            # inside the last day, always retaining the current one.
+            while (
+                evidence_window_start < len(points) - 1
+                and points[evidence_window_start].timestamp <= observed_at - RANGING_EVIDENCE_WINDOW
+            ):
+                evidence_window_start += 1
+            ranging_evidence = trailing_ranging_evidence(
+                points=points,
+                squared_log_returns=squared_log_returns,
+                notionals_usd=swap_notionals_usd,
+                window_start=evidence_window_start,
+                index=observation_index,
+                gauge_liquidity_raw=step.gauge_liquidity,
+                anchor_gauge_liquidity=emissions_history.anchor_gauge_liquidity,
+                anchor_staked_tvl_usd=emissions_history.anchor_staked_tvl_usd,
+                pool_fee_ppm=assumptions.pool_fee_ppm,
+                stock_decimals=price_path.token_decimals,
+                quote_decimals=price_path.quote_decimals,
+            )
         while (
             quote_pointer + 1 < len(reference_quotes)
             and quote_timestamps[quote_pointer + 1] <= observed_at
@@ -755,6 +924,7 @@ def replay_pool(
                 int((observed_at - quote.timestamp).total_seconds()) if quote is not None else None
             ),
             gas_price_gwei=assumptions.gas_price_assumption_gwei,
+            ranging=ranging_evidence,
         )
         outcome = active_engine.decide(state, observation)
         decision = outcome.decision
@@ -851,6 +1021,21 @@ def replay_pool(
                     swap_impact_cost_usd=impact_cost,
                     estimated_gas_units=decision.estimated_gas_units,
                     estimated_gas_cost_usd=decision.estimated_gas_cost_usd,
+                    width_mode=(
+                        decision.width_solution.mode
+                        if decision.width_solution is not None
+                        else None
+                    ),
+                    half_width_ticks=(
+                        decision.width_solution.half_width_ticks
+                        if decision.width_solution is not None
+                        else None
+                    ),
+                    half_width_fraction=(
+                        decision.width_solution.half_width_fraction
+                        if decision.width_solution is not None
+                        else None
+                    ),
                     cash_after_usd=cash,
                     equity_after_usd=cash + new_position_value + new_held_value,
                 )
@@ -923,6 +1108,23 @@ def replay_pool(
             "emissions APR is held at the anchor level for the whole window "
             "(constant-anchor fallback)"
         )
+    if width_selection is WidthSelectionMode.DERIVED_FROM_TARGET:
+        labels.append(
+            "range widths derive from the target net daily yield solver over the "
+            "trailing day of fee and volatility evidence, entering at the tightest "
+            "tick-aligned width whose modeled net meets the target and at one tick "
+            "spacing when the target is unreachable"
+        )
+        labels.append(
+            "ranging evidence spans the trailing day of reconstructed swaps and "
+            "values staked liquidity at the frozen per-liquidity-unit anchor value, "
+            "matching the emissions series' convention"
+        )
+    else:
+        labels.append(
+            "baseline replay: every entry and recenter uses the locked ceiling "
+            "width, the v1 fixed-width policy, instead of the target-derived solve"
+        )
     if unmodeled_impact_seen:
         labels.append(
             "one or more swaps executed against zero observed depth, so their impact is unmodeled"
@@ -940,6 +1142,7 @@ def replay_pool(
             if schedule is not None and schedule.episodes
             else "amm_equals_reference"
         ),
+        width_selection=width_selection,
         assumptions=assumptions,
         assumption_labels=tuple(labels),
         observation_count=len(price_path.points),

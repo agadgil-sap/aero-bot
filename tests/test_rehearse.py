@@ -17,7 +17,8 @@ from aero_bot.history import (
     PoolPricePath,
     PoolPricePoint,
 )
-from aero_bot.rehearsal import PoolRehearsalLedger
+from aero_bot.ranging import WidthSolveMode
+from aero_bot.rehearsal import PoolRehearsalLedger, WidthSelectionMode
 from aero_bot.rehearse import (
     PoolRehearsalFailure,
     RehearsalRunReport,
@@ -698,9 +699,41 @@ def test_main_writes_a_round_tripping_report(
     report = RehearsalRunReport.model_validate_json(output.read_text(encoding="utf-8"))
     assert [ledger.pool_address for ledger in report.ledgers] == [POOL_ADDRESS]
     assert report.lookback == timedelta(days=2)
+    assert report.width_selection == WidthSelectionMode.DERIVED_FROM_TARGET
     summary = capsys.readouterr().out
     assert "FIXc" in summary
     assert f"wrote 1 ledgers and 0 failures to {output}" in summary
+
+
+def test_run_rehearsal_records_the_baseline_width_selection() -> None:
+    """The width selection threads into every ledger and the run report."""
+    report = run_fixture(
+        one_pool_fixture(), width_selection=WidthSelectionMode.FIXED_CEILING_BASELINE
+    )
+
+    assert report.width_selection == WidthSelectionMode.FIXED_CEILING_BASELINE
+    assert all(
+        ledger.width_selection == WidthSelectionMode.FIXED_CEILING_BASELINE
+        for ledger in report.ledgers
+    )
+
+
+def test_fixed_ceiling_width_flag_selects_the_baseline_policy(
+    tmp_path: Path,
+) -> None:
+    """The baseline flag drives the whole run onto the v1 fixed-width policy."""
+    sources = one_pool_fixture(prices=(Decimal("100"), Decimal("101")))
+    output = tmp_path / "baseline.json"
+    exit_code = run_main_with_sources(
+        ["--output", str(output), "--no-synthetic-stress", "--fixed-ceiling-width"], sources
+    )
+
+    assert exit_code == 0
+    report = RehearsalRunReport.model_validate_json(output.read_text(encoding="utf-8"))
+    assert report.width_selection == WidthSelectionMode.FIXED_CEILING_BASELINE
+    entry = report.ledgers[0].actions[0]
+    assert entry.width_mode == WidthSolveMode.FALLBACK_CEILING
+    assert entry.half_width_ticks == 29
 
 
 def test_main_passes_settings_and_filters_to_the_sources(tmp_path: Path) -> None:
@@ -804,5 +837,6 @@ def test_argument_parser_defaults_match_the_documented_assumptions() -> None:
     assert arguments.gas_price_gwei == Decimal("0.001")
     assert arguments.pool_addresses == []
     assert arguments.synthetic_stress is True
+    assert arguments.fixed_ceiling_width is False
     assert arguments.output == Path("rehearsal-ledgers.json")
     assert arguments.header_batch_size == 10

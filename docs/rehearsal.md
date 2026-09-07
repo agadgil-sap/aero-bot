@@ -10,12 +10,14 @@ It never signs, broadcasts, or touches a wallet.
 ```bash
 uv run aero-bot-rehearse [--lookback-days N] [--aero-price USD] [--gas-price-gwei GWEI]
                          [--pool ADDRESS]... [--no-synthetic-stress]
+                         [--fixed-ceiling-width]
                          [--output PATH] [--header-batch-size N]
 ```
 
 The RPC endpoint and Sugar address come from the application settings, so `AERO_BOT_BASE_RPC_URL` and `AERO_BOT_LP_SUGAR_ADDRESS` override them unchanged.
 `--pool` is repeatable and selects a subset; every named address must appear in the verified discovery or the run refuses to start.
 `--lookback-days` defaults to the locked 21-day rehearsal window and multi-week windows take hours against the public RPC, so shorter proof runs are normal.
+Every entry and recenter derives its range width from the target net daily yield solver over live ranging evidence assembled from the reconstruction; `--fixed-ceiling-width` switches the run onto the v1 baseline where every width sits at the locked 0.3-percent ceiling instead.
 `--header-batch-size` groups block-header reads into JSON-RPC batches; the public Base endpoint serves at most ten calls per batch, which is the default and the maximum.
 The exit code is zero only when every selected pool produced a ledger, and one otherwise, so a partial run is never mistaken for a complete one.
 
@@ -30,6 +32,8 @@ One run executes the same per-pool pipeline for every selected pool, in pool-add
 4. Emissions history: the gauge's `Deposit` and `Withdraw` logs fold backward from the anchor into the stepwise emissions-APR series, with the documented constant-anchor fallback when the fold contradicts the anchor.
    The anchor staked value prices both staked balances at the snapshot's square-root price.
 5. Replay: the pure replay module folds the locked policy engine over the two histories and emits the per-pool ledger.
+   Each observation carries live ranging evidence assembled from the reconstruction - the gauge step's staked liquidity and anchor-scaled staked value, the swap's active liquidity, and the trailing day of swapped notional and realized volatility - so every entry and recenter solves its tick-aligned half width against the target net daily yield, entering at one tick spacing when the target is unreachable and at the labeled ceiling when the evidence is missing.
+   Baseline runs (`--fixed-ceiling-width`) attach no evidence and keep every width at the locked ceiling, reproducing the v1 fixed-width policy.
 6. Report: every ledger and every fail-closed failure lands in one immutable JSON report written to the output path, and a one-line summary per pool is printed.
 
 A pool whose reads or replay fail is recorded as a failure with its diagnostic while the remaining pools continue.
@@ -38,8 +42,9 @@ One pool never appears as both a ledger and a failure, and the report model reje
 ## Report contents
 
 Each ledger carries the replay window, final equity, cash, open position and held inventory, P&L and return fraction, exposure and in-range seconds, accrued fees and AERO, total swap-impact and gas drag, per-action-kind counts cross-checked against the recorded action list, and every assumption label in force.
+Every enter and recenter action records its width-solve mode (`solved`, `target_unreachable`, or `fallback_ceiling`), the chosen half width in ticks and as a fraction, and the full solver diagnostics, so the widths chosen over time are readable straight from the report.
 Each failure carries the pool, token, symbol, and the fail-closed diagnostic.
-The report header carries the discovery source and pin block, the lookback, the AERO and gas price assumptions, and whether the synthetic stress overlay was applied.
+The report header carries the discovery source and pin block, the lookback, the AERO and gas price assumptions, whether the synthetic stress overlay was applied, and the width selection in force.
 
 ## Documented approximations
 
@@ -53,6 +58,9 @@ Every approximation below is a first-class label on the ledger itself, so no dow
 - The AERO price is a constant assumption carried on the series, the ledger, and the report, defaulting to 0.50 USDC.
 - The gauge's reward rate is held constant across the window because Aerodrome resets it only at weekly epochs.
 - Staked value scales linearly with staked liquidity at the frozen per-liquidity-unit anchor value because other LPs' range shapes are private.
+- Range widths derive from the target net daily yield solver over live ranging evidence: the tightest tick-aligned half width whose modeled net meets the target wins, the one-tick-spacing tightest is entered when the target is unreachable, and missing evidence fails toward the labeled ceiling.
+- Ranging evidence spans the trailing day of reconstructed swaps - swapped notional and realized volatility - valued at the observation instant, so the solve sees the pool's recent state rather than whole-window averages.
+- Baseline replays attach no ranging evidence, so every entry and recenter falls back to the locked ceiling width, the v1 fixed-width policy.
 - When the stake-event fold contradicts the anchor, the emissions APR is held at the anchor level for the whole window and the ledger is labeled with the constant-anchor fallback.
 - Pool depth is the active-liquidity value across a plus-or-minus one-percent price band.
 - Swap tranches execute immediately with impact charged at half the modeled end impact.
@@ -65,6 +73,8 @@ Every approximation below is a first-class label on the ledger itself, so no dow
 ## Runtime bounds and politeness
 
 Every request retries rate-limit failures with exponential backoff, bounded at five attempts.
-Log reads page through 5,000-block windows with a 1,000-log bound per window and 50,000 decoded events per reconstruction; a window whose answer reaches the bound is presumed truncated and splits in half until every half answers below it, and only a single-block window still at the bound fails closed because no split can rule truncation out.
+Log reads page through 5,000-block windows with a 1,000-log bound per window and 150,000 decoded Swap events per reconstruction, the documented bound covering the busiest B20 pool's roughly 3,600 swaps a day across the locked 21-day window with headroom; a window whose answer reaches the bound is presumed truncated and splits in half until every half answers below it, and only a single-block window still at the bound fails closed because no split can rule truncation out.
+Gauge stake reads run under the same windowed discipline with a tighter 50,000-event bound because stake events run orders of magnitude sparser than swaps.
+Both total-event bounds are configurable on the history backend, and every fail-closed behavior is preserved unchanged when they are lowered.
 Block-header reads are bounded at one per unique event block plus the binary search's probes and a small window allowance, and the batched header prefetch groups them into at most ten-request batches so multi-week windows stay feasible without interpolating any timestamp.
 One pool's failure never aborts the run: it is recorded and the next pool proceeds.

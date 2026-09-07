@@ -33,7 +33,8 @@ Containment is the design center, not a property that emerges from responsible u
 | Receipt wait | 120 seconds, 2-second polls | Fixed in code | Fail-closed timeout |
 
 The router is Aerodrome's universal router, and the swap calldata is modeled byte for byte on the Safe's already-executed reference transaction: one `execute` call carrying a single `V3_SWAP_EXACT_IN` command with the 43-byte concentrated-liquidity path `USDC || 0x08 || tickSpacing(uint16) || stock` and a deadline eight minutes past build time.
-The offline test suite reproduces the reference calldata byte for byte as a golden vector.
+The offline test suite checks a fixed encoding vector and independently decodes the outer arguments and nested swap payload with a standard ABI decoder.
+Each `bytes[]` element includes its own byte-length word before the payload; omitting that word makes the router interpret the recipient address as a payload length and reject the call before executing the swap.
 The approval the reference transaction preceded its swap with was exact, so the standing allowance here is the bounded 20-USDC number and never the infinite maximum approval.
 
 ## Safe compatibility and canonical encoding

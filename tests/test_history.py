@@ -18,6 +18,8 @@ from aero_bot.history import (
     GAUGE_STAKE_TOPICS_LAYOUT,
     GAUGE_WITHDRAW_TOPIC0,
     MAX_HEADER_BATCH_SIZE,
+    MAX_TOTAL_GAUGE_STAKE_EVENTS,
+    MAX_TOTAL_SWAP_EVENTS,
     REHEARSAL_LOOKBACK,
     SWAP_DATA_LAYOUT,
     SWAP_EVENT_TOPIC0,
@@ -618,6 +620,20 @@ def test_fetch_price_path_binary_search_boundary_is_exact() -> None:
     assert REHEARSAL_LOOKBACK.days == 21
 
 
+def test_total_swap_event_bound_covers_the_locked_lookback_at_the_busiest_rate() -> None:
+    """The decoded-event bound fits a 21-day window on the busiest B20 pool."""
+    # The busiest B20 pool (AAPLc) reconstructs roughly 3,600 swaps a day, so
+    # the locked 21-day lookback needs about 76,000 events; the bound sits near
+    # twice that need, and the half-margin check below is what the bound must
+    # always satisfy for the locked lookback to reconstruct.
+    busiest_21_day_events = 3_600 * REHEARSAL_LOOKBACK.days
+    assert MAX_TOTAL_SWAP_EVENTS == 150_000
+    assert busiest_21_day_events * 3 // 2 <= MAX_TOTAL_SWAP_EVENTS
+    # Stake events run orders of magnitude sparser than swaps, so their guard
+    # stays tighter than the swap bound.
+    assert MAX_TOTAL_GAUGE_STAKE_EVENTS < MAX_TOTAL_SWAP_EVENTS
+
+
 def test_fetch_price_path_without_swaps_returns_empty_path() -> None:
     """A quiet pool reconstructs to an empty but well-formed path."""
     path = fetch_path(fixture_backend(FixtureRpcTransport()))
@@ -673,6 +689,25 @@ def test_fetch_price_path_refines_busy_windows_instead_of_dropping_them() -> Non
     assert (998, 1000) in queries
 
 
+def test_fetch_price_path_fails_closed_at_total_event_bound() -> None:
+    """A pool decoding past the total event bound fails the reconstruction closed."""
+    transport = FixtureRpcTransport(
+        logs=[
+            swap_log(996, 0, 1 << 95),
+            swap_log(997, 0, 1 << 96),
+            swap_log(998, 0, 1 << 97),
+        ]
+    )
+    # Three swaps spread across blocks stay below the per-window bound, so only
+    # the configurable total-event runaway guard trips.
+    fixture = EventHistoryRpcBackend(
+        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, max_total_swap_events=2
+    )
+
+    with pytest.raises(HistoryUnavailableError, match="exceeded 2 decoded Swap events"):
+        fetch_path(fixture)
+
+
 def test_fetch_price_path_fails_closed_on_malformed_logs() -> None:
     """One malformed log entry in a window fails the whole reconstruction."""
     broken = swap_log(996, 0, 1 << 96)
@@ -717,6 +752,11 @@ def test_backend_constructor_rejects_invalid_bounds() -> None:
         ("max_response_bytes", lambda: EventHistoryRpcBackend(max_response_bytes=0)),
         ("log_window_blocks", lambda: EventHistoryRpcBackend(log_window_blocks=0)),
         ("max_logs_per_window", lambda: EventHistoryRpcBackend(max_logs_per_window=0)),
+        ("max_total_swap_events", lambda: EventHistoryRpcBackend(max_total_swap_events=0)),
+        (
+            "max_total_gauge_stake_events",
+            lambda: EventHistoryRpcBackend(max_total_gauge_stake_events=0),
+        ),
         (
             "max_block_header_lookups",
             lambda: EventHistoryRpcBackend(max_block_header_lookups=0),
@@ -1337,6 +1377,20 @@ def test_fetch_emissions_apr_history_refines_busy_windows() -> None:
 
     # Both stake events fold into the series exactly as mined.
     assert [step.gauge_liquidity for step in history.steps] == [1_500, 1_200, 2_000]
+
+
+def test_fetch_emissions_apr_history_fails_closed_at_total_event_bound() -> None:
+    """A gauge decoding past the total event bound fails the reconstruction closed."""
+    transport = FixtureRpcTransport(logs=[gauge_log(996, 0, 100), gauge_log(998, 0, 100)])
+    fixture = EventHistoryRpcBackend(
+        transport=transport,
+        sleep=no_sleep,
+        page_delay_seconds=0.0,
+        max_total_gauge_stake_events=1,
+    )
+
+    with pytest.raises(HistoryUnavailableError, match="exceeded 1 decoded gauge stake events"):
+        fetch_emissions(fixture)
 
 
 def test_fetch_emissions_apr_history_falls_back_on_contradictory_events() -> None:

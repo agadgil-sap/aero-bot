@@ -47,6 +47,7 @@ from aero_bot.rehearsal import (
     DEFAULT_SYNTHETIC_DISLOCATION_SCHEDULE,
     PoolRehearsalLedger,
     RehearsalAssumptions,
+    WidthSelectionMode,
     replay_pool,
 )
 from aero_bot.sugar import LpSugarRpcBackend
@@ -113,6 +114,8 @@ class RehearsalRunReport(BaseModel):
     gas_price_assumption_gwei: Annotated[Decimal, Field(gt=0)]
     # Whether the documented synthetic dislocation schedule overlay was applied.
     synthetic_stress: bool
+    # How every entry and recenter range width was chosen in the replays.
+    width_selection: WidthSelectionMode = WidthSelectionMode.DERIVED_FROM_TARGET
     # One deterministic ledger per pool that replayed end to end.
     ledgers: tuple[PoolRehearsalLedger, ...] = ()
     # One fail-closed diagnostic per pool whose reads or replay failed.
@@ -361,6 +364,7 @@ def run_rehearsal(
     gas_price_assumption_gwei: Decimal,
     pool_addresses: frozenset[str] = frozenset(),
     apply_synthetic_stress: bool = True,
+    width_selection: WidthSelectionMode = WidthSelectionMode.DERIVED_FROM_TARGET,
     progress: Callable[[str], None] | None = None,
 ) -> RehearsalRunReport:
     """Rehearse every discovered pool and assemble the run report.
@@ -375,6 +379,8 @@ def run_rehearsal(
             match a discovered pool.
         apply_synthetic_stress: Whether the documented synthetic dislocation
             schedule overlays the reference path.
+        width_selection: Whether widths derive from the target-yield solver
+            or sit at the locked ceiling as the v1 baseline.
         progress: Optional sink receiving one line per pool stage.
 
     Returns:
@@ -452,6 +458,7 @@ def run_rehearsal(
                 schedule=(
                     DEFAULT_SYNTHETIC_DISLOCATION_SCHEDULE if apply_synthetic_stress else None
                 ),
+                width_selection=width_selection,
             )
         except (HistoryUnavailableError, ValueError) as error:
             report_progress(f"{symbol}: failed closed - {error}")
@@ -477,6 +484,7 @@ def run_rehearsal(
         aero_price_assumption_usd=aero_price_assumption_usd,
         gas_price_assumption_gwei=gas_price_assumption_gwei,
         synthetic_stress=apply_synthetic_stress,
+        width_selection=width_selection,
         ledgers=tuple(ledgers),
         failures=tuple(failures),
     )
@@ -581,6 +589,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--fixed-ceiling-width",
+        action="store_true",
+        dest="fixed_ceiling_width",
+        help=(
+            "Run the v1 baseline: every entry and recenter uses the locked "
+            "0.3-percent ceiling width instead of the target-yield-derived solve."
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=DEFAULT_OUTPUT_PATH,
@@ -645,6 +662,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 normalize_evm_address(address) for address in arguments.pool_addresses
             ),
             apply_synthetic_stress=arguments.synthetic_stress,
+            width_selection=(
+                WidthSelectionMode.FIXED_CEILING_BASELINE
+                if arguments.fixed_ceiling_width
+                else WidthSelectionMode.DERIVED_FROM_TARGET
+            ),
             progress=lambda message: print(message, flush=True),
         )
     except RehearsalUnavailableError as error:

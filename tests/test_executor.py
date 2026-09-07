@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from eth_abi import decode
 from eth_account import Account
 from eth_utils.crypto import keccak
 from pydantic import ValidationError
@@ -510,8 +511,8 @@ def test_swap_path_rejects_out_of_range_tick_spacing() -> None:
         build_swap_path(BASE_USDC_ADDRESS, AAPLC_ADDRESS, 0x10000)
 
 
-def test_swap_calldata_reproduces_the_reference_transaction_bytes() -> None:
-    """The encoder reproduces the Safe's executed reference swap byte for byte."""
+def test_swap_calldata_encodes_length_prefixed_router_input() -> None:
+    """Each bytes-array element includes its length before the swap payload."""
     path = build_swap_path(BASE_USDC_ADDRESS, AAPLC_ADDRESS, 10)
     calldata = build_swap_calldata(SAFE_ADDRESS, ONE_USDC_UNITS, 311_381, path, 0x6A9E34E0)
     expected = (
@@ -526,6 +527,8 @@ def test_swap_calldata_reproduces_the_reference_transaction_bytes() -> None:
         # Inputs: length one, element offset one word.
         + format(1, "064x")
         + format(0x20, "064x")
+        # Dynamic bytes element: payload length, distinct from array length.
+        + format(0x120, "064x")
         # Params: recipient, amountIn, amountOutMin, path offset, payer, zero.
         + "b69ab6c7e73f711d5f2d10fed8f0d09b1d028c28".rjust(64, "0")
         + format(0xF4240, "064x")
@@ -543,6 +546,24 @@ def test_swap_calldata_reproduces_the_reference_transaction_bytes() -> None:
         ).ljust(128, "0")
     )
     assert calldata == expected
+
+
+def test_swap_calldata_decodes_with_independent_abi_decoder() -> None:
+    """A standard decoder recovers the intended command and nested payload."""
+    path = build_swap_path(BASE_USDC_ADDRESS, AAPLC_ADDRESS, 10)
+    calldata = build_swap_calldata(SAFE_ADDRESS, ONE_USDC_UNITS, 311_381, path, 2_000_000_000)
+    commands, inputs, deadline = decode(
+        ["bytes", "bytes[]", "uint256"], bytes.fromhex(calldata[10:])
+    )
+    assert commands == b"\x00"
+    assert deadline == 2_000_000_000
+    assert len(inputs) == 1
+    recipient, amount, minimum, decoded_path, payer, extra = decode(
+        ["address", "uint256", "uint256", "bytes", "bool", "uint256"], inputs[0]
+    )
+    assert recipient == SAFE_ADDRESS.lower()
+    assert (amount, minimum, payer, extra) == (ONE_USDC_UNITS, 311_381, True, 0)
+    assert decoded_path == bytes.fromhex(path[2:])
 
 
 def test_swap_calldata_rejects_malformed_arguments() -> None:

@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from aero_bot.history import EmissionsAprHistory, EmissionsAprPoint, PoolPricePath, PoolPricePoint
 from aero_bot.policy import PolicyActionKind, PolicyReason
+from aero_bot.ranging import RangingEvidence, WidthSolveMode, realized_daily_volatility
 from aero_bot.rehearsal import (
     DEFAULT_SYNTHETIC_DISLOCATION_SCHEDULE,
     PoolRehearsalLedger,
@@ -19,10 +20,12 @@ from aero_bot.rehearsal import (
     SyntheticDislocationSchedule,
     SyntheticEpisode,
     SyntheticEpisodeKind,
+    WidthSelectionMode,
     band_depth_usd,
     build_reference_quotes,
     replay_pool,
     swap_usd_notional,
+    trailing_ranging_evidence,
 )
 
 # Fixture identities mirror official contracts without claiming live observations.
@@ -425,10 +428,19 @@ class TestReplayLifecycle:
         assert recenter.action == PolicyActionKind.RECENTER
         assert recenter.reason == PolicyReason.RECENTER_WAIT_ELAPSED
         assert recenter.timestamp == BASE_TIME + timedelta(minutes=16)
-        # The new range spans at least the locked half width around 101.
+        # The recenter re-derives its width from live evidence: the fixture's
+        # economics cannot reach the one-percent target, so the solve enters
+        # at the one-spacing tightest width rather than widening to hedge.
+        assert recenter.width_mode == WidthSolveMode.TARGET_UNREACHABLE
+        assert recenter.half_width_ticks == 10
+        with localcontext() as decimal_context:
+            decimal_context.prec = MATH_PRECISION
+            expected_fraction = Decimal("1.0001") ** Decimal(10) - Decimal(1)
+        assert recenter.half_width_fraction == expected_fraction
+        # The aligned new range spans roughly that width around 101.
         assert recenter.range_upper_price is not None
-        assert Decimal("101") * Decimal("1.0029") < recenter.range_upper_price
-        assert recenter.range_upper_price < Decimal("101") * Decimal("1.0045")
+        assert Decimal("101") * Decimal("1.0010") < recenter.range_upper_price
+        assert recenter.range_upper_price < Decimal("101") * Decimal("1.0021")
 
     def test_stale_high_episode_exits_on_the_amm(self) -> None:
         """A synthetic stale-high spell sells into the pool while it is high."""
@@ -700,6 +712,269 @@ class TestReplayAccounting:
                     pool_fee_ppm=500, aero_price_assumption_usd=Decimal("0.6")
                 ),
             )
+
+
+class TestTrailingRangingEvidence:
+    """Tests for the pure trailing-window ranging-evidence assembly."""
+
+    def _evidence_inputs(
+        self, path: PoolPricePath
+    ) -> tuple[tuple[Decimal, ...], tuple[Decimal, ...]]:
+        """Build the per-point evidence inputs exactly as the replay does.
+
+        Args:
+            path: The synthetic price path the inputs are derived from.
+
+        Returns:
+            The squared consecutive log returns and per-swap notionals.
+        """
+        with localcontext() as decimal_context:
+            decimal_context.prec = MATH_PRECISION
+            squared_log_returns = tuple(
+                (later.price_usdc / earlier.price_usdc).ln() ** Decimal(2)
+                # The pairwise zip is intentionally one element shorter on the right.
+                for earlier, later in zip(path.points, path.points[1:], strict=False)
+            )
+        notionals = tuple(
+            swap_usd_notional(point, path.token_is_token0, path.token_decimals, path.quote_decimals)
+            for point in path.points
+        )
+        return squared_log_returns, notionals
+
+    def _hourly_path(self, count: int) -> PoolPricePath:
+        """Build one hourly-observation path whose window truncates inside it.
+
+        Args:
+            count: Number of hourly observations, spanning more than a day.
+
+        Returns:
+            A geometrically drifting path over the fixture session.
+        """
+        prices = [Decimal("100") * Decimal("1.0005") ** index for index in range(count)]
+        return make_path(prices, step_seconds=3600)
+
+    def test_volatility_matches_the_ranging_estimator_on_the_retained_window(
+        self,
+    ) -> None:
+        """The trailing volatility equals the whole-path estimator bit for bit."""
+        path = self._hourly_path(30)
+        squared_log_returns, notionals = self._evidence_inputs(path)
+        index = 29
+        # The trailing day closes at 12:00 the previous day, so the window
+        # opens at the 18:00 observation, six hours later.
+        window_start = 6
+        evidence = trailing_ranging_evidence(
+            points=path.points,
+            squared_log_returns=squared_log_returns,
+            notionals_usd=notionals,
+            window_start=window_start,
+            index=index,
+            gauge_liquidity_raw=DEFAULT_GAUGE_LIQUIDITY,
+            anchor_gauge_liquidity=DEFAULT_GAUGE_LIQUIDITY,
+            anchor_staked_tvl_usd=Decimal("100000"),
+            pool_fee_ppm=500,
+            stock_decimals=FIXTURE_STOCK_DECIMALS,
+            quote_decimals=FIXTURE_QUOTE_DECIMALS,
+        )
+        retained_path = path.model_copy(update={"points": path.points[window_start:]})
+
+        assert evidence.realized_daily_volatility == realized_daily_volatility(retained_path)
+        assert evidence.fee_window_seconds == 23 * 3600
+        assert evidence.fee_window_notional_usd == Decimal("5000") * Decimal(24)
+        assert evidence.active_liquidity_raw == DEFAULT_POOL_LIQUIDITY
+        assert evidence.pool_fee_ppm == 500
+
+    def test_staked_value_scales_at_the_frozen_anchor_per_liquidity_unit(self) -> None:
+        """The evidence's staked value follows the emissions-series convention."""
+        path = make_path([Decimal("100"), Decimal("101")])
+        squared_log_returns, notionals = self._evidence_inputs(path)
+        evidence = trailing_ranging_evidence(
+            points=path.points,
+            squared_log_returns=squared_log_returns,
+            notionals_usd=notionals,
+            window_start=0,
+            index=1,
+            gauge_liquidity_raw=DEFAULT_GAUGE_LIQUIDITY // 2,
+            anchor_gauge_liquidity=DEFAULT_GAUGE_LIQUIDITY,
+            anchor_staked_tvl_usd=Decimal("100000"),
+            pool_fee_ppm=500,
+            stock_decimals=FIXTURE_STOCK_DECIMALS,
+            quote_decimals=FIXTURE_QUOTE_DECIMALS,
+        )
+
+        assert evidence.gauge_liquidity_raw == DEFAULT_GAUGE_LIQUIDITY // 2
+        assert evidence.staked_tvl_usd == Decimal("50000")
+
+    def test_single_observation_window_carries_no_volatility(self) -> None:
+        """A one-point window cannot estimate volatility and says so with None."""
+        path = make_path([Decimal("100")])
+        evidence = trailing_ranging_evidence(
+            points=path.points,
+            squared_log_returns=(),
+            notionals_usd=(Decimal("5000"),),
+            window_start=0,
+            index=0,
+            gauge_liquidity_raw=DEFAULT_GAUGE_LIQUIDITY,
+            anchor_gauge_liquidity=DEFAULT_GAUGE_LIQUIDITY,
+            anchor_staked_tvl_usd=Decimal("100000"),
+            pool_fee_ppm=500,
+            stock_decimals=FIXTURE_STOCK_DECIMALS,
+            quote_decimals=FIXTURE_QUOTE_DECIMALS,
+        )
+
+        assert evidence.realized_daily_volatility is None
+        assert evidence.fee_window_seconds == 0
+        assert evidence.fee_window_notional_usd == Decimal("5000")
+
+    def _assemble(
+        self,
+        path: PoolPricePath,
+        squared_log_returns: tuple[Decimal, ...],
+        notionals: tuple[Decimal, ...],
+        window_start: int,
+        index: int,
+        anchor_gauge_liquidity: int = DEFAULT_GAUGE_LIQUIDITY,
+    ) -> RangingEvidence:
+        """Assemble evidence for one observation under the fixture anchors.
+
+        Args:
+            path: The synthetic path the evidence is assembled over.
+            squared_log_returns: Squared consecutive log returns for the path.
+            notionals: Per-swap notionals for the path.
+            window_start: First retained point index of the evidence window.
+            index: The observation the evidence is assembled for.
+            anchor_gauge_liquidity: Staked liquidity at the anchor block.
+
+        Returns:
+            The assembled ranging evidence.
+        """
+        return trailing_ranging_evidence(
+            points=path.points,
+            squared_log_returns=squared_log_returns,
+            notionals_usd=notionals,
+            window_start=window_start,
+            index=index,
+            gauge_liquidity_raw=DEFAULT_GAUGE_LIQUIDITY,
+            anchor_gauge_liquidity=anchor_gauge_liquidity,
+            anchor_staked_tvl_usd=Decimal("100000"),
+            pool_fee_ppm=500,
+            stock_decimals=FIXTURE_STOCK_DECIMALS,
+            quote_decimals=FIXTURE_QUOTE_DECIMALS,
+        )
+
+    def test_mismatched_inputs_fail_closed(self) -> None:
+        """Wrong array lengths, window bounds, or anchors refuse to assemble."""
+        path = self._hourly_path(3)
+        squared_log_returns, notionals = self._evidence_inputs(path)
+        with pytest.raises(ValueError, match="consecutive pair"):
+            self._assemble(path, squared_log_returns[:-1], notionals, 0, 2)
+        with pytest.raises(ValueError, match="ordered observation prefix"):
+            self._assemble(path, squared_log_returns, notionals, 3, 2)
+        with pytest.raises(ValueError, match="ordered observation prefix"):
+            self._assemble(path, squared_log_returns, notionals, 0, 3)
+        with pytest.raises(ValueError, match="positive"):
+            self._assemble(path, squared_log_returns, notionals, 0, 2, anchor_gauge_liquidity=0)
+
+
+class TestDerivedWidthReplay:
+    """Tests for target-yield-derived widths inside the replay fold."""
+
+    def test_window_opening_entry_fails_toward_the_labeled_ceiling(self) -> None:
+        """The first observation carries no volatility evidence yet."""
+        ledger = run_rehearsal([Decimal("100")] * 5, high_apr_steps(5))
+
+        entry = ledger.actions[0]
+        assert entry.action == PolicyActionKind.ENTER
+        assert entry.width_mode == WidthSolveMode.FALLBACK_CEILING
+        assert entry.half_width_ticks == 29
+        assert entry.half_width_fraction is not None
+        assert entry.half_width_fraction < Decimal("0.003")
+
+    def test_derived_entry_solves_when_evidence_supports_the_target(self) -> None:
+        """A later entry with rich evidence solves at the tightest meeting width."""
+        steps = [
+            make_apr_step(0, Decimal("1.2")),
+            make_apr_step(2, Decimal("20")),
+        ]
+        ledger = run_rehearsal([Decimal("100")] * 5, steps)
+
+        entry = ledger.actions[0]
+        assert entry.timestamp == BASE_TIME + timedelta(minutes=2)
+        assert entry.width_mode == WidthSolveMode.SOLVED
+        assert entry.half_width_ticks == 10
+        assert entry.range_lower_price is not None
+        assert entry.range_upper_price is not None
+        assert entry.range_lower_price < Decimal("100") < entry.range_upper_price
+
+    def test_derived_recenter_re_solves_at_the_new_price(self) -> None:
+        """A recenter derives its width again from the evidence at that instant."""
+        prices = [Decimal("100")] + [Decimal("101")] * 16
+        ledger = run_rehearsal(prices, high_apr_steps(len(prices)))
+        recenter = ledger.actions[1]
+
+        assert recenter.width_mode == WidthSolveMode.TARGET_UNREACHABLE
+        assert recenter.half_width_ticks == 10
+        # The unreachable target never widens past the solver's tightest pick.
+        assert recenter.half_width_fraction is not None
+        assert recenter.half_width_fraction < Decimal("0.003")
+
+    def test_baseline_replay_keeps_the_fixed_ceiling_width_everywhere(self) -> None:
+        """Baseline mode reproduces the v1 fixed-width policy at every action."""
+        prices = [Decimal("100")] + [Decimal("101")] * 16
+        ledger = replay_pool(
+            price_path=make_path(prices),
+            emissions_history=make_apr_history([make_apr_step(0, Decimal("3.0"))]),
+            symbol="AAPLc/USDC",
+            assumptions=RehearsalAssumptions(pool_fee_ppm=500),
+            width_selection=WidthSelectionMode.FIXED_CEILING_BASELINE,
+        )
+
+        assert ledger.width_selection == WidthSelectionMode.FIXED_CEILING_BASELINE
+        width_actions = [
+            action
+            for action in ledger.actions
+            if action.action in (PolicyActionKind.ENTER, PolicyActionKind.RECENTER)
+        ]
+        assert {action.width_mode for action in width_actions} == {WidthSolveMode.FALLBACK_CEILING}
+        assert {action.half_width_ticks for action in width_actions} == {29}
+        recenter = ledger.actions[1]
+        # The baseline range spans the locked ceiling width around 101.
+        assert recenter.range_upper_price is not None
+        assert Decimal("101") * Decimal("1.0029") < recenter.range_upper_price
+        assert recenter.range_upper_price < Decimal("101") * Decimal("1.0045")
+
+    def test_ledgers_label_the_width_selection_and_its_approximations(self) -> None:
+        """Both modes surface their width policy as first-class labels."""
+        prices = [Decimal("100")] * 3
+        derived = run_rehearsal(prices, high_apr_steps(3))
+        baseline = replay_pool(
+            price_path=make_path(prices),
+            emissions_history=make_apr_history([make_apr_step(0, Decimal("3.0"))]),
+            symbol="AAPLc/USDC",
+            assumptions=RehearsalAssumptions(pool_fee_ppm=500),
+            width_selection=WidthSelectionMode.FIXED_CEILING_BASELINE,
+        )
+
+        assert derived.width_selection == WidthSelectionMode.DERIVED_FROM_TARGET
+        assert any(
+            "derive from the target net daily yield" in label for label in derived.assumption_labels
+        )
+        assert any(
+            "trailing day of reconstructed swaps" in label for label in derived.assumption_labels
+        )
+        assert baseline.width_selection == WidthSelectionMode.FIXED_CEILING_BASELINE
+        assert any("baseline replay" in label for label in baseline.assumption_labels)
+
+    def test_plain_holds_and_exits_carry_no_width_evidence(self) -> None:
+        """Only enter and recenter actions record a width solve."""
+        prices = [Decimal("100")] * 10 + [Decimal("99.5"), Decimal("98.5")]
+        ledger = run_rehearsal(prices, high_apr_steps(len(prices)))
+
+        exit_record = ledger.actions[1]
+        assert exit_record.action == PolicyActionKind.STOP_OUT
+        assert exit_record.width_mode is None
+        assert exit_record.half_width_ticks is None
+        assert exit_record.half_width_fraction is None
 
 
 class TestLedgerModels:

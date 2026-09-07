@@ -81,9 +81,13 @@ DEFAULT_MAX_LOGS_PER_WINDOW = 1_000
 # Block-header lookups are bounded so a pathological pool cannot page the
 # shared public endpoint for hours; the rehearsal CLI raises it explicitly.
 DEFAULT_MAX_BLOCK_HEADER_LOOKUPS = 4_096
-# A runaway guard bounds one pool's total decoded events like discovery pagination.
-MAX_TOTAL_SWAP_EVENTS = 50_000
-# A runaway guard bounds one gauge's decoded stake events the same way.
+# A runaway guard bounds one pool's total decoded events like discovery
+# pagination. The busiest B20 pool (AAPLc) reconstructs roughly 3,600 swaps a
+# day, so a 21-day window needs about 76,000 events; the bound sits near twice
+# that need so even a busier pool reconstructs at the locked lookback.
+MAX_TOTAL_SWAP_EVENTS = 150_000
+# A runaway guard bounds one gauge's decoded stake events the same way; stake
+# events run orders of magnitude sparser than swaps, so it stays tighter.
 MAX_TOTAL_GAUGE_STAKE_EVENTS = 50_000
 # Base's public endpoint serves at most ten JSON-RPC calls per batch request,
 # verified live; larger batches fail with error -32014 "maximum 10 calls in
@@ -846,6 +850,8 @@ class EventHistoryRpcBackend:
         max_response_bytes: int = MAX_RESPONSE_BYTES,
         log_window_blocks: int = DEFAULT_LOG_WINDOW_BLOCKS,
         max_logs_per_window: int = DEFAULT_MAX_LOGS_PER_WINDOW,
+        max_total_swap_events: int = MAX_TOTAL_SWAP_EVENTS,
+        max_total_gauge_stake_events: int = MAX_TOTAL_GAUGE_STAKE_EVENTS,
         max_block_header_lookups: int = DEFAULT_MAX_BLOCK_HEADER_LOOKUPS,
         header_batch_size: int = 1,
         transport: httpx.BaseTransport | None = None,
@@ -861,6 +867,10 @@ class EventHistoryRpcBackend:
             max_response_bytes: Maximum accepted size of one RPC response body.
             log_window_blocks: Maximum block span of one eth_getLogs window.
             max_logs_per_window: Log count at which one window fails closed.
+            max_total_swap_events: Runaway guard on one pool's total decoded
+                Swap events.
+            max_total_gauge_stake_events: Runaway guard on one gauge's total
+                decoded stake events.
             max_block_header_lookups: Unique block headers one reconstruction
                 may fetch before failing closed.
             header_batch_size: Block-header reads grouped into one JSON-RPC
@@ -884,6 +894,10 @@ class EventHistoryRpcBackend:
             raise ValueError("log_window_blocks must be positive")
         if max_logs_per_window <= 0:
             raise ValueError("max_logs_per_window must be positive")
+        if max_total_swap_events <= 0:
+            raise ValueError("max_total_swap_events must be positive")
+        if max_total_gauge_stake_events <= 0:
+            raise ValueError("max_total_gauge_stake_events must be positive")
         if max_block_header_lookups <= 0:
             raise ValueError("max_block_header_lookups must be positive")
         if not 1 <= header_batch_size <= MAX_HEADER_BATCH_SIZE:
@@ -895,6 +909,8 @@ class EventHistoryRpcBackend:
         self._max_response_bytes = max_response_bytes
         self._log_window_blocks = log_window_blocks
         self._max_logs_per_window = max_logs_per_window
+        self._max_total_swap_events = max_total_swap_events
+        self._max_total_gauge_stake_events = max_total_gauge_stake_events
         self._max_block_header_lookups = max_block_header_lookups
         self._header_batch_size = header_batch_size
         # An injected transport keeps unit tests completely off the network.
@@ -1105,7 +1121,7 @@ class EventHistoryRpcBackend:
                 anchor_block,
                 [[GAUGE_DEPOSIT_TOPIC0, GAUGE_WITHDRAW_TOPIC0]],
                 decode_gauge_stake_log,
-                MAX_TOTAL_GAUGE_STAKE_EVENTS,
+                self._max_total_gauge_stake_events,
                 "gauge stake",
             )
             # Every event block needs its header once; the cache deduplicates and
@@ -1450,7 +1466,7 @@ class EventHistoryRpcBackend:
             end_block,
             [SWAP_EVENT_TOPIC0],
             decode_swap_log,
-            MAX_TOTAL_SWAP_EVENTS,
+            self._max_total_swap_events,
             "Swap",
         )
 

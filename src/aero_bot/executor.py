@@ -784,6 +784,7 @@ def build_swap_calldata(
         + commands.ljust(_padded_length(len(commands)), b"\x00")
         + _word(1)
         + _word(WORD_BYTES)
+        + _word(len(struct))
         + struct
     )
     return f"0x{ROUTER_EXECUTE_SELECTOR}{encoded.hex()}"
