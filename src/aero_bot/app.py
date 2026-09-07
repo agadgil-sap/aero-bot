@@ -35,6 +35,7 @@ from aero_bot.oracles import (
 )
 from aero_bot.registry import B20RegistryResult, RegistryStatus, load_official_b20_registry
 from aero_bot.risk import RiskEngine
+from aero_bot.sugar import LpSugarRpcBackend
 from aero_bot.transactions import (
     AllowancePlanResult,
     ExactAllowanceRequest,
@@ -45,6 +46,7 @@ from aero_bot.transactions import (
 )
 from aero_bot.venues import (
     AerodromeVenueAdapter,
+    PoolDiscoveryBackend,
     PoolDiscoveryResult,
     PoolDiscoveryStatus,
 )
@@ -150,10 +152,18 @@ def create_app(
     resolved_registry = b20_registry or load_official_b20_registry()
     # Only verified issuer records are supplied to the strict venue adapter.
     official_b20_addresses = frozenset(asset.address for asset in resolved_registry.assets)
+    # Live enumeration is opt-in so default startup stays deterministic and offline.
+    discovery_backend: PoolDiscoveryBackend | None = None
+    if resolved_settings.pool_discovery_enabled:
+        # The backend performs only read-only eth_call pagination through LP Sugar.
+        discovery_backend = LpSugarRpcBackend(
+            rpc_url=resolved_settings.base_rpc_url,
+            sugar_address=resolved_settings.lp_sugar_address,
+        )
     # Without an injected live result, the adapter emits an explicit no-RPC diagnostic.
-    resolved_pool_discovery = pool_discovery or AerodromeVenueAdapter().discover_pools(
-        official_b20_addresses
-    )
+    resolved_pool_discovery = pool_discovery or AerodromeVenueAdapter(
+        discovery_backend
+    ).discover_pools(official_b20_addresses)
     # Without injected observations, oracle output explicitly reports the missing trust inputs.
     resolved_oracle_coverage = oracle_coverage or unavailable_chainlink_coverage(
         expected_assets=len(official_b20_addresses)

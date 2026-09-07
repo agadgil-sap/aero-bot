@@ -49,6 +49,13 @@ Only a market-open observation that passes every gate is healthy.
 The current release has no reviewed B20 proxy-address snapshot or read-only observation backend, so `/api/oracles/chainlink` and the dashboard report an explicit unavailable diagnostic instead of making live feed claims.
 See [the oracle health policy](docs/oracle-health.md) for evidence sources and exact gate ordering.
 
+## Pool discovery
+
+Aerodrome's own LP Sugar contract is the authoritative pool inventory for the application.
+When `AERO_BOT_POOL_DISCOVERY_ENABLED` is set, the application enumerates every pool through read-only paginated `eth_call` requests against the Base RPC endpoint, pins one block for a coherent snapshot, and accepts only official Slipstream pools pairing one verified B20 with native USDC under an alive gauge actively emitting official AERO.
+The default public Base RPC endpoint and pinned Sugar deployment can be overridden with `AERO_BOT_BASE_RPC_URL` and `AERO_BOT_LP_SUGAR_ADDRESS`; no third-party API key is used or embedded.
+See [the venue trust boundary](docs/venue-boundary.md) for the complete acceptance and fail-closed rules.
+
 ## Live yield screen
 
 The dashboard and `/api/market-data/aerodrome-yields` perform a bounded read-only query against DefiLlama's public yield dataset.

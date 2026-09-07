@@ -22,6 +22,7 @@ from aero_bot.transactions import (
     UnsignedTransactionPlan,
 )
 from aero_bot.venues import (
+    AERO_TOKEN_ADDRESS,
     PoolCandidate,
     PoolDiscoveryResult,
     PoolDiscoveryStatus,
@@ -147,7 +148,7 @@ async def test_dashboard_states_truthful_initial_status() -> None:
     assert "Source verified" in response.text
     assert "Verified 10 Coinbase-issued B20 listings" in response.text
     assert "Discovery blocked" in response.text
-    assert "No read-only Base RPC discovery backend is configured" in response.text
+    assert "No LP Sugar read-only Base RPC discovery backend is configured" in response.text
     assert "Health unavailable" in response.text
     assert "no reviewed proxy-address snapshot" in response.text
     assert "Wallet onboarding unavailable" in response.text
@@ -224,8 +225,20 @@ async def test_pool_endpoint_and_dashboard_expose_verified_discovery() -> None:
         token0_address="0xb20000000000000000000078ee7ce2fe4908108c",
         token1_address="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
         pool_kind=PoolKind.SLIPSTREAM,
-        fee_bps=30,
-        gauge_address=None,
+        tick_spacing=10,
+        current_tick=-5,
+        sqrt_ratio=1 << 96,
+        pool_fee_ppm=500,
+        unstaked_fee_ppm=100_000,
+        reserve0=10**18,
+        reserve1=5_000_000,
+        staked0=10**17,
+        staked1=1_000_000,
+        gauge_address="0x2222222222222222222222222222222222222222",
+        gauge_liquidity=9_999,
+        gauge_alive=True,
+        emissions_per_second=4_494_371_922_759_724,
+        emissions_token_address=AERO_TOKEN_ADDRESS,
     )
     # The discovery result simulates a completed read-only backend after adapter validation.
     pool_discovery = PoolDiscoveryResult(

@@ -3,9 +3,13 @@
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from aero_bot.domain import EvmAddress
+from aero_bot.sugar import DEFAULT_BASE_RPC_URL, LP_SUGAR_ADDRESS
 
 # The default product title appears in API metadata and the dashboard.
 DEFAULT_APP_NAME = "Aero Bot"
@@ -19,6 +23,8 @@ DEFAULT_BIND_PORT = 8765
 DEFAULT_AUDIT_DATABASE_PATH = (
     Path.home() / "Library" / "Application Support" / "Aero Bot" / "audit.sqlite3"
 )
+# Loopback host names are the only names permitted with plaintext HTTP RPC endpoints.
+PLAINTEXT_HTTP_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 class Settings(BaseSettings):
@@ -37,6 +43,12 @@ class Settings(BaseSettings):
     bind_port: Annotated[int, Field(ge=1024, le=65535)] = DEFAULT_BIND_PORT
     # The audit path keeps durable evidence outside the source repository by default.
     audit_database_path: Path = DEFAULT_AUDIT_DATABASE_PATH
+    # The Base JSON-RPC endpoint used only for read-only eth_call enumeration.
+    base_rpc_url: str = DEFAULT_BASE_RPC_URL
+    # The LP Sugar contract is the authoritative complete Aerodrome pool inventory.
+    lp_sugar_address: EvmAddress = LP_SUGAR_ADDRESS
+    # Live pool enumeration is opt-in so default startup stays deterministic and offline.
+    pool_discovery_enabled: bool = False
 
     @field_validator("bind_host")
     @classmethod
@@ -57,3 +69,19 @@ class Settings(BaseSettings):
         if not expanded_path.is_absolute():
             raise ValueError("audit_database_path must be absolute")
         return expanded_path
+
+    @field_validator("base_rpc_url")
+    @classmethod
+    def require_read_only_rpc_url(cls, value: str) -> str:
+        """Accept only HTTPS RPC endpoints, or plaintext endpoints on loopback hosts."""
+        # Parsed URL components distinguish remote HTTPS endpoints from local nodes.
+        parsed_url = urlparse(value)
+        # A remote plaintext endpoint would expose read traffic to network observers.
+        plaintext_to_remote_host = (
+            parsed_url.scheme == "http" and parsed_url.hostname not in PLAINTEXT_HTTP_HOSTS
+        )
+        if parsed_url.scheme not in {"http", "https"} or plaintext_to_remote_host:
+            raise ValueError("base_rpc_url must use HTTPS, or HTTP only on a loopback host")
+        if not parsed_url.netloc:
+            raise ValueError("base_rpc_url must include a host")
+        return value

@@ -72,11 +72,11 @@ class FactoryGeneration(StrEnum):
 class PoolDiscoveryStatus(StrEnum):
     """Describe whether pool observations are safe to consume."""
 
-    # Verified means every candidate passed venue, factory, pair, and uniqueness checks.
+    # Verified means every returned pool passed all hard checks with exclusions documented.
     VERIFIED = "verified"
     # Unavailable means no live source produced observations.
     UNAVAILABLE = "unavailable"
-    # Rejected means a source returned at least one candidate outside the hard boundary.
+    # Rejected means a source returned evidence inconsistent with its own contract.
     REJECTED = "rejected"
 
 
@@ -144,10 +144,34 @@ class PoolCandidate(BaseModel):
     token1_address: EvmAddress
     # Pool kind selects the correct invariant and position mathematics.
     pool_kind: PoolKind
-    # Fee basis points record the active swap fee observed by the backend.
-    fee_bps: Annotated[int, Field(ge=0, le=10_000)]
+    # Tick spacing is positive for Slipstream pools and 0 or -1 for classic pools.
+    tick_spacing: int
+    # The current pool tick is zero for classic pools.
+    current_tick: int
+    # The current square-root price is zero for classic pools.
+    sqrt_ratio: Annotated[int, Field(ge=0)]
+    # Pool fee is the Slipstream fee tier in parts per million.
+    pool_fee_ppm: Annotated[int, Field(ge=0)]
+    # Unstaked fee is the higher tier charged when liquidity is not staked.
+    unstaked_fee_ppm: Annotated[int, Field(ge=0)]
+    # Reserve zero is the raw token-unit pool balance.
+    reserve0: Annotated[int, Field(ge=0)]
+    # Reserve one is the raw token-unit pool balance.
+    reserve1: Annotated[int, Field(ge=0)]
+    # Staked zero is the raw token-unit balance held in gauge positions.
+    staked0: Annotated[int, Field(ge=0)]
+    # Staked one is the raw token-unit balance held in gauge positions.
+    staked1: Annotated[int, Field(ge=0)]
     # Gauge address is absent when Aerodrome has no gauge for the pool.
     gauge_address: EvmAddress | None
+    # Gauge liquidity measures the staked liquidity sharing gauge emissions.
+    gauge_liquidity: Annotated[int, Field(ge=0)]
+    # Gauge liveness is Aerodrome's own kill-switch state for emissions.
+    gauge_alive: bool
+    # Emissions are the raw per-second reward rate paid by the gauge.
+    emissions_per_second: Annotated[int, Field(ge=0)]
+    # The emissions token is absent when the gauge is not emitting.
+    emissions_token_address: EvmAddress | None
 
 
 class PoolDiscoveryBatch(BaseModel):
@@ -162,6 +186,8 @@ class PoolDiscoveryBatch(BaseModel):
     observed_at: datetime
     # Candidates remain untrusted until the Aerodrome adapter validates them.
     candidates: tuple[PoolCandidate, ...]
+    # Enumerated count records the complete inventory size before pair scoping.
+    enumerated_pool_count: Annotated[int, Field(ge=0)]
 
 
 class PoolDiscoveryResult(BaseModel):
@@ -190,14 +216,12 @@ class PoolDiscoveryBackend(Protocol):
 
     def discover(
         self,
-        factory_addresses: frozenset[str],
         b20_addresses: frozenset[str],
         quote_token_address: str,
     ) -> PoolDiscoveryBatch:
         """Read candidate pools without signing, sending, or mutating chain state.
 
         Args:
-            factory_addresses: Official Aerodrome factories eligible for read calls.
             b20_addresses: Official Coinbase-issued B20 contracts eligible for pairing.
             quote_token_address: Official native Base USDC contract.
 
@@ -294,20 +318,30 @@ class AerodromeVenueAdapter:
         return VenueId.AERODROME
 
     def discover_pools(self, b20_addresses: frozenset[str]) -> PoolDiscoveryResult:
-        """Return only official B20 and native-USDC pools from approved factories.
+        """Return official B20/native-USDC Slipstream pools with live AERO gauges.
+
+        The authoritative source is the LP Sugar enumeration backend, which supplies
+        every Aerodrome pool in one coherent block-pinned snapshot. Pools outside the
+        B20/native-USDC pair scope never reach this adapter; this method independently
+        revalidates that scope and then applies the factory, gauge, and emissions
+        acceptance boundaries.
 
         Args:
             b20_addresses: Issuer-verified B20 contracts allowed for pool matching.
 
         Returns:
-            An all-or-nothing pool set with freshness and validation diagnostics.
+            Validated pools plus ordered acceptance, exclusion, or failure diagnostics.
         """
-        # Normalized official factories are the sole contracts a backend may query.
+        # Official factory evidence identifies every known deployment lineage.
         factories_by_address = {
             factory.address: factory for factory in self._contracts.pool_factories
         }
-        # The immutable set is passed to the backend without arbitrary factory expansion.
-        factory_addresses = frozenset(factories_by_address)
+        # The emissions-farming policy accepts only the three official Slipstream factories.
+        slipstream_factory_addresses = frozenset(
+            factory.address
+            for factory in self._contracts.pool_factories
+            if PoolKind.SLIPSTREAM in factory.supported_pool_kinds
+        )
         # Registry addresses are normalized before pair validation and backend use.
         normalized_b20_addresses = frozenset(address.lower() for address in b20_addresses)
 
@@ -319,16 +353,16 @@ class AerodromeVenueAdapter:
                 observed_at=None,
                 pools=(),
                 diagnostics=(
-                    "No read-only Base RPC discovery backend is configured; no onchain pool "
-                    f"claims were made after loading {len(factory_addresses)} official Aerodrome "
-                    f"factories and {len(normalized_b20_addresses)} official B20 identities.",
+                    "No LP Sugar read-only Base RPC discovery backend is configured; no onchain "
+                    f"pool claims were made after loading {len(slipstream_factory_addresses)} "
+                    f"official Slipstream factories and {len(normalized_b20_addresses)} official "
+                    "B20 identities.",
                 ),
             )
 
         try:
-            # The backend returns read-only candidates for independent validation.
+            # The backend returns pair-scoped read-only candidates for validation.
             batch = self._backend.discover(
-                factory_addresses,
                 normalized_b20_addresses,
                 self._contracts.quote_token_address,
             )
@@ -339,63 +373,98 @@ class AerodromeVenueAdapter:
                 source="read_only_backend",
                 observed_at=None,
                 pools=(),
-                diagnostics=(f"Aerodrome pool discovery backend was unavailable: {error}",),
+                diagnostics=(f"Aerodrome LP Sugar discovery backend was unavailable: {error}",),
             )
-        # Rejection evidence accumulates in candidate order for deterministic diagnostics.
-        diagnostics: list[str] = []
-        # Duplicate pool contracts are rejected because they imply inconsistent source output.
+        # Integrity violations reject the entire batch because they contradict the
+        # backend's own enumeration contract rather than describing market state.
+        integrity_diagnostics: list[str] = []
+        # Exclusion diagnostics document pools that were inspected but not accepted.
+        exclusion_diagnostics: list[str] = []
+        # Duplicate pool contracts imply inconsistent pagination or source state.
         seen_pool_addresses: set[str] = set()
+        accepted_pools: list[PoolCandidate] = []
 
         for candidate in batch.candidates:
-            # The candidate factory determines the supported invariant family.
-            factory = factories_by_address.get(candidate.factory_address)
-            if factory is None:
-                diagnostics.append(
-                    f"Pool {candidate.pool_address} came from non-allowlisted factory "
-                    f"{candidate.factory_address}."
-                )
-                continue
-            if candidate.pool_kind not in factory.supported_pool_kinds:
-                diagnostics.append(
-                    f"Pool {candidate.pool_address} reported kind {candidate.pool_kind} that is "
-                    f"incompatible with factory {candidate.factory_address}."
-                )
             # Pair membership must contain exactly native USDC and one issuer-verified B20.
             candidate_tokens = frozenset({candidate.token0_address, candidate.token1_address})
-            # Matching assets identify whether exactly one official B20 is present.
             matching_b20_addresses = candidate_tokens.intersection(normalized_b20_addresses)
             if (
                 self._contracts.quote_token_address not in candidate_tokens
                 or len(candidate_tokens) != 2
                 or len(matching_b20_addresses) != 1
             ):
-                diagnostics.append(
-                    f"Pool {candidate.pool_address} is not an official B20/native-USDC pair."
+                integrity_diagnostics.append(
+                    f"Pair-scoped backend returned pool {candidate.pool_address} outside the "
+                    "official B20/native-USDC pair boundary."
                 )
+                continue
+            # The candidate factory determines the supported invariant family.
+            factory = factories_by_address.get(candidate.factory_address)
+            if factory is None:
+                integrity_diagnostics.append(
+                    f"Pool {candidate.pool_address} came from non-allowlisted factory "
+                    f"{candidate.factory_address}."
+                )
+                continue
+            if candidate.pool_kind not in factory.supported_pool_kinds:
+                integrity_diagnostics.append(
+                    f"Pool {candidate.pool_address} reported kind {candidate.pool_kind} that is "
+                    f"incompatible with factory {candidate.factory_address}."
+                )
+                continue
             if candidate.pool_address in seen_pool_addresses:
-                diagnostics.append(
+                integrity_diagnostics.append(
                     f"Pool {candidate.pool_address} appeared more than once in one discovery batch."
                 )
+                continue
             seen_pool_addresses.add(candidate.pool_address)
+            # Only the three official Slipstream factories support this policy's
+            # concentrated-liquidity mathematics; classic pairs are excluded by policy.
+            if candidate.factory_address not in slipstream_factory_addresses:
+                exclusion_diagnostics.append(
+                    f"Pool {candidate.pool_address} is a B20/native-USDC pair from "
+                    f"{factory.generation} factory {candidate.factory_address} that is outside "
+                    "the Slipstream-only policy."
+                )
+                continue
+            # A pool without a live gauge cannot support staked emissions farming.
+            if candidate.gauge_address is None or not candidate.gauge_alive:
+                exclusion_diagnostics.append(
+                    f"Pool {candidate.pool_address} has no live Aerodrome gauge and was excluded."
+                )
+                continue
+            # A live gauge that is not emitting AERO cannot clear the entry threshold.
+            if (
+                candidate.emissions_per_second == 0
+                or candidate.emissions_token_address != self._contracts.reward_token_address
+            ):
+                exclusion_diagnostics.append(
+                    f"Pool {candidate.pool_address} has a live gauge that is not emitting "
+                    "official AERO rewards and was excluded."
+                )
+                continue
+            accepted_pools.append(candidate)
 
-        if diagnostics:
+        if integrity_diagnostics:
             return PoolDiscoveryResult(
                 venue=self.venue_id,
                 status=PoolDiscoveryStatus.REJECTED,
                 source=batch.source,
                 observed_at=batch.observed_at,
                 pools=(),
-                diagnostics=tuple(diagnostics),
+                diagnostics=tuple(integrity_diagnostics),
             )
 
+        summary = (
+            f"Accepted {len(accepted_pools)} of {len(batch.candidates)} pair-scoped Aerodrome "
+            f"pools after factory, pair, kind, uniqueness, gauge-liveness, and AERO-emission "
+            f"validation; the LP Sugar enumeration inspected {batch.enumerated_pool_count} pools."
+        )
         return PoolDiscoveryResult(
             venue=self.venue_id,
             status=PoolDiscoveryStatus.VERIFIED,
             source=batch.source,
             observed_at=batch.observed_at,
-            pools=batch.candidates,
-            diagnostics=(
-                f"Accepted {len(batch.candidates)} Aerodrome pools after factory, pair, kind, "
-                "and uniqueness validation.",
-            ),
+            pools=tuple(accepted_pools),
+            diagnostics=(summary, *exclusion_diagnostics),
         )
