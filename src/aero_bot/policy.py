@@ -1263,21 +1263,32 @@ class PolicyEngine:
             next_state=next_state,
         )
 
-    def _stock_quantity(self, position: PolicyPosition, amm_price: Decimal) -> Decimal:
-        """Calculate the position's stock inventory at one pool price.
+    def position_composition(
+        self,
+        position: PolicyPosition,
+        amm_price: Decimal,
+    ) -> tuple[Decimal, Decimal]:
+        """Calculate the position's stock and USDC quantities at one pool price.
 
         The v3-style composition is exact for a range entered at its geometric
         center, which is how the engine builds every range: liquidity follows
-        from the committed value at the center, and the stock side spans the
-        evaluated-to-upper square-root-price band.
+        from the committed value at the center, the stock side spans the
+        evaluated-to-upper square-root-price band, and the USDC side spans the
+        lower-to-evaluated band.
 
         Args:
             position: Open position with its aligned range and committed value.
             amm_price: Positive pool price in USDC per stock.
 
         Returns:
-            The stock token quantity held at this price; zero above the range.
+            The (stock quantity, USDC quantity) pair held at this price; the
+            stock side is zero above the range and the USDC side is zero below.
+
+        Raises:
+            ValueError: If the pool price is not positive.
         """
+        if amm_price <= 0:
+            raise ValueError("amm_price must be positive")
         with localcontext() as decimal_context:
             # Local precision isolates deterministic composition math from settings.
             decimal_context.prec = MATH_PRECISION
@@ -1293,13 +1304,30 @@ class PolicyEngine:
             if amm_price <= lower:
                 # Below the range the position is entirely stock tokens.
                 stock_quantity = liquidity * (Decimal(1) / sqrt_lower - Decimal(1) / sqrt_upper)
+                usdc_quantity = Decimal(0)
             elif amm_price < upper:
-                # In range the stock side covers the current-to-upper band.
+                # In range the stock side covers the current-to-upper band and
+                # the USDC side covers the lower-to-current band.
                 stock_quantity = liquidity * (Decimal(1) / sqrt_price - Decimal(1) / sqrt_upper)
+                usdc_quantity = liquidity * (sqrt_price - sqrt_lower)
             else:
                 # Above the range the position is entirely USDC.
                 stock_quantity = Decimal(0)
-            return +stock_quantity
+                usdc_quantity = liquidity * (sqrt_upper - sqrt_lower)
+            return +stock_quantity, +usdc_quantity
+
+    def _stock_quantity(self, position: PolicyPosition, amm_price: Decimal) -> Decimal:
+        """Calculate the position's stock inventory at one pool price.
+
+        Args:
+            position: Open position with its aligned range and committed value.
+            amm_price: Positive pool price in USDC per stock.
+
+        Returns:
+            The stock token quantity held at this price; zero above the range.
+        """
+        # The stock side of the shared composition rule feeds every exit path.
+        return self.position_composition(position, amm_price)[0]
 
     def _swap_plan(
         self,

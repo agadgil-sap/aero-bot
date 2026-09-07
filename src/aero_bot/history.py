@@ -128,6 +128,10 @@ class SwapEventRecord(BaseModel):
     block_number: Annotated[int, Field(ge=0)]
     # The log index orders multiple swaps inside one block deterministically.
     log_index: Annotated[int, Field(ge=0)]
+    # The signed token-zero delta; positive means the pool received token zero.
+    amount0: int
+    # The signed token-one delta; positive means the pool received token one.
+    amount1: int
     # The post-swap square-root price is the raw price witness.
     sqrt_ratio: Annotated[int, Field(gt=0)]
     # Active liquidity after the swap feeds later depth approximations.
@@ -147,6 +151,10 @@ class PoolPricePoint(BaseModel):
     # Block number and log index preserve the onchain ordering evidence.
     block_number: Annotated[int, Field(ge=0)]
     log_index: Annotated[int, Field(ge=0)]
+    # The signed token-zero delta of this swap, exactly as emitted.
+    amount0: int
+    # The signed token-one delta of this swap, exactly as emitted.
+    amount1: int
     # The raw post-swap square-root price witness.
     sqrt_ratio: Annotated[int, Field(gt=0)]
     # Active liquidity after the swap.
@@ -339,15 +347,22 @@ def decode_swap_log(log: object) -> SwapEventRecord:
     block_number = _parse_hex_field(log.get("blockNumber"), "blockNumber")
     log_index = _parse_hex_field(log.get("logIndex"), "logIndex")
     # The data words are read positionally per the vendored event layout.
+    amount0_word = int.from_bytes(data_bytes[0:WORD_BYTES], "big")
+    amount1_word = int.from_bytes(data_bytes[WORD_BYTES : 2 * WORD_BYTES], "big")
     sqrt_ratio = int.from_bytes(data_bytes[2 * WORD_BYTES : 3 * WORD_BYTES], "big")
     liquidity = int.from_bytes(data_bytes[3 * WORD_BYTES : 4 * WORD_BYTES], "big")
     tick_word = int.from_bytes(data_bytes[4 * WORD_BYTES : 5 * WORD_BYTES], "big")
+    # Amounts and tick are sign-extended two's-complement words.
+    amount0 = amount0_word if amount0_word < SIGN_BIT else amount0_word - WORD_MODULUS
+    amount1 = amount1_word if amount1_word < SIGN_BIT else amount1_word - WORD_MODULUS
     tick = tick_word if tick_word < SIGN_BIT else tick_word - WORD_MODULUS
     if sqrt_ratio <= 0:
         raise ValueError("Swap log reported a non-positive sqrtPriceX96")
     return SwapEventRecord(
         block_number=block_number,
         log_index=log_index,
+        amount0=amount0,
+        amount1=amount1,
         sqrt_ratio=sqrt_ratio,
         liquidity=liquidity,
         tick=tick,
@@ -501,6 +516,8 @@ def build_price_path(
                 timestamp=timestamp,
                 block_number=record.block_number,
                 log_index=record.log_index,
+                amount0=record.amount0,
+                amount1=record.amount1,
                 sqrt_ratio=record.sqrt_ratio,
                 liquidity=record.liquidity,
                 tick=record.tick,

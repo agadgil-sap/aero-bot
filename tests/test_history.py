@@ -86,6 +86,8 @@ def swap_log(
     liquidity: int = 1_000,
     tick: int = -5,
     pool_address: str = POOL_ADDRESS,
+    amount0: int = 10,
+    amount1: int = -20,
 ) -> dict[str, Any]:
     """Build one well-formed raw Slipstream Swap log entry.
 
@@ -96,14 +98,16 @@ def swap_log(
         liquidity: Raw active liquidity after the swap.
         tick: Signed post-swap tick.
         pool_address: Pool the log was emitted from.
+        amount0: Signed token-zero delta carried by the log.
+        amount1: Signed token-one delta carried by the log.
 
     Returns:
         A JSON-RPC log object shaped exactly like an eth_getLogs entry.
     """
     data = b"".join(
         (
-            encode_word(10),
-            encode_word(-20),
+            encode_word(amount0),
+            encode_word(amount1),
             encode_word(sqrt_ratio),
             encode_word(liquidity),
             encode_word(tick),
@@ -334,12 +338,14 @@ def fetch_emissions(
 
 
 def test_decode_swap_log_round_trips_one_event() -> None:
-    """A well-formed log decodes with the negative tick sign-extended exactly."""
-    record = decode_swap_log(swap_log(123, 4, 1 << 96, 987, -77))
+    """A well-formed log decodes with the negative amounts and tick sign-extended."""
+    record = decode_swap_log(swap_log(123, 4, 1 << 96, 987, -77, amount0=-500, amount1=1_000))
 
     assert record == SwapEventRecord(
         block_number=123,
         log_index=4,
+        amount0=-500,
+        amount1=1_000,
         sqrt_ratio=1 << 96,
         liquidity=987,
         tick=-77,
@@ -386,9 +392,33 @@ def test_price_usdc_per_stock_handles_both_token_orderings() -> None:
 def test_build_price_path_orders_points_and_attaches_prices() -> None:
     """Records sort by block and log index and receive exact header timestamps."""
     records = (
-        SwapEventRecord(block_number=10, log_index=1, sqrt_ratio=1 << 96, liquidity=5, tick=1),
-        SwapEventRecord(block_number=9, log_index=7, sqrt_ratio=1 << 97, liquidity=6, tick=2),
-        SwapEventRecord(block_number=10, log_index=0, sqrt_ratio=1 << 95, liquidity=7, tick=3),
+        SwapEventRecord(
+            block_number=10,
+            log_index=1,
+            amount0=10,
+            amount1=-20,
+            sqrt_ratio=1 << 96,
+            liquidity=5,
+            tick=1,
+        ),
+        SwapEventRecord(
+            block_number=9,
+            log_index=7,
+            amount0=10,
+            amount1=-20,
+            sqrt_ratio=1 << 97,
+            liquidity=6,
+            tick=2,
+        ),
+        SwapEventRecord(
+            block_number=10,
+            log_index=0,
+            amount0=10,
+            amount1=-20,
+            sqrt_ratio=1 << 95,
+            liquidity=7,
+            tick=3,
+        ),
     )
     timestamps = {
         9: fixture_block_timestamp(9),
@@ -418,7 +448,15 @@ def test_build_price_path_orders_points_and_attaches_prices() -> None:
 def test_build_price_path_rejects_foreign_tokens() -> None:
     """A token outside the pool pair fails closed."""
     records = (
-        SwapEventRecord(block_number=9, log_index=0, sqrt_ratio=1 << 96, liquidity=1, tick=0),
+        SwapEventRecord(
+            block_number=9,
+            log_index=0,
+            amount0=10,
+            amount1=-20,
+            sqrt_ratio=1 << 96,
+            liquidity=1,
+            tick=0,
+        ),
     )
     with pytest.raises(ValueError, match="pool's two tokens"):
         build_price_path(
@@ -439,7 +477,15 @@ def test_build_price_path_rejects_foreign_tokens() -> None:
 def test_build_price_path_rejects_missing_timestamps() -> None:
     """A record block without a header timestamp fails closed."""
     records = (
-        SwapEventRecord(block_number=9, log_index=0, sqrt_ratio=1 << 96, liquidity=1, tick=0),
+        SwapEventRecord(
+            block_number=9,
+            log_index=0,
+            amount0=10,
+            amount1=-20,
+            sqrt_ratio=1 << 96,
+            liquidity=1,
+            tick=0,
+        ),
     )
     with pytest.raises(ValueError, match="lacks a header timestamp"):
         build_price_path(
@@ -584,7 +630,15 @@ def test_fetch_price_path_rejects_non_positive_lookback() -> None:
 def test_build_price_path_supports_stock_as_token1() -> None:
     """A pool where USDC sorts first still prices the stock in USDC."""
     records = (
-        SwapEventRecord(block_number=9, log_index=0, sqrt_ratio=1 << 96, liquidity=1, tick=0),
+        SwapEventRecord(
+            block_number=9,
+            log_index=0,
+            amount0=10,
+            amount1=-20,
+            sqrt_ratio=1 << 96,
+            liquidity=1,
+            tick=0,
+        ),
     )
     path = build_price_path(
         pool_address=POOL_ADDRESS,
@@ -613,6 +667,8 @@ def test_point_and_path_validators_reject_naive_or_inverted_inputs() -> None:
             timestamp=datetime.now(),
             block_number=1,
             log_index=0,
+            amount0=1,
+            amount1=-1,
             sqrt_ratio=1 << 96,
             liquidity=1,
             tick=0,

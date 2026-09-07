@@ -77,6 +77,15 @@ Staked positions can also change liquidity through the position manager while th
 Three approximations are documented per series: the gauge's AERO reward rate is held constant across the window because Aerodrome resets it only at weekly epochs, staked value scales linearly with staked liquidity at the frozen per-unit anchor value because other LPs' range shapes are private, and the constant fallback holds the anchor level across the window when the event fold cannot close.
 The AERO price behind every APR is an explicit assumption carried on the series itself.
 
+## Rehearsal replay and per-pool P&L ledger
+
+The replay module folds the locked policy engine over one pool's reconstructed histories and emits a deterministic per-pool profit-and-loss ledger.
+Every reconstructed swap becomes one observation, the books mark at each price, and every decision applies to USDC cash, the open position, and any held inventory exactly as the engine emitted it.
+Between observations, AERO emissions accrue to the open in-range position pro rata to gauge staked liquidity, and each observed swap credits fees pro rata to active pool liquidity while the position is open and in range.
+Because the underlying reference market cannot be reconstructed keylessly minute-by-minute, the reference path defaults to the assumption that the AMM equaled the real market at every swap, and a clearly labeled synthetic schedule may overlay bounded stale-high, stale-low, and stale-feed episodes so the dislocation monitor's exits, holds, and convergence-timeout sells appear in the ledger.
+The ledger carries final equity, P&L, exposure time, accrued fees and emissions, total swap-impact and gas drag, per-action-kind counts cross-checked against the recorded action list, and every documented approximation as explicit assumption labels.
+The replay is pure: all economic inputs are injected, so the module performs no I/O and unit tests drive it entirely from synthetic paths.
+
 ## Wallet-free transaction planning
 
 The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.
