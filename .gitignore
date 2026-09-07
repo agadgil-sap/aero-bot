@@ -26,5 +26,9 @@ run/
 # Local design-review artifacts.
 .lavish/
 
+# Local agent orchestrator and assistant state.
+.gnhf/
+.claude/
+
 # macOS metadata.
 .DS_Store
