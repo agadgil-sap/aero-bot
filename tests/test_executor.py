@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from eth_abi import decode
+from eth_abi.abi import decode
 from eth_account import Account
 from eth_utils.crypto import keccak
 from pydantic import ValidationError
