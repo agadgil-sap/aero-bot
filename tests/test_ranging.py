@@ -15,6 +15,7 @@ from aero_bot.ranging import (
     WidthSolution,
     WidthSolveMode,
     band_shape,
+    ceiling_width_solution,
     implied_average_half_width_fraction,
     liquidity_per_deployed_dollar,
     realized_daily_volatility,
@@ -511,6 +512,37 @@ class TestSolveModes:
         assert solution.mode == WidthSolveMode.SOLVED
         assert observations.target_net_daily_yield == Decimal("0.01")
 
+    def test_ceiling_solution_carries_the_reason_and_prefix_evidence(self) -> None:
+        """The public ceiling constructor labels its reason and echoes a prefix."""
+        solution = ceiling_width_solution(
+            pool_price_usdc=Decimal("100"),
+            tick_spacing=10,
+            max_range_half_width_fraction=Decimal("0.003"),
+            target_net_daily_yield=Decimal("0.01"),
+            reason="the observation carries no ranging evidence",
+            prefix_diagnostics=("Echoed input line.",),
+        )
+        with localcontext() as decimal_context:
+            decimal_context.prec = MATH_PRECISION
+            ceiling = TICK_PRICE_RATIO ** Decimal(29) - Decimal(1)
+        assert solution.mode == WidthSolveMode.FALLBACK_CEILING
+        assert solution.half_width_ticks == 29
+        assert solution.half_width_fraction == ceiling
+        assert solution.diagnostics[0] == "Echoed input line."
+        assert "the observation carries no ranging evidence" in solution.diagnostics[1]
+        assert len(solution.evaluations) == 1
+
+    def test_ceiling_solution_rejects_a_nonpositive_price(self) -> None:
+        """A nonpositive pool price cannot anchor a ceiling solution."""
+        with pytest.raises(ValueError, match="positive"):
+            ceiling_width_solution(
+                pool_price_usdc=Decimal("0"),
+                tick_spacing=10,
+                max_range_half_width_fraction=Decimal("0.003"),
+                target_net_daily_yield=Decimal("0.01"),
+                reason="unreachable in practice",
+            )
+
 
 class TestSolveEconomicsFromFirstPrinciples:
     """Tests recomputing every modeled quantity from the raw formulas."""
@@ -556,9 +588,12 @@ class TestSolveEconomicsFromFirstPrinciples:
             )
             fee = (
                 fee_stream
-                * liquidity_per_dollar
-                * human_scale
-                / Decimal(observations.active_liquidity_raw)
+                * (
+                    liquidity_per_dollar
+                    * observations.position_size_usd
+                    * human_scale
+                    / Decimal(observations.active_liquidity_raw)
+                )
                 / observations.position_size_usd
             )
             stop_distance = Decimal(1) - (Decimal(1) - width) * (
@@ -708,8 +743,8 @@ class TestDeterminismAndMonotonicity:
 
     def test_higher_targets_flip_the_solve_to_unreachable(self) -> None:
         """Targets above the tightest net report unreachable, never widen."""
-        _, near = solved_solution(target_net_daily_yield=Decimal("0.011"))
-        _, far = solved_solution(target_net_daily_yield=Decimal("0.012"))
+        _, near = solved_solution(target_net_daily_yield=Decimal("0.012"))
+        _, far = solved_solution(target_net_daily_yield=Decimal("0.013"))
         assert near.mode == WidthSolveMode.SOLVED
         assert near.half_width_ticks == 10
         assert far.mode == WidthSolveMode.TARGET_UNREACHABLE

@@ -17,6 +17,13 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field, model_validator
 
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, NonNegativeDecimal
+from aero_bot.ranging import (
+    RangingEvidence,
+    RangingObservations,
+    WidthSolution,
+    ceiling_width_solution,
+    solve_range_width,
+)
 
 # The bundled events file starts empty and is extended by the local operator.
 POLICY_EVENTS_RESOURCE = "policy_events.toml"
@@ -308,8 +315,15 @@ class PolicyParameters(BaseModel):
     # Frozen strict fields make the locked parameter set reproducible in audits.
     model_config = IMMUTABLE_MODEL_CONFIG
 
-    # Half width is 0.3 percent on each side of the reference price.
-    range_half_width_fraction: Decimal = Decimal("0.003")
+    # The target net daily yield per deployed dollar the range width is
+    # derived against; the tightest width meeting it wins and the tightest
+    # candidate enters anyway when the target proves unreachable.
+    target_net_daily_yield: Annotated[Decimal, Field(gt=0)] = Decimal("0.01")
+    # The maximum half width on each side of the reference price: the safety
+    # ceiling the derived width never exceeds and the fallback when the width
+    # solver's inputs are missing or inconsistent, never the entered value
+    # itself. The minimum width is exactly one tick spacing per side.
+    max_range_half_width_fraction: Decimal = Decimal("0.003")
     # Range boundaries are aligned to the pool tick grid of spacing ten.
     tick_spacing: Annotated[int, Field(ge=1)] = 10
     # Upside out-of-range recenters only after a fifteen-minute wait.
@@ -367,8 +381,8 @@ class PolicyParameters(BaseModel):
     @model_validator(mode="after")
     def require_unit_fractions(self) -> Self:
         """Reject fraction parameters outside their meaningful intervals."""
-        if not Decimal(0) < self.range_half_width_fraction < Decimal(1):
-            raise ValueError("range_half_width_fraction must be between zero and one")
+        if not Decimal(0) < self.max_range_half_width_fraction < Decimal(1):
+            raise ValueError("max_range_half_width_fraction must be between zero and one")
         if not Decimal(0) < self.stop_buffer_fraction < Decimal(1):
             raise ValueError("stop_buffer_fraction must be between zero and one")
         if not Decimal(0) < self.max_position_equity_fraction <= Decimal(1):
@@ -436,6 +450,10 @@ class PolicyObservation(BaseModel):
     # The current Base L2 gas price in gwei; None means the reading is
     # unavailable and the gas gate defers every non-urgent action fail-closed.
     gas_price_gwei: NonNegativeDecimal | None = None
+    # Live ranging observables behind the target-yield width derivation;
+    # absence fails the derived width toward the locked ceiling with an
+    # explicit fallback label on the entry or recenter decision.
+    ranging: RangingEvidence | None = None
 
     @model_validator(mode="after")
     def require_aware_observation_time(self) -> Self:
@@ -619,6 +637,11 @@ class PolicyDecision(BaseModel):
     # Swap plan models every swap the action performs against observed depth
     # with tranche splitting; absent when the action performs no swap.
     swap_plan: SwapPlan | None = None
+    # Width solution carries the complete target-yield width derivation behind
+    # an enter or recenter range: every input, every modeled candidate width,
+    # and how the solve resolved (solved, unreachable at the tightest width,
+    # or failed toward the ceiling).
+    width_solution: WidthSolution | None = None
     # Estimated batch gas units include the Safe proxy overhead per batch.
     estimated_gas_units: Annotated[int, Field(ge=0)] | None = None
     # Estimated batch cost applies the documented ETH price assumption; None
@@ -725,32 +748,43 @@ class PolicyEngine:
             return self._decide_with_position(working_state, observation, flat_description)
         return self._decide_flat(working_state, observation, flat_description)
 
-    def build_aligned_range(self, center_price: Decimal) -> AlignedPriceRange:
-        """Build the locked width range around one price, aligned to the tick grid.
+    def build_aligned_range(
+        self,
+        center_price: Decimal,
+        half_width_fraction: Decimal | None = None,
+    ) -> AlignedPriceRange:
+        """Build one width's range around a price, aligned to the tick grid.
 
         Args:
             center_price: Positive pool price in USDC per stock.
+            half_width_fraction: Fractional half width on each side of the
+                center the range must span; None means the locked ceiling,
+                which is the fallback width rather than a derived one.
 
         Returns:
-            The grid-aligned range spanning at least the locked half width.
+            The grid-aligned range spanning at least the requested half width.
 
         Raises:
-            ValueError: If the center price is not positive.
+            ValueError: If the center price is not positive or the requested
+                half width is not inside the unit interval.
         """
         if center_price <= 0:
             raise ValueError("center_price must be positive")
+        width = (
+            self._parameters.max_range_half_width_fraction
+            if half_width_fraction is None
+            else half_width_fraction
+        )
+        if not Decimal(0) < width < Decimal(1):
+            raise ValueError("half_width_fraction must be between zero and one")
         with localcontext() as decimal_context:
             # Local precision isolates deterministic tick logarithms from settings.
             decimal_context.prec = MATH_PRECISION
             # The tick index of a price is its natural logarithm over log(1.0001).
             tick_log = TICK_PRICE_RATIO.ln()
-            # Raw bounds apply the locked half width on each side of the center.
-            raw_lower_tick = (
-                center_price * (Decimal(1) - self._parameters.range_half_width_fraction)
-            ).ln() / tick_log
-            raw_upper_tick = (
-                center_price * (Decimal(1) + self._parameters.range_half_width_fraction)
-            ).ln() / tick_log
+            # Raw bounds apply the requested half width on each side of the center.
+            raw_lower_tick = (center_price * (Decimal(1) - width)).ln() / tick_log
+            raw_upper_tick = (center_price * (Decimal(1) + width)).ln() / tick_log
             # Grid alignment floors the lower and ceils the upper boundary so
             # the aligned range always contains the raw width.
             spacing = Decimal(self._parameters.tick_spacing)
@@ -769,6 +803,74 @@ class PolicyEngine:
                 lower_price=+lower_price,
                 upper_price=+upper_price,
             )
+
+    def _solve_range_width(
+        self,
+        observation: PolicyObservation,
+        position_size_usd: Decimal,
+    ) -> WidthSolution:
+        """Derive the range half width from the target net daily yield.
+
+        The solve consumes the observation's ranging evidence plus every
+        parameter the locked set already carries. Missing evidence, or a gas
+        reading the gate would have deferred on, fails toward the locked
+        ceiling with the fallback label rather than guessing a width.
+
+        Args:
+            observation: The passing observation whose entry or recenter
+                range is being built.
+            position_size_usd: The capped USDC value the range would commit.
+
+        Returns:
+            The immutable width solution with its complete evidence.
+        """
+        evidence = observation.ranging
+        gas_price = observation.gas_price_gwei
+        if evidence is None or gas_price is None:
+            # The gas gate defers before any solve, so an absent reading here
+            # is unreachable in practice; both absences fail toward the
+            # ceiling with the same explicit fallback label.
+            missing = (
+                "the observation carries no ranging evidence"
+                if evidence is None
+                else "the gas price reading is unavailable"
+            )
+            return ceiling_width_solution(
+                pool_price_usdc=observation.amm_price_usdc,
+                tick_spacing=self._parameters.tick_spacing,
+                max_range_half_width_fraction=self._parameters.max_range_half_width_fraction,
+                target_net_daily_yield=self._parameters.target_net_daily_yield,
+                reason=missing,
+            )
+        return solve_range_width(
+            RangingObservations(
+                pool_price_usdc=observation.amm_price_usdc,
+                emissions_apr=observation.emissions_apr,
+                gauge_liquidity_raw=evidence.gauge_liquidity_raw,
+                staked_tvl_usd=evidence.staked_tvl_usd,
+                active_liquidity_raw=evidence.active_liquidity_raw,
+                pool_depth_usd=observation.pool_depth_usd,
+                fee_window_seconds=evidence.fee_window_seconds,
+                fee_window_notional_usd=evidence.fee_window_notional_usd,
+                pool_fee_ppm=evidence.pool_fee_ppm,
+                realized_daily_volatility=evidence.realized_daily_volatility,
+                stock_decimals=evidence.stock_decimals,
+                quote_decimals=evidence.quote_decimals,
+                position_size_usd=position_size_usd,
+                gas_price_gwei=gas_price,
+                target_net_daily_yield=self._parameters.target_net_daily_yield,
+                max_range_half_width_fraction=self._parameters.max_range_half_width_fraction,
+                tick_spacing=self._parameters.tick_spacing,
+                stop_buffer_fraction=self._parameters.stop_buffer_fraction,
+                recenter_wait_seconds=int(self._parameters.recenter_wait.total_seconds()),
+                reentry_cooldown_seconds=int(self._parameters.reentry_cooldown.total_seconds()),
+                enter_batch_gas_units=self._parameters.enter_batch_gas_units,
+                recenter_batch_gas_units=self._parameters.recenter_batch_gas_units,
+                exit_batch_gas_units=self._parameters.exit_batch_gas_units,
+                safe_overhead_gas_per_batch=self._parameters.safe_overhead_gas_per_batch,
+                eth_price_assumption_usd=self._parameters.eth_price_assumption_usd,
+            )
+        )
 
     def _observe_day(self, state: PolicyState, observation: PolicyObservation) -> PolicyState:
         """Apply day rollover and the daily loss halt to the threaded state.
@@ -929,8 +1031,13 @@ class PolicyEngine:
                         PolicyReason.GAS_GATE_DEFERRED,
                         defer_diagnostics,
                     )
-                # The recenter range is rebuilt around the current pool price.
-                new_range = self.build_aligned_range(observation.amm_price_usdc)
+                # The recenter width is re-derived from the target net daily
+                # yield at the current observables, then the range is rebuilt
+                # around the current pool price.
+                width_solution = self._solve_range_width(observation, position.committed_usd)
+                new_range = self.build_aligned_range(
+                    observation.amm_price_usdc, width_solution.half_width_fraction
+                )
                 gas_units, gas_cost_usd = self._batch_gas(
                     observation, self._parameters.recenter_batch_gas_units
                 )
@@ -942,11 +1049,20 @@ class PolicyEngine:
                     observation.pool_depth_usd,
                 )
                 diagnostics = (
-                    f"Upside out-of-range wait of {waited} elapsed the locked "
-                    f"recenter wait {self._parameters.recenter_wait}.",
-                    f"New range {new_range.lower_price}..{new_range.upper_price} "
-                    f"USDC per stock around pool price {observation.amm_price_usdc}.",
-                ) + self._gas_diagnostics(gas_units, gas_cost_usd)
+                    (
+                        f"Upside out-of-range wait of {waited} elapsed the locked "
+                        f"recenter wait {self._parameters.recenter_wait}.",
+                        f"New range {new_range.lower_price}..{new_range.upper_price} "
+                        f"USDC per stock around pool price {observation.amm_price_usdc}.",
+                        f"Range half width {width_solution.half_width_fraction} "
+                        f"({width_solution.half_width_ticks} ticks per side) derived "
+                        f"against the target net daily yield "
+                        f"{self._parameters.target_net_daily_yield}; solve resolved as "
+                        f"{width_solution.mode.value}.",
+                    )
+                    + width_solution.diagnostics
+                    + self._gas_diagnostics(gas_units, gas_cost_usd)
+                )
                 next_position = position.model_copy(
                     update={
                         "price_range": new_range,
@@ -964,6 +1080,7 @@ class PolicyEngine:
                         swap_plan=swap_plan,
                         estimated_gas_units=gas_units,
                         estimated_gas_cost_usd=gas_cost_usd,
+                        width_solution=width_solution,
                     ),
                     next_state=next_state,
                 )
@@ -1601,8 +1718,12 @@ class PolicyEngine:
         )
         if deferred:
             return self._hold(hold_state, PolicyReason.GAS_GATE_DEFERRED, defer_diagnostics)
-        # The entry range is built around the observed pool price.
-        entry_range = self.build_aligned_range(observation.amm_price_usdc)
+        # The entry width is derived from the target net daily yield behind the
+        # coarse APR gate, then the range is built around the observed price.
+        width_solution = self._solve_range_width(observation, size_usd)
+        entry_range = self.build_aligned_range(
+            observation.amm_price_usdc, width_solution.half_width_fraction
+        )
         gas_units, gas_cost_usd = self._batch_gas(
             observation, self._parameters.enter_batch_gas_units
         )
@@ -1630,13 +1751,20 @@ class PolicyEngine:
                     f"Range {entry_range.lower_price}..{entry_range.upper_price} "
                     f"USDC per stock around pool price {observation.amm_price_usdc} "
                     f"aligned to tick spacing {self._parameters.tick_spacing}.",
+                    f"Range half width {width_solution.half_width_fraction} "
+                    f"({width_solution.half_width_ticks} ticks per side) derived "
+                    f"against the target net daily yield "
+                    f"{self._parameters.target_net_daily_yield}; solve resolved as "
+                    f"{width_solution.mode.value}.",
                 )
+                + width_solution.diagnostics
                 + self._gas_diagnostics(gas_units, gas_cost_usd),
                 price_range=entry_range,
                 size_usd=size_usd,
                 swap_plan=swap_plan,
                 estimated_gas_units=gas_units,
                 estimated_gas_cost_usd=gas_cost_usd,
+                width_solution=width_solution,
             ),
             next_state=next_state,
         )

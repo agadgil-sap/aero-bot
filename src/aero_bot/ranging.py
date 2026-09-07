@@ -123,8 +123,9 @@ class RangingObservations(BaseModel):
     quote_decimals: Annotated[int, Field(ge=0, le=MAX_TOKEN_DECIMALS)]
     # The capped position size in USDC the entry gates would commit.
     position_size_usd: Annotated[Decimal, Field(gt=0)]
-    # The current Base L2 gas price in gwei behind every batch cost.
-    gas_price_gwei: Annotated[Decimal, Field(gt=0)]
+    # The current Base L2 gas price in gwei behind every batch cost; zero is
+    # a valid injected reading that makes every batch cost exactly zero.
+    gas_price_gwei: Annotated[Decimal, Field(ge=0)]
     # Target net daily yield per deployed dollar the width must achieve.
     target_net_daily_yield: Annotated[Decimal, Field(gt=0)] = DEFAULT_TARGET_NET_DAILY_YIELD
     # The safety ceiling on each side; the solver never solves wider.
@@ -149,6 +150,41 @@ class RangingObservations(BaseModel):
     eth_price_assumption_usd: Annotated[Decimal, Field(gt=0)] = DEFAULT_ETH_PRICE_ASSUMPTION_USD
     # Flat hours per weekday from the market open and close event windows.
     flat_hours_per_weekday: Annotated[Decimal, Field(ge=0, le=24)] = DEFAULT_FLAT_HOURS_PER_WEEKDAY
+
+
+class RangingEvidence(BaseModel):
+    """Carry the live ranging observables the policy engine does not already see.
+
+    The engine's observation already supplies the pool price, the raw
+    emissions APR, the executable depth, the capped position size, and the
+    gas price; this model carries exactly the remaining observables one
+    width solve consumes, so the engine can assemble a complete
+    ``RangingObservations`` from one observation plus its locked parameters.
+    """
+
+    # Frozen strict fields keep one solve's live inputs on a single snapshot.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # Gauge staked liquidity in the pool's raw liquidity units at the same
+    # instant the staked value below was observed.
+    gauge_liquidity_raw: Annotated[int, Field(ge=0)]
+    # Staked value in USDC at that same instant, under the history module's
+    # linear staked-value convention.
+    staked_tvl_usd: Annotated[Decimal, Field(ge=0)]
+    # Active in-range pool liquidity in raw units, the fee-share denominator.
+    active_liquidity_raw: Annotated[int, Field(ge=0)]
+    # How many seconds of reconstructed swaps the fee evidence covers.
+    fee_window_seconds: Annotated[int, Field(ge=0)]
+    # Total swapped notional in USDC over that fee evidence window.
+    fee_window_notional_usd: Annotated[Decimal, Field(ge=0)]
+    # The pool's staked fee tier in parts per million.
+    pool_fee_ppm: Annotated[int, Field(ge=0)]
+    # Realized daily volatility of the pool price; None means the path was
+    # too thin to estimate it, which fails the solve toward the ceiling.
+    realized_daily_volatility: NonNegativeDecimal | None = None
+    # Decimal counts of the stock and USDC tokens scaling raw liquidity.
+    stock_decimals: Annotated[int, Field(ge=0, le=MAX_TOKEN_DECIMALS)]
+    quote_decimals: Annotated[int, Field(ge=0, le=MAX_TOKEN_DECIMALS)]
 
 
 class WidthSolveMode(StrEnum):
@@ -493,32 +529,53 @@ def _candidate_tick_bounds(observations: RangingObservations) -> tuple[int, int]
     return observations.tick_spacing, max(observations.tick_spacing, max_ticks)
 
 
-def _fallback_solution(
-    observations: RangingObservations,
+def ceiling_width_solution(
+    pool_price_usdc: Decimal,
+    tick_spacing: int,
+    max_range_half_width_fraction: Decimal,
+    target_net_daily_yield: Decimal,
     reason: str,
+    prefix_diagnostics: tuple[str, ...] = (),
 ) -> WidthSolution:
-    """Build the fail-toward-the-ceiling solution for unusable inputs.
+    """Build the fail-toward-the-ceiling solution for unusable solve inputs.
 
     Args:
-        observations: The solve inputs whose usability failed.
+        pool_price_usdc: Positive pool price in USDC per stock.
+        tick_spacing: The pool tick grid spacing; one spacing per side is the
+            tightest candidate the solver may select.
+        max_range_half_width_fraction: The locked ceiling half width.
+        target_net_daily_yield: The target the solve would have aimed for.
         reason: The fail-closed reason naming the unusable input.
+        prefix_diagnostics: Optional evidence lines echoed before the fallback
+            line, such as the raw inputs of a solve that failed.
 
     Returns:
         The ceiling-width solution with the fallback label and evidence.
+
+    Raises:
+        ValueError: If the pool price is not positive.
     """
-    _, max_ticks = _candidate_tick_bounds(observations)
+    if pool_price_usdc <= 0:
+        raise ValueError("pool_price_usdc must be positive")
     with localcontext() as decimal_context:
+        # Local precision isolates the deterministic logarithm from settings.
         decimal_context.prec = MATH_PRECISION
+        max_ticks = int(
+            (
+                (Decimal(1) + max_range_half_width_fraction).ln() / TICK_PRICE_RATIO.ln()
+            ).to_integral_value(rounding="ROUND_FLOOR")
+        )
+        max_ticks = max(tick_spacing, max_ticks)
         ceiling_fraction = TICK_PRICE_RATIO**max_ticks - Decimal(1)
         ceiling_liquidity_per_dollar = liquidity_per_deployed_dollar(
-            observations.pool_price_usdc, ceiling_fraction
+            pool_price_usdc, ceiling_fraction
         )
         return WidthSolution(
             mode=WidthSolveMode.FALLBACK_CEILING,
             half_width_ticks=max_ticks,
             half_width_fraction=+ceiling_fraction,
-            tick_spacing=observations.tick_spacing,
-            target_net_daily_yield=observations.target_net_daily_yield,
+            tick_spacing=tick_spacing,
+            target_net_daily_yield=target_net_daily_yield,
             evaluations=(
                 CandidateWidthEvaluation(
                     half_width_ticks=max_ticks,
@@ -535,12 +592,35 @@ def _fallback_solution(
                     meets_target=False,
                 ),
             ),
-            diagnostics=_input_diagnostics(observations)
+            diagnostics=prefix_diagnostics
             + (
                 f"Width solver inputs are unusable - {reason}; failing toward the locked "
-                f"ceiling half width {ceiling_fraction} ({max_ticks} ticks per side).",
+                f"ceiling half width {+ceiling_fraction} ({max_ticks} ticks per side).",
             ),
         )
+
+
+def _fallback_solution(
+    observations: RangingObservations,
+    reason: str,
+) -> WidthSolution:
+    """Build the fail-toward-the-ceiling solution for unusable inputs.
+
+    Args:
+        observations: The solve inputs whose usability failed.
+        reason: The fail-closed reason naming the unusable input.
+
+    Returns:
+        The ceiling-width solution with the fallback label and evidence.
+    """
+    return ceiling_width_solution(
+        pool_price_usdc=observations.pool_price_usdc,
+        tick_spacing=observations.tick_spacing,
+        max_range_half_width_fraction=observations.max_range_half_width_fraction,
+        target_net_daily_yield=observations.target_net_daily_yield,
+        reason=reason,
+        prefix_diagnostics=_input_diagnostics(observations),
+    )
 
 
 def _format_optional_decimal(value: Decimal | None) -> str:
@@ -697,13 +777,14 @@ def solve_range_width(observations: RangingObservations) -> WidthSolution:
                 / staked_liquidity_per_dollar
             )
             # Gross fees: the position's active-liquidity share of the
-            # observed daily fee stream, per deployed dollar.
+            # observed daily fee stream, per deployed dollar. The share's
+            # position size is already inside the raw liquidity per dollar,
+            # matching the ledger's raw-share fee convention.
             fee_yield = (
                 fee_stream_per_day
                 * liquidity_per_dollar
                 * human_scale
                 / Decimal(observations.active_liquidity_raw)
-                / position_size
                 if fee_stream_per_day > 0
                 else Decimal(0)
             )

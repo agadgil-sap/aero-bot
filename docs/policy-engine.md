@@ -11,7 +11,9 @@ The engine never signs, broadcasts, or touches a wallet.
 
 | Parameter | Locked value |
 | --- | --- |
-| Range half width | 0.3 percent each side of the reference price |
+| Target net daily yield | 1 percent per day on deployed capital (the width is derived against it) |
+| Maximum range half width | 0.3 percent each side (safety ceiling and fallback, never the entered value) |
+| Minimum range half width | exactly one tick spacing on each side |
 | Tick grid | spacing 10 on the 500-ppm Slipstream tier |
 | Upside recenter wait | 15 minutes out of range |
 | Downside stop | 0.5 percent below the lower range edge |
@@ -35,10 +37,28 @@ The engine never signs, broadcasts, or touches a wallet.
 The entry threshold reads the pool's raw AERO emissions APR per staked liquidity in the same APR convention Aerodrome displays (150 percent APR equals about 0.41 percent per day simple).
 Fees are credited on top and the conservative haircut is applied inside the P&L forecast, never to this gate.
 
+## Range width derivation
+
+The range width is not fixed: it is derived from the target net daily yield on deployed capital, default 1 percent per day.
+The high quoted APRs on these pools come from ultra-tight ranges, so a fixed plus-or-minus 0.3 percent width captures only a fraction of the quoted yield; the width must follow the target instead.
+
+Width derivation happens after the 150 percent raw-APR entry gate passes and after the size caps and gas gate clear, both at entry and at every recenter.
+The observation carries one `RangingEvidence` snapshot with the live observables the decision itself does not already see: gauge staked liquidity and staked value, active in-range liquidity, the fee-evidence window (seconds and swapped notional), the pool fee tier, the realized daily volatility of the reconstructed swap path, and both tokens' decimal counts.
+The engine assembles these with the pool price, emissions APR, executable depth, capped position size, gas price, and every locked width-relevant parameter, and calls the pure solver in `ranging.py`, which scans every tick-aligned candidate from one tick spacing per side up to the 0.3 percent ceiling and returns the tightest whose modeled net yield meets the target.
+Net yield subtracts, per the existing models: expected recenter frequency at the candidate width under realized volatility, per-recenter gas and impact at the capped position size, event-window flat time, and the stop-risk cost basis (the exact composition loss at the stop level plus exit and re-entry batch costs).
+
+The solve resolves one of three ways, and the decision carries the complete solution - every input, every modeled candidate, and the resolution - as a `width_solution` field plus diagnostics lines, so audit events persist the whole derivation.
+
+1. Solved: the tightest candidate meeting the target wins, however tight that is.
+2. Target unreachable: even the one-spacing width cannot reach the target, and the engine still enters at that tightest width because the coarse APR gate passed.
+   The solver never widens past its answer to hedge; the user farms one tick either side of price, and the ceiling exists for anomaly protection only.
+3. Fallback ceiling: the solver's inputs are missing (the observation carries no ranging evidence) or internally inconsistent (for example a volatility estimate the reconstructed path could not support), and the width falls back to the 0.3 percent ceiling with an explicit fallback label in the diagnostics.
+
 ## Range construction
 
-The entry range centers on the observed pool AMM price.
-The raw bounds at plus and minus 0.3 percent are aligned outward onto the pool tick grid (spacing 10): the lower boundary floors to the greatest grid tick at or below the raw lower bound and the upper boundary ceils to the least grid tick at or above the raw upper bound, so the aligned range always contains the raw width.
+The entry or recenter range centers on the observed pool AMM price at the derived half width.
+The raw bounds at plus and minus that width are aligned outward onto the pool tick grid (spacing 10): the lower boundary floors to the greatest grid tick at or below the raw lower bound and the upper boundary ceils to the least grid tick at or above the raw upper bound, so the aligned range always contains the raw width.
+Every downstream rule reads the aligned edges, so the downside stop stays exactly 0.5 percent below the aligned lower edge regardless of how tight the derived width is, and the composition math remains the exact v3-style rule below.
 
 ## Decision precedence
 
@@ -49,7 +69,7 @@ Held stock inventory from a stale-low burn resolves first, then safety exits are
 3. Downside stop: pool price at or below 0.5 percent under the lower range edge burns the position and swaps all inventory back to USDC.
 4. Emissions dilution: while open, the raw emissions APR is re-evaluated at every observation, because other LPs can add sticky staked liquidity that persistently lowers APR per unit of staked liquidity; a fall below the 150 percent threshold exits through the same burn-and-swap path.
 5. Event window: a flat window that opens while a position is open burns and swaps all inventory back to USDC.
-6. Upside recenter: price above the upper edge starts a 15-minute time-based wait; the recenter burns and re-mints the range around the current pool price only after the wait elapses and the gas gate allows it.
+6. Upside recenter: price above the upper edge starts a 15-minute time-based wait; the recenter re-derives the width from the target net daily yield at the current observables and re-mints the range around the current pool price only after the wait elapses and the gas gate allows it.
 7. In-range or below-edge holds keep the position otherwise.
 
 Between the 300-second entry bound and the 900-second open-position bound, the reference is too old for dislocation comparisons but fresh enough to keep the position, so the ordinary lifecycle rides on.
@@ -57,7 +77,7 @@ Between the 300-second entry bound and the 900-second open-position bound, the r
 Below the range edge but above the stop level, the position holds for recovery.
 
 Entry gates are evaluated in fixed order while flat: daily loss halt, re-entry cooldown, event window, reference staleness, emissions threshold, the size caps, and finally the gas sense-check gate.
-The size is the smaller of 20 percent of current equity and 1 percent of observed pool depth.
+The size is the smaller of 20 percent of current equity and 1 percent of observed pool depth, and only then is the range width derived against the target net daily yield.
 
 ## Underlying dislocation monitor
 

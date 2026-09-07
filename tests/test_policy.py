@@ -1,13 +1,14 @@
 """Behavior tests for the pure emissions-farming policy decision engine."""
 
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 from pydantic import ValidationError
 
 from aero_bot.policy import (
     NEW_YORK,
+    TICK_PRICE_RATIO,
     AlignedPriceRange,
     EventCalendar,
     HeldInventory,
@@ -26,6 +27,7 @@ from aero_bot.policy import (
     load_event_calendar,
     parse_event_calendar,
 )
+from aero_bot.ranging import RangingEvidence, WidthSolveMode
 
 # A deterministic fixture address represents one B20 stock contract.
 TOKEN_ADDRESS = "0x1111111111111111111111111111111111111111"
@@ -105,6 +107,45 @@ def stop_level_for(state: PolicyState) -> Decimal:
         The price 0.5 percent below the aligned lower range edge.
     """
     return entered_position_for(state).price_range.lower_price * Decimal("0.995")
+
+
+def ranging_evidence(**overrides: object) -> RangingEvidence:
+    """Build one solvable ranging-evidence fixture for width-derivation tests.
+
+    Args:
+        **overrides: Evidence fields changed to exercise one solve behavior.
+
+    Returns:
+        A validated immutable evidence set whose default inputs solve the
+        width at the tightest candidate given a passing high-APR observation.
+    """
+    values: dict[str, object] = {
+        "gauge_liquidity_raw": 80_000_000_000_000,
+        "staked_tvl_usd": Decimal("100000"),
+        "active_liquidity_raw": 80_000_000_000_000,
+        "fee_window_seconds": 86_400,
+        "fee_window_notional_usd": Decimal("1000000"),
+        "pool_fee_ppm": 500,
+        "realized_daily_volatility": Decimal("0.005"),
+        "stock_decimals": 6,
+        "quote_decimals": 6,
+    }
+    values.update(overrides)
+    return RangingEvidence.model_validate(values)
+
+
+def half_width_for_ticks(ticks: int) -> Decimal:
+    """Return the exact fractional half width of one tick count.
+
+    Args:
+        ticks: Whole ticks on each side of the reference price.
+
+    Returns:
+        The exact 1.0001**ticks - 1 fraction at engine precision.
+    """
+    with localcontext() as decimal_context:
+        decimal_context.prec = 60
+        return +(TICK_PRICE_RATIO ** Decimal(ticks) - Decimal(1))
 
 
 class TestEventCalendar:
@@ -206,7 +247,8 @@ class TestLockedParameters:
     def test_default_parameters_match_the_locked_policy(self) -> None:
         """The immutable defaults encode every locked v1 constant."""
         parameters = PolicyParameters()
-        assert parameters.range_half_width_fraction == Decimal("0.003")
+        assert parameters.target_net_daily_yield == Decimal("0.01")
+        assert parameters.max_range_half_width_fraction == Decimal("0.003")
         assert parameters.tick_spacing == 10
         assert parameters.recenter_wait.total_seconds() == 15 * 60
         assert parameters.stop_buffer_fraction == Decimal("0.005")
@@ -233,9 +275,11 @@ class TestLockedParameters:
     def test_out_of_range_fraction_parameters_are_rejected(self) -> None:
         """Fraction parameters outside their meaningful intervals fail closed."""
         with pytest.raises(ValidationError):
-            PolicyParameters(range_half_width_fraction=Decimal("1.5"))
+            PolicyParameters(max_range_half_width_fraction=Decimal("1.5"))
         with pytest.raises(ValidationError):
-            PolicyParameters(range_half_width_fraction=Decimal("0"))
+            PolicyParameters(max_range_half_width_fraction=Decimal("0"))
+        with pytest.raises(ValidationError):
+            PolicyParameters(target_net_daily_yield=Decimal("0"))
         with pytest.raises(ValidationError):
             PolicyParameters(stop_buffer_fraction=Decimal("0"))
         with pytest.raises(ValidationError):
@@ -1215,3 +1259,257 @@ class TestDislocationMonitor:
                 stock_quantity=Decimal("0.15"),
                 held_since=datetime(2026, 8, 19, 11, 1),
             )
+
+
+class TestDerivedRangeWidth:
+    """Target-yield-derived range-width behavior on entry and recenter."""
+
+    def test_entry_derives_the_tightest_solved_width(self) -> None:
+        """A passing solve enters at one tick spacing, not the ceiling."""
+        outcome = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("4000"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        solution = outcome.decision.width_solution
+        assert solution is not None
+        assert solution.mode is WidthSolveMode.SOLVED
+        assert solution.half_width_ticks == 10
+        assert solution.half_width_fraction == half_width_for_ticks(10)
+        price_range = entered_position_for(outcome.next_state).price_range
+        center = Decimal("200")
+        assert price_range.lower_price <= center * (Decimal(1) - solution.half_width_fraction)
+        assert price_range.upper_price >= center * (Decimal(1) + solution.half_width_fraction)
+        assert price_range.upper_price < center * Decimal("1.003")
+
+    def test_unreachable_target_still_enters_at_one_tick_spacing(self) -> None:
+        """A gate-passing pool enters at the tightest width without widening."""
+        outcome = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(ranging=ranging_evidence()),
+        )
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        solution = outcome.decision.width_solution
+        assert solution is not None
+        assert solution.mode is WidthSolveMode.TARGET_UNREACHABLE
+        assert solution.half_width_ticks == 10
+        joined = "\n".join(outcome.decision.diagnostics)
+        assert "cannot reach the target" in joined
+        assert "entering at the tightest width" in joined
+        price_range = entered_position_for(outcome.next_state).price_range
+        assert price_range.upper_price < Decimal("200") * Decimal("1.003")
+
+    def test_missing_evidence_fails_toward_the_ceiling(self) -> None:
+        """An observation without ranging evidence enters at the locked ceiling."""
+        outcome = PolicyEngine().decide(PolicyState(), base_observation())
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        solution = outcome.decision.width_solution
+        assert solution is not None
+        assert solution.mode is WidthSolveMode.FALLBACK_CEILING
+        assert solution.half_width_ticks == 29
+        assert solution.half_width_fraction == half_width_for_ticks(29)
+        assert any("no ranging evidence" in line for line in outcome.decision.diagnostics)
+
+    def test_inconsistent_evidence_fails_toward_the_ceiling(self) -> None:
+        """Evidence the solver cannot use falls back through the solver itself."""
+        outcome = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("4000"),
+                ranging=ranging_evidence(realized_daily_volatility=None),
+            ),
+        )
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        solution = outcome.decision.width_solution
+        assert solution is not None
+        assert solution.mode is WidthSolveMode.FALLBACK_CEILING
+        assert solution.half_width_ticks == 29
+        joined = "\n".join(outcome.decision.diagnostics)
+        assert "unusable" in joined
+        assert "realized volatility" in joined
+
+    def test_interior_solved_width_builds_the_matching_range(self) -> None:
+        """A solve landing past the tightest candidate widens the range to it."""
+        engine = PolicyEngine(
+            parameters=PolicyParameters(
+                tick_spacing=1,
+                target_net_daily_yield=Decimal("0.22"),
+            )
+        )
+        outcome = engine.decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("4000"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        solution = outcome.decision.width_solution
+        assert solution is not None
+        assert solution.mode is WidthSolveMode.SOLVED
+        assert solution.half_width_ticks == 2
+        width = solution.half_width_fraction
+        price_range = entered_position_for(outcome.next_state).price_range
+        center = Decimal("200")
+        assert price_range.lower_price <= center * (Decimal(1) - width)
+        assert price_range.upper_price >= center * (Decimal(1) + width)
+
+    def test_recenter_re_derives_the_width_at_the_current_price(self) -> None:
+        """The recenter solves again from current evidence around the new price."""
+        engine, state = entered_session(
+            emissions_apr=Decimal("4000"),
+            ranging=ranging_evidence(),
+        )
+        entered_solution = engine.decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("4000"),
+                ranging=ranging_evidence(),
+            ),
+        ).decision.width_solution
+        assert entered_solution is not None
+        assert entered_solution.mode is WidthSolveMode.SOLVED
+        upper = entered_position_for(state).price_range.upper_price
+        new_price = Decimal("200.4")
+        assert new_price > upper
+        # The first above-range observation only starts the wait anchor.
+        waiting = engine.decide(
+            state,
+            base_observation(
+                observed_at=BASE_OBSERVED_AT + timedelta(minutes=1),
+                amm_price_usdc=new_price,
+                emissions_apr=Decimal("4000"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        assert waiting.decision.reason is PolicyReason.OPEN_ABOVE_RANGE_WAITING
+        outcome = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=BASE_OBSERVED_AT + timedelta(minutes=17),
+                amm_price_usdc=new_price,
+                emissions_apr=Decimal("4000"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        assert outcome.decision.action is PolicyActionKind.RECENTER
+        solution = outcome.decision.width_solution
+        assert solution is not None
+        assert solution.mode is WidthSolveMode.SOLVED
+        assert solution.half_width_ticks == 10
+        price_range = outcome.decision.price_range
+        assert price_range is not None
+        assert price_range.lower_price <= new_price * (Decimal(1) - solution.half_width_fraction)
+        assert price_range.upper_price >= new_price * (Decimal(1) + solution.half_width_fraction)
+        assert outcome.next_state.position is not None
+        assert outcome.next_state.position.price_range == price_range
+
+    def test_derived_tight_width_keeps_the_downside_stop_math(self) -> None:
+        """The stop stays 0.5 percent below the aligned lower edge of a tight range."""
+        engine, state = entered_session(
+            emissions_apr=Decimal("4000"),
+            ranging=ranging_evidence(),
+        )
+        lower = entered_position_for(state).price_range.lower_price
+        stop_level = lower * Decimal("0.995")
+        holding = engine.decide(
+            state,
+            base_observation(
+                observed_at=BASE_OBSERVED_AT + timedelta(minutes=1),
+                amm_price_usdc=(lower + stop_level) / Decimal(2),
+            ),
+        )
+        assert holding.decision.reason is PolicyReason.OPEN_BELOW_EDGE_HOLDING
+        stopped = engine.decide(
+            state,
+            base_observation(
+                observed_at=BASE_OBSERVED_AT + timedelta(minutes=2),
+                amm_price_usdc=stop_level * Decimal("0.999"),
+            ),
+        )
+        assert stopped.decision.action is PolicyActionKind.STOP_OUT
+        assert stopped.decision.reason is PolicyReason.DOWNSIDE_STOP_TRIGGERED
+
+    def test_composition_splits_value_evenly_at_a_derived_tight_width(self) -> None:
+        """The exact v3 composition still marks the center as an even split."""
+        engine, state = entered_session(
+            emissions_apr=Decimal("4000"),
+            ranging=ranging_evidence(),
+        )
+        position = entered_position_for(state)
+        with localcontext() as decimal_context:
+            decimal_context.prec = 60
+            center = (position.price_range.lower_price * position.price_range.upper_price).sqrt()
+            stock_quantity, usdc_quantity = engine.position_composition(position, center)
+            stock_value = stock_quantity * center
+        assert abs(stock_value - usdc_quantity) < Decimal("1e-30")
+
+    def test_zero_gas_price_observation_still_solves(self) -> None:
+        """A zero gas reading passes the gate and solves with zero batch costs."""
+        outcome = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("4000"),
+                gas_price_gwei=Decimal("0"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        solution = outcome.decision.width_solution
+        assert solution is not None
+        assert solution.mode is WidthSolveMode.SOLVED
+
+    def test_entry_diagnostics_carry_the_full_width_derivation(self) -> None:
+        """Diagnostics echo the derivation summary and every solver input."""
+        outcome = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("4000"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        joined = "\n".join(outcome.decision.diagnostics)
+        assert "Range half width" in joined
+        assert "solve resolved as solved" in joined
+        assert "Solved half width" in joined
+        assert "Realized daily volatility 0.005" in joined
+        assert "Target net daily yield 0.01" in joined
+        assert "Gauge staked liquidity 80000000000000" in joined
+        solution = outcome.decision.width_solution
+        assert solution is not None
+        assert [row.half_width_ticks for row in solution.evaluations] == list(range(10, 30))
+
+    def test_plain_holds_carry_no_width_solution(self) -> None:
+        """Decisions that build no range leave the width solution absent."""
+        outcome = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("0.5"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        assert outcome.decision.action is PolicyActionKind.HOLD
+        assert outcome.decision.width_solution is None
+
+    def test_solved_width_never_exceeds_the_locked_ceiling(self) -> None:
+        """Every solved candidate fraction stays at or below the ceiling."""
+        outcome = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("4000"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        solution = outcome.decision.width_solution
+        assert solution is not None
+        assert all(row.half_width_fraction <= Decimal("0.003") for row in solution.evaluations)
+
+    def test_explicit_width_outside_the_unit_interval_is_rejected(self) -> None:
+        """A requested half width at or beyond one whole price unit fails closed."""
+        with pytest.raises(ValueError, match="between zero and one"):
+            PolicyEngine().build_aligned_range(Decimal("200"), Decimal("1.5"))
+        with pytest.raises(ValueError, match="between zero and one"):
+            PolicyEngine().build_aligned_range(Decimal("200"), Decimal("0"))
