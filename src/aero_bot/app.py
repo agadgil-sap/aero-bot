@@ -27,6 +27,7 @@ from aero_bot.concentrated import (
 )
 from aero_bot.config import Settings
 from aero_bot.domain import OpportunitySnapshot, RiskDecision, RiskPolicy
+from aero_bot.market_data import DefiLlamaYieldScanner, YieldScreenResult
 from aero_bot.oracles import (
     ChainlinkCoverageReport,
     OracleCoverageStatus,
@@ -122,6 +123,7 @@ def create_app(
     pool_discovery: PoolDiscoveryResult | None = None,
     oracle_coverage: ChainlinkCoverageReport | None = None,
     transaction_planner: TransactionPlanner | None = None,
+    yield_scanner: DefiLlamaYieldScanner | None = None,
     risk_engine: RiskEngine | None = None,
     audit_store: AuditStore | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -134,6 +136,7 @@ def create_app(
         pool_discovery: Optional preloaded Aerodrome discovery result for deterministic tests.
         oracle_coverage: Optional preloaded Chainlink coverage for deterministic tests.
         transaction_planner: Optional policy-bound wallet-free transaction planner.
+        yield_scanner: Optional read-only Aerodrome B20 secondary-market scanner.
         risk_engine: Optional explicit deterministic policy engine for this application.
         audit_store: Optional initialized immutable local audit store.
         clock: Optional aware UTC clock used to timestamp durable events.
@@ -157,6 +160,8 @@ def create_app(
     )
     # Default transaction policy is emergency-halted with no targets or live backend.
     resolved_transaction_planner = transaction_planner or TransactionPlanner()
+    # Default scanner performs only a bounded GET against one fixed public data endpoint.
+    resolved_yield_scanner = yield_scanner or DefiLlamaYieldScanner()
     # Pure Decimal analysis is stateless and shares no wallet or network capability.
     concentrated_analyzer = ConcentratedLiquidityAnalyzer()
     # Default policy is emergency-halted with empty token and pool allowlists.
@@ -181,6 +186,8 @@ def create_app(
     application.state.oracle_coverage = resolved_oracle_coverage
     # Storing the planner keeps all requests behind one immutable safety policy.
     application.state.transaction_planner = resolved_transaction_planner
+    # Storing the scanner preserves its exact source and haircut configuration across requests.
+    application.state.yield_scanner = resolved_yield_scanner
     # Storing the engine keeps every request behind the same immutable risk policy.
     application.state.risk_engine = resolved_risk_engine
     # Storing the audit boundary keeps all route writes on one durable hash chain.
@@ -225,6 +232,14 @@ def create_app(
     def chainlink_oracle_coverage() -> ChainlinkCoverageReport:
         """Return evaluated B20 feed health or an evidence-backed connector diagnostic."""
         return resolved_oracle_coverage
+
+    @application.get(
+        "/api/market-data/aerodrome-yields",
+        response_model=YieldScreenResult,
+    )
+    def aerodrome_yield_screen() -> YieldScreenResult:
+        """Fetch a live read-only B20/native-USDC secondary-source yield screen."""
+        return resolved_yield_scanner.scan(resolved_registry)
 
     @application.get("/api/transactions/capabilities", response_model=TransactionCapabilities)
     def transaction_capabilities() -> TransactionCapabilities:

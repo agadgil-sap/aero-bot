@@ -18,6 +18,7 @@ requires-python = ">=3.12"
 # Runtime dependencies are bounded to compatible major versions.
 dependencies = [
   "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
   "pydantic-settings>=2.10,<3",
   "uvicorn[standard]>=0.35,<1",
 ]
@@ -25,7 +26,6 @@ dependencies = [
 [project.optional-dependencies]
 # Development tools provide tests, linting, formatting, and static type checks.
 dev = [
-  "httpx>=0.28,<1",
   "mypy>=1.17,<2",
   "pytest>=8.4,<9",
   "pytest-cov>=6.2,<7",

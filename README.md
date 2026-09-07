@@ -49,6 +49,14 @@ Only a market-open observation that passes every gate is healthy.
 The current release has no reviewed B20 proxy-address snapshot or read-only observation backend, so `/api/oracles/chainlink` and the dashboard report an explicit unavailable diagnostic instead of making live feed claims.
 See [the oracle health policy](docs/oracle-health.md) for evidence sources and exact gate ordering.
 
+## Live yield screen
+
+The dashboard and `/api/market-data/aerodrome-yields` perform a bounded read-only query against DefiLlama's public yield dataset.
+The scanner accepts only Base records from `aerodrome-slipstream` whose underlying contracts are exactly native USDC and one address in the verified official B20 registry.
+Positive reward yield must identify the official AERO token contract.
+Fee APY and AERO emissions APY remain separate, and the displayed daily screen compares fee APY with fifty-percent-haircut emissions APY without adding them.
+This secondary-source screen is not eligible for execution until onchain pool identity, oracle, exit-depth, concentrated-liquidity, IL, and adverse-selection checks also pass.
+
 ## Wallet-free transaction planning
 
 The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.
