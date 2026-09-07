@@ -47,7 +47,7 @@ from aero_bot.executor import (
 from aero_bot.history import SWAP_EVENT_TOPIC0
 from aero_bot.registry import B20AssetListing, B20RegistryResult, RegistryStatus
 from aero_bot.safe_tx import (
-    CHECK_N_SIGNATURES_SELECTOR,
+    CHECK_SIGNATURES_SELECTOR,
     SAFE_NONCE_SELECTOR,
     SafeTransactionRpcBackend,
 )
@@ -352,7 +352,7 @@ class SafeRpcScript:
 
         Args:
             nonce_reads: Safe nonce served per fetch_live_nonce call, in order.
-            signature_verdicts: checkNSignatures verdict per validation call.
+            signature_verdicts: checkSignatures verdict per validation call.
         """
         self.nonce_reads = list(nonce_reads)
         self.signature_verdicts = list(signature_verdicts)
@@ -363,7 +363,7 @@ class SafeRpcScript:
         data = str(call["params"][0]["data"])
         if data.startswith(f"0x{SAFE_NONCE_SELECTOR}"):
             return self._result(word_hex(self.nonce_reads.pop(0)))
-        if data.startswith(f"0x{CHECK_N_SIGNATURES_SELECTOR}"):
+        if data.startswith(f"0x{CHECK_SIGNATURES_SELECTOR}"):
             if not self.signature_verdicts.pop(0):
                 return httpx.Response(
                     200,
@@ -1179,7 +1179,7 @@ def test_execute_refuses_a_rejected_owner_signature_before_broadcast() -> None:
     executor, rpc_script, _ = make_executor(
         safe_script=SafeRpcScript(nonce_reads=[4, 4], signature_verdicts=[False]),
     )
-    with pytest.raises(ExecutionRefusalError, match="checkNSignatures rejected"):
+    with pytest.raises(ExecutionRefusalError, match="checkSignatures rejected"):
         executor.execute("FIXc", Decimal("1"), bytes(Account.create().key))
     assert rpc_script.broadcasts == []
 

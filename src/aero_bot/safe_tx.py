@@ -5,7 +5,7 @@ the calldata for Safe ``execTransaction``, computes the EIP-712 SafeTx hash the
 contract will verify, signs it with an owner key through the audited
 ``eth-account`` library, and validates the resulting signature both locally
 (recovery round trip) and read-only against the live contract
-(``checkNSignatures``). It never sources key material itself: raw key bytes
+(``checkSignatures``). It never sources key material itself: raw key bytes
 arrive as an argument, are used only inside one signing call, and are never
 stored, logged, or persisted.
 
@@ -65,8 +65,8 @@ EXEC_TRANSACTION_SELECTOR = "6a761202"
 SAFE_NONCE_SELECTOR = "affed0e0"
 # keccak256("domainSeparator()")[0:4], used to cross-check local domain hashing.
 SAFE_DOMAIN_SEPARATOR_SELECTOR = "f698da25"
-# keccak256("checkNSignatures(bytes32,bytes,bytes)")[0:4], read-only signature proof.
-CHECK_N_SIGNATURES_SELECTOR = "9c546ffd"
+# keccak256("checkSignatures(bytes32,bytes,bytes)")[0:4], read-only signature proof.
+CHECK_SIGNATURES_SELECTOR = "934f3a11"
 # Every ABI argument or return word below occupies exactly 32 bytes.
 WORD_BYTES = 32
 # Twenty seconds bounds one failed request without blocking the caller.
@@ -159,7 +159,7 @@ class SafeOwnerSignature(BaseModel):
     # The public address derived from the signing key; exposing only this
     # keeps key material out of every model.
     signer_address: EvmAddress
-    # The 65-byte concatenated r||s||v encoding checkNSignatures consumes.
+    # The 65-byte concatenated r||s||v encoding checkSignatures consumes.
     encoded: Annotated[str, Field(pattern=r"^0x[0-9a-f]{130}$")]
 
 
@@ -348,26 +348,24 @@ def build_exec_transaction_calldata(
     Returns:
         Complete 0x-prefixed calldata targeting the Safe contract.
     """
-    # Eight static argument words precede the two dynamic offset words.
-    static_words = (
+    data_bytes = bytes.fromhex(transaction.data[2:])
+    signature_bytes = bytes.fromhex(signature.encoded[2:])
+    # Both dynamic arguments are addressed from the start of the ten-word head.
+    data_offset = 10 * WORD_BYTES
+    # The signature segment follows the data length word and padded data bytes.
+    signature_offset = data_offset + WORD_BYTES + _padded_length(len(data_bytes))
+    # ABI head order follows the function parameter order exactly. In
+    # particular, data is parameter three, so its offset occupies head slot 2.
+    head = (
         _address_word(transaction.to_address)
         + transaction.value_wei.to_bytes(WORD_BYTES, "big")
+        + data_offset.to_bytes(WORD_BYTES, "big")
         + transaction.operation.to_bytes(WORD_BYTES, "big")
         + transaction.safe_tx_gas.to_bytes(WORD_BYTES, "big")
         + transaction.base_gas.to_bytes(WORD_BYTES, "big")
         + transaction.gas_price_wei.to_bytes(WORD_BYTES, "big")
         + _address_word(transaction.gas_token)
         + _address_word(transaction.refund_receiver)
-    )
-    data_bytes = bytes.fromhex(transaction.data[2:])
-    signature_bytes = bytes.fromhex(signature.encoded[2:])
-    # The head holds the eight static words plus the two dynamic offsets.
-    data_offset = len(static_words) + 2 * WORD_BYTES
-    # The signature segment follows the data length word and padded data bytes.
-    signature_offset = data_offset + WORD_BYTES + _padded_length(len(data_bytes))
-    head = (
-        static_words
-        + data_offset.to_bytes(WORD_BYTES, "big")
         + signature_offset.to_bytes(WORD_BYTES, "big")
     )
     encoded = (
@@ -375,7 +373,7 @@ def build_exec_transaction_calldata(
         + len(data_bytes).to_bytes(WORD_BYTES, "big")
         + data_bytes.ljust(_padded_length(len(data_bytes)), b"\x00")
         + len(signature_bytes).to_bytes(WORD_BYTES, "big")
-        + signature_bytes
+        + signature_bytes.ljust(_padded_length(len(signature_bytes)), b"\x00")
     )
     return f"0x{EXEC_TRANSACTION_SELECTOR}{encoded.hex()}"
 
@@ -468,7 +466,7 @@ class SafeTransactionRpcBackend:
     ) -> SafeSignatureValidation:
         """Prove one signature against the live contract without spending gas.
 
-        The call is a read-only eth_call to checkNSignatures(safeTxHash, "0x",
+        The call is a read-only eth_call to checkSignatures(safeTxHash, "0x",
         signature); a plain ECDSA signature is validated directly against the
         hash, so empty data is correct.
 
@@ -488,13 +486,15 @@ class SafeTransactionRpcBackend:
         # The signature section follows the empty data section's length word.
         signature_offset = data_offset + WORD_BYTES
         calldata = (
-            f"0x{CHECK_N_SIGNATURES_SELECTOR}"
+            f"0x{CHECK_SIGNATURES_SELECTOR}"
             + built.safe_tx_hash[2:]
             + data_offset.to_bytes(WORD_BYTES, "big").hex()
             + signature_offset.to_bytes(WORD_BYTES, "big").hex()
             + (0).to_bytes(WORD_BYTES, "big").hex()
             + (len(signature.encoded[2:]) // 2).to_bytes(WORD_BYTES, "big").hex()
-            + signature.encoded[2:]
+            + bytes.fromhex(signature.encoded[2:])
+            .ljust(_padded_length(len(signature.encoded[2:]) // 2), b"\x00")
+            .hex()
         )
         try:
             self._eth_call(calldata)
@@ -502,7 +502,7 @@ class SafeTransactionRpcBackend:
             return SafeSignatureValidation(
                 verified=False,
                 source="read_only_eth_call",
-                diagnostic=f"checkNSignatures rejected the signature: {revert}",
+                diagnostic=f"checkSignatures rejected the signature: {revert}",
             )
         return SafeSignatureValidation(
             verified=True,

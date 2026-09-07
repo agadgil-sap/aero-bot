@@ -8,8 +8,7 @@ import pytest
 from eth_account import Account
 
 from aero_bot.safe_tx import (
-    CHECK_N_SIGNATURES_SELECTOR,
-    EXEC_TRANSACTION_SELECTOR,
+    CHECK_SIGNATURES_SELECTOR,
     SAFE_DOMAIN_SEPARATOR_SELECTOR,
     SAFE_NONCE_SELECTOR,
     BuiltSafeTransaction,
@@ -94,7 +93,7 @@ class FixtureSafeTransport(httpx.MockTransport):
             domain_separator: The domain separator served by domainSeparator().
             failures_before_success: Rate-limit failures served before success.
             error_code: The JSON-RPC error code used for transient failures.
-            check_signatures_reverts: Serve a contract revert for checkNSignatures.
+            check_signatures_reverts: Serve a contract revert for checkSignatures.
         """
         # Request counting lets tests assert bounded retry behavior exactly.
         self.calls: list[dict[str, Any]] = []
@@ -127,7 +126,7 @@ class FixtureSafeTransport(httpx.MockTransport):
             return httpx.Response(
                 200, json={"jsonrpc": "2.0", "id": 1, "result": self._domain_separator}
             )
-        if call_data.startswith(f"0x{CHECK_N_SIGNATURES_SELECTOR}"):
+        if call_data.startswith(f"0x{CHECK_SIGNATURES_SELECTOR}"):
             if self._check_signatures_reverts:
                 return httpx.Response(
                     200,
@@ -289,45 +288,37 @@ def test_sign_safe_tx_hash_detects_recovery_mismatch(
         sign_safe_tx_hash(bytes(account.key), safe_tx_hash)
 
 
-def test_exec_transaction_calldata_encodes_reference_shape() -> None:
-    """The calldata decodes back to every reference argument and signature."""
-    account = Account.create()
-    transaction = reference_swap_transaction()
-    built = build_safe_transaction(transaction, SAFE_ADDRESS)
-    signature = sign_safe_tx_hash(bytes(account.key), built.safe_tx_hash)
-    calldata = build_exec_transaction_calldata(transaction, signature)
-    assert calldata.startswith(f"0x{EXEC_TRANSACTION_SELECTOR}")
-    body = calldata[2 + 8 :]
-
-    def word(index: int) -> str:
-        return body[index * 64 : (index + 1) * 64]
-
-    # Eight static words then the two dynamic offsets follow the selector.
-    assert word(0)[-40:] == transaction.to_address[2:]
-    assert int(word(1), 16) == 0
-    assert int(word(2), 16) == 0
-    assert int(word(3), 16) == 0
-    assert int(word(4), 16) == 0
-    assert int(word(5), 16) == 0
-    assert word(6)[-40:] == "0" * 40
-    assert word(7)[-40:] == "0" * 40
-    data_offset = int(word(8), 16)
-    signature_offset = int(word(9), 16)
-    data_length = int(word(data_offset // 32), 16)
-    assert data_offset == 10 * 32
-    assert signature_offset == data_offset + 32 + ((data_length + 31) // 32) * 32
-    assert (
-        body[data_offset * 2 + 64 : data_offset * 2 + 64 + data_length * 2]
-        == (transaction.data[2:])
+def test_exec_transaction_calldata_matches_cast_canonical_vector() -> None:
+    """The complete encoding matches cast for one fixed approval and signature."""
+    transaction = SafeTransaction(
+        to_address="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        data=(
+            "0x095ea7b3000000000000000000000000caf22ce31298cf2bf1d152862f80216478ad7c67"
+            "0000000000000000000000000000000000000000000000000000000001312d00"
+        ),
+        nonce=4,
     )
-    signature_length = int(word(signature_offset // 32), 16)
-    assert signature_length == 65
-    encoded_signature = body[
-        signature_offset * 2 + 64 : signature_offset * 2 + 64 + signature_length * 2
-    ]
-    assert encoded_signature == signature.encoded[2:]
-    # The complete calldata is deterministic for identical inputs.
-    assert calldata == build_exec_transaction_calldata(transaction, signature)
+    signature = SafeOwnerSignature(
+        v=27,
+        r=1,
+        s=2,
+        signer_address="0x0000000000000000000000000000000000000001",
+        encoded="0x" + "0" * 63 + "1" + "0" * 63 + "2" + "1b",
+    )
+    expected = (
+        "0x6a761202000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+        "0000000000000000000000000000000000000000000000000000000000000000"
+        "0000000000000000000000000000000000000000000000000000000000000140"
+        + "0" * (6 * 64)
+        + "00000000000000000000000000000000000000000000000000000000000001c0"
+        + "0000000000000000000000000000000000000000000000000000000000000044"
+        + transaction.data[2:]
+        + "0" * 56
+        + "0000000000000000000000000000000000000000000000000000000000000041"
+        + signature.encoded[2:]
+        + "0" * 62
+    )
+    assert build_exec_transaction_calldata(transaction, signature) == expected
 
 
 def test_backend_fetch_live_nonce_reads_contract() -> None:
@@ -531,21 +522,42 @@ def test_backend_rejects_unrecoverable_rpc_error() -> None:
 
 
 def test_validate_owner_signature_accepts_live_contract_verdict() -> None:
-    """A non-reverting checkNSignatures call reports a verified signature."""
-    backend = make_backend(FixtureSafeTransport())
-    account = Account.create()
-    built = build_safe_transaction(reference_approve_transaction(), SAFE_ADDRESS)
-    signature = sign_safe_tx_hash(bytes(account.key), built.safe_tx_hash)
+    """The read-only proof matches cast's canonical checkSignatures vector."""
+    transport = FixtureSafeTransport()
+    backend = make_backend(transport)
+    built = BuiltSafeTransaction(
+        domain_separator=LIVE_DOMAIN_SEPARATOR,
+        transaction=reference_approve_transaction(),
+        safe_tx_hash="0x" + "11" * 32,
+    )
+    signature = SafeOwnerSignature(
+        v=27,
+        r=1,
+        s=2,
+        signer_address="0x0000000000000000000000000000000000000001",
+        encoded="0x" + "0" * 63 + "1" + "0" * 63 + "2" + "1b",
+    )
     validation = backend.validate_owner_signature(built, signature)
     assert validation == SafeSignatureValidation(
         verified=True,
         source="read_only_eth_call",
         diagnostic="The live Safe contract accepted the signature read-only.",
     )
+    expected = (
+        "0x934f3a11"
+        + "11" * 32
+        + "0000000000000000000000000000000000000000000000000000000000000060"
+        + "0000000000000000000000000000000000000000000000000000000000000080"
+        + "0000000000000000000000000000000000000000000000000000000000000000"
+        + "0000000000000000000000000000000000000000000000000000000000000041"
+        + signature.encoded[2:]
+        + "0" * 62
+    )
+    assert transport.calls[0]["params"][0]["data"] == expected
 
 
 def test_validate_owner_signature_reports_revert_evidence() -> None:
-    """A reverting checkNSignatures call reports the contract's rejection."""
+    """A reverting checkSignatures call reports the contract's rejection."""
     backend = make_backend(FixtureSafeTransport(check_signatures_reverts=True))
     account = Account.create()
     built = build_safe_transaction(reference_approve_transaction(), SAFE_ADDRESS)

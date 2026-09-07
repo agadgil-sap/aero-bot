@@ -1672,7 +1672,7 @@ class SwapExecutor:
         """
         if not built.signature_verified:
             raise ExecutionRefusalError(
-                f"the Safe's read-only checkNSignatures rejected the {built.role.value} "
+                f"the Safe's read-only checkSignatures rejected the {built.role.value} "
                 f"signature for safeTxHash {built.safe_tx_hash}: "
                 f"{built.signature_diagnostic}; the signing key is not an owner of this "
                 "Safe, so nothing was broadcast"
@@ -2208,7 +2208,7 @@ def _print_built(line_prefix: str, built: BuiltExecutionTransaction) -> None:
         else f"no estimate: {built.gas_estimate_diagnostic}"
     )
     verdict = "accepted" if built.signature_verified else "REJECTED"
-    print(f"{line_prefix} signature {verdict} by live checkNSignatures, {estimate}")
+    print(f"{line_prefix} signature {verdict} by live checkSignatures, {estimate}")
 
 
 def _print_dry_run(report: DryRunReport) -> None:
