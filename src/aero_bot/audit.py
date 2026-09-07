@@ -19,6 +19,13 @@ from aero_bot.domain import (
     RiskDecision,
     RiskPolicy,
 )
+from aero_bot.policy import (
+    EventCalendar,
+    PolicyDecision,
+    PolicyObservation,
+    PolicyParameters,
+    PolicyState,
+)
 from aero_bot.transactions import (
     AllowancePlanResult,
     ExactAllowanceRequest,
@@ -64,6 +71,9 @@ class AuditEventType(StrEnum):
 
     # Risk decision captures a deterministic hold or eligible result and its inputs.
     RISK_DECISION = "risk_decision"
+    # Policy decision captures one typed emissions-farming action, its injected
+    # observation and threaded state, the locked parameters, and the calendar.
+    POLICY_DECISION = "policy_decision"
     # Transaction plan captures an unsigned simulation-only plan outcome.
     TRANSACTION_PLAN = "transaction_plan"
     # Transaction simulation captures read-only eth_call evidence.
@@ -131,6 +141,24 @@ class RiskDecisionAuditPayload(BaseModel):
     policy: RiskPolicy
     # Decision contains the ordered hold or eligible result and exact calculations.
     decision: RiskDecision
+
+
+class PolicyDecisionAuditPayload(BaseModel):
+    """Capture every validated dependency and output of one policy decision."""
+
+    # Frozen strict fields preserve a coherent deterministic decision envelope.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # Observation contains the complete injected market, pool, and portfolio evidence.
+    observation: PolicyObservation
+    # State is the exact engine state the decision was evaluated against.
+    state: PolicyState
+    # Parameters contain every locked threshold, width, wait, cap, and gas assumption.
+    parameters: PolicyParameters
+    # Calendar contains the operator-scheduled events the decision consulted.
+    calendar: EventCalendar
+    # Decision contains the typed action, stable reason, and numeric evidence.
+    decision: PolicyDecision
 
 
 class TransactionPlanAuditPayload(BaseModel):

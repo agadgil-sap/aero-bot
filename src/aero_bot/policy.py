@@ -639,6 +639,19 @@ class PolicyOutcome(BaseModel):
     next_state: PolicyState
 
 
+class PolicyDecisionRequest(BaseModel):
+    """Carry one observation and the threaded state through the app boundary."""
+
+    # Frozen strict fields keep the request exactly as the audit will record it.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # Observation contains every external fact this decision depends on.
+    observation: PolicyObservation
+    # State is the engine state threaded from the previous decision's outcome;
+    # a fresh request defaults to a new session at the starting equity.
+    state: PolicyState = Field(default_factory=PolicyState)
+
+
 # The locked v1 parameters exist once as an immutable module-level default.
 LOCKED_POLICY_PARAMETERS = PolicyParameters()
 # The empty calendar exists once as the default until the operator schedules events.

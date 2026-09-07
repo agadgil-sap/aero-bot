@@ -16,6 +16,7 @@ from aero_bot.audit import (
     AuditStore,
     AuditVerification,
     AuditVerificationStatus,
+    PolicyDecisionAuditPayload,
     RiskDecisionAuditPayload,
     TransactionPlanAuditPayload,
     TransactionSimulationAuditPayload,
@@ -32,6 +33,13 @@ from aero_bot.oracles import (
     ChainlinkCoverageReport,
     OracleCoverageStatus,
     unavailable_chainlink_coverage,
+)
+from aero_bot.policy import (
+    LOCKED_POLICY_PARAMETERS,
+    PolicyDecisionRequest,
+    PolicyEngine,
+    PolicyOutcome,
+    load_event_calendar,
 )
 from aero_bot.registry import B20RegistryResult, RegistryStatus, load_official_b20_registry
 from aero_bot.risk import RiskEngine
@@ -127,6 +135,7 @@ def create_app(
     transaction_planner: TransactionPlanner | None = None,
     yield_scanner: DefiLlamaYieldScanner | None = None,
     risk_engine: RiskEngine | None = None,
+    policy_engine: PolicyEngine | None = None,
     audit_store: AuditStore | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
@@ -140,6 +149,7 @@ def create_app(
         transaction_planner: Optional policy-bound wallet-free transaction planner.
         yield_scanner: Optional read-only Aerodrome B20 secondary-market scanner.
         risk_engine: Optional explicit deterministic policy engine for this application.
+        policy_engine: Optional explicit emissions-farming decision engine.
         audit_store: Optional initialized immutable local audit store.
         clock: Optional aware UTC clock used to timestamp durable events.
 
@@ -176,6 +186,12 @@ def create_app(
     concentrated_analyzer = ConcentratedLiquidityAnalyzer()
     # Default policy is emergency-halted with empty token and pool allowlists.
     resolved_risk_engine = risk_engine or RiskEngine(RiskPolicy())
+    # Default engine decides on the locked v1 parameters and the bundled offline
+    # calendar, so startup stays deterministic and makes no network request.
+    resolved_policy_engine = policy_engine or PolicyEngine(
+        LOCKED_POLICY_PARAMETERS,
+        load_event_calendar(),
+    )
     # Default storage writes immutable evidence to the configured private application path.
     resolved_audit_store = audit_store or AuditStore(resolved_settings.audit_database_path)
     # Injectable clock makes event-time behavior deterministic in complete HTTP tests.
@@ -200,6 +216,8 @@ def create_app(
     application.state.yield_scanner = resolved_yield_scanner
     # Storing the engine keeps every request behind the same immutable risk policy.
     application.state.risk_engine = resolved_risk_engine
+    # Storing the engine keeps every decision on the same locked parameters.
+    application.state.policy_engine = resolved_policy_engine
     # Storing the audit boundary keeps all route writes on one durable hash chain.
     application.state.audit_store = resolved_audit_store
 
@@ -327,6 +345,30 @@ def create_app(
             "Risk evaluation",
         )
         return decision
+
+    @application.post("/api/policy/decide", response_model=PolicyOutcome)
+    def decide_policy(request: PolicyDecisionRequest) -> PolicyOutcome:
+        """Return one typed policy decision without execution or wallet access."""
+        # Pure evaluation completes before any response can leave the service boundary.
+        outcome = resolved_policy_engine.decide(request.state, request.observation)
+        # Envelope retains the observation, threaded state, locked parameters,
+        # calendar, and exact decision needed to reproduce the outcome.
+        audit_payload = PolicyDecisionAuditPayload(
+            observation=request.observation,
+            state=request.state,
+            parameters=resolved_policy_engine.parameters,
+            calendar=resolved_policy_engine.calendar,
+            decision=outcome.decision,
+        )
+        # Durable append must succeed before the decision is returned to the caller.
+        _append_audit_event(
+            resolved_audit_store,
+            AuditEventType.POLICY_DECISION,
+            audit_payload,
+            resolved_clock(),
+            "Policy decision",
+        )
+        return outcome
 
     @application.get("/", response_class=HTMLResponse)
     def dashboard() -> str:

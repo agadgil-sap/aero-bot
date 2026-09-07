@@ -6,7 +6,7 @@ The audit store uses a dedicated local SQLite file and the Python standard libra
 Initialization creates its parent directory with user-only permissions and tightens the database file to user read and write access.
 SQLite uses write-ahead logging, full synchronization, foreign-key enforcement, and an explicit schema version.
 
-The first schema supports reviewed risk-decision, unsigned-plan, read-only-simulation, and system-state event categories.
+The first schema supports reviewed risk-decision, policy-decision, unsigned-plan, read-only-simulation, and system-state event categories.
 Only validated Pydantic models can be appended.
 Nested credential-shaped field names such as private keys, seed phrases, passwords, signed transactions, and raw transactions are rejected before persistence.
 This is a defense in depth control and does not make the audit database an acceptable place for secrets.
@@ -36,6 +36,10 @@ Every `/api/risk/evaluate` response is appended before it is returned.
 The event contains the complete validated opportunity snapshot, immutable active policy, and exact deterministic hold or eligible decision.
 If durable append fails, the endpoint does not return an unaudited decision.
 Each append verifies the complete existing chain under its immediate write transaction and refuses to extend corrupt history.
+
+Every `/api/policy/decide` response is appended before it is returned.
+The event contains the complete injected observation, the threaded engine state, the locked policy parameters, the operator event calendar, and the exact typed decision.
+The successor state is deliberately not duplicated in the payload because it is a pure function of the persisted inputs, and the decision carries no signing, wallet, or broadcast capability.
 
 Every `/api/transactions/plan/exact-allowance` response is also appended before it is returned.
 The event contains the complete public request, immutable transaction policy, and exact blocked, no-action, or unsigned ready result.

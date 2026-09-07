@@ -74,6 +74,41 @@ def allowance_request_payload(
     }
 
 
+def policy_request_payload(
+    observed_at: str = "2026-08-19T15:00:00+00:00",
+    state: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Build complete public fixture evidence for the policy HTTP boundary.
+
+    Args:
+        observed_at: ISO observation instant used by this request; the default is
+            Wednesday 2026-08-19 11:00 New York, outside every event window.
+        state: Previously returned successor state threaded into this request;
+            omitted requests start from a fresh session at the starting equity.
+
+    Returns:
+        JSON-compatible policy decision request with no signing material.
+    """
+    request: dict[str, object] = {
+        "observation": {
+            "observed_at": observed_at,
+            "pool_address": "0x2222222222222222222222222222222222222222",
+            "token_address": "0xb20000000000000000000078ee7ce2fe4908108c",
+            "amm_price_usdc": "200",
+            "emissions_apr": "1.5",
+            "fee_apr": "0.5",
+            "pool_depth_usd": "10000",
+            "equity_usd": "200",
+            "reference_price_usdc": "200",
+            "reference_age_seconds": 10,
+            "gas_price_gwei": "0.002",
+        },
+    }
+    if state is not None:
+        request["state"] = state
+    return request
+
+
 class PassingSimulationBackend:
     """Return complete deterministic read-only observations for HTTP audit tests."""
 
@@ -575,6 +610,83 @@ async def test_risk_endpoint_persists_reproducible_audit_evidence(tmp_path: Path
 
 
 @pytest.mark.anyio
+async def test_policy_endpoint_persists_reproducible_decision_evidence(
+    tmp_path: Path,
+) -> None:
+    """A policy decision is durably recorded with its inputs, parameters, and output."""
+    # Explicit store makes the durable policy event directly inspectable.
+    audit_store = AuditStore(tmp_path / "policy-audit" / "audit.sqlite3")
+
+    def fixed_clock() -> datetime:
+        """Return one deterministic aware event time for the audited request."""
+        # Fixed UTC evidence keeps the complete persisted envelope exactly assertable.
+        return datetime(2026, 9, 6, 13, 30, tzinfo=UTC)
+
+    # Injected storage and clock isolate persistence without changing application behavior.
+    transport = httpx.ASGITransport(
+        app=create_app(Settings(), audit_store=audit_store, clock=fixed_clock)
+    )
+    # One client checks the decision and the durable chain view after the append.
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        decision_response = await client.post(
+            "/api/policy/decide",
+            json=policy_request_payload(),
+        )
+        audit_response = await client.get("/api/audit/health")
+
+    # Direct read confirms the API did not merely increment an in-memory counter.
+    records = audit_store.read_records()
+    # Canonical payload decoding exposes the exact persisted decision envelope.
+    persisted_payload = json.loads(records[0].payload_json)
+    body = decision_response.json()
+    assert decision_response.status_code == 200
+    assert body["decision"]["action"] == "enter"
+    assert body["decision"]["reason"] == "entry_threshold_met"
+    # Size is the 20-percent equity cap, smaller than the 1-percent depth cap here.
+    assert Decimal(body["decision"]["size_usd"]) == Decimal("40")
+    # The entry swap buys half the committed value, split at the tranche bound.
+    assert Decimal(body["decision"]["swap_plan"]["total_usd"]) == Decimal("20")
+    assert len(body["decision"]["swap_plan"]["tranches"]) == 4
+    assert len(records) == 1
+    assert records[0].event_type is AuditEventType.POLICY_DECISION
+    assert records[0].created_at == fixed_clock()
+    assert persisted_payload["observation"]["token_address"] == (
+        "0xb20000000000000000000078ee7ce2fe4908108c"  # noqa: S105
+    )
+    assert persisted_payload["parameters"]["min_entry_emissions_apr"] == "1.5"
+    assert persisted_payload["calendar"]["events"] == []
+    assert persisted_payload["decision"] == body["decision"]
+    assert audit_response.json()["status"] == AuditVerificationStatus.VERIFIED
+
+
+@pytest.mark.anyio
+async def test_policy_endpoint_threads_returned_state_into_the_next_request() -> None:
+    """The fold boundary accepts the returned successor state for the next decision."""
+    # Default application decides on the locked parameters and bundled empty calendar.
+    transport = httpx.ASGITransport(app=create_app(Settings()))
+    # Two sequential requests model the caller-side state threading of a session.
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        entry_response = await client.post("/api/policy/decide", json=policy_request_payload())
+        # The returned successor state becomes the next request's threaded state.
+        threaded_state = entry_response.json()["next_state"]
+        follow_up_response = await client.post(
+            "/api/policy/decide",
+            json=policy_request_payload(
+                observed_at="2026-08-19T15:05:00+00:00",
+                state=threaded_state,
+            ),
+        )
+
+    follow_up = follow_up_response.json()
+    assert entry_response.status_code == 200
+    assert follow_up_response.status_code == 200
+    assert follow_up["decision"]["action"] == "hold"
+    assert follow_up["decision"]["reason"] == "open_in_range"
+    # The threaded successor keeps the entered position alive across the boundary.
+    assert follow_up["next_state"]["position"] is not None
+
+
+@pytest.mark.anyio
 async def test_corrupt_audit_chain_degrades_health_and_dashboard(tmp_path: Path) -> None:
     """Local health surfaces durable audit corruption instead of reporting success."""
     # One valid record provides durable content for the tampering fixture.
@@ -607,6 +719,11 @@ async def test_corrupt_audit_chain_degrades_health_and_dashboard(tmp_path: Path)
             "/api/transactions/plan/exact-allowance",
             json=allowance_request_payload(),
         )
+        # Policy route must enforce the identical fail-closed persistence requirement.
+        policy_response = await client.post(
+            "/api/policy/decide",
+            json=policy_request_payload(),
+        )
 
     assert health_response.status_code == 200
     assert health_response.json()["status"] == "degraded"
@@ -617,4 +734,6 @@ async def test_corrupt_audit_chain_degrades_health_and_dashboard(tmp_path: Path)
     assert "audit integrity failed" in risk_response.json()["detail"]
     assert planning_response.status_code == 503
     assert "Transaction planning blocked" in planning_response.json()["detail"]
+    assert policy_response.status_code == 503
+    assert "Policy decision blocked" in policy_response.json()["detail"]
     assert audit_store.verify_chain().record_count == 1

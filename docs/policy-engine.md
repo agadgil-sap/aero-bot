@@ -125,8 +125,16 @@ Exit swap sizes and held-inventory quantities use the exact v3-style composition
 Entry rebalances buy half the committed value in stock and recenters buy half the committed value back, matching the even value split at the range center.
 These sizing rules are decision-level approximations of the swap the executor performs; the rehearsal ledger refines them with reconstructed history where it can and labels the rest as assumptions.
 
+## App exposure and audit
+
+The `/api/policy/decide` endpoint exposes the pure engine through the local HTTP boundary.
+A request carries one injected observation and the threaded engine state; an omitted state starts a fresh session at the documented 200-USDC starting equity.
+The response returns the typed decision together with its successor state, so a caller threads a whole session through repeated requests exactly like the rehearsal harness folds observations.
+Every decision is appended to the immutable local audit chain before it is returned, and a corrupt chain blocks the endpoint rather than returning an unaudited decision.
+The durable event retains the complete observation, the threaded state, the locked parameters, the event calendar, and the exact decision, which is everything required to reproduce the outcome deterministically.
+
 ## Deliberate v1 scope boundaries
 
 The engine decides the full lifecycle above: every gate, exit, dislocation action, gas deferral, and swap plan in this document.
-Two behaviors remain outside this module on purpose: exposure of policy decisions through the app and the audit chain, and the optional bounded arbitrage on stale-low pools, which v1 excludes in favor of pure emissions farming.
+Exposure through the app and the audit chain is described above; the optional bounded arbitrage on stale-low pools remains outside v1 in favor of pure emissions farming.
 No swap in v1 executes against anything but the position's own pool, and no decision in this module performs I/O.
