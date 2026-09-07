@@ -92,6 +92,9 @@ ERC20_APPROVE_SELECTOR = "095ea7b3"
 ERC20_ALLOWANCE_SELECTOR = "dd62ed3e"
 # keccak256("decimals()")[0:4], read on the stock token before quoting.
 ERC20_DECIMALS_SELECTOR = "0x313ce567"
+# keccak256("balanceOf(address)")[0:4], the inventory read this layer shares
+# with the LP lifecycle executor.
+ERC20_BALANCE_OF_SELECTOR = "70a08231"
 # Native Base USDC carries six decimals everywhere in this release.
 QUOTE_TOKEN_DECIMALS = 6
 # Every ABI word below is exactly 32 bytes.
@@ -917,11 +920,48 @@ class ExecutorRpcBackend:
             ExecutionUnavailableError: If the read cannot complete or is
                 malformed.
         """
+        return self.fetch_erc20_allowance(BASE_USDC_ADDRESS, owner_address, spender_address)
+
+    def fetch_erc20_allowance(
+        self, token_address: str, owner_address: str, spender_address: str
+    ) -> int:
+        """Read one owner's standing ERC20 allowance to one spender.
+
+        Args:
+            token_address: The ERC20 contract whose allowance mapping is read.
+            owner_address: The account whose allowance is read.
+            spender_address: The spender the allowance is granted to.
+
+        Returns:
+            The allowance in the token's raw units.
+
+        Raises:
+            ExecutionUnavailableError: If the read cannot complete or is
+                malformed.
+        """
         result = self.eth_call(
-            BASE_USDC_ADDRESS,
+            token_address,
             build_allowance_calldata(owner_address, spender_address),
         )
-        return self._decode_word_result(result, "USDC allowance()")
+        return self._decode_word_result(result, "ERC20 allowance()")
+
+    def fetch_token_balance(self, token_address: str, owner_address: str) -> int:
+        """Read one account's ERC20 balance in the token's raw units.
+
+        Args:
+            token_address: The ERC20 contract whose balances are read.
+            owner_address: The account whose balance is read.
+
+        Returns:
+            The balance in the token's raw units.
+
+        Raises:
+            ExecutionUnavailableError: If the read cannot complete or is
+                malformed.
+        """
+        calldata = f"0x{ERC20_BALANCE_OF_SELECTOR}" + _address_word(owner_address).hex()
+        result = self.eth_call(token_address, calldata)
+        return self._decode_word_result(result, "ERC20 balanceOf()")
 
     def fetch_token_decimals(self, token_address: str) -> int:
         """Read one ERC20 token's decimal count.

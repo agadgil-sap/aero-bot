@@ -88,6 +88,15 @@ class AuditEventType(StrEnum):
     EXECUTION_CONFIRMED = "execution_confirmed"
     # Execution failed captures one included transaction that reverted on-chain.
     EXECUTION_FAILED = "execution_failed"
+    # LP mint planned captures one capped mint plan accepted by the planner.
+    LP_MINT_PLANNED = "lp_mint_planned"
+    # LP stake planned captures one stake plan with its live ownership evidence.
+    LP_STAKE_PLANNED = "lp_stake_planned"
+    # LP transaction built captures one fully built and signed LP Safe
+    # transaction, validated read-only before any broadcast.
+    LP_TRANSACTION_BUILT = "lp_transaction_built"
+    # LP refused captures every LP lifecycle refusal with its catalog code.
+    LP_REFUSED = "lp_refused"
     # System state captures startup, migration, and diagnostic events without secrets.
     SYSTEM_STATE = "system_state"
 
