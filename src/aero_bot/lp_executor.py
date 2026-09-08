@@ -2407,6 +2407,26 @@ class LpLifecycleExecutor:
                 f"({error}); a pre-mint dry run proves machinery only, and an execute attempt "
                 "will refuse until the mint confirms"
             )
+        if owner == observation.gauge_address:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.POSITION_NOT_STAKED,
+                f"token {token_id} is already staked in the gauge {observation.gauge_address}; "
+                "a second deposit cannot pull an NFT the gauge already holds, so continue the "
+                "lifecycle with unstake instead",
+            )
+        if owner is not None and owner != self._safe_address:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.POSITION_NOT_OWNED,
+                f"token {token_id} is owned by {owner}, which is neither this Safe nor a "
+                "pre-mint id; this executor stakes only its own positions",
+            )
+        if owner is None and mode == ExecutionMode.EXECUTE:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.POSITION_UNKNOWN,
+                f"token {token_id} did not resolve ownerOf on NFPM {observation.nfpm_address}, "
+                "so the mint has not confirmed; an execute attempt cannot stake a token the "
+                "NFPM has not minted",
+            )
         position: LpPositionView | None = None
         position_diagnostic = ""
         try:

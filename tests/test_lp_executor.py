@@ -1462,6 +1462,39 @@ def test_dry_run_stake_builds_the_pre_mint_sequence() -> None:
     assert token_id == 77
 
 
+def test_dry_run_stake_refuses_an_already_staked_token() -> None:
+    """A token the gauge already holds refuses the second stake upfront.
+
+    The live 2026-09-08 idempotency battery composed a doomed gauge deposit
+    for an already-staked token and relied on the estimate gate; this pins
+    the upfront custody refusal the battery asked for.
+    """
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            operator_approved=True,
+        ),
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_stake("FIXc", 77, bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.POSITION_NOT_STAKED
+    assert rpc_script.broadcasts == []
+
+
+def test_execute_stake_refuses_an_unminted_token() -> None:
+    """An execute stake on an unconfirmed mint refuses before building."""
+    executor, rpc_script, _ = make_lp_executor()
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert raised.value.code is LpExecutionRefusalCode.POSITION_UNKNOWN
+    assert rpc_script.broadcasts == []
+
+
 def test_dry_run_stake_on_an_owned_position_skips_the_approval() -> None:
     """An owned, operator-approved position collapses to the bare deposit."""
     executor, rpc_script, _ = make_lp_executor(
@@ -3036,7 +3069,7 @@ def test_cli_never_attempts_a_broadcast_under_any_subcommand(
             nfpm_held_positions=1,
             position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
         ),
-        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True, True]),
+        safe_script=SafeRpcScript(nonce_reads=[4, 5], signature_verdicts=[True] * 4),
     )
     for executor, arguments in (
         (
@@ -3059,11 +3092,11 @@ def test_cli_never_attempts_a_broadcast_under_any_subcommand(
         ),
         (
             staked_executor,
-            ["dry-run", "stake", "--symbol", "FIXc", "--token-id", "77", "--ephemeral-key"],
+            ["dry-run", "unstake", "--symbol", "FIXc", "--token-id", "77", "--ephemeral-key"],
         ),
         (
-            staked_executor,
-            ["dry-run", "unstake", "--symbol", "FIXc", "--token-id", "77", "--ephemeral-key"],
+            owned_executor,
+            ["dry-run", "stake", "--symbol", "FIXc", "--token-id", "77", "--ephemeral-key"],
         ),
         (
             owned_executor,

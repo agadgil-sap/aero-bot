@@ -175,7 +175,8 @@ An entry composes into a sequence of individual Safe transactions, each occupyin
 
 The NFPM itself executes the mint's `transferFrom` pull (the payer is the calling Safe), so the two exact approvals target the NFPM rather than the router.
 A stake composes `nfpm_gauge_approval` (only when `isApprovedForAll` reports the gauge unapproved) then `gauge_deposit`, because the gauge's `deposit` pulls the NFT with `safeTransferFrom`.
-A stake dry run may name a token id that does not exist yet: the report labels the missing ownership honestly instead of refusing, so the signing and encoding path can be proven before the mint confirms.
+A stake dry run may name a token id that does not exist yet: the report labels the missing ownership honestly instead of refusing, so the signing and encoding path can be proven before the mint confirms (an execute attempt on an unconfirmed id refuses as `position_unknown`).
+A token the gauge already holds refuses upfront as `position_not_staked` and a foreign owner as `position_not_owned` - the same custody symmetry the exit side enforces - a gate added after the live 2026-09-08 idempotency battery showed a second stake composing a doomed deposit that only the estimate gate stopped.
 
 The exit side completes the lifecycle with seven more actions, every one first resolving the token id through `ownerOf` into one of three custodies - the Safe itself (unstaked), this pool's gauge (staked), or anything else (refused):
 
