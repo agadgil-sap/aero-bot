@@ -40,8 +40,9 @@ aero-bot = "aero_bot.__main__:main"
 aero-bot-rehearse = "aero_bot.rehearse:main"
 # The swap command manually executes one hard-capped Safe swap on Base.
 aero-bot-swap = "aero_bot.executor:main"
-# The LP command manually plans and validates hard-capped Safe LP lifecycle
-# transactions on Base; this release never broadcasts.
+# The LP command manually plans, validates, and executes hard-capped Safe LP
+# lifecycle transactions on Base, one audited nonce at a time behind an
+# explicit broadcast confirmation.
 aero-bot-lp = "aero_bot.lp_executor:main"
 # The decision command runs one complete policy verdict from live reads;
 # decision-only - nothing is built, signed, or broadcast.

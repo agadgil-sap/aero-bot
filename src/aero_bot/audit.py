@@ -101,6 +101,9 @@ class AuditEventType(StrEnum):
     # LP collect planned captures one fee or emissions claim plan with its
     # claimable amounts.
     LP_COLLECT_PLANNED = "lp_collect_planned"
+    # LP burn planned captures one emptied-NFT burn plan with its emptiness
+    # evidence.
+    LP_BURN_PLANNED = "lp_burn_planned"
     # LP recenter planned captures one full management-cycle batch plan.
     LP_RECENTER_PLANNED = "lp_recenter_planned"
     # LP status reported captures one read-only position report.

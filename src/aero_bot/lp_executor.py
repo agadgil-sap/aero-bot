@@ -232,6 +232,8 @@ class LpExecutionRefusalCode(StrEnum):
     POSITION_NOT_STAKED = "position_not_staked"
     # A withdraw was requested on a position holding no liquidity and no fees.
     POSITION_EMPTY = "position_empty"
+    # A burn was requested on a position still holding liquidity or owed fees.
+    POSITION_NOT_EMPTY = "position_not_empty"
     # The live AERO price read backing an emissions-APR quote failed.
     AERO_PRICE_UNREADABLE = "aero_price_unreadable"
     # A claim or withdrawal would land inside the early-exit penalty window.
@@ -694,6 +696,50 @@ class LpCollectDryRunReport(BaseModel):
     diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
 
 
+class LpBurnDryRunReport(BaseModel):
+    """Report one complete LP burn build-and-validate attempt.
+
+    The burn is the lifecycle's terminal step: it clears one position NFT
+    the Safe itself holds after the position emptied through its withdraw.
+    """
+
+    # Frozen strict fields preserve one coherent dry-run outcome.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode marker makes the no-broadcast guarantee auditable.
+    mode: Literal[ExecutionMode.DRY_RUN] = ExecutionMode.DRY_RUN
+    # The registry-matched stock symbol identifying the pool.
+    symbol: str
+    # The pool whose position is being burned.
+    pool_address: EvmAddress
+    # The pool's own NonfungiblePositionManager.
+    nfpm_address: EvmAddress
+    # The pool's live CLGauge, named for audit symmetry.
+    gauge_address: EvmAddress
+    # The position NFT being burned.
+    token_id: Annotated[int, Field(ge=0)]
+    # The live twelve-word position view proving the position is empty.
+    position: LpPositionView
+    # The Safe every built transaction targets.
+    safe_address: EvmAddress
+    # The public address of the EOA whose key signed the build.
+    relayer_address: EvmAddress
+    # Whether the signing key was generated for this dry run only.
+    ephemeral_key: bool
+    # The Base gas price observed before building.
+    gas_price_wei: Annotated[int, Field(ge=0)]
+    # The Safe ETH balance observed before building.
+    safe_eth_wei: Annotated[int, Field(ge=0)]
+    # Every built transaction in execution order.
+    transactions: Annotated[tuple[BuiltLpTransaction, ...], Field(min_length=1)]
+    # Every cap checked before signing, in enforced order.
+    caps_enforced: Annotated[tuple[str, ...], Field(min_length=1)]
+    # Wall-clock duration of the build phase in milliseconds.
+    build_duration_ms: Decimal
+    # Human-readable evidence lines covering the burn.
+    diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
 class LpActionExecutionReport(BaseModel):
     """Report one complete LP action executed through the broadcast path."""
 
@@ -711,6 +757,7 @@ class LpActionExecutionReport(BaseModel):
         | LpUnstakeDryRunReport
         | LpExitDryRunReport
         | LpCollectDryRunReport
+        | LpBurnDryRunReport
     )
     # Every broadcast step in execution order, including the halting one.
     steps: Annotated[tuple[LpStepExecutionReport, ...], Field(min_length=0)]
@@ -1009,6 +1056,32 @@ class LpCollectPlannedPayload(BaseModel):
     fees_owed0_units: Annotated[int, Field(ge=0)] = 0
     # The checkpointed token-one fees when unstaked, else zero.
     fees_owed1_units: Annotated[int, Field(ge=0)] = 0
+
+
+class LpBurnPlannedPayload(BaseModel):
+    """Persist one burn plan's public evidence on the audit chain."""
+
+    # Frozen strict fields keep the audited plan immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode of the attempt this plan belongs to.
+    mode: ExecutionMode
+    # The registry-matched stock symbol.
+    symbol: str
+    # The pool contract address.
+    pool_address: EvmAddress
+    # The pool's own NonfungingPositionManager.
+    nfpm_address: EvmAddress
+    # The pool's live CLGauge.
+    gauge_address: EvmAddress
+    # The emptied position NFT being burned.
+    token_id: Annotated[int, Field(ge=0)]
+    # The position's raw liquidity units, zero by the emptiness gate.
+    liquidity_units: Annotated[int, Field(ge=0)]
+    # The checkpointed token-zero fees, zero by the emptiness gate.
+    fees_owed0_units: Annotated[int, Field(ge=0)]
+    # The checkpointed token-one fees, zero by the emptiness gate.
+    fees_owed1_units: Annotated[int, Field(ge=0)]
 
 
 class LpRecenterPlannedPayload(BaseModel):
@@ -1504,6 +1577,40 @@ class LpLifecycleExecutor:
             self._record_refusal("collect", ExecutionMode.DRY_RUN, error, symbol)
             raise
 
+    def dry_run_burn(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> LpBurnDryRunReport:
+        """Fully build and validate one burn transaction without broadcasting.
+
+        The burn clears one emptied position NFT the Safe itself holds: it
+        refuses while the gauge holds the NFT (unstake first), while any
+        liquidity remains (withdraw first), and while any fees are still
+        owed (collect first), because burning non-empty contents would
+        forfeit them outright.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            token_id: The emptied position NFT being burned.
+            key_bytes: Exactly 32 raw signing-key bytes used for this build.
+            ephemeral_key: Whether the key was generated for this dry run.
+
+        Returns:
+            The complete dry-run report; nothing was broadcast.
+
+        Raises:
+            LpExecutionRefusalError: If any execution-layer gate refuses.
+        """
+        try:
+            report, _ = self._build_burn_attempt(symbol, token_id, key_bytes, ephemeral_key)
+            return report
+        except LpExecutionRefusalError as error:
+            self._record_refusal("burn", ExecutionMode.DRY_RUN, error, symbol)
+            raise
+
     def dry_run_recenter(
         self,
         symbol: str,
@@ -1804,6 +1911,56 @@ class LpLifecycleExecutor:
             raise
         return LpActionExecutionReport(
             action="collect",
+            build=build,
+            steps=step_reports,
+            completed=halted_reason == "",
+            halted_reason=halted_reason,
+        )
+
+    def execute_burn(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Build and broadcast one burn transaction step by step.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            token_id: The emptied position NFT being burned.
+            key_bytes: Exactly 32 raw signing-key bytes used for this attempt.
+            confirm_broadcast: The explicit operator confirmation.
+            ephemeral_key: Whether the key was generated for this attempt.
+
+        Returns:
+            The complete execution report with every broadcast step.
+
+        Raises:
+            LpExecutionRefusalError: If any gate, preflight, or per-step check
+                refuses.
+        """
+        if not confirm_broadcast:
+            error = LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "the execute command refuses to broadcast without the explicit "
+                "--confirm-broadcast flag; rerun with it to broadcast the built "
+                "sequence",
+            )
+            self._record_refusal("burn", ExecutionMode.EXECUTE, error, symbol)
+            raise error
+        try:
+            build, steps = self._build_burn_attempt(
+                symbol, token_id, key_bytes, ephemeral_key, ExecutionMode.EXECUTE
+            )
+            step_reports, halted_reason = self._execute_steps("burn", steps, key_bytes)
+        except LpExecutionRefusalError as error:
+            self._record_refusal("burn", ExecutionMode.EXECUTE, error, symbol)
+            raise
+        return LpActionExecutionReport(
+            action="burn",
             build=build,
             steps=step_reports,
             completed=halted_reason == "",
@@ -2265,8 +2422,8 @@ class LpLifecycleExecutor:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.POSITION_EMPTY,
                 f"token {token_id} holds no liquidity and no checkpointed fees, so there is "
-                "nothing to withdraw; recenter to burn and remint it, or burn it directly "
-                "once an execute path exists",
+                "nothing to withdraw; recenter to burn and remint it, or burn the emptied "
+                "NFT through execute burn",
             )
         range_state = position_range_state(
             position.tick_lower, position.tick_upper, observation.current_tick
@@ -2479,6 +2636,84 @@ class LpLifecycleExecutor:
             penalty=penalty,
             fees_owed0_units=position.tokens_owed0_units if not context.staked else 0,
             fees_owed1_units=position.tokens_owed1_units if not context.staked else 0,
+            safe_address=self._safe_address,
+            relayer_address=normalize_evm_address(Account.from_key(key_bytes).address),
+            ephemeral_key=ephemeral_key,
+            gas_price_wei=gas_price,
+            safe_eth_wei=safe_eth,
+            transactions=tuple(step.report for step in built_steps),
+            caps_enforced=tuple(caps),
+            build_duration_ms=self._milliseconds_since(build_started),
+            diagnostics=tuple(diagnostics),
+        )
+        return report, built_steps
+
+    def _build_burn_attempt(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        ephemeral_key: bool,
+        mode: ExecutionMode = ExecutionMode.DRY_RUN,
+    ) -> tuple[LpBurnDryRunReport, tuple[_BuiltLpStep, ...]]:
+        """Build, sign, validate, and estimate the single burn transaction."""
+        build_started = self._timer()
+        context = self._resolve_position(symbol, token_id)
+        if context.staked:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.POSITION_STAKED,
+                f"token {token_id} is staked in the gauge, which holds the NFT and blocks "
+                "every NFPM-side operation; unstake first, then withdraw, then burn the "
+                "emptied NFT",
+            )
+        position = context.position
+        observation = context.observation
+        if (
+            position.liquidity > 0
+            or position.tokens_owed0_units > 0
+            or position.tokens_owed1_units > 0
+        ):
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.POSITION_NOT_EMPTY,
+                f"token {token_id} still holds {position.liquidity} raw liquidity units and "
+                f"owes {position.tokens_owed0_units} + {position.tokens_owed1_units} raw "
+                "fee units; the burn only clears an emptied NFT, so withdraw and collect "
+                "first - burning now would forfeit those contents outright",
+            )
+        caps = list(context.caps)
+        caps.append("burn target holds no liquidity and no owed fees")
+        gas_price, safe_eth, live_nonce = self._preflight(caps)
+        steps = [
+            _LpStepSpec(
+                role=LpExecutionRole.NFPM_BURN,
+                to_address=observation.nfpm_address,
+                inner_calldata=build_lp_burn_calldata(token_id),
+                description=f"burn the emptied position NFT {token_id}",
+            )
+        ]
+        diagnostics = [
+            (
+                "the NFPM burn only clears the emptied NFT; every amount and fee left "
+                "the position through the earlier decrease and collect"
+            )
+        ]
+        self._record_burn_plan(
+            mode,
+            context.listing.symbol,
+            observation,
+            token_id,
+            position.liquidity,
+            position.tokens_owed0_units,
+            position.tokens_owed1_units,
+        )
+        built_steps = self._build_steps(steps, live_nonce, key_bytes, "burn", mode)
+        report = LpBurnDryRunReport(
+            symbol=context.listing.symbol,
+            pool_address=observation.pool_address,
+            nfpm_address=observation.nfpm_address,
+            gauge_address=observation.gauge_address,
+            token_id=token_id,
+            position=position,
             safe_address=self._safe_address,
             relayer_address=normalize_evm_address(Account.from_key(key_bytes).address),
             ephemeral_key=ephemeral_key,
@@ -4303,6 +4538,35 @@ class LpLifecycleExecutor:
             self._now(),
         )
 
+    def _record_burn_plan(
+        self,
+        mode: ExecutionMode,
+        symbol: str,
+        observation: LpPoolObservation,
+        token_id: int,
+        liquidity_units: int,
+        fees_owed0: int,
+        fees_owed1: int,
+    ) -> None:
+        """Append the burn plan audit event when a sink is configured."""
+        if self._audit_sink is None:
+            return
+        self._audit_sink.append(
+            AuditEventType.LP_BURN_PLANNED,
+            LpBurnPlannedPayload(
+                mode=mode,
+                symbol=symbol,
+                pool_address=observation.pool_address,
+                nfpm_address=observation.nfpm_address,
+                gauge_address=observation.gauge_address,
+                token_id=token_id,
+                liquidity_units=liquidity_units,
+                fees_owed0_units=fees_owed0,
+                fees_owed1_units=fees_owed1,
+            ),
+            self._now(),
+        )
+
     def _record_recenter_plan(
         self,
         mode: ExecutionMode,
@@ -4603,6 +4867,25 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
             "the Keychain key; the signature check will honestly report rejection."
         ),
     )
+    dry_run_burn_parser = dry_run_subparsers.add_parser(
+        "burn",
+        help="Build and validate the emptied-NFT burn; nothing is broadcast.",
+    )
+    _add_lp_symbol_arguments(dry_run_burn_parser)
+    dry_run_burn_parser.add_argument(
+        "--token-id",
+        type=int,
+        required=True,
+        help="Emptied position NFT the Safe holds, to be burned.",
+    )
+    dry_run_burn_parser.add_argument(
+        "--ephemeral-key",
+        action="store_true",
+        help=(
+            "Sign the dry run with a freshly generated throwaway key instead of "
+            "the Keychain key; the signature check will honestly report rejection."
+        ),
+    )
     dry_run_recenter_parser = dry_run_subparsers.add_parser(
         "recenter",
         help="Build and validate the full recenter batch; nothing is broadcast.",
@@ -4672,6 +4955,7 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
         execute_subparsers.add_parser(
             "collect", help="Build and broadcast the fee or emissions claim."
         ),
+        execute_subparsers.add_parser("burn", help="Build and broadcast the emptied-NFT burn."),
     ):
         if lifecycle_parser is not execute_mint_parser:
             _add_lp_symbol_arguments(lifecycle_parser)
@@ -4740,6 +5024,8 @@ def _print_execution_report(report: LpActionExecutionReport) -> None:
         _print_exit_dry_run(build)
     elif isinstance(build, LpCollectDryRunReport):
         _print_collect_dry_run(build)
+    elif isinstance(build, LpBurnDryRunReport):
+        _print_burn_dry_run(build)
     for step in report.steps:
         line = (
             f"[{step.action}/{step.role.value}] Safe nonce {step.nonce}: "
@@ -4964,6 +5250,34 @@ def _print_collect_dry_run(report: LpCollectDryRunReport) -> None:
             _print_penalty(penalty)
     else:
         print(f"checkpointed fees {report.fees_owed0_units} + {report.fees_owed1_units} raw units")
+    print(
+        f"safe {report.safe_address}, relayer {report.relayer_address} ({key_note} key, "
+        "nothing broadcast)"
+    )
+    print(f"gas price {report.gas_price_wei} wei, Safe ETH {report.safe_eth_wei} wei")
+    for transaction in report.transactions:
+        _print_built_lp(f"[{transaction.role.value}]", transaction)
+    for line in report.diagnostics:
+        print(f"note: {line}")
+    print(f"build took {report.build_duration_ms} ms")
+
+
+def _print_burn_dry_run(report: LpBurnDryRunReport) -> None:
+    """Print one burn dry-run report's human summary.
+
+    Args:
+        report: The dry-run report being printed.
+    """
+    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    print(
+        f"{report.symbol} pool {report.pool_address}, NFPM {report.nfpm_address}, "
+        f"token {report.token_id} (unstaked: held by the Safe)"
+    )
+    print(
+        f"position empty: {report.position.liquidity} raw liquidity, "
+        f"{report.position.tokens_owed0_units} + {report.position.tokens_owed1_units} "
+        "raw fees owed"
+    )
     print(
         f"safe {report.safe_address}, relayer {report.relayer_address} ({key_note} key, "
         "nothing broadcast)"
@@ -5210,6 +5524,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 _print_collect_dry_run(collect_report)
             return EXIT_OK
+        if arguments.command == "dry-run" and arguments.lifecycle == "burn":
+            if arguments.token_id < 0:
+                parser.error("--token-id must be non-negative")
+            if arguments.ephemeral_key:
+                key_bytes = bytes(Account.create().key)
+                ephemeral = True
+            else:
+                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                ephemeral = False
+            burn_report = executor.dry_run_burn(
+                arguments.symbol, arguments.token_id, key_bytes, ephemeral_key=ephemeral
+            )
+            if arguments.json:
+                print(burn_report.model_dump_json(indent=2))
+            else:
+                _print_burn_dry_run(burn_report)
+            return EXIT_OK
         if arguments.command == "dry-run" and arguments.lifecycle == "recenter":
             if arguments.token_id < 0:
                 parser.error("--token-id must be non-negative")
@@ -5280,8 +5611,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     confirm_broadcast=arguments.confirm_broadcast,
                     ephemeral_key=ephemeral,
                 )
-            else:
+            elif arguments.lifecycle == "collect":
                 execution_report = executor.execute_collect(
+                    arguments.symbol,
+                    arguments.token_id,
+                    key_bytes,
+                    confirm_broadcast=arguments.confirm_broadcast,
+                    ephemeral_key=ephemeral,
+                )
+            else:
+                execution_report = executor.execute_burn(
                     arguments.symbol,
                     arguments.token_id,
                     key_bytes,

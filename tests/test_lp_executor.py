@@ -1573,6 +1573,7 @@ def test_exit_side_actions_refuse_an_unknown_token() -> None:
         lambda: executor.dry_run_unstake("FIXc", 77, bytes(Account.create().key)),
         lambda: executor.dry_run_exit("FIXc", 77, bytes(Account.create().key)),
         lambda: executor.dry_run_collect("FIXc", 77, bytes(Account.create().key)),
+        lambda: executor.dry_run_burn("FIXc", 77, bytes(Account.create().key)),
         lambda: executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC),
     ):
         with pytest.raises(LpExecutionRefusalError) as raised:
@@ -1592,6 +1593,7 @@ def test_exit_side_actions_refuse_a_foreign_owner() -> None:
     for action in (
         lambda: executor.dry_run_unstake("FIXc", 77, bytes(Account.create().key)),
         lambda: executor.dry_run_exit("FIXc", 77, bytes(Account.create().key)),
+        lambda: executor.dry_run_burn("FIXc", 77, bytes(Account.create().key)),
         lambda: executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC),
     ):
         with pytest.raises(LpExecutionRefusalError) as raised:
@@ -1769,6 +1771,80 @@ def test_dry_run_collect_refuses_inside_the_penalty_window() -> None:
         executor.dry_run_collect("FIXc", 77, bytes(Account.create().key))
 
     assert raised.value.code is LpExecutionRefusalCode.WITHIN_PENALTY_WINDOW
+
+
+# ---------------------------------------------------------------------------
+# Burn dry-run composition
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_burn_clears_the_emptied_position() -> None:
+    """An unstaked fully emptied position burns through one NFPM call."""
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True]),
+    )
+
+    report = executor.dry_run_burn("FIXc", 77, bytes(Account.create().key))
+
+    assert tuple(transaction.role for transaction in report.transactions) == (
+        LpExecutionRole.NFPM_BURN,
+    )
+    assert report.position.liquidity == 0
+    assert report.position.tokens_owed0_units == 0
+    assert report.position.tokens_owed1_units == 0
+    assert "burn target holds no liquidity and no owed fees" in report.caps_enforced
+    assert rpc_script.estimate_requests != []
+    inner = decode_inner(rpc_script.estimate_requests[0])
+    assert inner == bytes.fromhex(build_lp_burn_calldata(77)[2:])
+
+
+def test_dry_run_burn_refuses_a_staked_position() -> None:
+    """The gauge's custody blocks the NFPM-side burn until unstaked."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_burn("FIXc", 77, bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.POSITION_STAKED
+
+
+def test_dry_run_burn_refuses_remaining_liquidity() -> None:
+    """A position still carrying liquidity refuses rather than forfeiting it."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            position_words=make_position_words(liquidity=12_345, fees_owed0=0, fees_owed1=0),
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_burn("FIXc", 77, bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.POSITION_NOT_EMPTY
+
+
+def test_dry_run_burn_refuses_owed_fees() -> None:
+    """Owed checkpointed fees refuse the burn until collected."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            position_words=make_position_words(liquidity=0, fees_owed0=10, fees_owed1=0),
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_burn("FIXc", 77, bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.POSITION_NOT_EMPTY
 
 
 # ---------------------------------------------------------------------------
@@ -2536,6 +2612,85 @@ def test_cli_dry_run_collect_prints_the_claim_path(
     assert "[gauge_get_reward]" in output
 
 
+def test_cli_dry_run_burn_prints_the_emptied_position(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The burn dry-run prints the emptiness evidence and the NFPM burn."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True]),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "dry-run",
+                "burn",
+                "--symbol",
+                "FIXc",
+                "--token-id",
+                "77",
+                "--ephemeral-key",
+            ]
+        )
+
+    assert exit_code == EXIT_OK
+    output = capsys.readouterr().out
+    assert "position empty: 0 raw liquidity, 0 + 0 raw fees owed" in output
+    assert "[nfpm_burn]" in output
+
+
+def test_cli_execute_burn_broadcasts_and_exits_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A confirmed burn execute prints its one broadcast hash and exits zero."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+            allow_broadcasts=True,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 2),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "execute",
+                "burn",
+                "--symbol",
+                "FIXc",
+                "--token-id",
+                "77",
+                "--ephemeral-key",
+                "--confirm-broadcast",
+                "--json",
+            ]
+        )
+
+    assert exit_code == EXIT_OK
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["mode"] == "execute"
+    assert printed["action"] == "burn"
+    assert printed["completed"] is True
+    assert [step["status"] for step in printed["steps"]] == ["confirmed"]
+
+
 def test_cli_dry_run_recenter_prints_the_restake_followup(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2961,6 +3116,60 @@ def make_execute_stake_executor(
         **executor_kwargs,  # type: ignore[arg-type]
     )
     return executor, script
+
+
+def test_execute_burn_broadcasts_one_audited_nonce(tmp_path: Path) -> None:
+    """A confirmed burn executes its single step and audits the full chain."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+            allow_broadcasts=True,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 2),
+    )
+
+    report = executor.execute_burn("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert report.completed is True
+    assert report.action == "burn"
+    assert [step.role for step in report.steps] == [LpExecutionRole.NFPM_BURN]
+    assert [step.nonce for step in report.steps] == [4]
+    assert all(step.status == "confirmed" for step in report.steps)
+    assert len(rpc_script.broadcasts) == 1
+
+    records = AuditStore(audit_path).read_records(100)
+    assert [record.event_type for record in records] == [
+        AuditEventType.LP_BURN_PLANNED,
+        AuditEventType.LP_TRANSACTION_BUILT,
+        AuditEventType.LP_EXECUTE_SENT,
+        AuditEventType.LP_EXECUTE_CONFIRMED,
+    ]
+    planned = json.loads(records[0].payload_json)
+    assert planned["mode"] == "execute"
+    assert planned["token_id"] == 77
+    assert planned["liquidity_units"] == 0
+    sent = json.loads(records[2].payload_json)
+    assert sent["action"] == "burn"
+    assert sent["role"] == "nfpm_burn"
+    assert AuditStore(audit_path).verify_chain().status.value == "verified"
+
+
+def test_execute_burn_refuses_without_broadcast_confirmation(tmp_path: Path) -> None:
+    """An unconfirmed execute burn refuses before building anything."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+        ),
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.execute_burn("FIXc", 77, bytes(Account.create().key), confirm_broadcast=False)
+
+    assert raised.value.code is LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING
 
 
 def test_execute_halts_at_an_execute_time_estimate_revert(tmp_path: Path) -> None:

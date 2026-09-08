@@ -177,13 +177,14 @@ The NFPM itself executes the mint's `transferFrom` pull (the payer is the callin
 A stake composes `nfpm_gauge_approval` (only when `isApprovedForAll` reports the gauge unapproved) then `gauge_deposit`, because the gauge's `deposit` pulls the NFT with `safeTransferFrom`.
 A stake dry run may name a token id that does not exist yet: the report labels the missing ownership honestly instead of refusing, so the signing and encoding path can be proven before the mint confirms.
 
-The exit side completes the lifecycle with five more actions, every one first resolving the token id through `ownerOf` into one of three custodies - the Safe itself (unstaked), this pool's gauge (staked), or anything else (refused):
+The exit side completes the lifecycle with six more actions, every one first resolving the token id through `ownerOf` into one of three custodies - the Safe itself (unstaked), this pool's gauge (staked), or anything else (refused):
 
 1. `unstake` requires the gauge's custody, reads `earned` and `rewards` for the accrued emissions, resolves the penalty window, and composes exactly `gauge_withdraw`, whose source-verified behavior auto-sweeps the position's checkpointed fees, auto-claims the accrued emissions, and returns the NFT to the Safe.
 2. `withdraw` requires the Safe's custody (the gauge holding the NFT blocks every NFPM operation) and composes `nfpm_decrease_liquidity` for the position's full liquidity at the snapshot price with slippage-floored minima, then `nfpm_collect` for both fee sides; a position with no liquidity and no fees collapses to the bare collect, and one with neither refuses as empty.
 3. `collect` routes by custody: staked it composes `gauge_get_reward` (checkpointed position fees never flow through the gauge; they arrive on the unstaking withdraw), unstaked it composes the NFPM `collect`.
-4. `recenter` recycles one position into a fresh mint inside a single sequenced batch: the gauge withdraw when staked, the decrease and collect when either liquidity or fees remain, the `nfpm_burn` clearing the emptied NFT, then the planner's full entry composition (bounded router allowance, balancing swap, exact approvals, mint) over a projected inventory that credits the decrease outputs and the collected fees, and finally the gauge operator approval when missing.
-5. `status` composes nothing: it is a completely read-only observation of custody, both sides' amounts and values at the snapshot price, accrued AERO, the penalty window, a quoted emissions APR, and the unrealized P&L against a supplied entry cost.
+4. `burn` is the lifecycle's terminal step: it composes exactly `nfpm_burn`, clearing one position NFT the Safe itself holds after the position emptied through its withdraw. It refuses while the gauge holds the NFT (`position_staked`), while any liquidity remains (`position_not_empty`), and while any fees are still owed (`position_not_empty`), because burning non-empty contents would forfeit them outright; the live twelve-word position view's liquidity and both owed sides ride the `lp_burn_planned` audit record as the emptiness evidence.
+5. `recenter` recycles one position into a fresh mint inside a single sequenced batch: the gauge withdraw when staked, the decrease and collect when either liquidity or fees remain, the `nfpm_burn` clearing the emptied NFT, then the planner's full entry composition (bounded router allowance, balancing swap, exact approvals, mint) over a projected inventory that credits the decrease outputs and the collected fees, and finally the gauge operator approval when missing.
+6. `status` composes nothing: it is a completely read-only observation of custody, both sides' amounts and values at the snapshot price, accrued AERO, the penalty window, a quoted emissions APR, and the unrealized P&L against a supplied entry cost.
 
 Each composed step is signed over its EIP-712 SafeTx hash, proven read-only against the live Safe with `checkSignatures`, gas-estimated with `eth_estimateGas`, and appended to the local audit chain before the report returns.
 A sequenced transaction's estimate legitimately reverts while its predecessors remain unexecuted, so an estimate revert behind index zero carries the diagnostic suffix "(expected while this transaction's predecessors in the sequence remain unexecuted)" instead of being treated as an anomaly.
@@ -262,6 +263,7 @@ The exit-side actions add their own gates, each enforcing the custody and emissi
 | Unstake requires staking | gauge custody | `position_not_staked` |
 | NFPM ops require custody | Safe custody | `position_staked` |
 | Withdraw needs contents | liquidity or fees above zero | `position_empty` |
+| Burn needs emptiness | liquidity and both owed sides at zero | `position_not_empty` |
 | Penalty window clear | clears-at at or before now when emissions accrued | `within_penalty_window` |
 | Penalty state readable | all four window views answer | `penalty_state_unreadable` |
 
@@ -298,9 +300,9 @@ Nothing in the status path builds, signs, estimates, or audits a transaction: th
 
 ### Audit chain and CLI surface
 
-Every plan, built transaction, and refusal appends to the same append-only hash-chained SQLite store as the swap executor, with these event types: `lp_mint_planned`, `lp_stake_planned`, `lp_unstake_planned`, `lp_exit_planned`, `lp_collect_planned`, `lp_recenter_planned`, `lp_status_reported`, `lp_transaction_built`, `lp_refused`, and - on the execute path - `lp_execute_sent`, `lp_execute_confirmed`, and `lp_execute_failed`.
+Every plan, built transaction, and refusal appends to the same append-only hash-chained SQLite store as the swap executor, with these event types: `lp_mint_planned`, `lp_stake_planned`, `lp_unstake_planned`, `lp_exit_planned`, `lp_collect_planned`, `lp_burn_planned`, `lp_recenter_planned`, `lp_status_reported`, `lp_transaction_built`, `lp_refused`, and - on the execute path - `lp_execute_sent`, `lp_execute_confirmed`, and `lp_execute_failed`.
 A recenter appends its inner mint plan as `lp_mint_planned` followed by the `lp_recenter_planned` batch record, so the recycled entry stays inspectable as a first-class plan.
-Refusal records carry the executor catalog code plus the planner's own code when the planner refused, and the action name (`mint`, `stake`, `unstake`, `withdraw`, `collect`, `recenter`, `status`), so both layers' decisions stay inspectable offline.
+Refusal records carry the executor catalog code plus the planner's own code when the planner refused, and the action name (`mint`, `stake`, `unstake`, `withdraw`, `collect`, `burn`, `recenter`, `status`), so both layers' decisions stay inspectable offline.
 The CLI exits zero on success, one on failures, and two on any refusal, with the catalog code printed to stderr as `refused [<code>]`.
 
 ```text
@@ -310,12 +312,14 @@ aero-bot-lp dry-run stake --symbol AAPLc --token-id 0
 aero-bot-lp dry-run unstake --symbol AAPLc --token-id 0
 aero-bot-lp dry-run withdraw --symbol AAPLc --token-id 0
 aero-bot-lp dry-run collect --symbol AAPLc --token-id 0
+aero-bot-lp dry-run burn --symbol AAPLc --token-id 0
 aero-bot-lp dry-run recenter --symbol AAPLc --token-id 0 --width-ticks 1 [--amount 12]
 aero-bot-lp execute mint --symbol AAPLc --amount 7 --width-ticks 1 --confirm-broadcast
 aero-bot-lp execute stake --symbol AAPLc --token-id 0 --confirm-broadcast
 aero-bot-lp execute unstake --symbol AAPLc --token-id 0 --confirm-broadcast
 aero-bot-lp execute withdraw --symbol AAPLc --token-id 0 --confirm-broadcast
 aero-bot-lp execute collect --symbol AAPLc --token-id 0 --confirm-broadcast
+aero-bot-lp execute burn --symbol AAPLc --token-id 0 --confirm-broadcast
 aero-bot-lp status --symbol AAPLc --token-id 0 --aero-price 0.30 [--entry-cost 7]
 ```
 
