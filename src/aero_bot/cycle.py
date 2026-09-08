@@ -1576,6 +1576,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(report.model_dump_json(indent=2))
     else:
         _print_report(report)
+    # The email hook never raises: a failed delivery warns on stderr and the
+    # cycle's report and exit code stand on their own.
+    from aero_bot.alerts import deliver_cycle_alerts
+
+    deliver_cycle_alerts(report)
     if report.halted_reason:
         if report.reconciliation.out_of_band or any(
             action.status == "refused" for action in report.actions
