@@ -115,6 +115,9 @@ DEFAULT_GAS_PRICE_CAP_WEI = 1_000_000_000
 # just under the canary's observed 0.0001 ETH and only guards the drained
 # state because the relaying EOA, not the Safe, pays the delivery gas.
 DEFAULT_SAFE_ETH_FLOOR_WEI = 5 * 10**13
+# The relaying EOA's broadcast floor: 0.0002 ETH of real headroom on top of
+# any bounded gas cost, shared by the LP execute path.
+DEFAULT_RELAYER_ETH_FLOOR_WEI = 2 * 10**14
 # A quote older than two minutes is stale and refuses execution.
 DEFAULT_QUOTE_MAX_AGE_SECONDS = 120
 # The reference swap's amountOutMinimum sat about 0.1 percent below its quote.
@@ -1072,6 +1075,23 @@ class ExecutorRpcBackend:
             "str",
             self._rpc_call("eth_sendRawTransaction", [raw_transaction_hex]),
         )
+
+    def fetch_transaction_receipt(self, transaction_hash: str) -> dict[str, object] | None:
+        """Fetch one transaction's receipt once, without any polling.
+
+        Args:
+            transaction_hash: The broadcast transaction's hash.
+
+        Returns:
+            The receipt object when included, None when not yet present.
+
+        Raises:
+            ExecutionUnavailableError: If the call cannot complete.
+        """
+        receipt = self._rpc_call("eth_getTransactionReceipt", [transaction_hash])
+        if receipt is None:
+            return None
+        return cast("dict[str, object]", receipt)
 
     def await_transaction_receipt(self, transaction_hash: str) -> dict[str, object]:
         """Poll for one transaction's receipt until inclusion or timeout.

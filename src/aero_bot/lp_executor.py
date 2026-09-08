@@ -40,11 +40,12 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from eth_account import Account
+from eth_utils.address import to_checksum_address
 from eth_utils.crypto import keccak
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -59,8 +60,10 @@ from aero_bot.executor import (
     DEFAULT_CANARY_SAFE_ADDRESS,
     DEFAULT_GAS_PRICE_CAP_WEI,
     DEFAULT_QUOTE_MAX_AGE_SECONDS,
+    DEFAULT_RELAYER_ETH_FLOOR_WEI,
     DEFAULT_SAFE_ETH_FLOOR_WEI,
     ERC20_BALANCE_OF_SELECTOR,
+    GAS_LIMIT_BUFFER_FRACTION,
     SAFE_ADDRESS_ENV,
     ExecutionAuditSink,
     ExecutionMode,
@@ -114,7 +117,9 @@ from aero_bot.lp_plan import (
 )
 from aero_bot.registry import B20AssetListing, RegistryStatus
 from aero_bot.safe_tx import (
+    SAFE_CHAIN_ID,
     BuiltSafeTransaction,
+    SafeOwnerSignature,
     SafeSignatureValidation,
     SafeTransaction,
     SafeTransactionRpcBackend,
@@ -130,6 +135,22 @@ ERC721_OWNER_OF_SELECTOR = "6352211e"
 ERC721_IS_APPROVED_FOR_ALL_SELECTOR = "e985e9c5"
 # The LP deadline sits eight minutes past its build time, mirroring the swap.
 LP_DEADLINE_SECONDS = 8 * 60
+# Fresh-estimate re-reads when a receipt landed on one public endpoint but the
+# estimating endpoint's latest block still predates it (observed live as a
+# transient GS026 with every predecessor already mined).
+EXECUTE_ESTIMATE_LAG_RETRIES = 3
+EXECUTE_ESTIMATE_LAG_RETRY_SECONDS = 4.0
+# Bounded cross-endpoint receipt wait: poll every backend once per round.
+EXECUTE_RECEIPT_TOTAL_TIMEOUT_SECONDS = 600.0
+EXECUTE_RECEIPT_POLL_SECONDS = 3.0
+# Public Base endpoints polled round-robin while awaiting one inclusion; the
+# configured primary RPC always leads the rotation.
+EXECUTE_RECEIPT_ENDPOINT_URLS: tuple[str, ...] = (
+    "https://mainnet.base.org",
+    "https://base.publicnode.com",
+    "https://1rpc.io/base",
+    "https://base.drpc.org",
+)
 # AERO is a standard eighteen-decimal ERC20; the emissions valuation scales by it.
 AERO_DECIMALS = 18
 # Timing metrics round to whole milliseconds.
@@ -196,6 +217,17 @@ class LpExecutionRefusalCode(StrEnum):
     # The penalty window could not be resolved from live reads, so any claim
     # or withdrawal is refused rather than guessed at.
     PENALTY_STATE_UNREADABLE = "penalty_state_unreadable"
+    # An execute command was issued without its explicit broadcast confirmation.
+    BROADCAST_CONFIRMATION_MISSING = "broadcast_confirmation_missing"
+    # A rebuilt SafeTx hash no longer equals its report, so the built content
+    # cannot be trusted to be what was validated.
+    REBUILD_HASH_MISMATCH = "rebuild_hash_mismatch"
+    # The live Safe rejected the owner signature at execute time.
+    SIGNATURE_REJECTED = "signature_rejected"
+    # The fresh on-chain estimate reverted with every predecessor mined.
+    ESTIMATE_REVERTED = "estimate_reverted"
+    # The relaying EOA cannot afford the floor plus the bounded gas cost.
+    RELAYER_ETH_INSUFFICIENT = "relayer_eth_insufficient"
 
 
 class LpExecutionRole(StrEnum):
@@ -246,6 +278,9 @@ class LpSafeExecutionPolicy(BaseModel):
     router_allowance_standing_cap_usdc: Annotated[Decimal, Field(gt=0)] = (
         DEFAULT_APPROVAL_STANDING_CAP_USDC
     )
+    # A relaying EOA balance below this floor refuses any broadcast, separate
+    # from the gas-cost check so a cheap delivery still needs real headroom.
+    relayer_eth_floor_wei: Annotated[int, Field(gt=0)] = DEFAULT_RELAYER_ETH_FLOOR_WEI
 
     @field_validator("router_address")
     @classmethod
@@ -303,6 +338,77 @@ class BuiltLpTransaction(BaseModel):
     gas_estimate: Annotated[int, Field(gt=0)] | None
     # Why the gas estimate is absent, empty when it succeeded.
     gas_estimate_diagnostic: str = ""
+
+
+class _BuiltLpStep:
+    """Carry one built step's report together with its signing artifacts."""
+
+    def __init__(
+        self,
+        report: BuiltLpTransaction,
+        transaction: SafeTransaction,
+        built: BuiltSafeTransaction,
+        signature: SafeOwnerSignature,
+        exec_calldata: str,
+    ) -> None:
+        """Bind the report to the exact artifacts that produced it."""
+        self.report = report
+        self.transaction = transaction
+        self.built = built
+        self.signature = signature
+        self.exec_calldata = exec_calldata
+
+
+class LpStepExecutionReport(BaseModel):
+    """Report one broadcast LP Safe transaction's delivery and inclusion."""
+
+    # Frozen strict fields preserve one coherent delivery outcome.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode marker makes the broadcast explicit in every report.
+    mode: Literal[ExecutionMode.EXECUTE] = ExecutionMode.EXECUTE
+    # The lifecycle action the delivery belongs to.
+    action: str
+    # Which transaction of the attempt was delivered.
+    role: LpExecutionRole
+    # The SafeTx hash of the executed Safe transaction.
+    safe_tx_hash: str
+    # The Safe nonce the executed transaction occupies.
+    nonce: Annotated[int, Field(ge=0)]
+    # The Base transaction hash that delivered execTransaction.
+    transaction_hash: str
+    # confirmed means included with status one; failed means included and
+    # reverted; unconfirmed means no receipt arrived within the bounded wait
+    # and the audit chain's send record remains the source of truth.
+    status: Literal["confirmed", "failed", "unconfirmed"]
+    # The block that included the delivery, absent while unconfirmed.
+    block_number: Annotated[int, Field(ge=0)] | None
+    # Gas units the delivery consumed, absent while unconfirmed.
+    gas_used: Annotated[int, Field(ge=0)] | None
+    # The effective gas price the delivery paid, absent while unconfirmed.
+    effective_gas_price_wei: Annotated[int, Field(ge=0)] | None
+    # The total fee the delivery consumed, absent while unconfirmed.
+    fee_wei: Annotated[int, Field(ge=0)] | None
+    # The delivery transaction's gas limit, estimate buffered by a fifth.
+    delivery_gas_limit: Annotated[int, Field(gt=0)]
+    # The delivery's max fee per gas, the observed price capped at the policy.
+    delivery_max_fee_per_gas_wei: Annotated[int, Field(gt=0)]
+    # The relaying EOA's nonce the delivery consumed.
+    relayer_nonce: Annotated[int, Field(ge=0)]
+    # Broadcast-to-inclusion duration in milliseconds; zero when unconfirmed.
+    inclusion_ms: Annotated[Decimal, Field(ge=0)]
+    # The rebuild pin's duration in milliseconds.
+    rebuild_ms: Annotated[Decimal, Field(ge=0)]
+    # The fresh live signature validation's duration in milliseconds.
+    validate_ms: Annotated[Decimal, Field(ge=0)]
+    # The fresh estimate's duration in milliseconds, retries included.
+    estimate_ms: Annotated[Decimal, Field(ge=0)]
+    # The delivery build's duration in milliseconds.
+    delivery_ms: Annotated[Decimal, Field(ge=0)]
+    # The broadcast submission's duration in milliseconds.
+    send_ms: Annotated[Decimal, Field(ge=0)]
+    # Human-readable evidence for the outcome, empty when plainly confirmed.
+    diagnostic: str = ""
 
 
 class LpMintDryRunReport(BaseModel):
@@ -564,6 +670,32 @@ class LpCollectDryRunReport(BaseModel):
     build_duration_ms: Decimal
     # Human-readable evidence lines covering the collect.
     diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
+class LpActionExecutionReport(BaseModel):
+    """Report one complete LP action executed through the broadcast path."""
+
+    # Frozen strict fields preserve one coherent execution outcome.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode marker makes the broadcast explicit.
+    mode: Literal[ExecutionMode.EXECUTE] = ExecutionMode.EXECUTE
+    # Which lifecycle action ran.
+    action: str
+    # The dry-run build every broadcast step executed, with its plan evidence.
+    build: (
+        LpMintDryRunReport
+        | LpStakeDryRunReport
+        | LpUnstakeDryRunReport
+        | LpExitDryRunReport
+        | LpCollectDryRunReport
+    )
+    # Every broadcast step in execution order, including the halting one.
+    steps: Annotated[tuple[LpStepExecutionReport, ...], Field(min_length=0)]
+    # Whether every composed step confirmed on-chain.
+    completed: bool
+    # Why the sequence halted early, empty when it ran to completion.
+    halted_reason: str = ""
 
 
 class LpRecenterDryRunReport(BaseModel):
@@ -962,6 +1094,56 @@ class LpRefusedPayload(BaseModel):
     symbol: str | None = None
 
 
+class LpExecuteSentPayload(BaseModel):
+    """Persist one LP broadcast submission's public evidence."""
+
+    # Frozen strict fields keep the audited submission immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The lifecycle action the broadcast belongs to.
+    action: str
+    # Which transaction of the attempt was broadcast.
+    role: LpExecutionRole
+    # The SafeTx hash of the broadcast Safe transaction.
+    safe_tx_hash: str
+    # The Base transaction hash that delivered execTransaction.
+    transaction_hash: str
+    # The Safe nonce the executed transaction occupies.
+    nonce: Annotated[int, Field(ge=0)]
+    # The public address of the relaying EOA.
+    relayer_address: EvmAddress
+    # The Safe contract the delivery transaction called.
+    safe_address: EvmAddress
+
+
+class LpExecuteReceiptPayload(BaseModel):
+    """Persist one LP delivery inclusion outcome's public evidence."""
+
+    # Frozen strict fields keep the audited outcome immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # Whether the delivery confirmed or reverted on-chain.
+    outcome: Literal["confirmed", "failed"]
+    # The lifecycle action the delivery belongs to.
+    action: str
+    # Which transaction of the attempt the receipt describes.
+    role: LpExecutionRole
+    # The SafeTx hash of the executed Safe transaction.
+    safe_tx_hash: str
+    # The Base transaction hash that delivered execTransaction.
+    transaction_hash: str
+    # The block that included the delivery.
+    block_number: Annotated[int, Field(ge=0)]
+    # Gas units the delivery consumed.
+    gas_used: Annotated[int, Field(ge=0)]
+    # The effective gas price the delivery paid, in wei.
+    effective_gas_price_wei: Annotated[int, Field(ge=0)]
+    # Broadcast-to-inclusion duration in milliseconds.
+    inclusion_ms: Annotated[int, Field(ge=0)]
+    # Human-readable evidence for the outcome, empty when plainly confirmed.
+    diagnostic: str = ""
+
+
 class _LpStepSpec:
     """Carry one composed Safe transaction before it is built and signed."""
 
@@ -1063,6 +1245,8 @@ class LpLifecycleExecutor:
         audit_sink: ExecutionAuditSink | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         timer: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        receipt_backends: Sequence[ExecutorRpcBackend] | None = None,
     ) -> None:
         """Configure one LP executor with every boundary it consumes.
 
@@ -1075,7 +1259,12 @@ class LpLifecycleExecutor:
             safe_rpc: The Safe read-only backend for nonces and validation.
             audit_sink: Optional append-only audit chain for attempt events.
             now: Injected clock producing timezone-aware event timestamps.
-            timer: Injected monotonic clock for duration metrics.
+            timer: Injected monotonic clock for duration metrics and the
+                bounded receipt wait.
+            sleep: Injected delay used by bounded estimate retries and receipt
+                polling.
+            receipt_backends: Backends polled round-robin while awaiting one
+                inclusion; defaults to the primary backend alone.
         """
         self._policy = policy
         self._plan_policy = plan_policy
@@ -1086,6 +1275,10 @@ class LpLifecycleExecutor:
         self._audit_sink = audit_sink
         self._now = now
         self._timer = timer
+        self._sleep = sleep
+        self._receipt_backends: tuple[ExecutorRpcBackend, ...] = (
+            tuple(receipt_backends) if receipt_backends is not None else (rpc,)
+        )
 
     @property
     def safe_address(self) -> str:
@@ -1144,7 +1337,10 @@ class LpLifecycleExecutor:
             LpPlanRefusalError: If any planning cap refuses.
         """
         try:
-            return self._dry_run_mint(symbol, budget_usdc, width_spacings, key_bytes, ephemeral_key)
+            report, _ = self._build_mint_attempt(
+                symbol, budget_usdc, width_spacings, key_bytes, ephemeral_key
+            )
+            return report
         except (LpExecutionRefusalError, LpPlanRefusalError) as error:
             self._record_refusal("mint", ExecutionMode.DRY_RUN, error, symbol)
             raise
@@ -1175,7 +1371,8 @@ class LpLifecycleExecutor:
             LpExecutionRefusalError: If any execution-layer gate refuses.
         """
         try:
-            return self._dry_run_stake(symbol, token_id, key_bytes, ephemeral_key)
+            report, _ = self._build_stake_attempt(symbol, token_id, key_bytes, ephemeral_key)
+            return report
         except LpExecutionRefusalError as error:
             self._record_refusal("stake", ExecutionMode.DRY_RUN, error, symbol)
             raise
@@ -1207,7 +1404,8 @@ class LpLifecycleExecutor:
             LpExecutionRefusalError: If any execution-layer gate refuses.
         """
         try:
-            return self._dry_run_unstake(symbol, token_id, key_bytes, ephemeral_key)
+            report, _ = self._build_unstake_attempt(symbol, token_id, key_bytes, ephemeral_key)
+            return report
         except LpExecutionRefusalError as error:
             self._record_refusal("unstake", ExecutionMode.DRY_RUN, error, symbol)
             raise
@@ -1238,7 +1436,8 @@ class LpLifecycleExecutor:
             LpExecutionRefusalError: If any execution-layer gate refuses.
         """
         try:
-            return self._dry_run_exit(symbol, token_id, key_bytes, ephemeral_key)
+            report, _ = self._build_exit_attempt(symbol, token_id, key_bytes, ephemeral_key)
+            return report
         except LpExecutionRefusalError as error:
             self._record_refusal("withdraw", ExecutionMode.DRY_RUN, error, symbol)
             raise
@@ -1270,7 +1469,8 @@ class LpLifecycleExecutor:
             LpExecutionRefusalError: If any execution-layer gate refuses.
         """
         try:
-            return self._dry_run_collect(symbol, token_id, key_bytes, ephemeral_key)
+            report, _ = self._build_collect_attempt(symbol, token_id, key_bytes, ephemeral_key)
+            return report
         except LpExecutionRefusalError as error:
             self._record_refusal("collect", ExecutionMode.DRY_RUN, error, symbol)
             raise
@@ -1316,6 +1516,271 @@ class LpLifecycleExecutor:
             self._record_refusal("recenter", ExecutionMode.DRY_RUN, error, symbol)
             raise
 
+    def execute_mint(
+        self,
+        symbol: str,
+        budget_usdc: Decimal,
+        width_spacings: int | None,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Build and broadcast one capped mint sequence step by step.
+
+        The build phase enforces every cap, refusal, and audit exactly as the
+        dry run does; the broadcast then proceeds one Safe nonce at a time,
+        with each step rebuilt, hash-pinned, re-validated, freshly estimated,
+        and audited before its receipt is awaited. Nothing is broadcast
+        without the explicit confirmation flag.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            budget_usdc: The total USDC value the position commits.
+            width_spacings: The explicit half width in tick spacings per side.
+            key_bytes: Exactly 32 raw signing-key bytes used for this attempt.
+            confirm_broadcast: The explicit operator confirmation; without it
+                the attempt refuses before building.
+            ephemeral_key: Whether the key was generated for this attempt.
+
+        Returns:
+            The complete execution report with every broadcast step.
+
+        Raises:
+            LpExecutionRefusalError: If any gate, preflight, or per-step check
+                refuses.
+            LpPlanRefusalError: If any planning cap refuses.
+        """
+        if not confirm_broadcast:
+            error = LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "the execute command refuses to broadcast without the explicit "
+                "--confirm-broadcast flag; rerun with it to broadcast the built "
+                "sequence",
+            )
+            self._record_refusal("mint", ExecutionMode.EXECUTE, error, symbol)
+            raise error
+        try:
+            build, steps = self._build_mint_attempt(
+                symbol,
+                budget_usdc,
+                width_spacings,
+                key_bytes,
+                ephemeral_key,
+                ExecutionMode.EXECUTE,
+            )
+            step_reports, halted_reason = self._execute_steps("mint", steps, key_bytes)
+        except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+            self._record_refusal("mint", ExecutionMode.EXECUTE, error, symbol)
+            raise
+        return LpActionExecutionReport(
+            action="mint",
+            build=build,
+            steps=step_reports,
+            completed=halted_reason == "",
+            halted_reason=halted_reason,
+        )
+
+    def execute_stake(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Build and broadcast one stake sequence step by step.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            token_id: The position NFT being staked.
+            key_bytes: Exactly 32 raw signing-key bytes used for this attempt.
+            confirm_broadcast: The explicit operator confirmation.
+            ephemeral_key: Whether the key was generated for this attempt.
+
+        Returns:
+            The complete execution report with every broadcast step.
+
+        Raises:
+            LpExecutionRefusalError: If any gate, preflight, or per-step check
+                refuses.
+        """
+        if not confirm_broadcast:
+            error = LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "the execute command refuses to broadcast without the explicit "
+                "--confirm-broadcast flag; rerun with it to broadcast the built "
+                "sequence",
+            )
+            self._record_refusal("stake", ExecutionMode.EXECUTE, error, symbol)
+            raise error
+        try:
+            build, steps = self._build_stake_attempt(
+                symbol, token_id, key_bytes, ephemeral_key, ExecutionMode.EXECUTE
+            )
+            step_reports, halted_reason = self._execute_steps("stake", steps, key_bytes)
+        except LpExecutionRefusalError as error:
+            self._record_refusal("stake", ExecutionMode.EXECUTE, error, symbol)
+            raise
+        return LpActionExecutionReport(
+            action="stake",
+            build=build,
+            steps=step_reports,
+            completed=halted_reason == "",
+            halted_reason=halted_reason,
+        )
+
+    def execute_unstake(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Build and broadcast one unstake sequence step by step.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            token_id: The staked position NFT being unstaked.
+            key_bytes: Exactly 32 raw signing-key bytes used for this attempt.
+            confirm_broadcast: The explicit operator confirmation.
+            ephemeral_key: Whether the key was generated for this attempt.
+
+        Returns:
+            The complete execution report with every broadcast step.
+
+        Raises:
+            LpExecutionRefusalError: If any gate, preflight, or per-step check
+                refuses.
+        """
+        if not confirm_broadcast:
+            error = LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "the execute command refuses to broadcast without the explicit "
+                "--confirm-broadcast flag; rerun with it to broadcast the built "
+                "sequence",
+            )
+            self._record_refusal("unstake", ExecutionMode.EXECUTE, error, symbol)
+            raise error
+        try:
+            build, steps = self._build_unstake_attempt(
+                symbol, token_id, key_bytes, ephemeral_key, ExecutionMode.EXECUTE
+            )
+            step_reports, halted_reason = self._execute_steps("unstake", steps, key_bytes)
+        except LpExecutionRefusalError as error:
+            self._record_refusal("unstake", ExecutionMode.EXECUTE, error, symbol)
+            raise
+        return LpActionExecutionReport(
+            action="unstake",
+            build=build,
+            steps=step_reports,
+            completed=halted_reason == "",
+            halted_reason=halted_reason,
+        )
+
+    def execute_withdraw(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Build and broadcast one withdraw sequence step by step.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            token_id: The unstaked position NFT being exited.
+            key_bytes: Exactly 32 raw signing-key bytes used for this attempt.
+            confirm_broadcast: The explicit operator confirmation.
+            ephemeral_key: Whether the key was generated for this attempt.
+
+        Returns:
+            The complete execution report with every broadcast step.
+
+        Raises:
+            LpExecutionRefusalError: If any gate, preflight, or per-step check
+                refuses.
+        """
+        if not confirm_broadcast:
+            error = LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "the execute command refuses to broadcast without the explicit "
+                "--confirm-broadcast flag; rerun with it to broadcast the built "
+                "sequence",
+            )
+            self._record_refusal("withdraw", ExecutionMode.EXECUTE, error, symbol)
+            raise error
+        try:
+            build, steps = self._build_exit_attempt(
+                symbol, token_id, key_bytes, ephemeral_key, ExecutionMode.EXECUTE
+            )
+            step_reports, halted_reason = self._execute_steps("withdraw", steps, key_bytes)
+        except LpExecutionRefusalError as error:
+            self._record_refusal("withdraw", ExecutionMode.EXECUTE, error, symbol)
+            raise
+        return LpActionExecutionReport(
+            action="withdraw",
+            build=build,
+            steps=step_reports,
+            completed=halted_reason == "",
+            halted_reason=halted_reason,
+        )
+
+    def execute_collect(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Build and broadcast one collect sequence step by step.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            token_id: The position NFT being collected.
+            key_bytes: Exactly 32 raw signing-key bytes used for this attempt.
+            confirm_broadcast: The explicit operator confirmation.
+            ephemeral_key: Whether the key was generated for this attempt.
+
+        Returns:
+            The complete execution report with every broadcast step.
+
+        Raises:
+            LpExecutionRefusalError: If any gate, preflight, or per-step check
+                refuses.
+        """
+        if not confirm_broadcast:
+            error = LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "the execute command refuses to broadcast without the explicit "
+                "--confirm-broadcast flag; rerun with it to broadcast the built "
+                "sequence",
+            )
+            self._record_refusal("collect", ExecutionMode.EXECUTE, error, symbol)
+            raise error
+        try:
+            build, steps = self._build_collect_attempt(
+                symbol, token_id, key_bytes, ephemeral_key, ExecutionMode.EXECUTE
+            )
+            step_reports, halted_reason = self._execute_steps("collect", steps, key_bytes)
+        except LpExecutionRefusalError as error:
+            self._record_refusal("collect", ExecutionMode.EXECUTE, error, symbol)
+            raise
+        return LpActionExecutionReport(
+            action="collect",
+            build=build,
+            steps=step_reports,
+            completed=halted_reason == "",
+            halted_reason=halted_reason,
+        )
+
     def position_status(
         self,
         symbol: str,
@@ -1347,19 +1812,20 @@ class LpLifecycleExecutor:
             self._record_refusal("status", ExecutionMode.DRY_RUN, error, symbol)
             raise
 
-    def _dry_run_mint(
+    def _build_mint_attempt(
         self,
         symbol: str,
         budget_usdc: Decimal,
         width_spacings: int | None,
         key_bytes: bytes,
         ephemeral_key: bool,
-    ) -> LpMintDryRunReport:
+        mode: ExecutionMode = ExecutionMode.DRY_RUN,
+    ) -> tuple[LpMintDryRunReport, tuple[_BuiltLpStep, ...]]:
         """Build, sign, validate, and estimate the complete mint sequence."""
         build_started = self._timer()
         context = self._resolve_mint_context(symbol, width_spacings)
         plan = self._plan_from_context(context, budget_usdc)
-        self._record_mint_plan(ExecutionMode.DRY_RUN, plan)
+        self._record_mint_plan(mode, plan)
         if plan.balancing_swap.required and plan.balancing_swap.tranche_count > 1:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.MULTI_TRANCHE_SWAP_UNSUPPORTED,
@@ -1394,8 +1860,8 @@ class LpLifecycleExecutor:
             nfpm_stock_allowance,
             deadline,
         )
-        transactions = self._build_steps(steps, live_nonce, key_bytes, "mint")
-        return LpMintDryRunReport(
+        built_steps = self._build_steps(steps, live_nonce, key_bytes, "mint", mode)
+        report = LpMintDryRunReport(
             plan=plan,
             safe_address=self._safe_address,
             relayer_address=normalize_evm_address(Account.from_key(key_bytes).address),
@@ -1405,10 +1871,11 @@ class LpLifecycleExecutor:
             nfpm_stock_allowance_units=nfpm_stock_allowance,
             gas_price_wei=gas_price,
             safe_eth_wei=safe_eth,
-            transactions=transactions,
+            transactions=tuple(step.report for step in built_steps),
             caps_enforced=tuple(caps),
             build_duration_ms=self._milliseconds_since(build_started),
         )
+        return report, built_steps
 
     def _compose_mint_steps(
         self,
@@ -1544,9 +2011,14 @@ class LpLifecycleExecutor:
         )
         return steps
 
-    def _dry_run_stake(
-        self, symbol: str, token_id: int, key_bytes: bytes, ephemeral_key: bool
-    ) -> LpStakeDryRunReport:
+    def _build_stake_attempt(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        ephemeral_key: bool,
+        mode: ExecutionMode = ExecutionMode.DRY_RUN,
+    ) -> tuple[LpStakeDryRunReport, tuple[_BuiltLpStep, ...]]:
         """Build, sign, validate, and estimate the complete stake sequence."""
         build_started = self._timer()
         listing, observation, caps = self._observe_pool(symbol)
@@ -1615,15 +2087,15 @@ class LpLifecycleExecutor:
             )
         )
         self._record_stake_plan(
-            ExecutionMode.DRY_RUN,
+            mode,
             listing.symbol,
             observation,
             token_id,
             owner,
             operator_approved,
         )
-        transactions = self._build_steps(steps, live_nonce, key_bytes, "stake")
-        return LpStakeDryRunReport(
+        built_steps = self._build_steps(steps, live_nonce, key_bytes, "stake", mode)
+        report = LpStakeDryRunReport(
             symbol=listing.symbol,
             pool_address=observation.pool_address,
             nfpm_address=observation.nfpm_address,
@@ -1639,14 +2111,20 @@ class LpLifecycleExecutor:
             ephemeral_key=ephemeral_key,
             gas_price_wei=gas_price,
             safe_eth_wei=safe_eth,
-            transactions=transactions,
+            transactions=tuple(step.report for step in built_steps),
             caps_enforced=tuple(caps),
             build_duration_ms=self._milliseconds_since(build_started),
         )
+        return report, built_steps
 
-    def _dry_run_unstake(
-        self, symbol: str, token_id: int, key_bytes: bytes, ephemeral_key: bool
-    ) -> LpUnstakeDryRunReport:
+    def _build_unstake_attempt(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        ephemeral_key: bool,
+        mode: ExecutionMode = ExecutionMode.DRY_RUN,
+    ) -> tuple[LpUnstakeDryRunReport, tuple[_BuiltLpStep, ...]]:
         """Build, sign, validate, and estimate the complete unstake sequence."""
         build_started = self._timer()
         context = self._resolve_position(symbol, token_id)
@@ -1687,7 +2165,7 @@ class LpLifecycleExecutor:
             )
         ]
         self._record_unstake_plan(
-            ExecutionMode.DRY_RUN,
+            mode,
             context.listing.symbol,
             observation,
             token_id,
@@ -1695,8 +2173,8 @@ class LpLifecycleExecutor:
             accrued_checkpoint,
             penalty,
         )
-        transactions = self._build_steps(steps, live_nonce, key_bytes, "unstake")
-        return LpUnstakeDryRunReport(
+        built_steps = self._build_steps(steps, live_nonce, key_bytes, "unstake", mode)
+        report = LpUnstakeDryRunReport(
             symbol=context.listing.symbol,
             pool_address=observation.pool_address,
             nfpm_address=observation.nfpm_address,
@@ -1711,7 +2189,7 @@ class LpLifecycleExecutor:
             ephemeral_key=ephemeral_key,
             gas_price_wei=gas_price,
             safe_eth_wei=safe_eth,
-            transactions=transactions,
+            transactions=tuple(step.report for step in built_steps),
             caps_enforced=tuple(caps),
             build_duration_ms=self._milliseconds_since(build_started),
             diagnostics=(
@@ -1727,10 +2205,16 @@ class LpLifecycleExecutor:
                 ),
             ),
         )
+        return report, built_steps
 
-    def _dry_run_exit(
-        self, symbol: str, token_id: int, key_bytes: bytes, ephemeral_key: bool
-    ) -> LpExitDryRunReport:
+    def _build_exit_attempt(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        ephemeral_key: bool,
+        mode: ExecutionMode = ExecutionMode.DRY_RUN,
+    ) -> tuple[LpExitDryRunReport, tuple[_BuiltLpStep, ...]]:
         """Build, sign, validate, and estimate the complete withdraw sequence."""
         build_started = self._timer()
         context = self._resolve_position(symbol, token_id)
@@ -1803,7 +2287,7 @@ class LpLifecycleExecutor:
             )
         )
         self._record_exit_plan(
-            ExecutionMode.DRY_RUN,
+            mode,
             context.listing.symbol,
             observation,
             token_id,
@@ -1815,7 +2299,7 @@ class LpLifecycleExecutor:
             position.tokens_owed0_units,
             position.tokens_owed1_units,
         )
-        transactions = self._build_steps(steps, live_nonce, key_bytes, "withdraw")
+        built_steps = self._build_steps(steps, live_nonce, key_bytes, "withdraw", mode)
         diagnostics = [
             (
                 f"the full decrease returns {amount0} + {amount1} raw units at the snapshot "
@@ -1832,7 +2316,7 @@ class LpLifecycleExecutor:
             diagnostics.append(
                 f"the position is entirely {side} because the price has left the range"
             )
-        return LpExitDryRunReport(
+        report = LpExitDryRunReport(
             symbol=context.listing.symbol,
             pool_address=observation.pool_address,
             nfpm_address=observation.nfpm_address,
@@ -1851,15 +2335,21 @@ class LpLifecycleExecutor:
             ephemeral_key=ephemeral_key,
             gas_price_wei=gas_price,
             safe_eth_wei=safe_eth,
-            transactions=transactions,
+            transactions=tuple(step.report for step in built_steps),
             caps_enforced=tuple(caps),
             build_duration_ms=self._milliseconds_since(build_started),
             diagnostics=tuple(diagnostics),
         )
+        return report, built_steps
 
-    def _dry_run_collect(
-        self, symbol: str, token_id: int, key_bytes: bytes, ephemeral_key: bool
-    ) -> LpCollectDryRunReport:
+    def _build_collect_attempt(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        ephemeral_key: bool,
+        mode: ExecutionMode = ExecutionMode.DRY_RUN,
+    ) -> tuple[LpCollectDryRunReport, tuple[_BuiltLpStep, ...]]:
         """Build, sign, validate, and estimate the complete collect sequence."""
         build_started = self._timer()
         context = self._resolve_position(symbol, token_id)
@@ -1936,7 +2426,7 @@ class LpLifecycleExecutor:
                 )
             ]
         self._record_collect_plan(
-            ExecutionMode.DRY_RUN,
+            mode,
             context.listing.symbol,
             observation,
             token_id,
@@ -1946,8 +2436,8 @@ class LpLifecycleExecutor:
             position.tokens_owed0_units,
             position.tokens_owed1_units,
         )
-        transactions = self._build_steps(steps, live_nonce, key_bytes, "collect")
-        return LpCollectDryRunReport(
+        built_steps = self._build_steps(steps, live_nonce, key_bytes, "collect", mode)
+        report = LpCollectDryRunReport(
             symbol=context.listing.symbol,
             pool_address=observation.pool_address,
             nfpm_address=observation.nfpm_address,
@@ -1965,11 +2455,12 @@ class LpLifecycleExecutor:
             ephemeral_key=ephemeral_key,
             gas_price_wei=gas_price,
             safe_eth_wei=safe_eth,
-            transactions=transactions,
+            transactions=tuple(step.report for step in built_steps),
             caps_enforced=tuple(caps),
             build_duration_ms=self._milliseconds_since(build_started),
             diagnostics=tuple(diagnostics),
         )
+        return report, built_steps
 
     def _dry_run_recenter(
         self,
@@ -2202,7 +2693,7 @@ class LpLifecycleExecutor:
             plan,
             restake_followup,
         )
-        transactions = self._build_steps(steps, live_nonce, key_bytes, "recenter")
+        built_steps = self._build_steps(steps, live_nonce, key_bytes, "recenter")
         return LpRecenterDryRunReport(
             symbol=context.listing.symbol,
             pool_address=observation.pool_address,
@@ -2225,7 +2716,7 @@ class LpLifecycleExecutor:
             ephemeral_key=ephemeral_key,
             gas_price_wei=gas_price,
             safe_eth_wei=safe_eth,
-            transactions=transactions,
+            transactions=tuple(step.report for step in built_steps),
             caps_enforced=tuple(caps),
             build_duration_ms=self._milliseconds_since(build_started),
         )
@@ -2842,8 +3333,13 @@ class LpLifecycleExecutor:
         return gas_price, safe_eth, live_nonce
 
     def _build_steps(
-        self, steps: Sequence[_LpStepSpec], live_nonce: int, key_bytes: bytes, action: str
-    ) -> tuple[BuiltLpTransaction, ...]:
+        self,
+        steps: Sequence[_LpStepSpec],
+        live_nonce: int,
+        key_bytes: bytes,
+        action: str,
+        mode: ExecutionMode = ExecutionMode.DRY_RUN,
+    ) -> tuple[_BuiltLpStep, ...]:
         """Build, sign, validate, and estimate every step in sequence order.
 
         Args:
@@ -2851,11 +3347,12 @@ class LpLifecycleExecutor:
             live_nonce: The Safe nonce the first transaction occupies.
             key_bytes: Exactly 32 raw signing-key bytes.
             action: The lifecycle action the sequence belongs to.
+            mode: The attempt mode every build audit record carries.
 
         Returns:
-            The fully built transaction reports in execution order.
+            The fully built steps with their reports in execution order.
         """
-        built: list[BuiltLpTransaction] = []
+        built: list[_BuiltLpStep] = []
         for index, step in enumerate(steps):
             built.append(
                 self._build_step(
@@ -2864,6 +3361,7 @@ class LpLifecycleExecutor:
                     key_bytes=key_bytes,
                     action=action,
                     sequenced_behind_predecessors=index > 0,
+                    mode=mode,
                 )
             )
         return tuple(built)
@@ -2875,7 +3373,8 @@ class LpLifecycleExecutor:
         key_bytes: bytes,
         action: str,
         sequenced_behind_predecessors: bool,
-    ) -> BuiltLpTransaction:
+        mode: ExecutionMode = ExecutionMode.DRY_RUN,
+    ) -> _BuiltLpStep:
         """Build, sign, validate, and estimate one LP Safe transaction.
 
         Args:
@@ -2886,9 +3385,10 @@ class LpLifecycleExecutor:
             sequenced_behind_predecessors: Whether earlier transactions of the
                 same sequence precede this one, so a reverting estimate is the
                 expected pre-execution answer rather than an anomaly.
+            mode: The attempt mode the build audit record carries.
 
         Returns:
-            The fully built transaction report; nothing was broadcast.
+            The fully built step carrying its report; nothing was broadcast.
         """
         transaction = SafeTransaction(
             to_address=step.to_address, data=step.inner_calldata, nonce=nonce
@@ -2910,7 +3410,7 @@ class LpLifecycleExecutor:
                     "unexecuted)"
                 )
         self._record_build(
-            ExecutionMode.DRY_RUN,
+            mode,
             action,
             step.role,
             built,
@@ -2919,18 +3419,361 @@ class LpLifecycleExecutor:
             validation,
             gas_estimate,
         )
-        return BuiltLpTransaction(
-            role=step.role,
+        return _BuiltLpStep(
+            report=BuiltLpTransaction(
+                role=step.role,
+                action=action,
+                safe_tx_hash=built.safe_tx_hash,
+                to_address=step.to_address,
+                calldata_digest=calldata_digest,
+                nonce=nonce,
+                description=step.description,
+                signature_verified=validation.verified,
+                signature_diagnostic=validation.diagnostic,
+                gas_estimate=gas_estimate,
+                gas_estimate_diagnostic=gas_diagnostic,
+            ),
+            transaction=transaction,
+            built=built,
+            signature=signature,
+            exec_calldata=calldata,
+        )
+
+    def _execute_steps(
+        self, action: str, steps: Sequence[_BuiltLpStep], key_bytes: bytes
+    ) -> tuple[tuple[LpStepExecutionReport, ...], str]:
+        """Broadcast every built step in nonce order, one inclusion at a time.
+
+        Per-nonce Safe sequencing requires each predecessor to be mined before
+        the next transaction can estimate or execute, so the loop never
+        proceeds past an unconfirmed or failed delivery.
+
+        Args:
+            action: The lifecycle action the sequence belongs to.
+            steps: The built steps in execution order.
+            key_bytes: Exactly 32 raw signing-key bytes signing every delivery.
+
+        Returns:
+            The per-step reports and the halt reason, empty when every step
+            confirmed.
+
+        Raises:
+            LpExecutionRefusalError: If a pre-broadcast check refuses; the
+                refusal names the step and the sequence stops at the completed
+                prefix.
+        """
+        reports: list[LpStepExecutionReport] = []
+        for step in steps:
+            report = self._execute_step(action, step, key_bytes)
+            reports.append(report)
+            if report.status != "confirmed":
+                reason = f"the {report.role.value} delivery is {report.status}"
+                if report.diagnostic:
+                    reason = f"{reason}: {report.diagnostic}"
+                return tuple(reports), reason
+        return tuple(reports), ""
+
+    def _execute_step(
+        self, action: str, step: _BuiltLpStep, key_bytes: bytes
+    ) -> LpStepExecutionReport:
+        """Rebuild, re-validate, estimate, deliver, and track one step.
+
+        Args:
+            action: The lifecycle action the step belongs to.
+            step: The built step being broadcast.
+            key_bytes: Exactly 32 raw signing-key bytes signing the delivery.
+
+        Returns:
+            The step's delivery report; a non-confirmed status halts the
+            sequence without being a refusal.
+
+        Raises:
+            LpExecutionRefusalError: If the hash pin, live validation, fresh
+            estimate, or relayer preflight refuses; nothing was broadcast for
+            this step when that happens.
+        """
+        role = step.report.role
+
+        # 1. Rebuild the SafeTx from its exact transaction and pin the hash.
+        rebuild_started = self._timer()
+        rebuilt = build_safe_transaction(step.transaction, self._safe_address)
+        if rebuilt.safe_tx_hash != step.built.safe_tx_hash:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.REBUILD_HASH_MISMATCH,
+                f"the rebuilt safe_tx_hash {rebuilt.safe_tx_hash} no longer equals the "
+                f"validated {step.built.safe_tx_hash}; refusing to broadcast content "
+                "that was never validated",
+            )
+        rebuild_ms = Decimal(self._milliseconds_since(rebuild_started))
+
+        # 2. Prove the owner signature against the live contract again.
+        validate_started = self._timer()
+        validation = self._safe_rpc.validate_owner_signature(step.built, step.signature)
+        if not validation.verified:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.SIGNATURE_REJECTED,
+                f"the live Safe rejected the {role.value} signature at execute time: "
+                f"{validation.diagnostic}",
+            )
+        validate_ms = Decimal(self._milliseconds_since(validate_started))
+
+        # 3. Fresh estimate: predecessors are mined by now, so a revert is a
+        #    genuine refusal to stop at; only a transient endpoint-lag GS026
+        #    earns bounded fresh re-reads.
+        estimate_started = self._timer()
+        gas_estimate: int | None = None
+        estimate_error = ExecutorRpcRevertError("the estimate never ran")
+        for _ in range(EXECUTE_ESTIMATE_LAG_RETRIES):
+            try:
+                gas_estimate = self._rpc.estimate_gas(self._safe_address, step.exec_calldata)
+                break
+            except ExecutorRpcRevertError as error:
+                estimate_error = error
+                if "GS026" not in str(error):
+                    break
+                self._sleep(EXECUTE_ESTIMATE_LAG_RETRY_SECONDS)
+        if gas_estimate is None:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.ESTIMATE_REVERTED,
+                f"the fresh on-chain estimate for the {role.value} transaction reverted "
+                f"with every predecessor mined: {estimate_error}; stopping honestly at "
+                "the completed prefix",
+            )
+        estimate_ms = Decimal(self._milliseconds_since(estimate_started))
+
+        # 4. Build the delivery transaction with the relayer preflights.
+        delivery_started = self._timer()
+        relayer = normalize_evm_address(Account.from_key(key_bytes).address)
+        gas_price = min(self._rpc.fetch_gas_price(), self._policy.gas_price_cap_wei)
+        buffered = Decimal(gas_estimate) * (Decimal(1) + GAS_LIMIT_BUFFER_FRACTION)
+        gas_limit = int(buffered.to_integral_value(rounding=ROUND_CEILING))
+        relayer_nonce = self._rpc.fetch_relayer_nonce(relayer)
+        relayer_balance = self._rpc.fetch_eth_balance(relayer)
+        required_wei = gas_limit * gas_price
+        floor_wei = max(self._policy.relayer_eth_floor_wei, 2 * required_wei)
+        if relayer_balance < floor_wei:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.RELAYER_ETH_INSUFFICIENT,
+                f"the relaying EOA {relayer} holds {relayer_balance} wei, below the "
+                f"{floor_wei}-wei floor (the policy floor and twice the "
+                f"{required_wei}-wei bounded gas cost); fund the EOA before executing",
+            )
+        delivery: dict[str, Any] = {
+            "to": to_checksum_address(self._safe_address),
+            "data": step.exec_calldata,
+            "nonce": relayer_nonce,
+            "gas": gas_limit,
+            "maxFeePerGas": gas_price,
+            "maxPriorityFeePerGas": gas_price,
+            "chainId": SAFE_CHAIN_ID,
+            "type": 2,
+        }
+        signed = Account.sign_transaction(delivery, key_bytes)
+        raw_transaction = "0x" + bytes(signed.raw_transaction).hex()
+        delivery_ms = Decimal(self._milliseconds_since(delivery_started))
+
+        # 5. Broadcast, print the hash immediately, and audit BEFORE any wait.
+        send_started = self._timer()
+        transaction_hash = self._rpc.send_raw_transaction(raw_transaction)
+        print(
+            f"[{action}/{role.value}] broadcast {transaction_hash} "
+            f"(Safe nonce {step.report.nonce}, delivery gas {gas_limit} at "
+            f"{gas_price} wei)",
+            file=sys.stderr,
+            flush=True,
+        )
+        self._record_execute_sent(action, role, step.report, transaction_hash, relayer)
+        send_ms = Decimal(self._milliseconds_since(send_started))
+
+        # 6. Bounded receipt wait across every configured backend.
+        receipt = self._await_receipt_multi(transaction_hash)
+        inclusion_ms = Decimal(self._milliseconds_since(send_started))
+        if receipt is None:
+            diagnostic = (
+                f"no receipt for {transaction_hash} within "
+                f"{EXECUTE_RECEIPT_TOTAL_TIMEOUT_SECONDS:.0f}s across "
+                f"{len(self._receipt_backends)} endpoint(s); the broadcast may still "
+                "land and the audit chain records the send"
+            )
+            print(
+                f"[{action}/{role.value}] WARNING: {diagnostic}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return LpStepExecutionReport(
+                action=action,
+                role=role,
+                safe_tx_hash=step.built.safe_tx_hash,
+                nonce=step.report.nonce,
+                transaction_hash=transaction_hash,
+                status="unconfirmed",
+                block_number=None,
+                gas_used=None,
+                effective_gas_price_wei=None,
+                fee_wei=None,
+                delivery_gas_limit=gas_limit,
+                delivery_max_fee_per_gas_wei=gas_price,
+                relayer_nonce=relayer_nonce,
+                inclusion_ms=inclusion_ms,
+                rebuild_ms=rebuild_ms,
+                validate_ms=validate_ms,
+                estimate_ms=estimate_ms,
+                delivery_ms=delivery_ms,
+                send_ms=send_ms,
+                diagnostic=diagnostic,
+            )
+        status = self._receipt_quantity(receipt, "status")
+        block_number = self._receipt_quantity(receipt, "blockNumber")
+        gas_used = self._receipt_quantity(receipt, "gasUsed")
+        effective_gas_price = self._receipt_quantity(receipt, "effectiveGasPrice")
+        fee_wei = gas_used * effective_gas_price
+        if status == 1:
+            outcome: Literal["confirmed", "failed"] = "confirmed"
+            diagnostic = ""
+            print(
+                f"[{action}/{role.value}] included {transaction_hash} block "
+                f"{block_number}, {gas_used} gas at {effective_gas_price} wei "
+                f"({fee_wei} wei fee)",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            outcome = "failed"
+            diagnostic = (
+                "the delivery transaction reverted on-chain; the Safe nonce was "
+                "consumed and the inner call did not execute"
+            )
+            print(
+                f"[{action}/{role.value}] FAILED {transaction_hash}: {diagnostic}",
+                file=sys.stderr,
+                flush=True,
+            )
+        self._record_execute_receipt(
+            outcome,
+            action,
+            role,
+            step.built.safe_tx_hash,
+            transaction_hash,
+            block_number,
+            gas_used,
+            effective_gas_price,
+            int(inclusion_ms),
+            diagnostic,
+        )
+        return LpStepExecutionReport(
             action=action,
-            safe_tx_hash=built.safe_tx_hash,
-            to_address=step.to_address,
-            calldata_digest=calldata_digest,
-            nonce=nonce,
-            description=step.description,
-            signature_verified=validation.verified,
-            signature_diagnostic=validation.diagnostic,
-            gas_estimate=gas_estimate,
-            gas_estimate_diagnostic=gas_diagnostic,
+            role=role,
+            safe_tx_hash=step.built.safe_tx_hash,
+            nonce=step.report.nonce,
+            transaction_hash=transaction_hash,
+            status=outcome,
+            block_number=block_number,
+            gas_used=gas_used,
+            effective_gas_price_wei=effective_gas_price,
+            fee_wei=fee_wei,
+            delivery_gas_limit=gas_limit,
+            delivery_max_fee_per_gas_wei=gas_price,
+            relayer_nonce=relayer_nonce,
+            inclusion_ms=inclusion_ms,
+            rebuild_ms=rebuild_ms,
+            validate_ms=validate_ms,
+            estimate_ms=estimate_ms,
+            delivery_ms=delivery_ms,
+            send_ms=send_ms,
+            diagnostic=diagnostic,
+        )
+
+    def _await_receipt_multi(self, transaction_hash: str) -> dict[str, object] | None:
+        """Poll every receipt backend round-robin under one total bound.
+
+        A landed broadcast is never relabeled a failure: exhaustion returns
+        None and the caller reports an unconfirmed warning whose source of
+        truth is the audit chain's send record.
+
+        Args:
+            transaction_hash: The broadcast transaction's hash.
+
+        Returns:
+            The receipt when included, None within the bounded wait.
+        """
+        started = self._timer()
+        while True:
+            for backend in self._receipt_backends:
+                receipt = backend.fetch_transaction_receipt(transaction_hash)
+                if receipt is not None:
+                    return receipt
+            if self._timer() - started >= EXECUTE_RECEIPT_TOTAL_TIMEOUT_SECONDS:
+                return None
+            self._sleep(EXECUTE_RECEIPT_POLL_SECONDS)
+
+    @staticmethod
+    def _receipt_quantity(receipt: dict[str, object], key: str) -> int:
+        """Decode one hex-or-integer receipt field."""
+        value = receipt.get(key)
+        if isinstance(value, str):
+            return int(value, 16)
+        if isinstance(value, int):
+            return value
+        return 0
+
+    def _record_execute_sent(
+        self,
+        action: str,
+        role: LpExecutionRole,
+        report: BuiltLpTransaction,
+        transaction_hash: str,
+        relayer_address: str,
+    ) -> None:
+        """Append the broadcast audit event before any receipt wait."""
+        if self._audit_sink is None:
+            return
+        self._audit_sink.append(
+            AuditEventType.LP_EXECUTE_SENT,
+            LpExecuteSentPayload(
+                action=action,
+                role=role,
+                safe_tx_hash=report.safe_tx_hash,
+                transaction_hash=transaction_hash,
+                nonce=report.nonce,
+                relayer_address=relayer_address,
+                safe_address=self._safe_address,
+            ),
+            self._now(),
+        )
+
+    def _record_execute_receipt(
+        self,
+        outcome: Literal["confirmed", "failed"],
+        action: str,
+        role: LpExecutionRole,
+        safe_tx_hash: str,
+        transaction_hash: str,
+        block_number: int,
+        gas_used: int,
+        effective_gas_price_wei: int,
+        inclusion_ms: int,
+        diagnostic: str,
+    ) -> None:
+        """Append the inclusion audit event for one delivery."""
+        if self._audit_sink is None:
+            return
+        self._audit_sink.append(
+            AuditEventType.LP_EXECUTE_CONFIRMED
+            if outcome == "confirmed"
+            else AuditEventType.LP_EXECUTE_FAILED,
+            LpExecuteReceiptPayload(
+                outcome=outcome,
+                action=action,
+                role=role,
+                safe_tx_hash=safe_tx_hash,
+                transaction_hash=transaction_hash,
+                block_number=block_number,
+                gas_used=gas_used,
+                effective_gas_price_wei=effective_gas_price_wei,
+                inclusion_ms=inclusion_ms,
+                diagnostic=diagnostic,
+            ),
+            self._now(),
         )
 
     def _read_word(self, to_address: str, calldata: str, source: str) -> int:
@@ -3331,9 +4174,11 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aero-bot-lp",
         description=(
-            "Manually build, validate, and plan hard-capped Slipstream LP "
-            "lifecycle transactions for the canary Safe on Base. This release "
-            "builds and validates only; nothing is ever broadcast."
+            "Manually build, validate, and execute hard-capped Slipstream LP "
+            "lifecycle transactions for the canary Safe on Base. Dry runs "
+            "never broadcast; execute commands refuse without an explicit "
+            "broadcast confirmation and then deliver one audited Safe nonce "
+            "at a time."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -3507,6 +4352,66 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
             "the Keychain key; the signature check will honestly report rejection."
         ),
     )
+    execute_parser = subparsers.add_parser(
+        "execute",
+        help=(
+            "Build, validate, and broadcast the Safe transaction sequence one "
+            "nonce at a time; refuses without --confirm-broadcast."
+        ),
+    )
+    execute_subparsers = execute_parser.add_subparsers(dest="lifecycle", required=True)
+    execute_mint_parser = execute_subparsers.add_parser(
+        "mint",
+        help="Build and broadcast the complete mint sequence.",
+    )
+    _add_lp_symbol_arguments(execute_mint_parser)
+    execute_mint_parser.add_argument(
+        "--amount",
+        type=Decimal,
+        required=True,
+        help="Total USDC value the position commits; refused above the caps.",
+    )
+    execute_mint_parser.add_argument(
+        "--width-ticks",
+        type=int,
+        default=None,
+        help="Half width in tick spacings per side; required for the mint.",
+    )
+    for lifecycle_parser in (
+        execute_mint_parser,
+        execute_subparsers.add_parser("stake", help="Build and broadcast the stake sequence."),
+        execute_subparsers.add_parser("unstake", help="Build and broadcast the unstake sequence."),
+        execute_subparsers.add_parser(
+            "withdraw", help="Build and broadcast the decrease-and-collect exit."
+        ),
+        execute_subparsers.add_parser(
+            "collect", help="Build and broadcast the fee or emissions claim."
+        ),
+    ):
+        if lifecycle_parser is not execute_mint_parser:
+            _add_lp_symbol_arguments(lifecycle_parser)
+            lifecycle_parser.add_argument(
+                "--token-id",
+                type=int,
+                required=True,
+                help="Position NFT the action targets.",
+            )
+        lifecycle_parser.add_argument(
+            "--ephemeral-key",
+            action="store_true",
+            help=(
+                "Sign with a freshly generated throwaway key; the live signature "
+                "check will honestly reject it before anything broadcasts."
+            ),
+        )
+        lifecycle_parser.add_argument(
+            "--confirm-broadcast",
+            action="store_true",
+            help=(
+                "Explicit operator confirmation to broadcast; without it the "
+                "command refuses before building anything."
+            ),
+        )
     status_parser = subparsers.add_parser(
         "status",
         help="Observe one position read-only; nothing is built or signed.",
@@ -3535,6 +4440,36 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
         help="Optional entry cost basis in USDC for the unrealized P&L.",
     )
     return parser
+
+
+def _print_execution_report(report: LpActionExecutionReport) -> None:
+    """Print one execution report: its build evidence then every delivery."""
+    build = report.build
+    if isinstance(build, LpMintDryRunReport):
+        _print_mint_dry_run(build)
+    elif isinstance(build, LpStakeDryRunReport):
+        _print_stake_dry_run(build)
+    elif isinstance(build, LpUnstakeDryRunReport):
+        _print_unstake_dry_run(build)
+    elif isinstance(build, LpExitDryRunReport):
+        _print_exit_dry_run(build)
+    elif isinstance(build, LpCollectDryRunReport):
+        _print_collect_dry_run(build)
+    for step in report.steps:
+        line = (
+            f"[{step.action}/{step.role.value}] Safe nonce {step.nonce}: "
+            f"{step.status} {step.transaction_hash}"
+        )
+        if step.gas_used is not None:
+            line += (
+                f", {step.gas_used} gas at {step.effective_gas_price_wei} wei "
+                f"({step.fee_wei} wei fee)"
+            )
+        print(line)
+        if step.diagnostic:
+            print(f"  {step.diagnostic}")
+    if not report.completed:
+        print(f"halted: {report.halted_reason}")
 
 
 def _print_lp_plan(plan: LpMintPlan) -> None:
@@ -3843,8 +4778,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     The RPC endpoint, Sugar address, and audit database come from the
     application settings, the Safe address defaults to the canary deployment
     behind ``AERO_BOT_SAFE_ADDRESS``, and the signing key comes from the
-    macOS Keychain or the dry run's explicit ephemeral flag. This release has
-    no broadcast path: every subcommand stops at building and validation.
+    macOS Keychain or the command's explicit ephemeral flag. Dry-run
+    subcommands stop at building and validation; execute subcommands refuse
+    without ``--confirm-broadcast`` and then broadcast one audited Safe nonce
+    at a time.
 
     Args:
         argv: Command-line arguments; None reads sys.argv.
@@ -3868,6 +4805,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, RuntimeError, ValueError) as error:
         print(f"the audit store is unavailable: {error}", file=sys.stderr)
         return EXIT_FAILURE
+    receipt_backends = [rpc] + [
+        ExecutorRpcBackend(rpc_url=url)
+        for url in EXECUTE_RECEIPT_ENDPOINT_URLS
+        if url != settings.base_rpc_url
+    ]
     executor = LpLifecycleExecutor(
         policy=LpSafeExecutionPolicy(),
         plan_policy=LpExecutionPolicy(),
@@ -3876,6 +4818,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         rpc=rpc,
         safe_rpc=safe_rpc,
         audit_sink=audit_store,
+        receipt_backends=receipt_backends,
     )
     try:
         if arguments.command == "plan" and arguments.lifecycle == "mint":
@@ -3999,6 +4942,67 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(recenter_report.model_dump_json(indent=2))
             else:
                 _print_recenter_dry_run(recenter_report)
+            return EXIT_OK
+        if arguments.command == "execute":
+            if arguments.lifecycle == "mint":
+                if arguments.amount <= 0:
+                    parser.error("--amount must be positive")
+            else:
+                if arguments.token_id < 0:
+                    parser.error("--token-id must be non-negative")
+            if arguments.ephemeral_key:
+                key_bytes = bytes(Account.create().key)
+                ephemeral = True
+            else:
+                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                ephemeral = False
+            if arguments.lifecycle == "mint":
+                execution_report = executor.execute_mint(
+                    arguments.symbol,
+                    arguments.amount,
+                    arguments.width_ticks,
+                    key_bytes,
+                    confirm_broadcast=arguments.confirm_broadcast,
+                    ephemeral_key=ephemeral,
+                )
+            elif arguments.lifecycle == "stake":
+                execution_report = executor.execute_stake(
+                    arguments.symbol,
+                    arguments.token_id,
+                    key_bytes,
+                    confirm_broadcast=arguments.confirm_broadcast,
+                    ephemeral_key=ephemeral,
+                )
+            elif arguments.lifecycle == "unstake":
+                execution_report = executor.execute_unstake(
+                    arguments.symbol,
+                    arguments.token_id,
+                    key_bytes,
+                    confirm_broadcast=arguments.confirm_broadcast,
+                    ephemeral_key=ephemeral,
+                )
+            elif arguments.lifecycle == "withdraw":
+                execution_report = executor.execute_withdraw(
+                    arguments.symbol,
+                    arguments.token_id,
+                    key_bytes,
+                    confirm_broadcast=arguments.confirm_broadcast,
+                    ephemeral_key=ephemeral,
+                )
+            else:
+                execution_report = executor.execute_collect(
+                    arguments.symbol,
+                    arguments.token_id,
+                    key_bytes,
+                    confirm_broadcast=arguments.confirm_broadcast,
+                    ephemeral_key=ephemeral,
+                )
+            if arguments.json:
+                print(execution_report.model_dump_json(indent=2))
+            else:
+                _print_execution_report(execution_report)
+            if any(step.status == "failed" for step in execution_report.steps):
+                return EXIT_FAILURE
             return EXIT_OK
         if arguments.command == "status":
             if arguments.token_id < 0:

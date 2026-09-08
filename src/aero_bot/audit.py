@@ -110,6 +110,13 @@ class AuditEventType(StrEnum):
     LP_TRANSACTION_BUILT = "lp_transaction_built"
     # LP refused captures every LP lifecycle refusal with its catalog code.
     LP_REFUSED = "lp_refused"
+    # LP execute sent captures one broadcast submission of an LP Safe
+    # transaction from the execute path, appended before any receipt wait.
+    LP_EXECUTE_SENT = "lp_execute_sent"
+    # LP execute confirmed captures one included LP delivery with status one.
+    LP_EXECUTE_CONFIRMED = "lp_execute_confirmed"
+    # LP execute failed captures one included LP delivery that reverted.
+    LP_EXECUTE_FAILED = "lp_execute_failed"
     # System state captures startup, migration, and diagnostic events without secrets.
     SYSTEM_STATE = "system_state"
 
