@@ -93,6 +93,12 @@ It accepts a lookback window, the AERO and gas price assumptions, an optional po
 A pool whose reads fail is recorded as a fail-closed failure with its diagnostic while the remaining pools continue.
 See [the rehearsal command documentation](docs/rehearsal.md) for the full pipeline, runtime bounds, and every documented approximation.
 
+## Decision command
+
+The `aero-bot-decide` command runs one complete policy-engine verdict from live Base reads - discovery, the corrected emissions-APR convention, depth, gas, and the event calendar - decision-only: nothing is built, signed, or broadcast, and the run audits one `policy_decision` record.
+Flat verdicts during closed-market event windows are the v1 doctrine working correctly, and the two honest input gaps (the unwired live reference quote and the zero fee APR) surface in every report's notes rather than hiding.
+See [the decision command documentation](docs/strategy.md) for the observation assembly, the flat-window doctrine, and the live proofs.
+
 ## Wallet-free transaction planning
 
 The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.

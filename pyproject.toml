@@ -43,6 +43,9 @@ aero-bot-swap = "aero_bot.executor:main"
 # The LP command manually plans and validates hard-capped Safe LP lifecycle
 # transactions on Base; this release never broadcasts.
 aero-bot-lp = "aero_bot.lp_executor:main"
+# The decision command runs one complete policy verdict from live reads;
+# decision-only - nothing is built, signed, or broadcast.
+aero-bot-decide = "aero_bot.strategy:main"
 
 [tool.hatch.build.targets.wheel]
 # The wheel contains only the application package under the src layout.
