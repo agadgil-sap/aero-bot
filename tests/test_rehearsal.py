@@ -1034,3 +1034,32 @@ class TestLedgerModels:
         assert ledger.action_counts.entries == 1
         with pytest.raises(ValidationError, match="frozen"):
             ledger.symbol = "other"
+
+
+def test_trailing_evidence_same_block_window_leaves_volatility_unset() -> None:
+    """Two observations inside one block carry no time basis, not a crash."""
+    path = make_path([Decimal("100"), Decimal("101")], step_seconds=0)
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        squared_log_returns = tuple(
+            (later.price_usdc / earlier.price_usdc).ln() ** Decimal(2)
+            for earlier, later in zip(path.points, path.points[1:], strict=False)
+        )
+    notionals = tuple(
+        swap_usd_notional(point, path.token_is_token0, path.token_decimals, path.quote_decimals)
+        for point in path.points
+    )
+    evidence = trailing_ranging_evidence(
+        points=path.points,
+        squared_log_returns=squared_log_returns,
+        notionals_usd=notionals,
+        window_start=0,
+        index=1,
+        gauge_liquidity_raw=DEFAULT_GAUGE_LIQUIDITY,
+        anchor_gauge_liquidity=DEFAULT_GAUGE_LIQUIDITY,
+        anchor_staked_tvl_usd=Decimal("100000"),
+        pool_fee_ppm=500,
+        stock_decimals=FIXTURE_STOCK_DECIMALS,
+        quote_decimals=FIXTURE_QUOTE_DECIMALS,
+    )
+    assert evidence.realized_daily_volatility is None

@@ -88,7 +88,7 @@ Everything in the module is offline and pure: no network calls, no signing, no m
 The operator names a half width in tick spacings per side, and the planner derives the range around the anchor `floor(current_tick / spacing) * spacing` (lower address token on the low side).
 The width is clamped, never widened, so the half width in whole ticks stays at or below the 0.3 percent ceiling: 29 whole ticks, since `floor(ln(1.003) / ln(1.0001)) = 29`, mirroring the ranging module's candidate-bound math.
 On a spacing-10 grid the widest permitted range is therefore two spacings per side (20 ticks), and one spacing per side - the user's own canary practice - is always available.
-Solver-derived widths carry the label `solver_pre_fix_apr` through every plan and audit surface until the APR convention fix lands, so nothing derived from the understated APR can masquerade as an operator override.
+Solver-derived widths carry the label `solver_derived_apr` through every plan and audit surface; the manual LP surface still requires the explicit override because the solver needs a reconstructed price path (the corrected emissions-APR convention itself is live).
 
 ### Amount mathematics
 
@@ -248,7 +248,7 @@ Both AFTER probes refused honestly at the same downstream gates as their full-sw
 The fast path's reads are the pool's own contract views, all verified live on the AAPLc pool during the speed pass: `slot0()` returned `sqrtPriceX96 44332337155365311163694903540` at tick `-11613`, `liquidity()` and `stakedLiquidity()` answered alongside, `tickSpacing() 10`, `factory() 0xf8f2eb4940cfe7d13603dddd87f123820fc061ef`, `gauge()`, the gauge's `rewardToken() 0x940181a94a35a4569e4529a3cdfb74e38fd98631` and `rewardRate() 103143109344970222` raw per second, and the gauge factory's `nft() 0xe1f8cd9ac4e4a65f54f38a5cdafca44f6dd68b53`.
 
 The untracked-positions gate is deliberately fail-closed: once the Safe holds any position NFT, the total-exposure cap cannot be evaluated honestly without a live position-value read, so entry refuses until that read exists.
-The `derived_width_unavailable` gate stands until the emissions-APR convention fix lands, because the solver's APR input is known understated; no solver-derived width can masquerade as an operator override in the meantime.
+The `derived_width_unavailable` gate stands because the width solver needs a reconstructed price path the manual surface does not carry; the corrected emissions-APR convention is live, so the gate is about plumbing, not calibration.
 The router whitelist is exactly the swap executor's single router address, enforced by a validator that rejects any other configuration.
 
 ### Exit-side gates
@@ -276,10 +276,23 @@ The default budget is therefore the recycled position value itself, and an expli
 The fresh mint's gauge deposit cannot be bound into the same pre-execution batch: the NFPM exposes no next-id view (`nextTokenId()` reverts, verified live), so the new token id exists only after the mint confirms.
 The report's `restake_followup` therefore documents the stake command with the confirmed token id as the explicit second step, and the batch's audit record carries that follow-up verbatim.
 
-### Position status and the pre-fix APR label
+### Position status and Aerodrome's displayed emissions APR
 
-Status values the position's two sides at the snapshot price, reports the accrued AERO from `earned` and `rewards`, resolves the penalty window, and quotes a pool-level emissions APR from the gauge's per-second rate, the caller-supplied AERO price, and the staked reserves valued at the snapshot price.
-That quote follows the rehearsal convention and is labeled `PRE-FIX APR INPUT` in the report, because the emissions-APR convention fix (deliverable 2) has not landed and Aerodrome's own displayed numbers use a different base; the label stands on the report, the diagnostic, and the audit payload.
+Status values the position's two sides at the snapshot price, reports the accrued AERO from `earned` and `rewards`, resolves the penalty window, and quotes a pool-level emissions APR in Aerodrome's own displayed convention.
+The conversion lives in `aero_bot.emissions_apr` and is shared verbatim with the rehearsal reconstruction, so the two paths cannot drift: the gauge's annualized reward value (per-second rate x seconds per year x AERO price) divided by the Sugar snapshot's current-cell staked value - the staked balances `LpSugar.vy`'s concentrated branch computes via `getAmountsForLiquidity(sqrtPriceX96, sqrtRatioAtTick(tick_low), sqrtRatioAtTick(tick_high), gauge_liquidity)` over the pool's current grid cell.
+That base is what Aerodrome's frontend divides over, which makes the displayed number a per-cell concentration APR - the captain's screening indicator, deliberately inflated at thin widths, not a pool-wide average yield: halving the window carried per unit of staked liquidity doubles the number.
+The historical 119.7-percent "naive" reconciliation (830.0 percent displayed for AAPLc on 2026-09-07) divided by the frontend's separately displayed staked-TVL column instead - a wider, different quantity - which is exactly the factor-6.94 gap; the identified cell base for that frozen snapshot is about 210,935 USDC, and the frozen unit test reproduces the displayed 830 percent from the reward rate 0.10227763 AERO/s, the AERO price 0.5428, and that base.
+The report's diagnostic also carries the width family - the same reward stream at +/-1, +/-3, and +/-10 ticks around the grid anchor - because emissions accrue per unit of staked liquidity regardless of range, so the concentration APR scales with the window the same way.
+The AERO price defaults to a live read from Aerodrome's own canonical USDC/AERO volatile pair (factory `getPool` lookup, reserve ratio at the snapshot block) and fails closed as `aero_price_unreadable`; `--aero-price` remains as an explicit override for reproducibility.
+The rehearsal CLI keeps its `--aero-price` override for reproducibility but defaults to the same live read pinned to its anchor block.
+
+Live verification (2026-09-08, formula from this repo's own Sugar reads vs the frontend minutes apart):
+
+- MSFTc 3,128.8 percent computed vs 3,106.9 displayed; SPCXc 4,125.6 vs 4,078.87; TSLAc 3,692.2 vs 3,653.54; AAPLc 1,043.9 vs 991.78 (its displayed number had moved from 945.83 to 991.78 inside the hour); GOOGLc 1,282.9 vs 1,207.98.
+- The captain's anchor read live - wtSGOV/USDC (spacing 1) at 357.21 percent - computes 346.5 percent forty minutes later, inside that pool's own display drift; the convention is exactly the one-cell window his "+/-1 tick" framing names.
+- AMZNc, MSTRc, SNDKc, and wtSPYM display "+9,000%": that is the frontend's display clamp, not an anomaly - the convention computes values at or above the clamp for each (MSTRc 15,639 percent, SNDKc 8,373 percent at +/-1 spacing on the same snapshot).
+- NVDAc moves too fast for minute-scale comparison (its displayed number moved five-fold inside an hour on live liquidity shifts); the convention's inputs come from the same Sugar record the frontend reads, so the divergence is display lag, not formula.
+
 The unrealized P&L is reported only against an explicitly supplied `--entry-cost`; without one the diagnostic says the entry cost is unknown rather than implying zero.
 Nothing in the status path builds, signs, estimates, or audits a transaction: the single audit event is `lp_status_reported`, and the read-only proof in tests is that the Safe script's preloaded nonce and signature queues are never consumed.
 
@@ -438,3 +451,26 @@ exit=2
 The `NA` revert is the gauge's own answer: `earned(owner, tokenId)` reports only for the address that staked the token, and the canary Safe is not 5660106's staker.
 The executor treats that unreadable reward state exactly like an unreadable penalty window - fail-closed with the chain's reason quoted verbatim - rather than assuming zero emissions and proceeding into a withdraw that could forfeit someone else's accrued rewards.
 Once the canary's own mint and stake confirm, its positions resolve through the same reads with the Safe as the staker, and the unstake path opens.
+
+## Corrected replays under the displayed convention
+
+The multi-pool rehearsal re-ran under the corrected convention (2026-09-08, live AERO price 0.626339 USDC read at anchor block 51029890, synthetic stress on, derived-width mode; ledgers preserved at `data/aero-bot-lp-canary-campaign/corrected-rehearsal-ledgers.json`):
+
+| pool | window | obs | entries | sample entry APR | fees+AERO USDC | impact+gas USDC | net P&L USDC |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| SPCXc | 2d | 6,664 | 33 | 1,623.8% | 0.153 | 0.155 | +0.067 |
+| TSLAc | 2d | 2,923 | 6 | 3,744.6% | 0.125 | 0.030 | +0.098 |
+| SNDKc | 2d | 2,540 | 23 | 11,695.2% | 0.141 | 0.113 | +0.108 |
+| MSFTc | 2d | 7,940 | 39 | 6,300.5% | 0.132 | 2.234 | -2.072 |
+| NVDAc | 2d | 13,630 | 11 | 1,573.0% | 0.982 | 0.149 | +0.728 |
+| MSTRc | 2d | 3,672 | 42 | 37,499.6% | 0.426 | 0.171 | +0.392 |
+| GOOGLc | 2d | 6,898 | 9 | 1,360.1% | 0.711 | 0.126 | +0.224 |
+| AMZNc | 2d | 5,017 | 17 | 10,628.4% | 0.394 | 0.077 | +0.323 |
+| METAc | 2d | 5,398 | 13 | 623.4% | 0.719 | 0.160 | +0.413 |
+| AAPLc | 12h | 2,443 | 6 | 899.4% | 0.359 | 0.082 | -0.005 |
+
+AAPLc ran on a twelve-hour window because the public RPC hard-fails its two-day swap-log volume (`eth_getLogs` 500 after bounded retries, reproduced four times); every other pool covered the full two-day window.
+
+Versus the old numbers, nothing carries forward: the understated 4.35-35.4 percent series meant the 150-percent raw-emissions entry gate never opened, so the old replays produced no entries at all; under the corrected convention every pool clears the gate and the decisions now turn on the depth, dislocation, and defensive gates instead.
+The economics that matter are small in absolute terms (a 200-USDC rehearsal stake over two days): eight of ten pools net positive on emissions plus fees against impact and gas, MSFTc loses to swap impact in a thin executable depth (2.07 USDC of impact across 39 entries), and AAPLc is flat on a quiet twelve-hour window.
+The corrected lesson for the policy layer: emissions APRs in the hundreds-to-thousands of percent are real but concentrated - the width solver's inputs, not the entry gate, are what should discipline deployment, which is exactly the strategy/policy E2E's next scope.

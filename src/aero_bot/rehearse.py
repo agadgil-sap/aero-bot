@@ -28,6 +28,11 @@ from aero_bot.domain import (
     EvmAddress,
     normalize_evm_address,
 )
+from aero_bot.executor import (
+    ExecutionUnavailableError,
+    ExecutorRpcBackend,
+    ExecutorRpcRevertError,
+)
 from aero_bot.history import (
     MAX_BINARY_SEARCH_PROBES,
     MAX_HEADER_BATCH_SIZE,
@@ -42,7 +47,6 @@ from aero_bot.history import (
 )
 from aero_bot.registry import load_official_b20_registry
 from aero_bot.rehearsal import (
-    DEFAULT_AERO_PRICE_ASSUMPTION_USD,
     DEFAULT_GAS_PRICE_ASSUMPTION_GWEI,
     DEFAULT_SYNTHETIC_DISLOCATION_SCHEDULE,
     PoolRehearsalLedger,
@@ -158,6 +162,10 @@ class RehearsalSources(Protocol):
         """Reconstruct the pool's gauge emissions-APR series."""
         ...
 
+    def read_aero_price_usdc(self, block_number: int) -> Decimal:
+        """Read the AERO price in USDC pinned to one block."""
+        ...
+
 
 def stock_token_address(pool: PoolCandidate) -> EvmAddress:
     """Return the B20 stock side of one accepted native-USDC pair.
@@ -223,7 +231,7 @@ class LiveRehearsalSources:
         sugar_address: str,
         b20_addresses: frozenset[str],
         lookback: timedelta,
-        aero_price_assumption_usd: Decimal,
+        aero_price_assumption_usd: Decimal | None,
         header_batch_size: int = MAX_HEADER_BATCH_SIZE,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -235,7 +243,8 @@ class LiveRehearsalSources:
             sugar_address: LP Sugar contract address anchoring pool discovery.
             b20_addresses: Issuer-verified B20 contracts allowed for pairing.
             lookback: Reconstruction window every pool covers.
-            aero_price_assumption_usd: Documented AERO price assumption.
+            aero_price_assumption_usd: Optional documented AERO price override;
+                absent means the per-run live read at the anchor block sets it.
             header_batch_size: Block-header reads grouped per JSON-RPC batch.
             transport: Optional injected HTTP transport for deterministic tests.
             sleep: Injected delay function used for backoff and politeness waits.
@@ -344,6 +353,10 @@ class LiveRehearsalSources:
             raise HistoryUnavailableError(
                 f"pool {pool.pool_address} carries no gauge for emissions reconstruction"
             )
+        if self._aero_price_assumption_usd is None:
+            # No operator override: resolve once, live, at the anchor block.
+            self.read_aero_price_usdc(anchor_block)
+        assert self._aero_price_assumption_usd is not None  # noqa: S101 - resolved above
         return self._history.fetch_emissions_apr_history(
             pool_address=pool.pool_address,
             gauge_address=pool.gauge_address,
@@ -355,12 +368,35 @@ class LiveRehearsalSources:
             lookback=self._lookback,
         )
 
+    def read_aero_price_usdc(self, block_number: int) -> Decimal:
+        """Read the AERO price in USDC pinned to one block.
+
+        Args:
+            block_number: The block pinning the reserve read.
+
+        Returns:
+            The USDC price of one whole AERO token at that block.
+
+        Raises:
+            ExecutionUnavailableError: If the read cannot complete.
+            ExecutorRpcRevertError: If a call reverts on-chain.
+            ValueError: If the pool or a reserve is absent.
+        """
+        price = ExecutorRpcBackend(
+            rpc_url=self._rpc_url, transport=self._transport, sleep=self._sleep
+        ).fetch_aero_price_usdc(hex(block_number))
+        # The per-run resolution becomes the assumption every pool's
+        # emissions-history reconstruction replays under, unless the operator
+        # overrode the price explicitly.
+        self._aero_price_assumption_usd = price
+        return price
+
 
 def run_rehearsal(
     sources: RehearsalSources,
     symbols_by_token_address: Mapping[str, str],
     lookback: timedelta,
-    aero_price_assumption_usd: Decimal,
+    aero_price_assumption_usd: Decimal | None,
     gas_price_assumption_gwei: Decimal,
     pool_addresses: frozenset[str] = frozenset(),
     apply_synthetic_stress: bool = True,
@@ -373,7 +409,9 @@ def run_rehearsal(
         sources: The read-only sources performing every network read.
         symbols_by_token_address: Stock symbol by normalized B20 token address.
         lookback: The reconstruction window every pool covers.
-        aero_price_assumption_usd: The documented AERO price assumption.
+        aero_price_assumption_usd: Optional documented AERO price override;
+            absent means the price is read live from Aerodrome's own
+                       USDC/AERO pool at the anchor block, failing closed.
         gas_price_assumption_gwei: The documented constant Base gas price.
         pool_addresses: Optional normalized pool filter; every address must
             match a discovered pool.
@@ -402,6 +440,18 @@ def run_rehearsal(
             "verified discovery carried no snapshot block for the emissions anchor"
         )
     anchor_block = discovery.snapshot_block
+    if aero_price_assumption_usd is None:
+        try:
+            aero_price_assumption_usd = sources.read_aero_price_usdc(anchor_block)
+            report_progress(
+                f"AERO price read live at anchor block {anchor_block}: "
+                f"{aero_price_assumption_usd} USDC"
+            )
+        except (ExecutorRpcRevertError, ExecutionUnavailableError, ValueError) as error:
+            raise RehearsalUnavailableError(
+                f"the live AERO price read at anchor block {anchor_block} failed: {error}; "
+                "pass --aero-price to assume a price explicitly"
+            ) from error
     pools_by_address = {pool.pool_address: pool for pool in discovery.pools}
     if not pools_by_address:
         raise RehearsalUnavailableError(
@@ -563,8 +613,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--aero-price",
         type=Decimal,
-        default=DEFAULT_AERO_PRICE_ASSUMPTION_USD,
-        help="USD price assumed per accrued AERO (default: 0.50).",
+        default=None,
+        help=(
+            "USD price override assumed per accrued AERO for reproducibility; "
+            "absent means the price is read live from Aerodrome's own "
+            "USDC/AERO pool at the anchor block (fails closed)."
+        ),
     )
     parser.add_argument(
         "--gas-price-gwei",
@@ -632,7 +686,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if arguments.lookback_days <= 0:
         parser.error("--lookback-days must be positive")
-    if arguments.aero_price <= 0:
+    if arguments.aero_price is not None and arguments.aero_price <= 0:
         parser.error("--aero-price must be positive")
     if arguments.gas_price_gwei <= 0:
         parser.error("--gas-price-gwei must be positive")

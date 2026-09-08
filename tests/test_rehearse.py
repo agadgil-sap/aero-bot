@@ -283,11 +283,17 @@ class FakeSources:
         self.decimals_reads: list[str] = []
         self.price_path_calls: list[str] = []
         self.emissions_calls: list[tuple[str, int]] = []
+        self.aero_price_reads: list[int] = []
 
     def discover_pools(self) -> PoolDiscoveryResult:
         """Return the fixture discovery result."""
         self.discover_calls += 1
         return self._discovery
+
+    def read_aero_price_usdc(self, block_number: int) -> Decimal:
+        """Return the fixture AERO price, recording the anchor block read."""
+        self.aero_price_reads.append(block_number)
+        return FIXTURE_AERO_PRICE
 
     def read_token_decimals(self, token_address: str) -> int:
         """Return the fixture token's decimal count."""
@@ -833,10 +839,30 @@ def test_argument_parser_defaults_match_the_documented_assumptions() -> None:
     """The parser defaults mirror the locked rehearsal assumptions."""
     arguments = build_argument_parser().parse_args([])
     assert arguments.lookback_days == Decimal(21)
-    assert arguments.aero_price == Decimal("0.50")
+    assert arguments.aero_price is None  # live read at the anchor block
     assert arguments.gas_price_gwei == Decimal("0.001")
     assert arguments.pool_addresses == []
     assert arguments.synthetic_stress is True
     assert arguments.fixed_ceiling_width is False
     assert arguments.output == Path("rehearsal-ledgers.json")
     assert arguments.header_batch_size == 10
+
+
+def test_run_rehearsal_resolves_the_live_aero_price_at_the_anchor_block() -> None:
+    """Without an override, the AERO price is read once at the anchor block."""
+    sources = two_pool_fixture()
+
+    report = run_fixture(sources, aero_price_assumption_usd=None)
+
+    assert report.aero_price_assumption_usd == FIXTURE_AERO_PRICE
+    assert sources.aero_price_reads == [123]
+
+
+def test_run_rehearsal_override_skips_the_live_read() -> None:
+    """An explicit override never touches the live read."""
+    sources = two_pool_fixture()
+
+    report = run_fixture(sources, aero_price_assumption_usd=Decimal("0.75"))
+
+    assert report.aero_price_assumption_usd == Decimal("0.75")
+    assert sources.aero_price_reads == []

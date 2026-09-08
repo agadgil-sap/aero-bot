@@ -30,6 +30,7 @@ from aero_bot.domain import (
     NonNegativeDecimal,
     normalize_evm_address,
 )
+from aero_bot.emissions_apr import SECONDS_PER_YEAR as EMISSIONS_YEAR_SECONDS
 from aero_bot.sugar import DEFAULT_BASE_RPC_URL
 
 # Aerodrome's official Slipstream repository publishes the concentrated-pool contracts.
@@ -591,6 +592,29 @@ def staked_tvl_usd(
         return +(staked_usdc + staked_stock * stock_price_usdc)
 
 
+def annual_emissions_reward_value_usdc(
+    emissions_per_second: int, aero_price_usdc: Decimal
+) -> Decimal:
+    """Annualize one gauge's reward stream, the shared conversion core.
+
+    Both the live runtime quote and this module's reconstruction divide this
+    value by their staked value, so the two paths share one annualization.
+
+    Args:
+        emissions_per_second: Raw AERO reward rate per second.
+        aero_price_usdc: USDC price of one whole AERO token.
+
+    Returns:
+        The annual reward value in USDC.
+    """
+    return +(
+        Decimal(emissions_per_second)
+        * aero_price_usdc
+        * Decimal(EMISSIONS_YEAR_SECONDS)
+        / Decimal(10) ** AERO_DECIMALS
+    )
+
+
 def _emissions_apr(
     gauge_liquidity: int,
     anchor_gauge_liquidity: int,
@@ -626,12 +650,12 @@ def _emissions_apr(
     with localcontext() as decimal_context:
         # Local precision isolates deterministic APR math from settings.
         decimal_context.prec = MATH_PRECISION
-        # Annual reward value under the constant-rate assumption.
-        annual_reward_usd = (
-            Decimal(emissions_per_second)
-            * aero_price_assumption_usd
-            * Decimal(SECONDS_PER_YEAR)
-            / Decimal(10) ** AERO_DECIMALS
+        # Annual reward value under the constant-rate assumption, computed by
+        # the same shared conversion the live runtime quotes through so the
+        # two paths cannot drift apart.
+        annual_reward_usd = annual_emissions_reward_value_usdc(
+            emissions_per_second,
+            aero_price_assumption_usd,
         )
         # Staked value scales linearly with liquidity at the frozen anchor value.
         staked_tvl = (

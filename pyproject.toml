@@ -71,6 +71,9 @@ fail_under = 90
 line-length = 100
 # Ruff analyzes code supported by the minimum Python runtime.
 target-version = "py312"
+# Campaign evidence under data/ preserves verbatim scratch drivers and is
+# not shipped source.
+exclude = ["data"]
 
 [tool.ruff.lint]
 # The selected rules cover correctness, imports, security, annotations, and docs.

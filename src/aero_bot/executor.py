@@ -31,7 +31,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Protocol, cast, runtime_checkable
 
@@ -42,6 +42,7 @@ from eth_utils.crypto import keccak
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from aero_bot.audit import AuditEventType, AuditStore
+from aero_bot.concentrated import MATH_PRECISION
 from aero_bot.config import Settings
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
 from aero_bot.history import (
@@ -65,6 +66,7 @@ from aero_bot.safe_tx import (
 )
 from aero_bot.sugar import DEFAULT_BASE_RPC_URL, LP_SUGAR_ADDRESS, LpSugarRpcBackend
 from aero_bot.venues import (
+    AERO_TOKEN_ADDRESS,
     BASE_USDC_ADDRESS,
     AerodromeVenueAdapter,
     PoolDiscoveryResult,
@@ -97,6 +99,17 @@ ERC20_DECIMALS_SELECTOR = "0x313ce567"
 ERC20_BALANCE_OF_SELECTOR = "70a08231"
 # Native Base USDC carries six decimals everywhere in this release.
 QUOTE_TOKEN_DECIMALS = 6
+# Aerodrome's canonical volatile PoolFactory on Base, the source of the
+# USDC/AERO pair the emissions-APR convention prices AERO from.
+AERODROME_VOLATILE_FACTORY_ADDRESS = "0x420dd381b31aef6683db6b902084cb0ffece40da"
+# keccak256("getPool(address,address,bool)")[0:4], the factory lookup.
+POOL_FACTORY_GET_POOL_SELECTOR = "0x79bc57d5"
+# keccak256("token0()")[0:4], the pair's token ordering read.
+POOL_TOKEN0_SELECTOR = "0x0dfe1681"
+# keccak256("reserve0()")[0:4].
+POOL_RESERVE0_SELECTOR = "0x443cb4bc"
+# keccak256("reserve1()")[0:4].
+POOL_RESERVE1_SELECTOR = "0x5a76f25e"
 # Every ABI word below is exactly 32 bytes.
 WORD_BYTES = 32
 # The reference swap's deadline sat eight minutes past its build time.
@@ -1084,6 +1097,80 @@ class ExecutorRpcBackend:
             self._rpc_call("eth_getTransactionCount", [normalize_evm_address(address), "pending"]),
         )
         return self._decode_hex_quantity(result, "eth_getTransactionCount")
+
+    def fetch_aero_price_usdc(self, block_tag: str = "latest") -> Decimal:
+        """Read AERO's USDC price from Aerodrome's own USDC/AERO pool.
+
+        The price comes from the canonical volatile pair on the official
+        Aerodrome pool factory - the same pool the frontend prices the
+        emissions token from - as the USDC reserve over the AERO reserve at
+        the requested block tag. This is the live read the emissions-APR
+        convention consumes; it fails closed on any absent or zero-leg
+        response.
+
+        Args:
+            block_tag: Hex block tag or "latest" pinning the reserve read;
+                the rehearsal passes its anchor block so replay assumptions
+                match the reconstructed state.
+
+        Returns:
+            The USDC price of one whole AERO token.
+
+        Raises:
+            ExecutionUnavailableError: If any read cannot complete.
+            ExecutorRpcRevertError: If a call reverts on-chain.
+            ValueError: If the pool is absent or either reserve is zero.
+        """
+        pool_address = normalize_evm_address(
+            "0x"
+            + str(
+                self._rpc_call(
+                    "eth_call",
+                    [
+                        {
+                            "to": AERODROME_VOLATILE_FACTORY_ADDRESS,
+                            "data": (
+                                POOL_FACTORY_GET_POOL_SELECTOR
+                                + _address_word(BASE_USDC_ADDRESS).hex()
+                                + _address_word(AERO_TOKEN_ADDRESS).hex()
+                                + "0" * 64
+                            ),
+                        },
+                        block_tag,
+                    ],
+                )
+            )[-40:]
+        )
+        if int(pool_address, 16) == 0:
+            raise ValueError("the Aerodrome USDC/AERO volatile pool does not exist")
+
+        def _pool_word(data: str) -> int:
+            return int(
+                str(self._rpc_call("eth_call", [{"to": pool_address, "data": data}, block_tag])),
+                16,
+            )
+
+        token0 = normalize_evm_address(
+            "0x"
+            + str(
+                self._rpc_call(
+                    "eth_call", [{"to": pool_address, "data": POOL_TOKEN0_SELECTOR}, block_tag]
+                )
+            )[-40:]
+        )
+        reserve0 = _pool_word(POOL_RESERVE0_SELECTOR)
+        reserve1 = _pool_word(POOL_RESERVE1_SELECTOR)
+        token0_is_usdc = token0 == normalize_evm_address(BASE_USDC_ADDRESS)
+        usdc_reserve = Decimal(reserve0 if token0_is_usdc else reserve1)
+        aero_reserve = Decimal(reserve1 if token0_is_usdc else reserve0)
+        if usdc_reserve <= 0 or aero_reserve <= 0:
+            raise ValueError("the USDC/AERO pool carries a zero reserve; the price is undefined")
+        with localcontext() as context:
+            context.prec = MATH_PRECISION
+            return +(
+                (usdc_reserve / Decimal(10) ** QUOTE_TOKEN_DECIMALS)
+                / (aero_reserve / Decimal(10) ** 18)
+            )
 
     def estimate_gas(self, to_address: str, calldata: str) -> int:
         """Estimate the gas one transaction needs from the endpoint.
