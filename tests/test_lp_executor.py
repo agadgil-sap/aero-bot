@@ -350,6 +350,7 @@ class LpRpcScript:
         relayer_starting_nonce: int = 3,
         receipt_status: int = 1,
         receipt_present: bool = True,
+        receipt_http_status: int | None = None,
         estimate_reverts_after: int | None = None,
         estimate_revert_message: str = "execution reverted: PSC",
         estimate_gs026_lag_calls: int = 0,
@@ -416,6 +417,9 @@ class LpRpcScript:
             receipt_status: Status word served for included deliveries.
             receipt_present: Whether receipts are served at all; False keeps
                 every poll empty so the bounded wait can time out.
+            receipt_http_status: Serve this HTTP status for every receipt
+                request instead of a result, scripting an endpoint outage
+                (a rate-limit 403) the rotation must absorb.
             estimate_reverts_after: Make every estimateGas call past this
                 count revert with estimate_revert_message, counting both the
                 build-time and execute-time estimates.
@@ -475,6 +479,7 @@ class LpRpcScript:
         self.relayer_next_nonce = relayer_starting_nonce
         self.receipt_status = receipt_status
         self.receipt_present = receipt_present
+        self.receipt_http_status = receipt_http_status
         self.estimate_reverts_after = estimate_reverts_after
         self.estimate_revert_message = estimate_revert_message
         self.estimate_gs026_lag_remaining = estimate_gs026_lag_calls
@@ -524,6 +529,11 @@ class LpRpcScript:
             self.broadcasts.append(str(params[0]))
             result = "0x" + f"{len(self.broadcasts):064x}"
         elif method == "eth_getTransactionReceipt":
+            if self.receipt_http_status is not None:
+                return httpx.Response(
+                    self.receipt_http_status,
+                    json={"jsonrpc": "2.0", "id": 1, "error": "rate limited"},
+                )
             if not self.receipt_present:
                 result = None
             else:
@@ -3277,6 +3287,54 @@ def test_execute_reports_an_unconfirmed_delivery_as_a_warning(tmp_path: Path) ->
     records = AuditStore(audit_path).read_records(100)
     # The send record exists; no confirmed or failed record was invented.
     assert records[3].event_type is AuditEventType.LP_EXECUTE_SENT
+    assert not any(
+        record.event_type in (AuditEventType.LP_EXECUTE_CONFIRMED, AuditEventType.LP_EXECUTE_FAILED)
+        for record in records
+    )
+
+
+def test_execute_absorbs_a_rate_limited_receipt_endpoint(tmp_path: Path) -> None:
+    """A 403-ing primary receipt endpoint never abandons the landed broadcast.
+
+    The live 2026-09-08 burn of token 5703026 confirmed on-chain while the
+    primary endpoint's 403 crashed the receipt poll; this pins the rotation
+    absorbing per-endpoint outages and confirming through the next one.
+    """
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, rpc_script = make_execute_stake_executor(
+        audit_path=audit_path,
+        script_kwargs={"receipt_http_status": 403},
+        receipt_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS}, position_words=make_position_words()
+        ),
+    )
+
+    report = executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert report.completed is True
+    assert all(step.status == "confirmed" for step in report.steps)
+    assert len(rpc_script.broadcasts) == 2
+    records = AuditStore(audit_path).read_records(100)
+    assert AuditEventType.LP_EXECUTE_CONFIRMED in [record.event_type for record in records]
+
+
+def test_execute_survives_every_receipt_endpoint_failing(tmp_path: Path) -> None:
+    """An all-endpoint outage ends at the bounded unconfirmed warning."""
+    audit_path = tmp_path / "audit.sqlite3"
+    clock_values = iter(float(value) for value in range(0, 10**7, 10_000))
+    executor, rpc_script = make_execute_stake_executor(
+        audit_path=audit_path,
+        script_kwargs={"receipt_http_status": 403},
+        timer=lambda: next(clock_values),
+    )
+
+    report = executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert report.completed is False
+    assert report.steps[0].status == "unconfirmed"
+    assert "may still land" in report.steps[0].diagnostic
+    assert len(rpc_script.broadcasts) == 1
+    records = AuditStore(audit_path).read_records(100)
     assert not any(
         record.event_type in (AuditEventType.LP_EXECUTE_CONFIRMED, AuditEventType.LP_EXECUTE_FAILED)
         for record in records

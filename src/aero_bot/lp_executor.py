@@ -4199,7 +4199,10 @@ class LpLifecycleExecutor:
 
         A landed broadcast is never relabeled a failure: exhaustion returns
         None and the caller reports an unconfirmed warning whose source of
-        truth is the audit chain's send record.
+        truth is the audit chain's send record. A failing endpoint - a
+        rate-limit 403, a 5xx, a transport error - is absorbed and the
+        rotation moves on, because one endpoint's outage must not abandon a
+        broadcast that already landed.
 
         Args:
             transaction_hash: The broadcast transaction's hash.
@@ -4210,7 +4213,14 @@ class LpLifecycleExecutor:
         started = self._timer()
         while True:
             for backend in self._receipt_backends:
-                receipt = backend.fetch_transaction_receipt(transaction_hash)
+                try:
+                    receipt = backend.fetch_transaction_receipt(transaction_hash)
+                except ExecutionUnavailableError:
+                    # One endpoint's transport failure - a rate-limit 403, a
+                    # 5xx - never abandons a landed broadcast: the rotation
+                    # moves to the next endpoint, and the bounded total wait
+                    # stays the only exit, reporting unconfirmed at worst.
+                    continue
                 if receipt is not None:
                     return receipt
             if self._timer() - started >= EXECUTE_RECEIPT_TOTAL_TIMEOUT_SECONDS:
