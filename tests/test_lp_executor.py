@@ -1010,7 +1010,7 @@ def test_planner_refusals_surface_with_their_own_codes() -> None:
     executor, _, _ = make_lp_executor()
 
     with pytest.raises(LpPlanRefusalError) as raised:
-        executor.plan_mint("FIXc", Decimal("60"), MINT_WIDTH_SPACINGS)
+        executor.plan_mint("FIXc", Decimal("100.01"), MINT_WIDTH_SPACINGS)
 
     assert "per-pool cap" in str(raised.value)
 
@@ -1651,7 +1651,7 @@ def test_dry_run_recenter_surfaces_planner_cap_refusals() -> None:
 
     with pytest.raises(LpPlanRefusalError) as raised:
         executor.dry_run_recenter(
-            "FIXc", 77, MINT_WIDTH_SPACINGS, Decimal("60"), bytes(Account.create().key)
+            "FIXc", 77, MINT_WIDTH_SPACINGS, Decimal("100.01"), bytes(Account.create().key)
         )
 
     assert raised.value.code.value == "budget_above_pool_cap"
@@ -1817,7 +1817,7 @@ def test_planner_refusals_audit_their_plan_code(tmp_path: Path) -> None:
     executor, _, _ = make_lp_executor(audit_path=audit_path)
 
     with pytest.raises(LpPlanRefusalError):
-        executor.plan_mint("FIXc", Decimal("60"), MINT_WIDTH_SPACINGS)
+        executor.plan_mint("FIXc", Decimal("100.01"), MINT_WIDTH_SPACINGS)
 
     store = AuditStore(audit_path)
     records = store.read_records(10)
