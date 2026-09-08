@@ -46,6 +46,10 @@ aero-bot-lp = "aero_bot.lp_executor:main"
 # The decision command runs one complete policy verdict from live reads;
 # decision-only - nothing is built, signed, or broadcast.
 aero-bot-decide = "aero_bot.strategy:main"
+# The cycle command runs one scheduled reconcile-decide-act cycle; the
+# systemd timer decides when cycles run, and every broadcast flows through
+# the audited capped executor surfaces.
+aero-bot-cycle = "aero_bot.cycle:main"
 
 [tool.hatch.build.targets.wheel]
 # The wheel contains only the application package under the src layout.

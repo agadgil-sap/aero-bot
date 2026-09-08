@@ -40,7 +40,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
@@ -122,6 +122,7 @@ from aero_bot.lp_calldata import (
 from aero_bot.lp_pins import LpPoolPin, LpPoolPinStore, build_pool_pin_from_discovery
 from aero_bot.lp_plan import (
     DEFAULT_MINT_SLIPPAGE_TOLERANCE,
+    MAX_POSITION_USDC_PER_POOL,
     QUOTE_TOKEN_DECIMALS,
     LpExecutionPolicy,
     LpMintPlan,
@@ -153,6 +154,14 @@ from aero_bot.venues import BASE_USDC_ADDRESS, PoolDiscoveryStatus
 ERC721_OWNER_OF_SELECTOR = "6352211e"
 # keccak256("isApprovedForAll(address,address)")[0:4], the operator read.
 ERC721_IS_APPROVED_FOR_ALL_SELECTOR = "e985e9c5"
+# keccak256("tokenOfOwnerByIndex(address,uint256)")[0:4], the ERC721
+# enumeration read backing position reconciliation.
+ERC721_TOKEN_OF_OWNER_BY_INDEX_SELECTOR = "2f745c59"  # noqa: S105 - a keccak selector, not a secret
+# keccak256("IncreaseLiquidity(uint256,uint128,uint256,uint256)")[0:4], the
+# NFPM mint event whose first indexed topic carries the fresh token id.
+NFPM_INCREASE_LIQUIDITY_TOPIC0 = (
+    "0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f"
+)
 # The LP deadline sits eight minutes past its build time, mirroring the swap.
 LP_DEADLINE_SECONDS = 8 * 60
 # Fresh-estimate re-reads when a receipt landed on one public endpoint but the
@@ -250,6 +259,12 @@ class LpExecutionRefusalCode(StrEnum):
     ESTIMATE_REVERTED = "estimate_reverted"
     # The relaying EOA cannot afford the floor plus the bounded gas cost.
     RELAYER_ETH_INSUFFICIENT = "relayer_eth_insufficient"
+    # The exit swap found no stock balance to convert back to USDC.
+    STOCK_BALANCE_ZERO = "stock_balance_zero"
+    # The exit swap's quoted USDC output exceeds the per-pool pilot cap.
+    EXIT_OUTPUT_ABOVE_POOL_CAP = "exit_output_above_pool_cap"
+    # The Safe's held-NFT enumeration could not be read honestly.
+    ENUMERATION_UNREADABLE = "enumeration_unreadable"
 
 
 class LpExecutionRole(StrEnum):
@@ -279,6 +294,10 @@ class LpExecutionRole(StrEnum):
     NFPM_BURN = "nfpm_burn"
     # The CLGauge per-token emissions claim.
     GAUGE_GET_REWARD = "gauge_get_reward"
+    # The exact stock approval the router's exit swap pull requires.
+    STOCK_ROUTER_ALLOWANCE = "stock_router_allowance"
+    # The exact-input stock-to-USDC swap closing one LP exit.
+    EXIT_SWAP = "exit_swap"
 
 
 class LpSafeExecutionPolicy(BaseModel):
@@ -694,6 +713,65 @@ class LpCollectDryRunReport(BaseModel):
     diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
 
 
+class LpExitSwapDryRunReport(BaseModel):
+    """Report one complete LP exit-swap build-and-validate attempt.
+
+    The exit swap converts the Safe's ENTIRE stock balance back to USDC
+    through the same whitelisted router every balancing swap uses, in the
+    reverse direction: exact-input stock, minimum-output USDC, recipient
+    Safe. The quoted output may never exceed the per-pool pilot cap, so an
+    out-of-band inventory refuses instead of swapping.
+    """
+
+    # Frozen strict fields preserve one coherent dry-run outcome.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode marker makes the no-broadcast guarantee auditable.
+    mode: Literal[ExecutionMode.DRY_RUN] = ExecutionMode.DRY_RUN
+    # The registry-matched stock symbol identifying the pool.
+    symbol: str
+    # The pool whose stock side is being sold.
+    pool_address: EvmAddress
+    # The pool's live CLGauge naming the pool's lifecycle.
+    gauge_address: EvmAddress
+    # The whitelisted router executing the reverse swap.
+    router_address: EvmAddress
+    # The stock token being converted.
+    stock_token_address: EvmAddress
+    # The Sugar snapshot block anchoring the quote.
+    snapshot_block: Annotated[int, Field(ge=0)]
+    # The snapshot's USDC price of one whole stock token.
+    price_usdc_per_stock: Decimal
+    # The Safe's entire live stock balance in raw units.
+    stock_balance_units: Annotated[int, Field(ge=0)]
+    # The exact-input stock units the swap sells.
+    amount_in_units: Annotated[int, Field(ge=0)]
+    # The quoted USDC output at the snapshot price.
+    expected_out_units: Annotated[int, Field(ge=0)]
+    # The minimum accepted USDC output after slippage.
+    amount_out_min_units: Annotated[int, Field(ge=0)]
+    # The live stock allowance the Safe held for the router at build time.
+    router_stock_allowance_units: Annotated[int, Field(ge=0)]
+    # The Safe every built transaction targets.
+    safe_address: EvmAddress
+    # The public address of the EOA whose key signed the build.
+    relayer_address: EvmAddress
+    # Whether the signing key was generated for this dry run only.
+    ephemeral_key: bool
+    # The Base gas price observed before building.
+    gas_price_wei: Annotated[int, Field(ge=0)]
+    # The Safe ETH balance observed before building.
+    safe_eth_wei: Annotated[int, Field(ge=0)]
+    # Every built transaction in execution order.
+    transactions: Annotated[tuple[BuiltLpTransaction, ...], Field(min_length=1)]
+    # Every cap checked before signing, in enforced order.
+    caps_enforced: Annotated[tuple[str, ...], Field(min_length=1)]
+    # Wall-clock duration of the build phase in milliseconds.
+    build_duration_ms: Decimal
+    # Human-readable evidence lines covering the exit swap.
+    diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
 class LpActionExecutionReport(BaseModel):
     """Report one complete LP action executed through the broadcast path."""
 
@@ -711,6 +789,7 @@ class LpActionExecutionReport(BaseModel):
         | LpUnstakeDryRunReport
         | LpExitDryRunReport
         | LpCollectDryRunReport
+        | LpExitSwapDryRunReport
     )
     # Every broadcast step in execution order, including the halting one.
     steps: Annotated[tuple[LpStepExecutionReport, ...], Field(min_length=0)]
@@ -782,6 +861,66 @@ class LpRecenterDryRunReport(BaseModel):
     caps_enforced: Annotated[tuple[str, ...], Field(min_length=1)]
     # Wall-clock duration of the build phase in milliseconds.
     build_duration_ms: Decimal
+
+
+class LpHeldPosition(BaseModel):
+    """Carry one Safe-held position NFT's exposure-relevant live fields."""
+
+    # Frozen strict fields keep one enumerated snapshot immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The enumerated position NFT id.
+    token_id: Annotated[int, Field(ge=0)]
+    # The position's live liquidity, zero once fully decreased.
+    liquidity: Annotated[int, Field(ge=0)]
+    # The checkpointed token-zero fees waiting to be collected.
+    tokens_owed0_units: Annotated[int, Field(ge=0)]
+    # The checkpointed token-one fees waiting to be collected.
+    tokens_owed1_units: Annotated[int, Field(ge=0)]
+
+    @property
+    def live(self) -> bool:
+        """Return whether this NFT still carries liquidity or owed fees."""
+        return self.liquidity > 0 or self.tokens_owed0_units > 0 or self.tokens_owed1_units > 0
+
+
+class LpSafePositionsSnapshot(BaseModel):
+    """Report the Safe's complete held-NFT inventory on one pool's NFPM.
+
+    The snapshot is the reconciliation primitive: it enumerates every NFT the
+    Safe holds, classifies each as live (liquidity or owed fees) or an empty
+    residual, and anchors both to the block-pinned observation.
+    """
+
+    # Frozen strict fields keep one coherent reconciliation snapshot.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The registry-matched stock symbol identifying the pool.
+    symbol: str
+    # The pool whose NFPM was enumerated.
+    pool_address: EvmAddress
+    # The enumerated NonfungiblePositionManager.
+    nfpm_address: EvmAddress
+    # Every Safe-held NFT in enumeration order.
+    positions: Annotated[tuple[LpHeldPosition, ...], Field(min_length=0)]
+    # The Sugar snapshot block anchoring the identity.
+    snapshot_block: Annotated[int, Field(ge=0)]
+    # When the snapshot completed, timezone-aware.
+    observed_at: datetime
+    # Every gate checked before the observation, in enforced order.
+    caps_enforced: Annotated[tuple[str, ...], Field(min_length=1)]
+    # Human-readable evidence lines covering the enumeration.
+    diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
+
+    @property
+    def live_positions(self) -> tuple[LpHeldPosition, ...]:
+        """Return only the NFTs still carrying liquidity or owed fees."""
+        return tuple(position for position in self.positions if position.live)
+
+    @property
+    def empty_count(self) -> int:
+        """Return how many held NFTs are empty residuals carrying no exposure."""
+        return len(self.positions) - len(self.live_positions)
 
 
 class LpPositionStatusReport(BaseModel):
@@ -1095,6 +1234,34 @@ class LpTransactionBuiltPayload(BaseModel):
     signature_verified: bool
     # The on-chain gas estimate, absent when the estimate reverted.
     gas_estimate: Annotated[int, Field(gt=0)] | None
+
+
+class LpExitSwapPlannedPayload(BaseModel):
+    """Persist one accepted exit-swap plan's public numbers on the audit chain."""
+
+    # Frozen strict fields keep the audited plan immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode of the attempt this plan belongs to.
+    mode: ExecutionMode
+    # The registry-matched stock symbol.
+    symbol: str
+    # The pool contract address.
+    pool_address: EvmAddress
+    # The whitelisted router executing the reverse swap.
+    router_address: EvmAddress
+    # The Sugar snapshot block anchoring the quote.
+    snapshot_block: Annotated[int, Field(ge=0)]
+    # The Safe's entire live stock balance in raw units.
+    stock_balance_units: Annotated[int, Field(ge=0)]
+    # The snapshot's USDC price of one whole stock token.
+    price_usdc_per_stock: str
+    # The quoted USDC output in raw units.
+    expected_out_units: Annotated[int, Field(ge=0)]
+    # The minimum accepted USDC output in raw units.
+    amount_out_min_units: Annotated[int, Field(ge=0)]
+    # The live stock allowance the Safe held for the router.
+    router_stock_allowance_units: Annotated[int, Field(ge=0)]
 
 
 class LpRefusedPayload(BaseModel):
@@ -1810,6 +1977,80 @@ class LpLifecycleExecutor:
             halted_reason=halted_reason,
         )
 
+    def dry_run_exit_swap(
+        self,
+        symbol: str,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> LpExitSwapDryRunReport:
+        """Fully build and validate one exit swap without broadcasting.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            key_bytes: Exactly 32 raw signing-key bytes used for this build.
+            ephemeral_key: Whether the key was generated for this dry run.
+
+        Returns:
+            The complete dry-run report; nothing was broadcast.
+
+        Raises:
+            LpExecutionRefusalError: If any execution-layer gate refuses.
+        """
+        try:
+            report, _ = self._build_exit_swap_attempt(symbol, key_bytes, ephemeral_key)
+            return report
+        except LpExecutionRefusalError as error:
+            self._record_refusal("exit_swap", ExecutionMode.DRY_RUN, error, symbol)
+            raise
+
+    def execute_exit_swap(
+        self,
+        symbol: str,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Build and broadcast one exit-swap sequence step by step.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            key_bytes: Exactly 32 raw signing-key bytes used for this attempt.
+            confirm_broadcast: The explicit operator confirmation.
+            ephemeral_key: Whether the key was generated for this attempt.
+
+        Returns:
+            The complete execution report with every broadcast step.
+
+        Raises:
+            LpExecutionRefusalError: If any gate, preflight, or per-step check
+                refuses.
+        """
+        if not confirm_broadcast:
+            error = LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "the execute command refuses to broadcast without the explicit "
+                "--confirm-broadcast flag; rerun with it to broadcast the built "
+                "sequence",
+            )
+            self._record_refusal("exit_swap", ExecutionMode.EXECUTE, error, symbol)
+            raise error
+        try:
+            build, steps = self._build_exit_swap_attempt(
+                symbol, key_bytes, ephemeral_key, ExecutionMode.EXECUTE
+            )
+            step_reports, halted_reason = self._execute_steps("exit_swap", steps, key_bytes)
+        except LpExecutionRefusalError as error:
+            self._record_refusal("exit_swap", ExecutionMode.EXECUTE, error, symbol)
+            raise
+        return LpActionExecutionReport(
+            action="exit_swap",
+            build=build,
+            steps=step_reports,
+            completed=halted_reason == "",
+            halted_reason=halted_reason,
+        )
+
     def position_status(
         self,
         symbol: str,
@@ -2491,6 +2732,143 @@ class LpLifecycleExecutor:
         )
         return report, built_steps
 
+    def _build_exit_swap_attempt(
+        self,
+        symbol: str,
+        key_bytes: bytes,
+        ephemeral_key: bool,
+        mode: ExecutionMode = ExecutionMode.DRY_RUN,
+    ) -> tuple[LpExitSwapDryRunReport, tuple[_BuiltLpStep, ...]]:
+        """Build, sign, validate, and estimate the complete exit-swap sequence."""
+        build_started = self._timer()
+        listing, observation, caps = self._observe_pool(symbol)
+        stock_token = (
+            observation.token0_address
+            if observation.stock_is_token0
+            else observation.token1_address
+        )
+        balance_units = self._rpc.fetch_token_balance(stock_token, self._safe_address)
+        if balance_units <= 0:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.STOCK_BALANCE_ZERO,
+                f"the Safe holds no {listing.symbol} balance to convert back to USDC; "
+                "there is nothing to exit-swap",
+            )
+        allowance_units = self._rpc.fetch_erc20_allowance(
+            stock_token, self._safe_address, self._policy.router_address
+        )
+        price = observation.price_usdc_per_stock
+        with localcontext() as context:
+            context.prec = 50
+            expected_out_units = int(
+                (
+                    Decimal(balance_units).scaleb(-observation.stock_decimals)
+                    * price
+                    * Decimal(10) ** observation.quote_decimals
+                ).to_integral_value(ROUND_FLOOR)
+            )
+        tolerance = DEFAULT_MINT_SLIPPAGE_TOLERANCE
+        amount_out_min_units = int(
+            (Decimal(expected_out_units) * (Decimal(1) - tolerance)).to_integral_value(ROUND_FLOOR)
+        )
+        per_pool_cap_units = usdc_units(MAX_POSITION_USDC_PER_POOL)
+        if expected_out_units > per_pool_cap_units:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.EXIT_OUTPUT_ABOVE_POOL_CAP,
+                f"the exit swap's quoted output {expected_out_units} raw USDC exceeds the "
+                f"{MAX_POSITION_USDC_PER_POOL} USDC per-pool pilot cap ({per_pool_cap_units} "
+                "raw units); an inventory this large is out of band for a capped pilot, so "
+                "the swap refuses rather than moving it",
+            )
+        if amount_out_min_units <= 0:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.STOCK_BALANCE_ZERO,
+                f"the Safe's {balance_units} raw {listing.symbol} balance quotes to a "
+                "zero USDC minimum at the snapshot price; the dust is not worth a swap",
+            )
+        caps.append(
+            f"exit output at or below the {MAX_POSITION_USDC_PER_POOL} USDC per-pool pilot cap"
+        )
+        caps.append(f"exit minimum floored at the {tolerance} slippage tolerance")
+        gas_price, safe_eth, live_nonce = self._preflight(caps)
+        deadline = int(self._now().timestamp()) + LP_DEADLINE_SECONDS
+        steps: list[_LpStepSpec] = []
+        if allowance_units < balance_units:
+            steps.append(
+                _LpStepSpec(
+                    role=LpExecutionRole.STOCK_ROUTER_ALLOWANCE,
+                    to_address=stock_token,
+                    inner_calldata=build_approval_calldata(
+                        self._policy.router_address, balance_units
+                    ),
+                    description=(
+                        f"approve exactly {balance_units} raw {listing.symbol} to the "
+                        "whitelisted router for the exit pull"
+                    ),
+                )
+            )
+        steps.append(
+            _LpStepSpec(
+                role=LpExecutionRole.EXIT_SWAP,
+                to_address=self._policy.router_address,
+                inner_calldata=build_swap_calldata(
+                    self._safe_address,
+                    balance_units,
+                    amount_out_min_units,
+                    build_swap_path(stock_token, BASE_USDC_ADDRESS, observation.tick_spacing),
+                    deadline,
+                ),
+                description=(
+                    f"swap the entire {balance_units} raw {listing.symbol} balance for at "
+                    f"least {amount_out_min_units} raw USDC (quoted {expected_out_units})"
+                ),
+            )
+        )
+        self._record_exit_swap_plan(
+            mode,
+            listing.symbol,
+            observation,
+            balance_units,
+            price,
+            expected_out_units,
+            amount_out_min_units,
+            allowance_units,
+        )
+        built_steps = self._build_steps(steps, live_nonce, key_bytes, "exit_swap", mode)
+        report = LpExitSwapDryRunReport(
+            symbol=listing.symbol,
+            pool_address=observation.pool_address,
+            gauge_address=observation.gauge_address,
+            router_address=self._policy.router_address,
+            stock_token_address=stock_token,
+            snapshot_block=observation.snapshot_block,
+            price_usdc_per_stock=price,
+            stock_balance_units=balance_units,
+            amount_in_units=balance_units,
+            expected_out_units=expected_out_units,
+            amount_out_min_units=amount_out_min_units,
+            router_stock_allowance_units=allowance_units,
+            safe_address=self._safe_address,
+            relayer_address=normalize_evm_address(Account.from_key(key_bytes).address),
+            ephemeral_key=ephemeral_key,
+            gas_price_wei=gas_price,
+            safe_eth_wei=safe_eth,
+            transactions=tuple(step.report for step in built_steps),
+            caps_enforced=tuple(caps),
+            build_duration_ms=self._milliseconds_since(build_started),
+            diagnostics=(
+                (
+                    f"selling the Safe's entire {balance_units} raw {listing.symbol} "
+                    f"balance at the snapshot price {price} USDC per stock"
+                ),
+                (
+                    f"quoted {expected_out_units} raw USDC with a {amount_out_min_units} "
+                    f"raw minimum at the {tolerance} tolerance"
+                ),
+            ),
+        )
+        return report, built_steps
+
     def _dry_run_recenter(
         self,
         symbol: str,
@@ -2513,18 +2891,19 @@ class LpLifecycleExecutor:
             )
         position = context.position
         observation = context.observation
-        held_positions = self._read_word(
-            observation.nfpm_address,
-            self._erc20_balance_calldata(self._safe_address),
-            "NFPM balanceOf()",
-        )
-        allowed_held = 0 if context.staked else 1
-        if held_positions > allowed_held:
+        held = self._enumerate_held_positions(observation)
+        live_others = [
+            held_position.token_id
+            for held_position in held
+            if held_position.live and held_position.token_id != token_id
+        ]
+        if live_others:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS,
-                f"the Safe holds {held_positions} position NFT(s) on this NFPM beyond the one "
-                "being recentered, and no live position-value read exists yet, so the total "
-                "pilot exposure cap cannot be evaluated honestly; refuse until that read lands",
+                f"the Safe holds {len(live_others)} live untracked position NFT(s) "
+                f"(token ids {', '.join(str(token) for token in live_others)}) on this NFPM "
+                "beyond the one being recentered, so the total pilot exposure cap cannot "
+                "be evaluated honestly; refuse until they are reconciled or exited",
             )
         accrued_earned = 0
         if context.staked:
@@ -3202,6 +3581,106 @@ class LpLifecycleExecutor:
             f"the current price{width_line}"
         )
 
+    def safe_position_inventory(self, symbol: str) -> LpSafePositionsSnapshot:
+        """Enumerate every position NFT the Safe holds on one pool's NFPM.
+
+        The snapshot is read-only: registry and discovery gates run exactly as
+        every other surface, then the Safe's NFPM balance is enumerated token
+        by token with each position's live liquidity and owed fees. A
+        mid-enumeration revert refuses fail-closed rather than guessing at
+        the missing entries.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+
+        Returns:
+            The complete held-NFT snapshot; nothing was built or signed.
+
+        Raises:
+            LpExecutionRefusalError: If any registry, discovery, or
+                enumeration gate refuses.
+        """
+        try:
+            listing, observation, caps = self._observe_pool(symbol)
+            held = self._enumerate_held_positions(observation)
+            caps.append(
+                f"enumerated {len(held)} Safe-held NFT(s) on the NFPM "
+                f"({sum(1 for position in held if position.live)} live)"
+            )
+            return LpSafePositionsSnapshot(
+                symbol=listing.symbol,
+                pool_address=observation.pool_address,
+                nfpm_address=observation.nfpm_address,
+                positions=held,
+                snapshot_block=observation.snapshot_block,
+                observed_at=observation.observed_at,
+                caps_enforced=tuple(caps),
+                diagnostics=(
+                    (
+                        f"the Safe holds {len(held)} position NFT(s) on NFPM "
+                        f"{observation.nfpm_address}"
+                    ),
+                    (
+                        "live token ids: " + ", ".join(str(p.token_id) for p in held if p.live)
+                        if any(p.live for p in held)
+                        else "no live positions"
+                    ),
+                ),
+            )
+        except LpExecutionRefusalError as error:
+            self._record_refusal("inventory", ExecutionMode.DRY_RUN, error, symbol)
+            raise
+
+    def _enumerate_held_positions(
+        self, observation: LpPoolObservation
+    ) -> tuple[LpHeldPosition, ...]:
+        """Enumerate the Safe's held NFTs with their live exposure fields.
+
+        Args:
+            observation: The block-pinned pool observation naming the NFPM.
+
+        Returns:
+            Every Safe-held position NFT in enumeration order.
+
+        Raises:
+            LpExecutionRefusalError: If any enumeration read reverts, because
+                the held inventory cannot be established honestly.
+        """
+        try:
+            held_count = self._read_word(
+                observation.nfpm_address,
+                self._erc20_balance_calldata(self._safe_address),
+                "NFPM balanceOf()",
+            )
+            held: list[LpHeldPosition] = []
+            for index in range(held_count):
+                token_id = self._read_word(
+                    observation.nfpm_address,
+                    self._erc721_token_of_owner_by_index_calldata(self._safe_address, index),
+                    "tokenOfOwnerByIndex(address,uint256)",
+                )
+                view = decode_lp_positions_view(
+                    self._rpc.eth_call(
+                        observation.nfpm_address, build_lp_positions_read_calldata(token_id)
+                    )
+                )
+                held.append(
+                    LpHeldPosition(
+                        token_id=token_id,
+                        liquidity=view.liquidity,
+                        tokens_owed0_units=view.tokens_owed0_units,
+                        tokens_owed1_units=view.tokens_owed1_units,
+                    )
+                )
+        except (ExecutorRpcRevertError, ValueError) as error:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.ENUMERATION_UNREADABLE,
+                f"the Safe's held-position enumeration on NFPM "
+                f"{observation.nfpm_address} could not complete ({error}); the total "
+                "pilot exposure cannot be evaluated honestly, so the attempt refuses",
+            ) from error
+        return tuple(held)
+
     def _resolve_mint_context(self, symbol: str, width_spacings: int | None) -> _LpMintContext:
         """Resolve one mint to its observation, inventory, and shared gates.
 
@@ -3233,20 +3712,24 @@ class LpLifecycleExecutor:
         )
         stock_balance = self._rpc.fetch_token_balance(stock_token, self._safe_address)
         # The total-exposure cap stays honest by refusing once the Safe holds
-        # position NFTs this executor cannot yet value live.
-        held_positions = self._read_word(
-            observation.nfpm_address,
-            self._erc20_balance_calldata(self._safe_address),
-            "NFPM balanceOf()",
-        )
-        if held_positions > 0:
+        # LIVE untracked positions this executor cannot value; empty residual
+        # NFTs carry no exposure and no longer block entry.
+        held = self._enumerate_held_positions(observation)
+        live_untracked = [position.token_id for position in held if position.live]
+        if live_untracked:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS,
-                f"the Safe already holds {held_positions} position NFT(s) on this NFPM and no "
-                "live position-value read exists yet, so the total pilot exposure cap cannot "
-                "be evaluated honestly; refuse until that read lands",
+                f"the Safe holds {len(live_untracked)} live untracked position NFT(s) "
+                f"(token ids {', '.join(str(token) for token in live_untracked)}) on this "
+                "NFPM, so the total pilot exposure cap cannot be evaluated honestly; "
+                "refuse until they are reconciled or exited",
             )
-        caps.append("Safe holds no untracked position NFTs on this NFPM")
+        if held:
+            caps.append(
+                f"Safe holds {len(held)} empty residual NFT(s) on this NFPM carrying no exposure"
+            )
+        else:
+            caps.append("Safe holds no untracked position NFTs on this NFPM")
         inventory = SafeInventory(usdc_units=usdc_balance, stock_units=stock_balance)
         return _LpMintContext(listing, observation, inventory, width_spacings, caps)
 
@@ -4117,6 +4600,30 @@ class LpLifecycleExecutor:
         return "0x" + ERC721_OWNER_OF_SELECTOR + token_id.to_bytes(32, "big").hex()
 
     @staticmethod
+    def _erc721_token_of_owner_by_index_calldata(owner_address: str, index: int) -> str:
+        """Encode one ERC721 tokenOfOwnerByIndex read.
+
+        Args:
+            owner_address: The normalized account whose NFTs are enumerated.
+            index: The enumeration index being read.
+
+        Returns:
+            Complete 0x-prefixed tokenOfOwnerByIndex calldata.
+
+        Raises:
+            ValueError: If the index is negative.
+        """
+        if index < 0:
+            raise ValueError("index must be non-negative")
+        return (
+            "0x"
+            + ERC721_TOKEN_OF_OWNER_BY_INDEX_SELECTOR
+            + "0" * 24
+            + owner_address[2:]
+            + index.to_bytes(32, "big").hex()
+        )
+
+    @staticmethod
     def _erc721_is_approved_for_all_calldata(owner_address: str, operator_address: str) -> str:
         """Encode one ERC721 isApprovedForAll read.
 
@@ -4172,6 +4679,37 @@ class LpLifecycleExecutor:
                 swap_usdc_in_units=plan.balancing_swap.usdc_in_units,
                 swap_modeled_impact_fraction=plan.balancing_swap.modeled_impact_fraction,
                 caps_enforced=plan.caps_enforced,
+            ),
+            self._now(),
+        )
+
+    def _record_exit_swap_plan(
+        self,
+        mode: ExecutionMode,
+        symbol: str,
+        observation: LpPoolObservation,
+        balance_units: int,
+        price: Decimal,
+        expected_out_units: int,
+        amount_out_min_units: int,
+        allowance_units: int,
+    ) -> None:
+        """Append the exit-swap plan audit event when a sink is configured."""
+        if self._audit_sink is None:
+            return
+        self._audit_sink.append(
+            AuditEventType.LP_EXIT_SWAP_PLANNED,
+            LpExitSwapPlannedPayload(
+                mode=mode,
+                symbol=symbol,
+                pool_address=observation.pool_address,
+                router_address=self._policy.router_address,
+                snapshot_block=observation.snapshot_block,
+                stock_balance_units=balance_units,
+                price_usdc_per_stock=str(price),
+                expected_out_units=expected_out_units,
+                amount_out_min_units=amount_out_min_units,
+                router_stock_allowance_units=allowance_units,
             ),
             self._now(),
         )
@@ -4643,6 +5181,20 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
             "report rejection."
         ),
     )
+    dry_run_exit_swap_parser = dry_run_subparsers.add_parser(
+        "exit-swap",
+        help="Build and validate the stock-to-USDC exit swap; nothing is broadcast.",
+    )
+    _add_lp_symbol_arguments(dry_run_exit_swap_parser)
+    dry_run_exit_swap_parser.add_argument(
+        "--ephemeral-key",
+        action="store_true",
+        help=(
+            "Sign the dry run with a freshly generated throwaway key instead of "
+            "the configured signing-key source; the signature check will honestly "
+            "report rejection."
+        ),
+    )
     execute_parser = subparsers.add_parser(
         "execute",
         help=(
@@ -4667,6 +5219,26 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Half width in tick spacings per side; required for the mint.",
+    )
+    execute_exit_swap_parser = execute_subparsers.add_parser(
+        "exit-swap", help="Build and broadcast the stock-to-USDC exit swap."
+    )
+    _add_lp_symbol_arguments(execute_exit_swap_parser)
+    execute_exit_swap_parser.add_argument(
+        "--ephemeral-key",
+        action="store_true",
+        help=(
+            "Sign with a freshly generated throwaway key; the live signature "
+            "check will honestly reject it before anything broadcasts."
+        ),
+    )
+    execute_exit_swap_parser.add_argument(
+        "--confirm-broadcast",
+        action="store_true",
+        help=(
+            "Explicit operator confirmation to broadcast; without it the "
+            "command refuses before building anything."
+        ),
     )
     for lifecycle_parser in (
         execute_mint_parser,
@@ -4746,6 +5318,8 @@ def _print_execution_report(report: LpActionExecutionReport) -> None:
         _print_exit_dry_run(build)
     elif isinstance(build, LpCollectDryRunReport):
         _print_collect_dry_run(build)
+    elif isinstance(build, LpExitSwapDryRunReport):
+        _print_exit_swap_dry_run(build)
     for step in report.steps:
         line = (
             f"[{step.action}/{step.role.value}] Safe nonce {step.nonce}: "
@@ -4970,6 +5544,34 @@ def _print_collect_dry_run(report: LpCollectDryRunReport) -> None:
             _print_penalty(penalty)
     else:
         print(f"checkpointed fees {report.fees_owed0_units} + {report.fees_owed1_units} raw units")
+    print(
+        f"safe {report.safe_address}, relayer {report.relayer_address} ({key_note} key, "
+        "nothing broadcast)"
+    )
+    print(f"gas price {report.gas_price_wei} wei, Safe ETH {report.safe_eth_wei} wei")
+    for transaction in report.transactions:
+        _print_built_lp(f"[{transaction.role.value}]", transaction)
+    for line in report.diagnostics:
+        print(f"note: {line}")
+    print(f"build took {report.build_duration_ms} ms")
+
+
+def _print_exit_swap_dry_run(report: LpExitSwapDryRunReport) -> None:
+    """Print one exit-swap dry-run report's human summary.
+
+    Args:
+        report: The dry-run report being printed.
+    """
+    key_note = "ephemeral" if report.ephemeral_key else "configured source"
+    print(
+        f"{report.symbol} pool {report.pool_address} at block {report.snapshot_block}, "
+        f"stock {report.stock_token_address}"
+    )
+    print(
+        f"selling the entire {report.stock_balance_units} raw stock balance at "
+        f"{report.price_usdc_per_stock} USDC per stock: quoted "
+        f"{report.expected_out_units} raw USDC, minimum {report.amount_out_min_units}"
+    )
     print(
         f"safe {report.safe_address}, relayer {report.relayer_address} ({key_note} key, "
         "nothing broadcast)"
@@ -5218,6 +5820,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 _print_collect_dry_run(collect_report)
             return EXIT_OK
+        if arguments.command == "dry-run" and arguments.lifecycle == "exit-swap":
+            if arguments.ephemeral_key:
+                key_bytes = bytes(Account.create().key)
+                ephemeral = True
+            else:
+                key_bytes = load_signing_key_source().load_signing_key()
+                ephemeral = False
+            exit_swap_report = executor.dry_run_exit_swap(
+                arguments.symbol, key_bytes, ephemeral_key=ephemeral
+            )
+            if arguments.json:
+                print(exit_swap_report.model_dump_json(indent=2))
+            else:
+                _print_exit_swap_dry_run(exit_swap_report)
+            return EXIT_OK
         if arguments.command == "dry-run" and arguments.lifecycle == "recenter":
             if arguments.token_id < 0:
                 parser.error("--token-id must be non-negative")
@@ -5246,6 +5863,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if arguments.lifecycle == "mint":
                 if arguments.amount <= 0:
                     parser.error("--amount must be positive")
+            elif arguments.lifecycle == "exit-swap":
+                pass
             else:
                 if arguments.token_id < 0:
                     parser.error("--token-id must be non-negative")
@@ -5288,10 +5907,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     confirm_broadcast=arguments.confirm_broadcast,
                     ephemeral_key=ephemeral,
                 )
-            else:
+            elif arguments.lifecycle == "collect":
                 execution_report = executor.execute_collect(
                     arguments.symbol,
                     arguments.token_id,
+                    key_bytes,
+                    confirm_broadcast=arguments.confirm_broadcast,
+                    ephemeral_key=ephemeral,
+                )
+            else:
+                execution_report = executor.execute_exit_swap(
+                    arguments.symbol,
                     key_bytes,
                     confirm_broadcast=arguments.confirm_broadcast,
                     ephemeral_key=ephemeral,

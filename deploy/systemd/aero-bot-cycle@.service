@@ -1,0 +1,38 @@
+[Unit]
+Description=Aero Bot decision cycle (one reconcile-decide-act pass)
+Documentation=file:/opt/aero-bot/docs/cycle.md
+# The timer - never an in-process scheduler - decides when cycles run; the
+# service is a oneshot so a wedged cycle can never overlap a second one.
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/aero-bot/cycle.env
+
+[Service]
+Type=oneshot
+# The dedicated unprivileged service user owns the state, audit, and pin
+# files under /var/lib/aero-bot and nothing else on the host.
+User=aero-bot
+Group=aero-bot
+# Sealed environment: the 0600 file carries the signing-key source selection
+# and the public addresses; the key itself arrives through the sealed source
+# (AERO_BOT_SIGNING_KEY_HEX from a systemd credential, or the 0600 key file).
+EnvironmentFile=/etc/aero-bot/cycle.env
+# Hardening: the service sees only its own state tree and read-only system
+# paths; no new privileges, a tight umask, and a private /tmp.
+WorkingDirectory=/var/lib/aero-bot
+StateDirectory=aero-bot
+Environment=UMASK=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aero-bot
+# One cycle is bounded: reconciliation, decision, and at most one sequenced
+# action family; the executor's own bounded waits dominate the budget.
+TimeoutStartSec=1800
+# The JSON report lands in the journal for the smoke checklist and alerts.
+ExecStart=/opt/aero-bot/.venv/bin/aero-bot-cycle --symbol %i --json
+# A failed cycle exits nonzero and is visible through systemctl and the
+# email hook; it is never restarted automatically - the timer retries at
+# the next tick after reconciling.
+Restart=no

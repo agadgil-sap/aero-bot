@@ -99,6 +99,12 @@ The `aero-bot-decide` command runs one complete policy-engine verdict from live 
 Flat verdicts during closed-market event windows are the v1 doctrine working correctly, and the two honest input gaps (the unwired live reference quote and the zero fee APR) surface in every report's notes rather than hiding.
 See [the decision command documentation](docs/strategy.md) for the observation assembly, the flat-window doctrine, and the live proofs.
 
+## Cycle command
+
+The `aero-bot-cycle` command runs one scheduled decision cycle - reconcile on-chain state, run the locked policy engine, and execute the authorized action through the audited capped surfaces - then exits; a hardened systemd timer decides when cycles run.
+A crashed cycle reconciles toward chain truth and never double-acts, adopting a crashed entry only through the audit chain's own confirmed-mint evidence.
+See [the cycle command documentation](docs/cycle.md) for the fixed cycle order, the action mapping, the crash discipline, and the systemd wiring.
+
 ## Wallet-free transaction planning
 
 The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.

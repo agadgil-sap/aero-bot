@@ -28,6 +28,7 @@ from aero_bot.executor import (
     ExecutionUnavailableError,
     ExecutorRpcBackend,
     build_approval_calldata,
+    build_swap_path,
 )
 from aero_bot.history import price_usdc_per_stock
 from aero_bot.lp_calldata import (
@@ -43,6 +44,8 @@ from aero_bot.lp_calldata import (
     build_lp_mint_calldata,
 )
 from aero_bot.lp_executor import (
+    ERC721_TOKEN_OF_OWNER_BY_INDEX_SELECTOR,
+    NFPM_INCREASE_LIQUIDITY_TOPIC0,
     LpExecutionRefusalCode,
     LpExecutionRefusalError,
     LpExecutionRole,
@@ -324,7 +327,9 @@ class LpRpcScript:
         stock_balance_units: int = 0,
         nfpm_held_positions: int = 0,
         nfpm_balance_hex: str | None = None,
+        held_token_ids: list[int] | None = None,
         router_allowance_units: int = 0,
+        stock_router_allowance_units: int = 0,
         nfpm_usdc_allowance_units: int = 0,
         nfpm_stock_allowance_units: int = 0,
         owner_addresses: dict[int, str] | None = None,
@@ -375,7 +380,12 @@ class LpRpcScript:
             nfpm_held_positions: The Safe's NFPM position-NFT balanceOf answer.
             nfpm_balance_hex: Raw result served for that NFPM balanceOf read,
                 bypassing the held-positions word to script malformed returns.
+            held_token_ids: Token ids served by tokenOfOwnerByIndex in order;
+                an index past the list (or None with a positive balance)
+                reverts like an out-of-range enumeration.
             router_allowance_units: Standing USDC allowance for the router.
+            stock_router_allowance_units: Standing stock allowance for the
+                router, backing the exit-swap approval skip.
             nfpm_usdc_allowance_units: Standing USDC allowance for the NFPM.
             nfpm_stock_allowance_units: Standing stock allowance for the NFPM.
             owner_addresses: ownerOf answers keyed by token id; missing ids
@@ -447,7 +457,9 @@ class LpRpcScript:
         self.stock_balance_units = stock_balance_units
         self.nfpm_held_positions = nfpm_held_positions
         self.nfpm_balance_hex = nfpm_balance_hex
+        self.held_token_ids = held_token_ids
         self.router_allowance_units = router_allowance_units
+        self.stock_router_allowance_units = stock_router_allowance_units
         self.nfpm_usdc_allowance_units = nfpm_usdc_allowance_units
         self.nfpm_stock_allowance_units = nfpm_stock_allowance_units
         self.owner_addresses = owner_addresses if owner_addresses is not None else {}
@@ -565,6 +577,12 @@ class LpRpcScript:
                     return word_hex(self.nfpm_usdc_allowance_units)
             elif to_address == B20_ADDRESS and spender == NFPM_ADDRESS:
                 return word_hex(self.nfpm_stock_allowance_units)
+            elif (
+                to_address == B20_ADDRESS
+                and spender == AERODROME_ROUTER_ADDRESS
+                and data.startswith(f"0x{ERC20_ALLOWANCE_SELECTOR}")
+            ):
+                return word_hex(self.stock_router_allowance_units)
             raise AssertionError(f"unexpected allowance read to {to_address} for {spender}")
         if data.startswith(f"0x{ERC20_BALANCE_OF_SELECTOR}"):
             if to_address == usdc_token:
@@ -585,6 +603,11 @@ class LpRpcScript:
             if owner is None:
                 raise _ScriptedRevertError("ERC721: invalid token ID")
             return word_hex(int(owner, 16))
+        if data.startswith("0x2f745c59"):
+            index = int(data[2 + 8 + 64 : 2 + 8 + 128], 16)
+            if self.held_token_ids is None or index >= len(self.held_token_ids):
+                raise _ScriptedRevertError("ERC721: owner index out of range")
+            return word_hex(self.held_token_ids[index])
         if data.startswith("0xe985e9c5"):
             return word_hex(1 if self.operator_approved else 0)
         if data.startswith("0x99fbab88"):
@@ -1243,14 +1266,234 @@ def test_mint_refuses_without_an_explicit_width() -> None:
     assert "--width-ticks" in str(raised.value)
 
 
-def test_mint_refuses_untracked_existing_positions() -> None:
-    """A Safe holding position NFTs refuses entry fail-closed."""
-    executor, _, _ = make_lp_executor(rpc_script=LpRpcScript(nfpm_held_positions=2))
+def test_mint_refuses_live_untracked_positions() -> None:
+    """A Safe holding LIVE position NFTs refuses entry fail-closed."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            nfpm_held_positions=2,
+            held_token_ids=[900, 901],
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+        )
+    )
 
     with pytest.raises(LpExecutionRefusalError) as raised:
         executor.plan_mint("FIXc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS)
 
     assert raised.value.code is LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS
+    assert "900" in str(raised.value) and "901" in str(raised.value)
+
+
+def test_mint_allows_empty_residual_nfts() -> None:
+    """Empty residual NFTs carry no exposure and no longer block entry."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            nfpm_held_positions=1,
+            held_token_ids=[5_703_026],
+            position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+            router_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_usdc_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_stock_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 5),
+    )
+
+    report = executor.dry_run_mint(
+        "FIXc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS, bytes(Account.create().key)
+    )
+
+    assert any("empty residual" in cap for cap in report.caps_enforced)
+
+
+def test_enumeration_selectors_are_the_keccak_canonical_forms() -> None:
+    """The enumeration selector and mint topic are pinned to keccak itself."""
+    from eth_utils.crypto import keccak
+
+    assert (
+        "0x" + keccak(text="tokenOfOwnerByIndex(address,uint256)").hex()[:8]
+        == "0x" + ERC721_TOKEN_OF_OWNER_BY_INDEX_SELECTOR
+    )
+    assert (
+        "0x" + keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
+        == NFPM_INCREASE_LIQUIDITY_TOPIC0
+    )
+
+
+def test_safe_position_inventory_classifies_live_and_empty() -> None:
+    """The inventory snapshot separates live positions from empty residuals."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            nfpm_held_positions=2,
+            held_token_ids=[900, 901],
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+        )
+    )
+
+    snapshot = executor.safe_position_inventory("FIXc")
+
+    assert [position.token_id for position in snapshot.live_positions] == [900, 901]
+    assert snapshot.empty_count == 0
+
+    empty_executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            nfpm_held_positions=1,
+            held_token_ids=[5_703_026],
+            position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+        )
+    )
+    empty_snapshot = empty_executor.safe_position_inventory("FIXc")
+    assert empty_snapshot.live_positions == ()
+    assert empty_snapshot.empty_count == 1
+
+
+def test_safe_position_inventory_refuses_when_enumeration_reverts() -> None:
+    """A mid-enumeration revert refuses fail-closed as unreadable."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(nfpm_held_positions=1, held_token_ids=None)
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.safe_position_inventory("FIXc")
+
+    assert raised.value.code is LpExecutionRefusalCode.ENUMERATION_UNREADABLE
+
+
+def fixture_expected_exit_out_units(stock_whole: Decimal) -> int:
+    """Floor the fixture exit swap's quoted USDC output for whole stock."""
+    price = price_usdc_per_stock(LP_SQRT_RATIO, False, STOCK_DECIMALS, 6)
+    return int((stock_whole * price * Decimal(10) ** 6).to_integral_value(rounding=ROUND_FLOOR))
+
+
+def test_exit_swap_dry_run_builds_approval_and_reverse_swap() -> None:
+    """The exit swap sells the entire stock balance through the router."""
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            stock_balance_units=5 * 10**7,
+            stock_router_allowance_units=0,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+    )
+
+    report = executor.dry_run_exit_swap("FIXc", bytes(Account.create().key))
+
+    assert report.stock_balance_units == 5 * 10**7
+    expected_out = fixture_expected_exit_out_units(Decimal("0.5"))
+    assert report.expected_out_units == expected_out
+    assert report.amount_out_min_units == int(Decimal(expected_out) * Decimal("0.99"))
+    assert [transaction.role for transaction in report.transactions] == [
+        LpExecutionRole.STOCK_ROUTER_ALLOWANCE,
+        LpExecutionRole.EXIT_SWAP,
+    ]
+    # The estimate requests carry the built inner calls: the swap's exact
+    # input is the entire stock balance and its path runs stock -> USDC, the
+    # reverse of every balancing swap.
+    inner_calls = [decode_inner(calldata) for calldata in rpc_script.estimate_requests]
+    assert "0x" + inner_calls[0].hex() == build_approval_calldata(
+        AERODROME_ROUTER_ADDRESS, 5 * 10**7
+    )
+    commands, inputs, deadline = decode(["bytes", "bytes[]", "uint256"], inner_calls[1][4:])
+    recipient, amount_in, minimum, path, _, _ = decode(
+        ["address", "uint256", "uint256", "bytes", "bool", "uint256"], inputs[0]
+    )
+    assert commands == b"\x00"
+    assert deadline == fixture_deadline()
+    assert recipient == SAFE_ADDRESS
+    assert amount_in == 5 * 10**7
+    assert minimum == int(Decimal(expected_out) * Decimal("0.99"))
+    assert path == bytes.fromhex(
+        build_swap_path(B20_ADDRESS, BASE_USDC_ADDRESS, LP_TICK_SPACING)[2:]
+    )
+
+
+def test_exit_swap_skips_approval_when_allowance_suffices() -> None:
+    """A sufficient standing stock allowance collapses to the bare swap."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            stock_balance_units=5 * 10**7,
+            stock_router_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 2),
+    )
+
+    report = executor.dry_run_exit_swap("FIXc", bytes(Account.create().key))
+
+    assert [transaction.role for transaction in report.transactions] == [LpExecutionRole.EXIT_SWAP]
+    assert report.router_stock_allowance_units == SATISFIED_ALLOWANCE_UNITS
+
+
+def test_exit_swap_refuses_a_zero_stock_balance() -> None:
+    """Nothing to sell refuses before any preflight or build."""
+    executor, _, _ = make_lp_executor(rpc_script=LpRpcScript(stock_balance_units=0))
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_exit_swap("FIXc", bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.STOCK_BALANCE_ZERO
+
+
+def test_exit_swap_refuses_output_above_the_per_pool_cap() -> None:
+    """An out-of-band inventory quoting past the pilot cap refuses."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(stock_balance_units=200 * 10**STOCK_DECIMALS)
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_exit_swap("FIXc", bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.EXIT_OUTPUT_ABOVE_POOL_CAP
+
+
+def test_execute_exit_swap_broadcasts_both_steps(tmp_path: Path) -> None:
+    """A confirmed exit swap broadcasts approval then swap, audited."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=LpRpcScript(
+            stock_balance_units=5 * 10**7,
+            stock_router_allowance_units=0,
+            allow_broadcasts=True,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+    )
+
+    report = executor.execute_exit_swap("FIXc", bytes(Account.create().key), confirm_broadcast=True)
+
+    assert report.completed is True
+    assert [step.role for step in report.steps] == [
+        LpExecutionRole.STOCK_ROUTER_ALLOWANCE,
+        LpExecutionRole.EXIT_SWAP,
+    ]
+    assert [step.nonce for step in report.steps] == [4, 5]
+    assert len(rpc_script.broadcasts) == 2
+    records = AuditStore(audit_path).read_records(100)
+    assert [record.event_type for record in records] == [
+        AuditEventType.LP_EXIT_SWAP_PLANNED,
+        AuditEventType.LP_TRANSACTION_BUILT,
+        AuditEventType.LP_TRANSACTION_BUILT,
+        AuditEventType.LP_EXECUTE_SENT,
+        AuditEventType.LP_EXECUTE_CONFIRMED,
+        AuditEventType.LP_EXECUTE_SENT,
+        AuditEventType.LP_EXECUTE_CONFIRMED,
+    ]
+    planned = json.loads(records[0].payload_json)
+    assert planned["symbol"] == "FIXc"
+    assert planned["stock_balance_units"] == 5 * 10**7
+
+
+def test_execute_exit_swap_refuses_without_confirmation(tmp_path: Path) -> None:
+    """The exit swap refuses to broadcast without the explicit flag."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=LpRpcScript(stock_balance_units=2 * 10**STOCK_DECIMALS),
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.execute_exit_swap("FIXc", bytes(Account.create().key), confirm_broadcast=False)
+
+    assert raised.value.code is LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING
+    assert rpc_script.broadcasts == []
+    records = AuditStore(audit_path).read_records(100)
+    assert [record.event_type for record in records] == [AuditEventType.LP_REFUSED]
 
 
 def test_mint_refuses_a_multi_tranche_balancing_swap() -> None:
@@ -1869,6 +2112,7 @@ def test_dry_run_recenter_unstaked_skips_the_withdraw() -> None:
         rpc_script=LpRpcScript(
             owner_addresses={77: SAFE_ADDRESS},
             nfpm_held_positions=1,
+            held_token_ids=[77],
             position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
             router_allowance_units=SATISFIED_ALLOWANCE_UNITS,
             nfpm_usdc_allowance_units=SATISFIED_ALLOWANCE_UNITS,
@@ -1940,12 +2184,13 @@ def test_dry_run_recenter_refuses_without_an_explicit_width() -> None:
     assert raised.value.code is LpExecutionRefusalCode.DERIVED_WIDTH_UNAVAILABLE
 
 
-def test_dry_run_recenter_refuses_extra_held_positions() -> None:
-    """Untracked NFTs beside the recentered one refuse the total cap."""
+def test_dry_run_recenter_refuses_extra_live_held_positions() -> None:
+    """Live untracked NFTs beside the recentered one refuse the total cap."""
     executor, _, _ = make_lp_executor(
         rpc_script=LpRpcScript(
             owner_addresses={77: SAFE_ADDRESS},
             nfpm_held_positions=2,
+            held_token_ids=[77, 900],
             position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
         )
     )
@@ -1964,6 +2209,7 @@ def test_dry_run_recenter_surfaces_planner_cap_refusals() -> None:
         rpc_script=LpRpcScript(
             owner_addresses={77: SAFE_ADDRESS},
             nfpm_held_positions=1,
+            held_token_ids=[77],
             position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
         )
     )
@@ -3136,6 +3382,52 @@ def test_cli_execute_refuses_without_the_confirmation_flag(
                 "--ephemeral-key",
             ]
         )
+
+    assert exit_code == EXIT_REFUSED
+    assert "refused [broadcast_confirmation_missing]" in capsys.readouterr().err
+
+
+def test_cli_dry_run_exit_swap_prints_the_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The dry-run exit-swap CLI path builds and prints its report."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            stock_balance_units=5 * 10**7,
+            stock_router_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 2),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(["dry-run", "exit-swap", "--symbol", "FIXc", "--ephemeral-key"])
+
+    assert exit_code == EXIT_OK
+    output = capsys.readouterr().out
+    assert "nothing broadcast" in output
+    assert "selling the entire" in output
+
+
+def test_cli_execute_exit_swap_refuses_without_the_confirmation_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The execute exit-swap CLI refuses with exit two unless flagged."""
+    executor, _, _ = make_lp_executor(rpc_script=LpRpcScript(stock_balance_units=5 * 10**7))
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(["execute", "exit-swap", "--symbol", "FIXc", "--ephemeral-key"])
 
     assert exit_code == EXIT_REFUSED
     assert "refused [broadcast_confirmation_missing]" in capsys.readouterr().err

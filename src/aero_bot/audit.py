@@ -117,8 +117,12 @@ class AuditEventType(StrEnum):
     LP_EXECUTE_CONFIRMED = "lp_execute_confirmed"
     # LP execute failed captures one included LP delivery that reverted.
     LP_EXECUTE_FAILED = "lp_execute_failed"
+    # One exit swap converting the Safe's stock inventory back to USDC.
+    LP_EXIT_SWAP_PLANNED = "lp_exit_swap_planned"
     # System state captures startup, migration, and diagnostic events without secrets.
     SYSTEM_STATE = "system_state"
+    # One scheduled cycle's complete reconcile-decide-act summary.
+    CYCLE_REPORTED = "cycle_reported"
 
 
 class AuditVerificationStatus(StrEnum):
@@ -355,24 +359,29 @@ class AuditStore:
             record_hash=record_hash,
         )
 
-    def read_records(self, limit: int = 100) -> tuple[AuditRecord, ...]:
-        """Read a bounded ascending prefix of immutable audit records.
+    def read_records(self, limit: int = 100, *, offset: int = 0) -> tuple[AuditRecord, ...]:
+        """Read a bounded ascending window of immutable audit records.
 
         Args:
-            limit: Positive maximum number of oldest records to return.
+            limit: Positive maximum number of records to return.
+            offset: Non-negative number of leading records to skip, backing
+                complete-chain pagination for reconciliation readers.
 
         Returns:
             Immutable records ordered by contiguous sequence.
 
         Raises:
-            ValueError: If limit falls outside the safe read boundary.
+            ValueError: If limit or offset falls outside the safe boundary.
         """
         if limit < 1 or limit > MAX_RECORDS_PER_READ:
             raise ValueError(f"limit must be between 1 and {MAX_RECORDS_PER_READ}")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
         with closing(self._connect()) as connection:
             # Parameterized limit retains a bounded query without interpolated SQL text.
             rows = connection.execute(
-                "SELECT * FROM audit_records ORDER BY sequence ASC LIMIT ?", (limit,)
+                "SELECT * FROM audit_records ORDER BY sequence ASC LIMIT ? OFFSET ?",
+                (limit, offset),
             ).fetchall()
         # Each row is validated into an immutable public model before leaving the store.
         return tuple(self._record_from_row(row) for row in rows)
