@@ -55,7 +55,9 @@ Delivery transactions are type-2 EOA transactions whose both fee parameters sit 
 The relaying EOA, not the Safe, pays the delivery gas, and the attempt refuses if the EOA cannot afford the buffered gas cost.
 If the base fee rises above the capped price after signing, the transaction simply cannot be included and the bounded receipt wait fails closed instead of overpaying.
 
-## Keychain setup
+## Signing-key setup
+
+### macOS Keychain (default on macOS)
 
 The signing key is the bot EOA owner of the Safe (`0x0c49cc4D53423CCd6be2Bcf115a25F418649C5C9`).
 Store it once in the macOS Keychain:
@@ -69,6 +71,22 @@ The existing canary item uses service `bot-signing-key` and account `aero-bot`.
 The code defaults remain `aero-bot` and `bot-key`, so canary commands must set `AERO_BOT_KEYCHAIN_SERVICE=bot-signing-key` and `AERO_BOT_KEYCHAIN_ACCOUNT=aero-bot` as shown below.
 The keychain module reads the secret at runtime through the absolute `/usr/bin/security` tool path, never logs or caches it, and reports only the derived public address.
 A missing item, an empty secret, a non-hex secret, and the all-zero placeholder each fail closed with distinct diagnostics.
+
+### Linux: sealed environment variable or owner-only key file
+
+`aero_bot.signing_key` carries the same discipline to Linux deployments through two sealed sources, selected with the same environment mechanism (`aero_bot.keychain` stays the macOS default):
+
+- `AERO_BOT_KEY_SOURCE=env` reads the 64-character hexadecimal key (leading `0x` optional) from `AERO_BOT_SIGNING_KEY_HEX`. The variable must be sealed by the process supervisor - a mode-0600 `EnvironmentFile=` or a systemd credential - never exported by a shell profile, never committed, never logged. Errors quote only the variable name and the stored length, never the value.
+- `AERO_BOT_KEY_SOURCE=file` reads the key from an owner-only regular file: `AERO_BOT_SIGNING_KEY_FILE` overrides the default `~/.config/aero-bot/signing-key.hex`. The file must carry mode 0600 or stricter; any group or other permission bit refuses before a single key byte is read, with the exact `chmod 600` remedy quoted. Set it up with:
+
+  ```bash
+  mkdir -p ~/.config/aero-bot
+  umask 077
+  printf '%s\n' 'PASTE-64-CHARACTER-HEX-KEY' > ~/.config/aero-bot/signing-key.hex
+  chmod 600 ~/.config/aero-bot/signing-key.hex
+  ```
+
+With `AERO_BOT_KEY_SOURCE` unset, macOS defaults to the Keychain and every other platform prefers the sealed variable when present, falling back to the key file - so a systemd deployment that seals either one needs no selector at all. Both sources report only the derived public address, hold key bytes only in the return value of one `load_signing_key` call, and refuse the all-zero placeholder exactly like the Keychain source. The Ubuntu deployment kit documents the systemd wiring of these variables.
 
 The relayer EOA `0x0c49cc4D53423CCd6be2Bcf115a25F418649C5C9` pays delivery gas.
 Its live balance was verified as 0.001 ETH on 2026-09-07, which is ample for the first capped canary at the observed gas price.
