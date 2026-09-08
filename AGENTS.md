@@ -11,9 +11,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - The LP execution layer's contracts, caps, refusal catalog, and live evidence live in `docs/lp_execution.md`; the swap executor's in `docs/execution.md`.
 - Aerodrome's displayed emissions APR is the current-cell staked-value convention shared by runtime and rehearsal in `src/aero_bot/emissions_apr.py`; the derivation and live cross-checks are documented in `docs/lp_execution.md` under "Position status and Aerodrome's displayed emissions APR".
 - Live Base reads use the app settings' public RPC; heavy sweeps (Sugar discovery ~3 min, rehearsal price paths) get rate-limited - space them out and expect 429 backoff.
-- Real signing keys live in the macOS Keychain (`AERO_BOT_KEYCHAIN_SERVICE`/`AERO_BOT_KEYCHAIN_ACCOUNT`); never print or persist key material - public addresses only.
+- Real signing keys live in the macOS Keychain (`AERO_BOT_KEYCHAIN_SERVICE`/`AERO_BOT_KEYCHAIN_ACCOUNT`) on dev machines and in sealed sources on Linux (`AERO_BOT_KEY_SOURCE` selecting keychain/env/file - see `src/aero_bot/signing_key.py`); never print or persist key material - public addresses only.
 - `run/` and `data/` hold campaign artifacts: `data/aero-bot-lp-canary-campaign/timing-report.md` is the canonical canary evidence.
-- The canary's residual empty NFT 5703026 sits at the Safe and refuses every `execute mint` (`untracked_existing_positions`) until a burn path ships (recenter is dry-run-only); `data/aero-bot-live-cycle-2/report.md` documents the blocked 2026-09-08 cycle and the read-only evidence.
+- The scheduled loop is `aero-bot-cycle` (`docs/cycle.md`): reconcile-decide-act per run, the systemd timer decides when; the empty residual NFT 5703026 no longer blocks entry (only LIVE untracked positions refuse), and exits close through `execute exit-swap`.
+- The deployed surfaces: cycle + alerts (`docs/alerts.md`), encrypted daily audit backup (`docs/audit-backup.md`), and the Ubuntu kit (`deploy/install.sh`, `docs/deployment.md` - the installer never arms a timer; Phase 2 does).
 
 ## Maintaining this file
 

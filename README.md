@@ -169,3 +169,9 @@ Every read-only simulation response is persisted with its submitted unsigned pla
 Every capped swap attempt persists its quote, each fully built Safe transaction, each broadcast submission, and each inclusion receipt before the command reports, with no key material in any event.
 See [the audit log design](docs/audit-log.md) for guarantees, limitations, and integration status.
 The chain leaves the host daily as an encrypted bundle on a private git branch through a deploy key; see [the audit backup documentation](docs/audit-backup.md) for the verify-export-encrypt-push order and the sealed configuration.
+
+## Ubuntu deployment
+
+The complete kit for the $0-tier always-on Linux VM ships in `deploy/`: an idempotent installer (uv, the dedicated service user, the locked venv, sealed environment templates at 0600/0640, every systemd unit, ufw with OpenSSH-only before enable, unattended-upgrades) plus the docs - and it never arms a timer: Phase 2 seals the secrets, funds the Safe, walks the ten-line smoke checklist, and verifies one live micro-cycle before the captain leaves.
+The repo stays loopback-only; the operator reaches the dashboard through an SSH tunnel.
+See [the deployment guide](docs/deployment.md) for the install, the secrets discipline, the arming steps, the smoke checklist, and the day-two runbook.
