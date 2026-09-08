@@ -61,3 +61,8 @@ A `hold (event_window_flat)` inside a market open/close window, the condition-dr
 - The JSON report lands in the journal: `journalctl -u aero-bot-cycle@AAPLc.service`.
 
 See `docs/deployment.md` (the deployment kit) for the full Ubuntu install and smoke checklist.
+
+## Email alerts
+
+Every cycle can email its summary and its alerts - position state, P&L vs entry, gas and balance floors (relayer ETH, Safe USDC), and any refusal, failure, or out-of-band condition - through a provider-agnostic SMTP transport or a Resend-style HTTP adapter, with credentials sealed in the environment and a delivery failure that never crashes the cycle.
+See [the alerts documentation](docs/alerts.md) for the configuration table, the alert semantics, and the wiring.

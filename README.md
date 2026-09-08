@@ -104,6 +104,7 @@ See [the decision command documentation](docs/strategy.md) for the observation a
 The `aero-bot-cycle` command runs one scheduled decision cycle - reconcile on-chain state, run the locked policy engine, and execute the authorized action through the audited capped surfaces - then exits; a hardened systemd timer decides when cycles run.
 A crashed cycle reconciles toward chain truth and never double-acts, adopting a crashed entry only through the audit chain's own confirmed-mint evidence.
 See [the cycle command documentation](docs/cycle.md) for the fixed cycle order, the action mapping, the crash discipline, and the systemd wiring.
+Each cycle can email its summary and alerts through a sealed-credential SMTP or Resend-style transport; see [the alerts documentation](docs/alerts.md) for the configuration and semantics.
 
 ## Wallet-free transaction planning
 
