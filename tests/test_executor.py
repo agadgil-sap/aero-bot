@@ -1384,29 +1384,25 @@ def test_cli_dry_run_uses_an_ephemeral_key_without_the_keychain(
         patch("aero_bot.executor.ExecutorRpcBackend"),
         patch("aero_bot.executor.SafeTransactionRpcBackend"),
         patch("aero_bot.executor.SwapExecutor", return_value=executor),
-        patch("aero_bot.executor.KeychainKeySource") as keychain,
+        patch("aero_bot.executor.load_signing_key_source") as key_source,
     ):
         exit_code = main(["dry-run", "--symbol", "FIXc", "--amount", "1", "--ephemeral-key"])
 
     assert exit_code == EXIT_OK
-    keychain.from_environment.assert_not_called()
+    key_source.assert_not_called()
     output = capsys.readouterr().out
     assert "ephemeral" in output
     assert "nothing broadcast" in output
 
 
-def test_cli_dry_run_defaults_to_the_keychain_key(
+def test_cli_dry_run_defaults_to_the_configured_key_source(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A dry run without the flag reads the Keychain key and says so."""
+    """A dry run without the flag reads the configured key source and says so."""
     account = Account.create()
     executor, _, _ = make_executor()
 
-    class FakeKeychain:
-        @classmethod
-        def from_environment(cls) -> "FakeKeychain":
-            return cls()
-
+    class FakeKeySource:
         def load_signing_key(self) -> bytes:
             return bytes(account.key)
 
@@ -1417,12 +1413,15 @@ def test_cli_dry_run_defaults_to_the_keychain_key(
         patch("aero_bot.executor.ExecutorRpcBackend"),
         patch("aero_bot.executor.SafeTransactionRpcBackend"),
         patch("aero_bot.executor.SwapExecutor", return_value=executor),
-        patch("aero_bot.executor.KeychainKeySource", FakeKeychain),
+        patch(
+            "aero_bot.executor.load_signing_key_source",
+            return_value=FakeKeySource(),
+        ),
     ):
         exit_code = main(["dry-run", "--symbol", "FIXc", "--amount", "1"])
 
     assert exit_code == EXIT_OK
-    assert "Keychain key" in capsys.readouterr().out
+    assert "configured source key" in capsys.readouterr().out
 
 
 def test_cli_dry_run_prints_the_bounded_approval_sequence(
@@ -1455,11 +1454,7 @@ def test_cli_json_flag_prints_every_typed_model(
     """Both dry-run and execute --json print their complete typed models."""
     account = Account.create()
 
-    class FakeKeychain:
-        @classmethod
-        def from_environment(cls) -> "FakeKeychain":
-            return cls()
-
+    class FakeKeySource:
         def load_signing_key(self) -> bytes:
             return bytes(account.key)
 
@@ -1481,7 +1476,10 @@ def test_cli_json_flag_prints_every_typed_model(
             patch("aero_bot.executor.ExecutorRpcBackend"),
             patch("aero_bot.executor.SafeTransactionRpcBackend"),
             patch("aero_bot.executor.SwapExecutor", return_value=executor),
-            patch("aero_bot.executor.KeychainKeySource", FakeKeychain),
+            patch(
+                "aero_bot.executor.load_signing_key_source",
+                return_value=FakeKeySource(),
+            ),
         ):
             exit_code = main([command, *arguments])
         assert exit_code == EXIT_OK
@@ -1500,11 +1498,7 @@ def test_cli_execute_prints_the_failed_approval_diagnostic(
         safe_script=SafeRpcScript(nonce_reads=[4, 4], signature_verdicts=[True, True]),
     )
 
-    class FakeKeychain:
-        @classmethod
-        def from_environment(cls) -> "FakeKeychain":
-            return cls()
-
+    class FakeKeySource:
         def load_signing_key(self) -> bytes:
             return bytes(account.key)
 
@@ -1515,7 +1509,10 @@ def test_cli_execute_prints_the_failed_approval_diagnostic(
         patch("aero_bot.executor.ExecutorRpcBackend"),
         patch("aero_bot.executor.SafeTransactionRpcBackend"),
         patch("aero_bot.executor.SwapExecutor", return_value=executor),
-        patch("aero_bot.executor.KeychainKeySource", FakeKeychain),
+        patch(
+            "aero_bot.executor.load_signing_key_source",
+            return_value=FakeKeySource(),
+        ),
     ):
         exit_code = main(["execute", "--symbol", "FIXc", "--amount", "1", "--confirm-broadcast"])
 
@@ -1553,7 +1550,7 @@ def test_cli_execute_refuses_without_the_confirmation_flag(
         patch("aero_bot.executor.ExecutorRpcBackend"),
         patch("aero_bot.executor.SafeTransactionRpcBackend"),
         patch("aero_bot.executor.SwapExecutor") as executor_factory,
-        patch("aero_bot.executor.KeychainKeySource") as keychain,
+        patch("aero_bot.executor.load_signing_key_source") as key_source,
     ):
         exit_code = main(["execute", "--symbol", "FIXc", "--amount", "1"])
 
@@ -1561,24 +1558,20 @@ def test_cli_execute_refuses_without_the_confirmation_flag(
     assert "--confirm-broadcast" in capsys.readouterr().err
     # The wired executor was never asked to broadcast anything.
     executor_factory.return_value.execute.assert_not_called()
-    keychain.from_environment.assert_not_called()
+    key_source.assert_not_called()
 
 
-def test_cli_execute_confirmed_broadcast_uses_the_keychain_key(
+def test_cli_execute_confirmed_broadcast_uses_the_configured_key_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Execute with the flag reads the Keychain key and threads the Safe."""
+    """Execute with the flag reads the configured key source and threads the Safe."""
     account = Account.create()
     executor, _, _ = make_executor(
         rpc_script=ExecutorRpcScript(receipts=[make_receipt(logs=[make_swap_log()])]),
         safe_script=SafeRpcScript(nonce_reads=[4, 4], signature_verdicts=[True]),
     )
 
-    class FakeKeychain:
-        @classmethod
-        def from_environment(cls) -> "FakeKeychain":
-            return cls()
-
+    class FakeKeySource:
         def load_signing_key(self) -> bytes:
             return bytes(account.key)
 
@@ -1590,7 +1583,10 @@ def test_cli_execute_confirmed_broadcast_uses_the_keychain_key(
         patch("aero_bot.executor.ExecutorRpcBackend"),
         patch("aero_bot.executor.SafeTransactionRpcBackend") as safe_backend_factory,
         patch("aero_bot.executor.SwapExecutor", return_value=executor) as factory,
-        patch("aero_bot.executor.KeychainKeySource", FakeKeychain),
+        patch(
+            "aero_bot.executor.load_signing_key_source",
+            return_value=FakeKeySource(),
+        ),
     ):
         exit_code = main(["execute", "--symbol", "FIXc", "--amount", "1", "--confirm-broadcast"])
 
@@ -1609,11 +1605,7 @@ def test_cli_execute_without_the_override_targets_the_canary_safe(
     """The default Safe is the canary deployment when no override is set."""
     account = Account.create()
 
-    class FakeKeychain:
-        @classmethod
-        def from_environment(cls) -> "FakeKeychain":
-            return cls()
-
+    class FakeKeySource:
         def load_signing_key(self) -> bytes:
             return bytes(account.key)
 
@@ -1629,7 +1621,10 @@ def test_cli_execute_without_the_override_targets_the_canary_safe(
         patch("aero_bot.executor.ExecutorRpcBackend"),
         patch("aero_bot.executor.SafeTransactionRpcBackend") as safe_backend_factory,
         patch("aero_bot.executor.SwapExecutor", return_value=executor),
-        patch("aero_bot.executor.KeychainKeySource", FakeKeychain),
+        patch(
+            "aero_bot.executor.load_signing_key_source",
+            return_value=FakeKeySource(),
+        ),
     ):
         main(["execute", "--symbol", "FIXc", "--amount", "1", "--confirm-broadcast"])
 

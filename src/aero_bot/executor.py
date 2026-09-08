@@ -51,7 +51,6 @@ from aero_bot.history import (
     decode_swap_log,
     price_usdc_per_stock,
 )
-from aero_bot.keychain import KeychainKeySource
 from aero_bot.registry import B20RegistryResult, RegistryStatus, load_official_b20_registry
 from aero_bot.safe_tx import (
     BuiltSafeTransaction,
@@ -64,6 +63,7 @@ from aero_bot.safe_tx import (
     ensure_usable_nonce,
     sign_safe_tx_hash,
 )
+from aero_bot.signing_key import load_signing_key_source
 from aero_bot.sugar import DEFAULT_BASE_RPC_URL, LP_SUGAR_ADDRESS, LpSugarRpcBackend
 from aero_bot.venues import (
     AERO_TOKEN_ADDRESS,
@@ -2353,7 +2353,8 @@ def build_swap_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Sign the dry run with a freshly generated throwaway key instead of "
-            "the Keychain key; the signature check will honestly report rejection."
+            "the configured signing-key source; the signature check will honestly "
+            "report rejection."
         ),
     )
     execute_parser = subparsers.add_parser(
@@ -2418,7 +2419,7 @@ def _print_dry_run(report: DryRunReport) -> None:
         report: The dry-run report being printed.
     """
     _print_quote(report.quote)
-    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    key_note = "ephemeral" if report.ephemeral_key else "configured source"
     print(
         f"safe {report.safe_address}, relayer {report.relayer_address} ({key_note} key, "
         "nothing broadcast)"
@@ -2481,7 +2482,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     The RPC endpoint, Sugar address, and audit database come from the
     application settings, the Safe address defaults to the canary deployment
     behind ``AERO_BOT_SAFE_ADDRESS``, and the signing key comes from the
-    macOS Keychain or the dry run's explicit ephemeral flag.
+    platform key source (macOS Keychain, sealed environment variable, or
+    owner-only key file - see ``aero_bot.signing_key``) or the dry run's
+    explicit ephemeral flag.
 
     Args:
         argv: Command-line arguments; None reads sys.argv.
@@ -2528,7 +2531,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 key_bytes = bytes(Account.create().key)
                 ephemeral = True
             else:
-                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                key_bytes = load_signing_key_source().load_signing_key()
                 ephemeral = False
             report = executor.dry_run(
                 arguments.symbol, arguments.amount, key_bytes, ephemeral_key=ephemeral
@@ -2545,7 +2548,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return EXIT_REFUSED
-        key_bytes = KeychainKeySource.from_environment().load_signing_key()
+        key_bytes = load_signing_key_source().load_signing_key()
         outcome = executor.execute(arguments.symbol, arguments.amount, key_bytes)
         if arguments.json:
             print(outcome.model_dump_json(indent=2))

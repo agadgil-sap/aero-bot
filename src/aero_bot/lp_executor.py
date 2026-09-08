@@ -82,7 +82,6 @@ from aero_bot.executor import (
     build_swap_path,
     usdc_units,
 )
-from aero_bot.keychain import KeychainKeySource
 from aero_bot.lp_calldata import (
     MAX_UINT128,
     LpCollectParams,
@@ -147,6 +146,7 @@ from aero_bot.safe_tx import (
     build_safe_transaction,
     sign_safe_tx_hash,
 )
+from aero_bot.signing_key import load_signing_key_source
 from aero_bot.venues import BASE_USDC_ADDRESS, PoolDiscoveryStatus
 
 # keccak256("ownerOf(uint256)")[0:4], the ERC721 ownership read.
@@ -4524,7 +4524,8 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Sign the dry run with a freshly generated throwaway key instead of "
-            "the Keychain key; the signature check will honestly report rejection."
+            "the configured signing-key source; the signature check will honestly "
+            "report rejection."
         ),
     )
     dry_run_stake_parser = dry_run_subparsers.add_parser(
@@ -4543,7 +4544,8 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Sign the dry run with a freshly generated throwaway key instead of "
-            "the Keychain key; the signature check will honestly report rejection."
+            "the configured signing-key source; the signature check will honestly "
+            "report rejection."
         ),
     )
     dry_run_unstake_parser = dry_run_subparsers.add_parser(
@@ -4562,7 +4564,8 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Sign the dry run with a freshly generated throwaway key instead of "
-            "the Keychain key; the signature check will honestly report rejection."
+            "the configured signing-key source; the signature check will honestly "
+            "report rejection."
         ),
     )
     dry_run_withdraw_parser = dry_run_subparsers.add_parser(
@@ -4581,7 +4584,8 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Sign the dry run with a freshly generated throwaway key instead of "
-            "the Keychain key; the signature check will honestly report rejection."
+            "the configured signing-key source; the signature check will honestly "
+            "report rejection."
         ),
     )
     dry_run_collect_parser = dry_run_subparsers.add_parser(
@@ -4600,7 +4604,8 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Sign the dry run with a freshly generated throwaway key instead of "
-            "the Keychain key; the signature check will honestly report rejection."
+            "the configured signing-key source; the signature check will honestly "
+            "report rejection."
         ),
     )
     dry_run_recenter_parser = dry_run_subparsers.add_parser(
@@ -4634,7 +4639,8 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Sign the dry run with a freshly generated throwaway key instead of "
-            "the Keychain key; the signature check will honestly report rejection."
+            "the configured signing-key source; the signature check will honestly "
+            "report rejection."
         ),
     )
     execute_parser = subparsers.add_parser(
@@ -4813,7 +4819,7 @@ def _print_mint_dry_run(report: LpMintDryRunReport) -> None:
         report: The dry-run report being printed.
     """
     _print_lp_plan(report.plan)
-    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    key_note = "ephemeral" if report.ephemeral_key else "configured source"
     print(
         f"safe {report.safe_address}, relayer {report.relayer_address} ({key_note} key, "
         "nothing broadcast)"
@@ -4834,7 +4840,7 @@ def _print_stake_dry_run(report: LpStakeDryRunReport) -> None:
     Args:
         report: The dry-run report being printed.
     """
-    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    key_note = "ephemeral" if report.ephemeral_key else "configured source"
     print(
         f"{report.symbol} pool {report.pool_address}, NFPM {report.nfpm_address}, "
         f"gauge {report.gauge_address}, token {report.token_id}"
@@ -4888,7 +4894,7 @@ def _print_unstake_dry_run(report: LpUnstakeDryRunReport) -> None:
     Args:
         report: The dry-run report being printed.
     """
-    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    key_note = "ephemeral" if report.ephemeral_key else "configured source"
     print(
         f"{report.symbol} pool {report.pool_address}, gauge {report.gauge_address}, "
         f"token {report.token_id}"
@@ -4920,7 +4926,7 @@ def _print_exit_dry_run(report: LpExitDryRunReport) -> None:
     Args:
         report: The dry-run report being printed.
     """
-    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    key_note = "ephemeral" if report.ephemeral_key else "configured source"
     print(
         f"{report.symbol} pool {report.pool_address}, NFPM {report.nfpm_address}, "
         f"token {report.token_id} ({report.range_state.value})"
@@ -4951,7 +4957,7 @@ def _print_collect_dry_run(report: LpCollectDryRunReport) -> None:
     Args:
         report: The dry-run report being printed.
     """
-    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    key_note = "ephemeral" if report.ephemeral_key else "configured source"
     path = "gauge getReward" if report.staked else "NFPM collect"
     print(f"{report.symbol} pool {report.pool_address}, token {report.token_id}, claim path {path}")
     if report.staked:
@@ -4982,7 +4988,7 @@ def _print_recenter_dry_run(report: LpRecenterDryRunReport) -> None:
     Args:
         report: The dry-run report being printed.
     """
-    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    key_note = "ephemeral" if report.ephemeral_key else "configured source"
     print(
         f"{report.symbol} pool {report.pool_address}, token {report.token_id} "
         f"({'staked' if report.staked else 'unstaked'}, {report.range_state.value})"
@@ -5063,7 +5069,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     The RPC endpoint, Sugar address, and audit database come from the
     application settings, the Safe address defaults to the canary deployment
     behind ``AERO_BOT_SAFE_ADDRESS``, and the signing key comes from the
-    macOS Keychain or the command's explicit ephemeral flag. Dry-run
+    the platform key source (macOS Keychain, sealed environment variable,
+    or owner-only key file - see ``aero_bot.signing_key``) or the
+    command's explicit ephemeral flag. Dry-run
     subcommands stop at building and validation; execute subcommands refuse
     without ``--confirm-broadcast`` and then broadcast one audited Safe nonce
     at a time.
@@ -5128,7 +5136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 key_bytes = bytes(Account.create().key)
                 ephemeral = True
             else:
-                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                key_bytes = load_signing_key_source().load_signing_key()
                 ephemeral = False
             report = executor.dry_run_mint(
                 arguments.symbol,
@@ -5149,7 +5157,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 key_bytes = bytes(Account.create().key)
                 ephemeral = True
             else:
-                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                key_bytes = load_signing_key_source().load_signing_key()
                 ephemeral = False
             stake_report = executor.dry_run_stake(
                 arguments.symbol, arguments.token_id, key_bytes, ephemeral_key=ephemeral
@@ -5166,7 +5174,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 key_bytes = bytes(Account.create().key)
                 ephemeral = True
             else:
-                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                key_bytes = load_signing_key_source().load_signing_key()
                 ephemeral = False
             unstake_report = executor.dry_run_unstake(
                 arguments.symbol, arguments.token_id, key_bytes, ephemeral_key=ephemeral
@@ -5183,7 +5191,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 key_bytes = bytes(Account.create().key)
                 ephemeral = True
             else:
-                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                key_bytes = load_signing_key_source().load_signing_key()
                 ephemeral = False
             exit_report = executor.dry_run_exit(
                 arguments.symbol, arguments.token_id, key_bytes, ephemeral_key=ephemeral
@@ -5200,7 +5208,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 key_bytes = bytes(Account.create().key)
                 ephemeral = True
             else:
-                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                key_bytes = load_signing_key_source().load_signing_key()
                 ephemeral = False
             collect_report = executor.dry_run_collect(
                 arguments.symbol, arguments.token_id, key_bytes, ephemeral_key=ephemeral
@@ -5219,7 +5227,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 key_bytes = bytes(Account.create().key)
                 ephemeral = True
             else:
-                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                key_bytes = load_signing_key_source().load_signing_key()
                 ephemeral = False
             recenter_report = executor.dry_run_recenter(
                 arguments.symbol,
@@ -5245,7 +5253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 key_bytes = bytes(Account.create().key)
                 ephemeral = True
             else:
-                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                key_bytes = load_signing_key_source().load_signing_key()
                 ephemeral = False
             if arguments.lifecycle == "mint":
                 execution_report = executor.execute_mint(
