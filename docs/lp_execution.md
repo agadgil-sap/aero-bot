@@ -93,7 +93,7 @@ Solver-derived widths carry the label `solver_pre_fix_apr` through every plan an
 ### Amount mathematics
 
 Position amounts come from the exact v3 identities over raw `sqrtPriceX96`, evaluated in 60-digit Decimal arithmetic: `amount0 = L * 2**96 * (Sb - Sp) / (Sp * Sb)` and `amount1 = L * (Sp - Sa) / 2**96`.
-A unit of liquidity is valued over the range to split the budget into both sides; desired amounts floor to raw units and minima sit exactly one slippage tolerance (default 0.1 percent) below.
+A unit of liquidity is valued over the range to split the budget into both sides; desired amounts floor to raw units and minima sit exactly one slippage tolerance (default 1 percent, raised from 0.1 percent by the captain's calibration ruling of 2026-09-08: 0.1-percent-of-amount minima on a width-1 range leave a ~0.005-tick price tolerance on the near-bound side, which the measured pool wobble of 0.265 ticks per 180 seconds always exceeds before the observation-to-execution latency completes) below.
 A snapshot price at or beyond either bound refuses rather than producing a one-sided position.
 The two-sided formulas are pinned by independent inversion (each side recovers the input liquidity), the geometric-mean identity `amount0 = amount1 * 2**192 / (Sa * Sb)`, and a float cross-reference.
 The exit side instead reads amounts through `position_amounts_at_sqrt_ratio`, the general-case sibling that accepts any price: below the range the position is entirely token zero (`L * 2**96 * (Sb - Sa) / (Sa * Sb)`), above it entirely token one (`L * (Sb - Sa) / 2**96`), and zero liquidity is allowed because an emptied position still owes fees.
