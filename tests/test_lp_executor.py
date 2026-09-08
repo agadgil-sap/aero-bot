@@ -28,6 +28,8 @@ from aero_bot.executor import (
     ExecutionUnavailableError,
     ExecutorRpcBackend,
     build_approval_calldata,
+    build_swap_calldata,
+    build_swap_path,
 )
 from aero_bot.history import price_usdc_per_stock
 from aero_bot.lp_calldata import (
@@ -53,8 +55,11 @@ from aero_bot.lp_executor import (
 from aero_bot.lp_pins import LpPoolPin, LpPoolPinStore
 from aero_bot.lp_plan import (
     DEFAULT_MINT_SLIPPAGE_TOLERANCE,
+    QUOTE_TOKEN_DECIMALS,
     LpExecutionPolicy,
+    LpPlanRefusalCode,
     LpPlanRefusalError,
+    plan_swap_back,
     position_amounts_at_sqrt_ratio,
 )
 from aero_bot.registry import B20AssetListing, B20RegistryResult, RegistryStatus
@@ -325,6 +330,7 @@ class LpRpcScript:
         nfpm_held_positions: int = 0,
         nfpm_balance_hex: str | None = None,
         router_allowance_units: int = 0,
+        router_stock_allowance_units: int = 0,
         nfpm_usdc_allowance_units: int = 0,
         nfpm_stock_allowance_units: int = 0,
         owner_addresses: dict[int, str] | None = None,
@@ -361,6 +367,7 @@ class LpRpcScript:
         fast_active_liquidity: int = LP_ACTIVE_LIQUIDITY,
         fast_staked_liquidity: int = 9_999,
         fast_usdc_reserve_units: int = FIXTURE_USDC_RESERVE,
+        fast_stock_reserve_units: int = 40_000_000_000,
         fast_reward_rate_units: int = 4_494_371_922_759_724,
         fast_token1_address: str | None = None,
         fast_views_revert: bool = False,
@@ -377,6 +384,8 @@ class LpRpcScript:
             nfpm_balance_hex: Raw result served for that NFPM balanceOf read,
                 bypassing the held-positions word to script malformed returns.
             router_allowance_units: Standing USDC allowance for the router.
+            router_stock_allowance_units: Standing stock allowance for the
+                router, the swap-back pull.
             nfpm_usdc_allowance_units: Standing USDC allowance for the NFPM.
             nfpm_stock_allowance_units: Standing stock allowance for the NFPM.
             owner_addresses: ownerOf answers keyed by token id; missing ids
@@ -437,6 +446,8 @@ class LpRpcScript:
             fast_staked_liquidity: Live stakedLiquidity() answer.
             fast_usdc_reserve_units: USDC balanceOf(pool) answer, the swap
                 impact base on the fast path.
+            fast_stock_reserve_units: Stock balanceOf(pool) answer, the
+                swap-back impact base on the fast path.
             fast_reward_rate_units: The gauge's live rewardRate() answer.
             fast_token1_address: Overrides the pool's token1 identity answer
                 to script a stale pin's identity mismatch.
@@ -452,6 +463,7 @@ class LpRpcScript:
         self.nfpm_held_positions = nfpm_held_positions
         self.nfpm_balance_hex = nfpm_balance_hex
         self.router_allowance_units = router_allowance_units
+        self.router_stock_allowance_units = router_stock_allowance_units
         self.nfpm_usdc_allowance_units = nfpm_usdc_allowance_units
         self.nfpm_stock_allowance_units = nfpm_stock_allowance_units
         self.owner_addresses = owner_addresses if owner_addresses is not None else {}
@@ -490,6 +502,7 @@ class LpRpcScript:
         self.fast_active_liquidity = fast_active_liquidity
         self.fast_staked_liquidity = fast_staked_liquidity
         self.fast_usdc_reserve_units = fast_usdc_reserve_units
+        self.fast_stock_reserve_units = fast_stock_reserve_units
         self.fast_reward_rate_units = fast_reward_rate_units
         self.fast_token1_address = fast_token1_address
         self.fast_views_revert = fast_views_revert
@@ -573,8 +586,11 @@ class LpRpcScript:
                     return word_hex(self.router_allowance_units)
                 if spender == NFPM_ADDRESS:
                     return word_hex(self.nfpm_usdc_allowance_units)
-            elif to_address == B20_ADDRESS and spender == NFPM_ADDRESS:
-                return word_hex(self.nfpm_stock_allowance_units)
+            elif to_address == B20_ADDRESS:
+                if spender == NFPM_ADDRESS:
+                    return word_hex(self.nfpm_stock_allowance_units)
+                if spender == AERODROME_ROUTER_ADDRESS:
+                    return word_hex(self.router_stock_allowance_units)
             raise AssertionError(f"unexpected allowance read to {to_address} for {spender}")
         if data.startswith(f"0x{ERC20_BALANCE_OF_SELECTOR}"):
             if to_address == usdc_token:
@@ -583,6 +599,8 @@ class LpRpcScript:
                     return word_hex(self.fast_usdc_reserve_units)
                 return word_hex(self.usdc_balance_units)
             if to_address == B20_ADDRESS:
+                if address_argument(data, 0) == POOL_ADDRESS:
+                    return word_hex(self.fast_stock_reserve_units)
                 return word_hex(self.stock_balance_units)
             if to_address == NFPM_ADDRESS:
                 if self.nfpm_balance_hex is not None:
@@ -1855,6 +1873,108 @@ def test_dry_run_burn_refuses_owed_fees() -> None:
         executor.dry_run_burn("FIXc", 77, bytes(Account.create().key))
 
     assert raised.value.code is LpExecutionRefusalCode.POSITION_NOT_EMPTY
+
+
+# ---------------------------------------------------------------------------
+# Swap-back dry-run composition
+# ---------------------------------------------------------------------------
+
+
+SWAP_BACK_STOCK_UNITS = 2_172_446
+
+
+def test_dry_run_swap_back_composes_allowance_and_the_reversed_path() -> None:
+    """The swap-back approves exactly its input and swaps stock to USDC."""
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(stock_balance_units=SWAP_BACK_STOCK_UNITS),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 2),
+    )
+
+    report = executor.dry_run_swap_back("FIXc", None, bytes(Account.create().key))
+
+    assert tuple(transaction.role for transaction in report.transactions) == (
+        LpExecutionRole.ROUTER_STOCK_ALLOWANCE,
+        LpExecutionRole.SWAP_BACK,
+    )
+    assert report.stock_in_units == SWAP_BACK_STOCK_UNITS
+    assert report.stock_balance_units == SWAP_BACK_STOCK_UNITS
+    approval_inner = decode_inner(rpc_script.estimate_requests[0])
+    assert approval_inner == bytes.fromhex(
+        build_approval_calldata(AERODROME_ROUTER_ADDRESS, SWAP_BACK_STOCK_UNITS)[2:]
+    )
+    price = price_usdc_per_stock(LP_SQRT_RATIO, False, STOCK_DECIMALS, QUOTE_TOKEN_DECIMALS)
+    expected_plan = plan_swap_back(
+        SWAP_BACK_STOCK_UNITS,
+        price,
+        STOCK_DECIMALS,
+        40_000_000_000,
+        Decimal("0.01"),
+        Decimal("0.001"),
+        Decimal("0.0005"),
+    )
+    swap_inner = decode_inner(rpc_script.estimate_requests[1])
+    assert swap_inner == bytes.fromhex(
+        build_swap_calldata(
+            SAFE_ADDRESS,
+            SWAP_BACK_STOCK_UNITS,
+            expected_plan.min_usdc_units,
+            build_swap_path(B20_ADDRESS, BASE_USDC_ADDRESS, LP_TICK_SPACING),
+            fixture_deadline(),
+        )[2:]
+    )
+
+
+def test_dry_run_swap_back_skips_a_satisfied_router_allowance() -> None:
+    """A live router stock allowance covering the input skips its approval."""
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            stock_balance_units=SWAP_BACK_STOCK_UNITS,
+            router_stock_allowance_units=SWAP_BACK_STOCK_UNITS,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True]),
+    )
+
+    report = executor.dry_run_swap_back("FIXc", None, bytes(Account.create().key))
+
+    assert tuple(transaction.role for transaction in report.transactions) == (
+        LpExecutionRole.SWAP_BACK,
+    )
+    assert rpc_script.estimate_requests != []
+
+
+def test_dry_run_swap_back_refuses_without_stock() -> None:
+    """A zero stock balance refuses before anything is built."""
+    executor, _, _ = make_lp_executor(rpc_script=LpRpcScript(stock_balance_units=0))
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_swap_back("FIXc", None, bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.NOTHING_TO_SWAP_BACK
+
+
+def test_dry_run_swap_back_refuses_an_amount_above_the_balance() -> None:
+    """An explicit amount beyond the live balance refuses honestly."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(stock_balance_units=SWAP_BACK_STOCK_UNITS)
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_swap_back("FIXc", Decimal("100"), bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.SWAP_BACK_INPUT_ABOVE_BALANCE
+
+
+def test_dry_run_swap_back_refuses_impact_above_the_ceiling() -> None:
+    """A stock balance exceeding the pool's depth refuses through the planner."""
+    executor, _, _ = make_lp_executor(
+        sources=FakeSources(discovery=make_discovery((make_candidate(reserve1=100_000_000),))),
+        rpc_script=LpRpcScript(stock_balance_units=SWAP_BACK_STOCK_UNITS),
+    )
+
+    with pytest.raises(LpPlanRefusalError) as raised:
+        executor.dry_run_swap_back("FIXc", None, bytes(Account.create().key))
+
+    assert raised.value.code is LpPlanRefusalCode.SWAP_BACK_IMPACT_ABOVE_CEILING
 
 
 # ---------------------------------------------------------------------------
@@ -3485,6 +3605,113 @@ def test_cli_execute_with_a_failed_delivery_exits_one(
     output = capsys.readouterr().out
     assert "failed" in output
     assert "halted:" in output
+
+
+def test_execute_swap_back_broadcasts_two_audited_nonces(tmp_path: Path) -> None:
+    """A confirmed swap-back executes allowance then swap with full audits."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=LpRpcScript(stock_balance_units=SWAP_BACK_STOCK_UNITS, allow_broadcasts=True),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+    )
+
+    report = executor.execute_swap_back(
+        "FIXc", None, bytes(Account.create().key), confirm_broadcast=True
+    )
+
+    assert report.completed is True
+    assert report.action == "swap-back"
+    assert [step.role for step in report.steps] == [
+        LpExecutionRole.ROUTER_STOCK_ALLOWANCE,
+        LpExecutionRole.SWAP_BACK,
+    ]
+    assert [step.nonce for step in report.steps] == [4, 5]
+    assert all(step.status == "confirmed" for step in report.steps)
+    assert len(rpc_script.broadcasts) == 2
+
+    records = AuditStore(audit_path).read_records(100)
+    assert [record.event_type for record in records] == [
+        AuditEventType.LP_SWAP_BACK_PLANNED,
+        *([AuditEventType.LP_TRANSACTION_BUILT] * 2),
+        *([AuditEventType.LP_EXECUTE_SENT, AuditEventType.LP_EXECUTE_CONFIRMED] * 2),
+    ]
+    planned = json.loads(records[0].payload_json)
+    assert planned["mode"] == "execute"
+    assert planned["stock_in_units"] == SWAP_BACK_STOCK_UNITS
+    assert planned["min_usdc_units"] < planned["expected_usdc_units"]
+
+
+def test_cli_dry_run_swap_back_prints_the_quote(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The swap-back dry-run prints its quote, floor, and both steps."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            stock_balance_units=SWAP_BACK_STOCK_UNITS,
+            router_stock_allowance_units=SWAP_BACK_STOCK_UNITS,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True]),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "dry-run",
+                "swap-back",
+                "--symbol",
+                "FIXc",
+                "--ephemeral-key",
+            ]
+        )
+
+    assert exit_code == EXIT_OK
+    output = capsys.readouterr().out
+    assert "-> at least" in output
+    assert "[swap_back]" in output
+    assert "[router_stock_allowance]" not in output
+
+
+def test_cli_execute_swap_back_broadcasts_and_exits_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A confirmed swap-back execute prints both broadcasts and exits zero."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(stock_balance_units=SWAP_BACK_STOCK_UNITS, allow_broadcasts=True),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "execute",
+                "swap-back",
+                "--symbol",
+                "FIXc",
+                "--ephemeral-key",
+                "--confirm-broadcast",
+                "--json",
+            ]
+        )
+
+    assert exit_code == EXIT_OK
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["mode"] == "execute"
+    assert printed["action"] == "swap-back"
+    assert printed["completed"] is True
+    assert [step["status"] for step in printed["steps"]] == ["confirmed"] * 2
 
 
 def test_cli_full_discovery_flag_bypasses_the_pin_store(tmp_path: Path) -> None:

@@ -103,6 +103,8 @@ class LpPlanRefusalCode(StrEnum):
     SWAP_IMPACT_ABOVE_CEILING = "swap_impact_above_ceiling"
     # The Safe's USDC cannot fund both the quote side and the balancing swap.
     INSUFFICIENT_USDC_FOR_ENTRY = "insufficient_usdc_for_entry"
+    # A swap-back would reach or exceed the impact ceiling.
+    SWAP_BACK_IMPACT_ABOVE_CEILING = "swap_back_impact_above_ceiling"
 
 
 class WidthSource(StrEnum):
@@ -250,8 +252,10 @@ class LpPoolObservation(BaseModel):
     sqrt_ratio: Annotated[int, Field(gt=0)]
     # The pool's current active in-range liquidity, raw L units.
     pool_active_liquidity: Annotated[int, Field(gt=0)]
-    # The pool's USDC-side reserve in raw units, the swap impact base.
+    # The pool's USDC-side reserve in raw units, the entry swap impact base.
     usdc_reserve_units: Annotated[int, Field(gt=0)]
+    # The pool's stock-side reserve in raw units, the swap-back impact base.
+    stock_reserve_units: Annotated[int, Field(gt=0)]
     # The gauge's raw per-second AERO reward rate from the same snapshot;
     # zero when the gauge is not emitting.
     emissions_per_second_units: Annotated[int, Field(ge=0)] = 0
@@ -832,6 +836,108 @@ def plan_balancing_swap(
             modeled_impact_fraction=+impact,
             tranche_count=tranche_count,
             buffer_fraction=buffer_fraction,
+        )
+
+
+class SwapBackPlan(BaseModel):
+    """Hold the terminal stock-to-USDC swap-back the lifecycle ends with."""
+
+    # Frozen strict fields keep the swap plan bound to one inventory snapshot.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The raw stock units the swap spends, the Safe's whole balance by default.
+    stock_in_units: Annotated[int, Field(gt=0)]
+    # The spot-quoted USDC output, in raw six-decimal units.
+    expected_usdc_units: Annotated[int, Field(gt=0)]
+    # The minimum accepted USDC output at the slippage tolerance.
+    min_usdc_units: Annotated[int, Field(gt=0)]
+    # The conservative reserve-based impact bound of the whole swap.
+    modeled_impact_fraction: NonNegativeDecimal
+    # How many tranches the swap splits into; one below the tranche rule.
+    tranche_count: Annotated[int, Field(gt=0)]
+    # The slippage tolerance the minimum output floors at.
+    slippage_tolerance_fraction: NonNegativeDecimal
+
+    @model_validator(mode="after")
+    def require_min_below_expected(self) -> Self:
+        """Reject a minimum that exceeds the quoted output."""
+        if self.min_usdc_units > self.expected_usdc_units:
+            raise ValueError("min_usdc_units exceeds expected_usdc_units")
+        return self
+
+
+def plan_swap_back(
+    stock_in_units: int,
+    price_usdc_per_stock_value: Decimal,
+    stock_decimals: int,
+    stock_reserve_units: int,
+    slippage_tolerance_fraction: Decimal,
+    impact_ceiling_fraction: Decimal,
+    tranche_threshold_fraction: Decimal,
+) -> SwapBackPlan:
+    """Plan the terminal stock-to-USDC swap returning inventory to quote.
+
+    The swap spends the given raw stock units at the snapshot price, floors
+    the accepted USDC output one slippage tolerance below the quote, and
+    models impact as the conservative whole-reserve bound against the pool's
+    stock-side reserve; an impact above the tranche threshold splits the swap
+    into enough tranches to bring each below the threshold, mirroring the
+    entry balancing swap's discipline exactly.
+
+    Args:
+        stock_in_units: The positive raw stock units to swap back.
+        price_usdc_per_stock_value: The snapshot price of one whole stock.
+        stock_decimals: The stock token's decimal count.
+        stock_reserve_units: The pool's stock-side reserve in raw units.
+        slippage_tolerance_fraction: The tolerance the minimum output floors at.
+        impact_ceiling_fraction: The ceiling the whole swap's impact refuses at.
+        tranche_threshold_fraction: The threshold that splits the swap.
+
+    Returns:
+        The swap-back plan with its impact and tranche evidence.
+
+    Raises:
+        LpPlanRefusalError: If the whole swap's modeled impact reaches the
+            impact ceiling.
+        ValueError: If any argument is malformed.
+    """
+    if stock_in_units <= 0:
+        raise ValueError("stock_in_units must be positive")
+    if price_usdc_per_stock_value <= 0:
+        raise ValueError("price must be positive")
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        stock_in = Decimal(stock_in_units).scaleb(-stock_decimals)
+        expected_usdc_units = int(
+            (
+                stock_in * price_usdc_per_stock_value * Decimal(10) ** QUOTE_TOKEN_DECIMALS
+            ).to_integral_value(rounding=ROUND_FLOOR)
+        )
+        min_usdc_units = int(
+            (
+                Decimal(expected_usdc_units) * (Decimal(1) - slippage_tolerance_fraction)
+            ).to_integral_value(rounding=ROUND_FLOOR)
+        )
+        impact = Decimal(stock_in_units) / Decimal(stock_reserve_units + stock_in_units)
+        if impact >= impact_ceiling_fraction:
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.SWAP_BACK_IMPACT_ABOVE_CEILING,
+                f"the swap-back's conservative impact bound {impact:.6f} reaches the "
+                f"{impact_ceiling_fraction} ceiling; the Safe's stock exceeds the pool's "
+                "executable depth, so split the exit across tranches manually",
+            )
+        tranche_count = 1
+        if impact > tranche_threshold_fraction:
+            tranche_count = int(
+                (impact / tranche_threshold_fraction).to_integral_value(rounding=ROUND_CEILING)
+            )
+        return SwapBackPlan(
+            stock_in_units=stock_in_units,
+            expected_usdc_units=expected_usdc_units,
+            min_usdc_units=min_usdc_units,
+            modeled_impact_fraction=+impact,
+            tranche_count=tranche_count,
+            slippage_tolerance_fraction=slippage_tolerance_fraction,
         )
 
 

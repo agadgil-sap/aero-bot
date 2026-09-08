@@ -130,8 +130,10 @@ from aero_bot.lp_plan import (
     LpPoolObservation,
     MintDirective,
     SafeInventory,
+    SwapBackPlan,
     WidthSource,
     plan_mint_entry,
+    plan_swap_back,
     position_amounts_at_sqrt_ratio,
     position_range_state,
 )
@@ -234,6 +236,10 @@ class LpExecutionRefusalCode(StrEnum):
     POSITION_EMPTY = "position_empty"
     # A burn was requested on a position still holding liquidity or owed fees.
     POSITION_NOT_EMPTY = "position_not_empty"
+    # A swap-back was requested with no stock balance to swap.
+    NOTHING_TO_SWAP_BACK = "nothing_to_swap_back"
+    # A swap-back input exceeds the Safe's live stock balance.
+    SWAP_BACK_INPUT_ABOVE_BALANCE = "swap_back_input_above_balance"
     # The live AERO price read backing an emissions-APR quote failed.
     AERO_PRICE_UNREADABLE = "aero_price_unreadable"
     # A claim or withdrawal would land inside the early-exit penalty window.
@@ -279,6 +285,10 @@ class LpExecutionRole(StrEnum):
     NFPM_COLLECT = "nfpm_collect"
     # The NFPM burn clearing one emptied position NFT.
     NFPM_BURN = "nfpm_burn"
+    # The exact stock approval the router's swap-back pull requires.
+    ROUTER_STOCK_ALLOWANCE = "router_stock_allowance"
+    # The terminal stock-to-USDC swap through the whitelisted router.
+    SWAP_BACK = "swap_back"
     # The CLGauge per-token emissions claim.
     GAUGE_GET_REWARD = "gauge_get_reward"
 
@@ -740,6 +750,59 @@ class LpBurnDryRunReport(BaseModel):
     diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
 
 
+class LpSwapBackDryRunReport(BaseModel):
+    """Report one complete LP swap-back build-and-validate attempt.
+
+    The swap-back is the lifecycle's terminal swap: it returns the Safe's
+    stock inventory to USDC through the same whitelisted router the entry's
+    balancing swap uses, with the path reversed.
+    """
+
+    # Frozen strict fields preserve one coherent dry-run outcome.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode marker makes the no-broadcast guarantee auditable.
+    mode: Literal[ExecutionMode.DRY_RUN] = ExecutionMode.DRY_RUN
+    # The registry-matched stock symbol identifying the pool.
+    symbol: str
+    # The pool whose snapshot prices the swap.
+    pool_address: EvmAddress
+    # The block the pricing snapshot pinned.
+    snapshot_block: Annotated[int, Field(gt=0)]
+    # The snapshot price of one whole stock in USDC.
+    price_usdc_per_stock: Annotated[Decimal, Field(gt=0)]
+    # The raw stock units the swap spends.
+    stock_in_units: Annotated[int, Field(gt=0)]
+    # The Safe's live stock balance when the attempt built, raw units.
+    stock_balance_units: Annotated[int, Field(ge=0)]
+    # The spot-quoted USDC output, raw units.
+    expected_usdc_units: Annotated[int, Field(gt=0)]
+    # The minimum accepted USDC output, raw units.
+    min_usdc_units: Annotated[int, Field(gt=0)]
+    # The conservative whole-reserve impact bound.
+    modeled_impact_fraction: Decimal
+    # The slippage tolerance the minimum output floors at.
+    slippage_tolerance_fraction: Decimal
+    # The Safe every built transaction targets.
+    safe_address: EvmAddress
+    # The public address of the EOA whose key signed the build.
+    relayer_address: EvmAddress
+    # Whether the signing key was generated for this dry run only.
+    ephemeral_key: bool
+    # The Base gas price observed before building.
+    gas_price_wei: Annotated[int, Field(ge=0)]
+    # The Safe ETH balance observed before building.
+    safe_eth_wei: Annotated[int, Field(ge=0)]
+    # Every built transaction in execution order.
+    transactions: Annotated[tuple[BuiltLpTransaction, ...], Field(min_length=1)]
+    # Every cap checked before signing, in enforced order.
+    caps_enforced: Annotated[tuple[str, ...], Field(min_length=1)]
+    # Wall-clock duration of the build phase in milliseconds.
+    build_duration_ms: Decimal
+    # Human-readable evidence lines covering the swap-back.
+    diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
 class LpActionExecutionReport(BaseModel):
     """Report one complete LP action executed through the broadcast path."""
 
@@ -758,6 +821,7 @@ class LpActionExecutionReport(BaseModel):
         | LpExitDryRunReport
         | LpCollectDryRunReport
         | LpBurnDryRunReport
+        | LpSwapBackDryRunReport
     )
     # Every broadcast step in execution order, including the halting one.
     steps: Annotated[tuple[LpStepExecutionReport, ...], Field(min_length=0)]
@@ -1082,6 +1146,32 @@ class LpBurnPlannedPayload(BaseModel):
     fees_owed0_units: Annotated[int, Field(ge=0)]
     # The checkpointed token-one fees, zero by the emptiness gate.
     fees_owed1_units: Annotated[int, Field(ge=0)]
+
+
+class LpSwapBackPlannedPayload(BaseModel):
+    """Persist one swap-back plan's public evidence on the audit chain."""
+
+    # Frozen strict fields keep the audited plan immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode of the attempt this plan belongs to.
+    mode: ExecutionMode
+    # The registry-matched stock symbol.
+    symbol: str
+    # The pool contract address.
+    pool_address: EvmAddress
+    # The block the pricing snapshot pinned.
+    snapshot_block: Annotated[int, Field(gt=0)]
+    # The snapshot price of one whole stock in USDC.
+    price_usdc_per_stock: Decimal
+    # The raw stock units the swap spends.
+    stock_in_units: Annotated[int, Field(gt=0)]
+    # The spot-quoted USDC output, raw units.
+    expected_usdc_units: Annotated[int, Field(gt=0)]
+    # The minimum accepted USDC output, raw units.
+    min_usdc_units: Annotated[int, Field(gt=0)]
+    # The conservative whole-reserve impact bound.
+    modeled_impact_fraction: Decimal
 
 
 class LpRecenterPlannedPayload(BaseModel):
@@ -1611,6 +1701,43 @@ class LpLifecycleExecutor:
             self._record_refusal("burn", ExecutionMode.DRY_RUN, error, symbol)
             raise
 
+    def dry_run_swap_back(
+        self,
+        symbol: str,
+        stock_amount: Decimal | None,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> LpSwapBackDryRunReport:
+        """Fully build and validate the swap-back sequence without broadcasting.
+
+        The swap-back returns the Safe's stock inventory to USDC through the
+        whitelisted router with the concentrated path reversed. A None amount
+        spends the whole live stock balance; an explicit amount must not
+        exceed it.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            stock_amount: Whole stock units to swap, or None for the whole
+                live balance.
+            key_bytes: Exactly 32 raw signing-key bytes used for this build.
+            ephemeral_key: Whether the key was generated for this dry run.
+
+        Returns:
+            The complete dry-run report; nothing was broadcast.
+
+        Raises:
+            LpExecutionRefusalError: If any execution-layer gate refuses.
+            LpPlanRefusalError: If the swap-back's impact cap refuses.
+        """
+        try:
+            report, _ = self._build_swap_back_attempt(
+                symbol, stock_amount, key_bytes, ephemeral_key
+            )
+            return report
+        except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+            self._record_refusal("swap-back", ExecutionMode.DRY_RUN, error, symbol)
+            raise
+
     def dry_run_recenter(
         self,
         symbol: str,
@@ -1961,6 +2088,58 @@ class LpLifecycleExecutor:
             raise
         return LpActionExecutionReport(
             action="burn",
+            build=build,
+            steps=step_reports,
+            completed=halted_reason == "",
+            halted_reason=halted_reason,
+        )
+
+    def execute_swap_back(
+        self,
+        symbol: str,
+        stock_amount: Decimal | None,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Build and broadcast the swap-back sequence step by step.
+
+        Args:
+            symbol: The registry-matched B20 stock symbol.
+            stock_amount: Whole stock units to swap, or None for the whole
+                live balance.
+            key_bytes: Exactly 32 raw signing-key bytes used for this attempt.
+            confirm_broadcast: The explicit operator confirmation.
+            ephemeral_key: Whether the key was generated for this attempt.
+
+        Returns:
+            The complete execution report with every broadcast step.
+
+        Raises:
+            LpExecutionRefusalError: If any gate, preflight, or per-step check
+                refuses.
+            LpPlanRefusalError: If the swap-back's impact cap refuses.
+        """
+        if not confirm_broadcast:
+            error = LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "the execute command refuses to broadcast without the explicit "
+                "--confirm-broadcast flag; rerun with it to broadcast the built "
+                "sequence",
+            )
+            self._record_refusal("swap-back", ExecutionMode.EXECUTE, error, symbol)
+            raise error
+        try:
+            build, steps = self._build_swap_back_attempt(
+                symbol, stock_amount, key_bytes, ephemeral_key, ExecutionMode.EXECUTE
+            )
+            step_reports, halted_reason = self._execute_steps("swap-back", steps, key_bytes)
+        except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+            self._record_refusal("swap-back", ExecutionMode.EXECUTE, error, symbol)
+            raise
+        return LpActionExecutionReport(
+            action="swap-back",
             build=build,
             steps=step_reports,
             completed=halted_reason == "",
@@ -2714,6 +2893,149 @@ class LpLifecycleExecutor:
             gauge_address=observation.gauge_address,
             token_id=token_id,
             position=position,
+            safe_address=self._safe_address,
+            relayer_address=normalize_evm_address(Account.from_key(key_bytes).address),
+            ephemeral_key=ephemeral_key,
+            gas_price_wei=gas_price,
+            safe_eth_wei=safe_eth,
+            transactions=tuple(step.report for step in built_steps),
+            caps_enforced=tuple(caps),
+            build_duration_ms=self._milliseconds_since(build_started),
+            diagnostics=tuple(diagnostics),
+        )
+        return report, built_steps
+
+    def _build_swap_back_attempt(
+        self,
+        symbol: str,
+        stock_amount: Decimal | None,
+        key_bytes: bytes,
+        ephemeral_key: bool,
+        mode: ExecutionMode = ExecutionMode.DRY_RUN,
+    ) -> tuple[LpSwapBackDryRunReport, tuple[_BuiltLpStep, ...]]:
+        """Build, sign, validate, and estimate the swap-back sequence."""
+        build_started = self._timer()
+        listing, observation, caps = self._observe_pool(symbol)
+        stock_token = (
+            observation.token0_address
+            if observation.stock_is_token0
+            else observation.token1_address
+        )
+        stock_balance = self._rpc.fetch_token_balance(stock_token, self._safe_address)
+        if stock_balance <= 0:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.NOTHING_TO_SWAP_BACK,
+                f"the Safe holds no {listing.symbol} to swap back; nothing to return to USDC",
+            )
+        if stock_amount is not None:
+            if stock_amount <= 0:
+                raise LpExecutionRefusalError(
+                    LpExecutionRefusalCode.NOTHING_TO_SWAP_BACK,
+                    "the requested swap-back amount is not positive; pass a whole-stock "
+                    "amount or omit --amount to swap the entire balance",
+                )
+            stock_in_units = int(
+                (stock_amount * Decimal(10) ** observation.stock_decimals).to_integral_value(
+                    rounding=ROUND_FLOOR
+                )
+            )
+            if stock_in_units > stock_balance:
+                raise LpExecutionRefusalError(
+                    LpExecutionRefusalCode.SWAP_BACK_INPUT_ABOVE_BALANCE,
+                    f"the requested {stock_in_units} raw units exceed the Safe's live "
+                    f"{stock_balance} raw {listing.symbol} balance",
+                )
+        else:
+            stock_in_units = stock_balance
+        plan = plan_swap_back(
+            stock_in_units=stock_in_units,
+            price_usdc_per_stock_value=observation.price_usdc_per_stock,
+            stock_decimals=observation.stock_decimals,
+            stock_reserve_units=observation.stock_reserve_units,
+            slippage_tolerance_fraction=DEFAULT_MINT_SLIPPAGE_TOLERANCE,
+            impact_ceiling_fraction=self._plan_policy.swap_impact_ceiling_fraction,
+            tranche_threshold_fraction=self._plan_policy.swap_tranche_threshold_fraction,
+        )
+        if plan.tranche_count > 1:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.MULTI_TRANCHE_SWAP_UNSUPPORTED,
+                f"the swap-back plans {plan.tranche_count} tranches and this surface "
+                "executes exactly one; lower the amount below the pool's executable "
+                "depth",
+            )
+        caps.append(f"swap-back amount {stock_in_units} raw units inside the Safe's live balance")
+        caps.append(
+            f"swap-back impact {plan.modeled_impact_fraction:.6f} below the "
+            f"{self._plan_policy.swap_impact_ceiling_fraction} ceiling in "
+            f"{plan.tranche_count} tranche(s)"
+        )
+        gas_price, safe_eth, live_nonce = self._preflight(caps)
+        deadline = int(self._now().timestamp()) + LP_DEADLINE_SECONDS
+        router_stock_allowance = self._rpc.fetch_erc20_allowance(
+            stock_token, self._safe_address, self._policy.router_address
+        )
+        steps: list[_LpStepSpec] = []
+        if router_stock_allowance < plan.stock_in_units:
+            steps.append(
+                _LpStepSpec(
+                    role=LpExecutionRole.ROUTER_STOCK_ALLOWANCE,
+                    to_address=stock_token,
+                    inner_calldata=build_approval_calldata(
+                        self._policy.router_address, plan.stock_in_units
+                    ),
+                    description=(
+                        f"approve exactly {plan.stock_in_units} raw {listing.symbol} to "
+                        "the router for the swap-back pull"
+                    ),
+                )
+            )
+        steps.append(
+            _LpStepSpec(
+                role=LpExecutionRole.SWAP_BACK,
+                to_address=self._policy.router_address,
+                inner_calldata=build_swap_calldata(
+                    self._safe_address,
+                    plan.stock_in_units,
+                    plan.min_usdc_units,
+                    build_swap_path(stock_token, BASE_USDC_ADDRESS, observation.tick_spacing),
+                    deadline,
+                ),
+                description=(
+                    f"swap {plan.stock_in_units} raw {listing.symbol} for at least "
+                    f"{plan.min_usdc_units} raw USDC returning the inventory to quote"
+                ),
+            )
+        )
+        diagnostics = [
+            (
+                f"quote: {plan.stock_in_units} raw units at "
+                f"{observation.price_usdc_per_stock} USDC per {listing.symbol} -> "
+                f"expected {plan.expected_usdc_units} raw USDC, floored at the "
+                f"{DEFAULT_MINT_SLIPPAGE_TOLERANCE} tolerance"
+            ),
+            (
+                "the realized output lands in the Safe's USDC balance; verify the "
+                "before-and-after balance reads against this quote"
+            ),
+        ]
+        self._record_swap_back_plan(
+            mode,
+            listing.symbol,
+            observation,
+            plan,
+        )
+        built_steps = self._build_steps(steps, live_nonce, key_bytes, "swap-back", mode)
+        report = LpSwapBackDryRunReport(
+            symbol=listing.symbol,
+            pool_address=observation.pool_address,
+            snapshot_block=observation.snapshot_block,
+            price_usdc_per_stock=observation.price_usdc_per_stock,
+            stock_in_units=plan.stock_in_units,
+            stock_balance_units=stock_balance,
+            expected_usdc_units=plan.expected_usdc_units,
+            min_usdc_units=plan.min_usdc_units,
+            modeled_impact_fraction=plan.modeled_impact_fraction,
+            slippage_tolerance_fraction=plan.slippage_tolerance_fraction,
             safe_address=self._safe_address,
             relayer_address=normalize_evm_address(Account.from_key(key_bytes).address),
             ephemeral_key=ephemeral_key,
@@ -3631,6 +3953,7 @@ class LpLifecycleExecutor:
             sqrt_ratio=pool.sqrt_ratio,
             pool_active_liquidity=pool.pool_active_liquidity,
             usdc_reserve_units=pool.reserve1 if stock_is_token0 else pool.reserve0,
+            stock_reserve_units=pool.reserve0 if stock_is_token0 else pool.reserve1,
             emissions_per_second_units=pool.emissions_per_second,
             emissions_token_address=pool.emissions_token_address,
             gauge_liquidity_units=pool.gauge_liquidity,
@@ -3727,6 +4050,9 @@ class LpLifecycleExecutor:
         usdc_reserve = decode_uint_view_result(
             read(BASE_USDC_ADDRESS, self._erc20_balance_calldata(pool_address))
         )
+        stock_reserve = decode_uint_view_result(
+            read(listing_stock, self._erc20_balance_calldata(pool_address))
+        )
         emissions_token = decode_address_view_result(
             read(pin.gauge_address, build_gauge_reward_token_read_calldata())
         )
@@ -3748,6 +4074,7 @@ class LpLifecycleExecutor:
             sqrt_ratio=sqrt_ratio,
             pool_active_liquidity=pool_active_liquidity,
             usdc_reserve_units=usdc_reserve,
+            stock_reserve_units=stock_reserve,
             emissions_per_second_units=emissions_per_second,
             emissions_token_address=emissions_token,
             gauge_liquidity_units=gauge_liquidity,
@@ -4577,6 +4904,32 @@ class LpLifecycleExecutor:
             self._now(),
         )
 
+    def _record_swap_back_plan(
+        self,
+        mode: ExecutionMode,
+        symbol: str,
+        observation: LpPoolObservation,
+        plan: SwapBackPlan,
+    ) -> None:
+        """Append the swap-back plan audit event when a sink is configured."""
+        if self._audit_sink is None:
+            return
+        self._audit_sink.append(
+            AuditEventType.LP_SWAP_BACK_PLANNED,
+            LpSwapBackPlannedPayload(
+                mode=mode,
+                symbol=symbol,
+                pool_address=observation.pool_address,
+                snapshot_block=observation.snapshot_block,
+                price_usdc_per_stock=observation.price_usdc_per_stock,
+                stock_in_units=plan.stock_in_units,
+                expected_usdc_units=plan.expected_usdc_units,
+                min_usdc_units=plan.min_usdc_units,
+                modeled_impact_fraction=plan.modeled_impact_fraction,
+            ),
+            self._now(),
+        )
+
     def _record_recenter_plan(
         self,
         mode: ExecutionMode,
@@ -4896,6 +5249,28 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
             "the Keychain key; the signature check will honestly report rejection."
         ),
     )
+    dry_run_swap_back_parser = dry_run_subparsers.add_parser(
+        "swap-back",
+        help="Build and validate the terminal stock-to-USDC swap; nothing is broadcast.",
+    )
+    _add_lp_symbol_arguments(dry_run_swap_back_parser)
+    dry_run_swap_back_parser.add_argument(
+        "--amount",
+        type=Decimal,
+        default=None,
+        help=(
+            "Whole stock units to swap back; omit to return the Safe's entire "
+            "live stock balance to USDC."
+        ),
+    )
+    dry_run_swap_back_parser.add_argument(
+        "--ephemeral-key",
+        action="store_true",
+        help=(
+            "Sign the dry run with a freshly generated throwaway key instead of "
+            "the Keychain key; the signature check will honestly report rejection."
+        ),
+    )
     dry_run_recenter_parser = dry_run_subparsers.add_parser(
         "recenter",
         help="Build and validate the full recenter batch; nothing is broadcast.",
@@ -4955,6 +5330,20 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Half width in tick spacings per side; required for the mint.",
     )
+    execute_swap_back_parser = execute_subparsers.add_parser(
+        "swap-back",
+        help="Build and broadcast the terminal stock-to-USDC swap.",
+    )
+    _add_lp_symbol_arguments(execute_swap_back_parser)
+    execute_swap_back_parser.add_argument(
+        "--amount",
+        type=Decimal,
+        default=None,
+        help=(
+            "Whole stock units to swap back; omit to return the Safe's entire "
+            "live stock balance to USDC."
+        ),
+    )
     for lifecycle_parser in (
         execute_mint_parser,
         execute_subparsers.add_parser("stake", help="Build and broadcast the stake sequence."),
@@ -4966,8 +5355,9 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
             "collect", help="Build and broadcast the fee or emissions claim."
         ),
         execute_subparsers.add_parser("burn", help="Build and broadcast the emptied-NFT burn."),
+        execute_swap_back_parser,
     ):
-        if lifecycle_parser is not execute_mint_parser:
+        if lifecycle_parser not in (execute_mint_parser, execute_swap_back_parser):
             _add_lp_symbol_arguments(lifecycle_parser)
             lifecycle_parser.add_argument(
                 "--token-id",
@@ -5036,6 +5426,8 @@ def _print_execution_report(report: LpActionExecutionReport) -> None:
         _print_collect_dry_run(build)
     elif isinstance(build, LpBurnDryRunReport):
         _print_burn_dry_run(build)
+    elif isinstance(build, LpSwapBackDryRunReport):
+        _print_swap_back_dry_run(build)
     for step in report.steps:
         line = (
             f"[{step.action}/{step.role.value}] Safe nonce {step.nonce}: "
@@ -5300,6 +5692,35 @@ def _print_burn_dry_run(report: LpBurnDryRunReport) -> None:
     print(f"build took {report.build_duration_ms} ms")
 
 
+def _print_swap_back_dry_run(report: LpSwapBackDryRunReport) -> None:
+    """Print one swap-back dry-run report's human summary.
+
+    Args:
+        report: The dry-run report being printed.
+    """
+    key_note = "ephemeral" if report.ephemeral_key else "Keychain"
+    print(
+        f"{report.symbol} pool {report.pool_address} (snapshot block "
+        f"{report.snapshot_block}), price {report.price_usdc_per_stock} USDC per stock"
+    )
+    print(
+        f"swap {report.stock_in_units} raw {report.symbol} (of {report.stock_balance_units} "
+        f"held) -> at least {report.min_usdc_units} raw USDC, expected "
+        f"{report.expected_usdc_units} (impact {report.modeled_impact_fraction:.6f}, "
+        f"{report.slippage_tolerance_fraction} tolerance)"
+    )
+    print(
+        f"safe {report.safe_address}, relayer {report.relayer_address} ({key_note} key, "
+        "nothing broadcast)"
+    )
+    print(f"gas price {report.gas_price_wei} wei, Safe ETH {report.safe_eth_wei} wei")
+    for transaction in report.transactions:
+        _print_built_lp(f"[{transaction.role.value}]", transaction)
+    for line in report.diagnostics:
+        print(f"note: {line}")
+    print(f"build took {report.build_duration_ms} ms")
+
+
 def _print_recenter_dry_run(report: LpRecenterDryRunReport) -> None:
     """Print one recenter dry-run report's human summary.
 
@@ -5551,6 +5972,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 _print_burn_dry_run(burn_report)
             return EXIT_OK
+        if arguments.command == "dry-run" and arguments.lifecycle == "swap-back":
+            if arguments.amount is not None and arguments.amount <= 0:
+                parser.error("--amount must be positive")
+            if arguments.ephemeral_key:
+                key_bytes = bytes(Account.create().key)
+                ephemeral = True
+            else:
+                key_bytes = KeychainKeySource.from_environment().load_signing_key()
+                ephemeral = False
+            swap_back_report = executor.dry_run_swap_back(
+                arguments.symbol, arguments.amount, key_bytes, ephemeral_key=ephemeral
+            )
+            if arguments.json:
+                print(swap_back_report.model_dump_json(indent=2))
+            else:
+                _print_swap_back_dry_run(swap_back_report)
+            return EXIT_OK
         if arguments.command == "dry-run" and arguments.lifecycle == "recenter":
             if arguments.token_id < 0:
                 parser.error("--token-id must be non-negative")
@@ -5578,6 +6016,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "execute":
             if arguments.lifecycle == "mint":
                 if arguments.amount <= 0:
+                    parser.error("--amount must be positive")
+            elif arguments.lifecycle == "swap-back":
+                if arguments.amount is not None and arguments.amount <= 0:
                     parser.error("--amount must be positive")
             else:
                 if arguments.token_id < 0:
@@ -5629,10 +6070,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     confirm_broadcast=arguments.confirm_broadcast,
                     ephemeral_key=ephemeral,
                 )
-            else:
+            elif arguments.lifecycle == "burn":
                 execution_report = executor.execute_burn(
                     arguments.symbol,
                     arguments.token_id,
+                    key_bytes,
+                    confirm_broadcast=arguments.confirm_broadcast,
+                    ephemeral_key=ephemeral,
+                )
+            else:
+                execution_report = executor.execute_swap_back(
+                    arguments.symbol,
+                    arguments.amount,
                     key_bytes,
                     confirm_broadcast=arguments.confirm_broadcast,
                     ephemeral_key=ephemeral,

@@ -32,6 +32,7 @@ from aero_bot.lp_plan import (
     plan_balancing_swap,
     plan_mint_composition,
     plan_mint_entry,
+    plan_swap_back,
     position_amounts_at_sqrt_ratio,
     position_amounts_for_liquidity,
     position_range_state,
@@ -58,6 +59,8 @@ STOCK_DECIMALS = 8
 ONE_USDC_UNITS = 10**QUOTE_TOKEN_DECIMALS
 # A pool-scale USDC reserve for impact bounds, roughly seven hundred thousand.
 POOL_USDC_RESERVE_UNITS = 700_000 * ONE_USDC_UNITS
+# The pool's stock-side reserve, the swap-back impact base in unit fixtures.
+POOL_STOCK_RESERVE_UNITS = 20_000_000 * 10**STOCK_DECIMALS
 # A pool-scale active liquidity in raw L units.
 POOL_ACTIVE_LIQUIDITY = 10**14
 # A fixed snapshot timestamp shared by the observation fixtures.
@@ -102,6 +105,7 @@ def pool_observation(**overrides: object) -> LpPoolObservation:
         "sqrt_ratio": sqrt_ratio_at_tick(POOL_CURRENT_TICK),
         "pool_active_liquidity": POOL_ACTIVE_LIQUIDITY,
         "usdc_reserve_units": POOL_USDC_RESERVE_UNITS,
+        "stock_reserve_units": POOL_STOCK_RESERVE_UNITS,
         "snapshot_block": 30_000_000,
         "observed_at": OBSERVED_AT,
     }
@@ -567,6 +571,71 @@ def test_balancing_swap_refuses_impact_at_the_ceiling() -> None:
         assert error.code is LpPlanRefusalCode.SWAP_IMPACT_ABOVE_CEILING
     else:
         raise AssertionError("a ceiling-reaching swap did not refuse")
+
+
+def test_swap_back_prices_floors_and_bounds_impact() -> None:
+    """The swap-back quotes at the snapshot price with a floored minimum."""
+    observation = pool_observation()
+    price = observation.price_usdc_per_stock
+    stock_in_units = 2_000_000
+    swap = plan_swap_back(
+        stock_in_units,
+        price,
+        STOCK_DECIMALS,
+        POOL_STOCK_RESERVE_UNITS,
+        Decimal("0.01"),
+        Decimal("0.001"),
+        Decimal("0.0005"),
+    )
+
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        quoted = Decimal(stock_in_units).scaleb(-STOCK_DECIMALS) * price * 10**QUOTE_TOKEN_DECIMALS
+        assert swap.expected_usdc_units == int(quoted.to_integral_value(rounding="ROUND_FLOOR"))
+        floored = Decimal(swap.expected_usdc_units) * Decimal("0.99")
+        assert swap.min_usdc_units == int(floored.to_integral_value(rounding="ROUND_FLOOR"))
+        impact = Decimal(stock_in_units) / Decimal(POOL_STOCK_RESERVE_UNITS + stock_in_units)
+        assert swap.modeled_impact_fraction == +impact
+    assert swap.tranche_count == 1
+
+
+def test_swap_back_splits_into_tranches_above_the_threshold() -> None:
+    """Impact above the tranche threshold splits the exit symmetrically."""
+    observation = pool_observation()
+    price = observation.price_usdc_per_stock
+    shallow_reserve = 300_000_000
+    swap = plan_swap_back(
+        200_000,
+        price,
+        STOCK_DECIMALS,
+        shallow_reserve,
+        Decimal("0.01"),
+        Decimal("0.001"),
+        Decimal("0.0005"),
+    )
+
+    assert Decimal("0.0005") < swap.modeled_impact_fraction < Decimal("0.001")
+    assert swap.tranche_count == 2
+
+
+def test_swap_back_refuses_impact_at_the_ceiling() -> None:
+    """A stock balance exceeding the pool's depth refuses with its code."""
+    observation = pool_observation()
+    price = observation.price_usdc_per_stock
+    try:
+        plan_swap_back(
+            500_000_000,
+            price,
+            STOCK_DECIMALS,
+            100_000_000,
+            Decimal("0.01"),
+            Decimal("0.001"),
+            Decimal("0.0005"),
+        )
+    except LpPlanRefusalError as error:
+        assert error.code is LpPlanRefusalCode.SWAP_BACK_IMPACT_ABOVE_CEILING
+    else:
+        raise AssertionError("a ceiling-reaching swap-back did not refuse")
 
 
 def test_plan_mint_entry_builds_the_canary_plan_end_to_end() -> None:
