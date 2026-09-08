@@ -1,0 +1,96 @@
+{
+  "mode": "execute",
+  "action": "unstake",
+  "build": {
+    "mode": "dry_run",
+    "symbol": "AAPLc",
+    "pool_address": "0xa3b1e3f9747065e2073722ff4c9027d3ea4994f0",
+    "nfpm_address": "0xe1f8cd9ac4e4a65f54f38a5cdafca44f6dd68b53",
+    "gauge_address": "0x43021fbbd01b967704ab2379f6e90e2d367042f3",
+    "token_id": 5703026,
+    "position": {
+      "nonce": 0,
+      "operator_address": "0x0000000000000000000000000000000000000000",
+      "token0_address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+      "token1_address": "0xb200000000000000000000c2e324d24d7eecd1fb",
+      "tick_spacing": 10,
+      "tick_lower": -11630,
+      "tick_upper": -11610,
+      "liquidity": 3918128710,
+      "fee_growth_inside0_last_x128": 80084705134181281308652621563390254,
+      "fee_growth_inside1_last_x128": 24076384826010396880419693103064289,
+      "tokens_owed0_units": 0,
+      "tokens_owed1_units": 0
+    },
+    "accrued_aero_earned_units": 529256529608932,
+    "accrued_aero_checkpoint_units": 0,
+    "penalty": {
+      "penalty_rate_bps": 10000,
+      "min_stake_seconds": 300,
+      "deposit_timestamp": 1788840741,
+      "window_clears_at_timestamp": 1788841041,
+      "remaining_seconds": 0
+    },
+    "safe_address": "0xb69ab6c7e73f711d5f2d10fed8f0d09b1d028c28",
+    "relayer_address": "0x0c49cc4d53423ccd6be2bcf115a25f418649c5c9",
+    "ephemeral_key": false,
+    "gas_price_wei": 6000000,
+    "safe_eth_wei": 100000000000000,
+    "transactions": [
+      {
+        "role": "gauge_withdraw",
+        "action": "unstake",
+        "safe_tx_hash": "0x6d9379ffbb2d82a3daf8bc54aeb157199b92c5616a38e1b04385b2247ccbe138",
+        "to_address": "0x43021fbbd01b967704ab2379f6e90e2d367042f3",
+        "calldata_digest": "0xc243297bd84fb9073181330087f4555f3e471527a7d3adaa0ae3887d5bf3b0d7",
+        "nonce": 20,
+        "description": "unstake token 5703026; the withdraw also sweeps pending fees and auto-claims the accrued emissions",
+        "signature_verified": true,
+        "signature_diagnostic": "The live Safe contract accepted the signature read-only.",
+        "gas_estimate": 497585,
+        "gas_estimate_diagnostic": ""
+      }
+    ],
+    "caps_enforced": [
+      "token within the USDC-plus-registry whitelist",
+      "pool 0xa3b1e3f9747065e2073722ff4c9027d3ea4994f0 from live Sugar discovery",
+      "snapshot fresher than 120 seconds",
+      "position 5703026 resolved staked in the gauge",
+      "penalty window clear with 0s margin at 10000 bps",
+      "effective gas price at or below 1000000000 wei",
+      "Safe ETH balance at or above the 50000000000000-wei floor"
+    ],
+    "build_duration_ms": "196662.229",
+    "diagnostics": [
+      "earned reports 529256529608932 raw AERO live and 0 raw AERO checkpointed; the withdraw claims the live amount",
+      "the penalty window clears at 1788841041 (0s remaining at 10000 bps)"
+    ]
+  },
+  "steps": [
+    {
+      "mode": "execute",
+      "action": "unstake",
+      "role": "gauge_withdraw",
+      "safe_tx_hash": "0x6d9379ffbb2d82a3daf8bc54aeb157199b92c5616a38e1b04385b2247ccbe138",
+      "nonce": 20,
+      "transaction_hash": "0x27c0f186c6bb8471b5ba32a32633b3aeab2d4d91245133530e047f655c8e519a",
+      "status": "confirmed",
+      "block_number": 51025990,
+      "gas_used": 406110,
+      "effective_gas_price_wei": 6000000,
+      "fee_wei": 2436660000000,
+      "delivery_gas_limit": 597102,
+      "delivery_max_fee_per_gas_wei": 6000000,
+      "relayer_nonce": 16,
+      "inclusion_ms": "647.122",
+      "rebuild_ms": "0.082",
+      "validate_ms": "8892.395",
+      "estimate_ms": "370.089",
+      "delivery_ms": "953.066",
+      "send_ms": "332.434",
+      "diagnostic": ""
+    }
+  ],
+  "completed": true,
+  "halted_reason": ""
+}

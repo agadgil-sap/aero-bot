@@ -1,0 +1,53 @@
+{
+  "stages": {
+    "quote": {
+      "epoch": 1788841831.3967118,
+      "balance_units": 2172446,
+      "price": "319.3874",
+      "expected_usdc_units": 6938517,
+      "min_units": 6869131,
+      "allowance_units": 0,
+      "ms": 1099.4990234375
+    }
+  },
+  "steps": [
+    {
+      "role": "router_stock_allowance",
+      "safe_nonce": 23,
+      "tx_hash": "0xff0f6f958e952149aa9fc1e94c9bf75ffd24248c0c5180dcaa30c898900df9fa",
+      "gas_used": 84972,
+      "gas_price_wei": 6000000,
+      "fee_wei": 509832000000,
+      "block_number": 51026244,
+      "estimate": 85892,
+      "stage_ms": {
+        "build_ms": 347.194091796875,
+        "validate_ms": 335.912841796875,
+        "estimate_ms": 316.343017578125,
+        "delivery_ms": 992.73876953125,
+        "inclusion_ms": 616.0703125
+      }
+    },
+    {
+      "role": "swap_aaplc_to_usdc",
+      "safe_nonce": 24,
+      "tx_hash": "0x059d2a20c8889c87ada5f99cb70e29ac811e09a990010efab04122e352d0ec73",
+      "gas_used": 285803,
+      "gas_price_wei": 6000000,
+      "fee_wei": 1714818000000,
+      "block_number": 51026250,
+      "estimate": 309630,
+      "stage_ms": {
+        "build_ms": 8935.2998046875,
+        "validate_ms": 310.22509765625,
+        "estimate_ms": 304.574951171875,
+        "delivery_ms": 907.423095703125,
+        "inclusion_ms": 20099.548095703125
+      }
+    }
+  ],
+  "final": {
+    "stock_units": 0,
+    "usdc_units": 8972790
+  }
+}

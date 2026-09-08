@@ -1,0 +1,131 @@
+{
+  "mode": "execute",
+  "action": "mint",
+  "build": {
+    "mode": "dry_run",
+    "plan": {
+      "symbol": "AAPLc",
+      "pool_address": "0xa3b1e3f9747065e2073722ff4c9027d3ea4994f0",
+      "nfpm_address": "0xe1f8cd9ac4e4a65f54f38a5cdafca44f6dd68b53",
+      "gauge_address": "0x43021fbbd01b967704ab2379f6e90e2d367042f3",
+      "position_range": {
+        "tick_spacing": 10,
+        "current_tick": -11614,
+        "requested_half_width_spacings": 1,
+        "half_width_ticks": 10,
+        "half_width_fraction": "0.0010004501200210025202100120004500100001",
+        "tick_lower": -11630,
+        "tick_upper": -11610,
+        "width_source": "explicit_override",
+        "clamped_to_ceiling": false
+      },
+      "amounts": {
+        "liquidity": "3918458358.67186740728630291472464845524988392449419846303668",
+        "amount0_desired_units": 1105446,
+        "amount1_desired_units": 1845538,
+        "amount0_min_units": 1094391,
+        "amount1_min_units": 1827082,
+        "token0_value_usdc": "1.105446",
+        "token1_value_usdc": "5.89455193095396345088952794154672882061271111062205762244851",
+        "slippage_tolerance_fraction": "0.01"
+      },
+      "balancing_swap": {
+        "required": false,
+        "stock_shortfall_units": 0,
+        "usdc_in_units": 0,
+        "expected_stock_units": 0,
+        "modeled_impact_fraction": "0",
+        "tranche_count": 1,
+        "buffer_fraction": "0.001"
+      },
+      "price_usdc_per_stock": "319.394774366822219368527114670449962049695596114632027216373",
+      "budget_usdc": "7",
+      "pool_depth_usdc": "240357.9363247609473513247872",
+      "caps_enforced": [
+        "budget at or below the 50 USDC per-pool cap",
+        "budget at or below the remaining 100 USDC of the 100 USDC total pilot cap",
+        "half width 10 ticks at or below the 0.003 ceiling (explicit override)",
+        "snapshot price strictly inside the derived range",
+        "budget at or below 0.01 of the estimated 240357.9363247609473513247872 USDC in-range depth",
+        "held stock covers the stock side; no balancing swap required",
+        "Safe USDC covers the quote side plus the balancing swap"
+      ],
+      "diagnostics": [
+        "AAPLc pool 0xa3b1e3f9747065e2073722ff4c9027d3ea4994f0 at snapshot block 51025469, price 319.394774366822219368527114670449962049695596114632027216373 USDC per AAPLc",
+        "range [-11630, -11610) ticks, half width 10 ticks (explicit override), fraction 0.0010004501200210025202100120004500100001",
+        "composition: 1105446 raw USDC + 1845538 raw stock, liquidity 3918458358.67186740728630291472464845524988392449419846303668, sides valued 1.105446 + 5.89455193095396345088952794154672882061271111062205762244851 USDC of the 7 USDC budget",
+        "minima 1094391/1827082 raw at tolerance 0.01",
+        "pool in-range depth estimate 240357.9363247609473513247872 USDC; budget is 0.0029% of it",
+        "balancing swap: none required; held stock covers the stock side"
+      ],
+      "snapshot_block": 51025469,
+      "observed_at": "2026-09-08T04:07:46.056733Z"
+    },
+    "safe_address": "0xb69ab6c7e73f711d5f2d10fed8f0d09b1d028c28",
+    "relayer_address": "0x0c49cc4d53423ccd6be2bcf115a25f418649c5c9",
+    "ephemeral_key": false,
+    "router_usdc_allowance_units": 14119135,
+    "nfpm_usdc_allowance_units": 1486577,
+    "nfpm_stock_allowance_units": 2146953,
+    "gas_price_wei": 6000000,
+    "safe_eth_wei": 100000000000000,
+    "transactions": [
+      {
+        "role": "mint",
+        "action": "mint",
+        "safe_tx_hash": "0x8500342f0ded39dc1e6bed538d95794585a0051a1686e519d341d8fcfcda8e14",
+        "to_address": "0xe1f8cd9ac4e4a65f54f38a5cdafca44f6dd68b53",
+        "calldata_digest": "0x8bac3cc403e9567222fd9b2806aa9ec82657b32a4dbd3e152d1ddd86b85e65d0",
+        "nonce": 16,
+        "description": "mint range [-11630, -11610) with 1105446 + 1845538 raw units",
+        "signature_verified": true,
+        "signature_diagnostic": "The live Safe contract accepted the signature read-only.",
+        "gas_estimate": 508200,
+        "gas_estimate_diagnostic": ""
+      }
+    ],
+    "caps_enforced": [
+      "token within the USDC-plus-registry whitelist",
+      "pool 0xa3b1e3f9747065e2073722ff4c9027d3ea4994f0 from live Sugar discovery",
+      "snapshot fresher than 120 seconds",
+      "Safe holds no untracked position NFTs on this NFPM",
+      "budget at or below the 50 USDC per-pool cap",
+      "budget at or below the remaining 100 USDC of the 100 USDC total pilot cap",
+      "half width 10 ticks at or below the 0.003 ceiling (explicit override)",
+      "snapshot price strictly inside the derived range",
+      "budget at or below 0.01 of the estimated 240357.9363247609473513247872 USDC in-range depth",
+      "held stock covers the stock side; no balancing swap required",
+      "Safe USDC covers the quote side plus the balancing swap",
+      "effective gas price at or below 1000000000 wei",
+      "Safe ETH balance at or above the 50000000000000-wei floor"
+    ],
+    "build_duration_ms": "198325.605"
+  },
+  "steps": [
+    {
+      "mode": "execute",
+      "action": "mint",
+      "role": "mint",
+      "safe_tx_hash": "0x8500342f0ded39dc1e6bed538d95794585a0051a1686e519d341d8fcfcda8e14",
+      "nonce": 16,
+      "transaction_hash": "0x85ac42f2994ca554905cd46acc30b5a4d4e39815cc114e5e03a379e9b4399188",
+      "status": "confirmed",
+      "block_number": 51025570,
+      "gas_used": 487773,
+      "effective_gas_price_wei": 6000000,
+      "fee_wei": 2926638000000,
+      "delivery_gas_limit": 609840,
+      "delivery_max_fee_per_gas_wei": 6000000,
+      "relayer_nonce": 12,
+      "inclusion_ms": "626.183",
+      "rebuild_ms": "0.040",
+      "validate_ms": "306.220",
+      "estimate_ms": "319.816",
+      "delivery_ms": "939.434",
+      "send_ms": "313.932",
+      "diagnostic": ""
+    }
+  ],
+  "completed": true,
+  "halted_reason": ""
+}

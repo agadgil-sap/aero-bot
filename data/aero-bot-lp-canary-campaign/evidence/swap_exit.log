@@ -1,0 +1,8 @@
+[04:30:31] quote: {'balance_units': 2172446, 'price': '319.3874', 'expected_usdc_units': 6938517, 'min_units': 6869131, 'allowance_units': 0}
+[router_stock_allowance] BROADCAST 0xff0f6f958e952149aa9fc1e94c9bf75ffd24248c0c5180dcaa30c898900df9fa (Safe nonce 23, gas 103071 at 6000000 wei, estimate 85892)
+[router_stock_allowance] INCLUDED 0xff0f6f958e952149aa9fc1e94c9bf75ffd24248c0c5180dcaa30c898900df9fa block 51026244, 84972 gas at 6000000 wei (509832000000 wei fee)
+[swap_aaplc_to_usdc] BROADCAST 0x059d2a20c8889c87ada5f99cb70e29ac811e09a990010efab04122e352d0ec73 (Safe nonce 24, gas 371556 at 6000000 wei, estimate 309630)
+receipt poll failed on backend: RPC request failed with unexpected HTTP status 403
+receipt poll failed on backend: RPC error -32001: You've reached the usage limit for your current plan. To continue with higher limits and uninterrupted access, please upgrade here: https://www.1rpc.io/#pricing
+[swap_aaplc_to_usdc] INCLUDED 0x059d2a20c8889c87ada5f99cb70e29ac811e09a990010efab04122e352d0ec73 block 51026250, 285803 gas at 6000000 wei (1714818000000 wei fee)
+final balances: AAPLc 0 raw, USDC 8972790 raw
