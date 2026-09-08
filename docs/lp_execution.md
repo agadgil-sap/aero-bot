@@ -3,8 +3,7 @@
 ## Scope of this page
 
 This page documents the LP position lifecycle work.
-It records the verified contract interface the lifecycle builds on, the pure planning layer that turns a Sugar snapshot plus Safe inventory into a capped mint plan, and the executor layer that composes, signs, validates, and audits the Safe transaction sequences without ever broadcasting them.
-The canary broadcast procedure is added when that surface lands.
+It records the verified contract interface the lifecycle builds on, the pure planning layer that turns a Sugar snapshot plus Safe inventory into a capped mint plan, the executor layer that composes, signs, validates, and audits the Safe transaction sequences, and the execute surface that broadcasts them one audited nonce at a time behind an explicit confirmation flag.
 
 ## Verified Slipstream contract interface
 
@@ -159,7 +158,7 @@ The plan's amounts feed `build_lp_mint_calldata` directly, which the pinned offl
 ## LP lifecycle executor
 
 `src/aero_bot/lp_executor.py` is the lifecycle's signing and validation layer, shaped on the swap executor's containment posture.
-Every action is a manual one-shot CLI request, every hard cap is enforced in code before anything is signed, and this release has no broadcast path at all: the `aero-bot-lp` command stops at building, read-only validation, and auditing.
+Every action is a manual one-shot CLI request, every hard cap is enforced in code before anything is signed, and dry runs stop at building, read-only validation, and auditing; the execute subcommands add the broadcast path behind an explicit confirmation flag with the same audit-first discipline.
 There is no loop, scheduler, watcher, or policy-driven trigger anywhere in the module.
 
 ### Sequence composition
@@ -205,6 +204,11 @@ These gates run before anything is signed, in order, and each appends its label 
 | Single-tranche swap | planner tranche count is one | `multi_tranche_swap_unsupported` |
 | Gas price cap | 1 gwei | `gas_price_above_cap` |
 | Safe ETH floor | 0.00005 ETH | `safe_eth_below_floor` |
+| Relayer ETH floor (execute) | 0.0002 ETH plus twice the bounded gas cost | `relayer_eth_insufficient` |
+| Broadcast confirmation (execute) | explicit `--confirm-broadcast` flag | `broadcast_confirmation_missing` |
+| Rebuilt hash pin (execute) | byte-exact against the report | `rebuild_hash_mismatch` |
+| Execute-time signature | live `checkSignatures` accepts again | `signature_rejected` |
+| Fresh estimate (execute) | succeeds with predecessors mined | `estimate_reverted` |
 
 The untracked-positions gate is deliberately fail-closed: once the Safe holds any position NFT, the total-exposure cap cannot be evaluated honestly without a live position-value read, so entry refuses until that read exists.
 The `derived_width_unavailable` gate stands until the emissions-APR convention fix lands, because the solver's APR input is known understated; no solver-derived width can masquerade as an operator override in the meantime.
@@ -244,7 +248,7 @@ Nothing in the status path builds, signs, estimates, or audits a transaction: th
 
 ### Audit chain and CLI surface
 
-Every plan, built transaction, and refusal appends to the same append-only hash-chained SQLite store as the swap executor, with these event types: `lp_mint_planned`, `lp_stake_planned`, `lp_unstake_planned`, `lp_exit_planned`, `lp_collect_planned`, `lp_recenter_planned`, `lp_status_reported`, `lp_transaction_built`, and `lp_refused`.
+Every plan, built transaction, and refusal appends to the same append-only hash-chained SQLite store as the swap executor, with these event types: `lp_mint_planned`, `lp_stake_planned`, `lp_unstake_planned`, `lp_exit_planned`, `lp_collect_planned`, `lp_recenter_planned`, `lp_status_reported`, `lp_transaction_built`, `lp_refused`, and - on the execute path - `lp_execute_sent`, `lp_execute_confirmed`, and `lp_execute_failed`.
 A recenter appends its inner mint plan as `lp_mint_planned` followed by the `lp_recenter_planned` batch record, so the recycled entry stays inspectable as a first-class plan.
 Refusal records carry the executor catalog code plus the planner's own code when the planner refused, and the action name (`mint`, `stake`, `unstake`, `withdraw`, `collect`, `recenter`, `status`), so both layers' decisions stay inspectable offline.
 The CLI exits zero on success, one on failures, and two on any refusal, with the catalog code printed to stderr as `refused [<code>]`.
@@ -257,16 +261,55 @@ aero-bot-lp dry-run unstake --symbol AAPLc --token-id 0
 aero-bot-lp dry-run withdraw --symbol AAPLc --token-id 0
 aero-bot-lp dry-run collect --symbol AAPLc --token-id 0
 aero-bot-lp dry-run recenter --symbol AAPLc --token-id 0 --width-ticks 1 [--amount 12]
+aero-bot-lp execute mint --symbol AAPLc --amount 7 --width-ticks 1 --confirm-broadcast
+aero-bot-lp execute stake --symbol AAPLc --token-id 0 --confirm-broadcast
+aero-bot-lp execute unstake --symbol AAPLc --token-id 0 --confirm-broadcast
+aero-bot-lp execute withdraw --symbol AAPLc --token-id 0 --confirm-broadcast
+aero-bot-lp execute collect --symbol AAPLc --token-id 0 --confirm-broadcast
 aero-bot-lp status --symbol AAPLc --token-id 0 --aero-price 0.30 [--entry-cost 7]
 ```
 
-Every subcommand accepts `--json` for the complete typed report; the dry-run subcommands accept `--ephemeral-key` to sign with a throwaway key whose signature check then honestly reports rejection.
+Every subcommand accepts `--json` for the complete typed report; the dry-run and execute subcommands accept `--ephemeral-key` to sign with a throwaway key whose signature check then honestly reports rejection.
 Status takes no key at all, because nothing is signed, and requires the AERO price explicitly rather than reading one from an unregistered source.
+
+## Execute path (broadcast surface)
+
+The `execute` subcommands productize the canary driver's proven send loop as a first-class CLI surface with the same containment posture as the swap executor: read-only by default, broadcast only behind the explicit `--confirm-broadcast` flag, and a refusal - `broadcast_confirmation_missing` - audited and exited as code two without it before anything is built.
+The recenter action has no execute form: its restake is a documented follow-up command by design, so it stays a dry-run-only batch until that composition changes.
+
+Each execute runs the complete dry-run build first - every cap, refusal, live `checkSignatures` validation, and audit record, carrying `mode: execute` - and then broadcasts one Safe nonce at a time:
+
+1. The built step is rebuilt from its exact transaction and the SafeTx hash is pinned byte-for-byte against the report's; any mismatch refuses as `rebuild_hash_mismatch` so substituted content can never broadcast.
+2. The owner signature is proven against the live Safe again; a rejection refuses as `signature_rejected` before anything is sent.
+3. A fresh `eth_estimateGas` runs with every predecessor mined, so a revert is a genuine refusal - `estimate_reverted` - that stops the sequence honestly at the completed prefix. The one observed transient - a `GS026` whose receipt simply had not reached the estimating endpoint's latest block yet - earns three bounded fresh re-reads four seconds apart, exactly the live behavior seen during the canary.
+4. The delivery transaction is built exactly like the swap executor's: type 2, `to` the checksummed Safe, gas limit at the fresh estimate buffered by a fifth, both fee parameters at the observed gas price capped at the one-gwei policy, and the relaying EOA's pending nonce. The relayer preflight demands the policy floor (0.0002 ETH) and twice the bounded gas cost, refusing as `relayer_eth_insufficient` otherwise.
+5. `eth_sendRawTransaction` lands, the transaction hash prints immediately to stderr, and the `lp_execute_sent` audit record is appended BEFORE any receipt wait - the audit chain, not a receipt poll, is the source of truth for what was broadcast.
+6. The receipt is awaited under one bounded 600-second wait, polling every configured endpoint round-robin (the primary plus `base.publicnode.com`, `1rpc.io/base`, and `base.drpc.org`) every three seconds. Exhaustion reports the step as `unconfirmed` with a warning diagnostic and halts the sequence - never relabeled a failure, because a landed broadcast was mislabeled once before. An included-but-reverted delivery audits `lp_execute_failed` and exits one; a confirmed one audits `lp_execute_confirmed` and proceeds to the next nonce.
+
+Every step report carries the full timing capture (rebuild, validate, estimate, delivery, send, inclusion), the gas and fee actually consumed, and the relayer nonce - the same evidence the canary's timing report needs.
+
+### Live broadcast evidence (2026-09-08, canary driver)
+
+This surface is the productized form of the `run/lp_canary.py` driver that executed the first real LP broadcasts through the canary Safe during the 2026-09-08 campaign.
+Seven Safe transactions mined on Base mainnet (nonces 6-12), each hash-pinned, re-validated, freshly estimated, delivered at 6 mgas, receipted in 0.6-0.8 seconds, and audited:
+
+| Safe nonce | Role | Transaction | Gas used | Fee (wei) |
+| --- | --- | --- | --- | --- |
+| 6 | balancing_swap | `0xc0c8bd1bf27d168acfb0c6c6490674dda75c59be0f61f50bd4ef641dd5a2e83f` | 286,348 | 1,718,088,000,000 |
+| 7 | nfpm_usdc_allowance | `0x491037215ee4057486dc8eb56526e912888a7d93b3815cdd278c42a3a8a90ae3` | 94,959 | 569,754,000,000 |
+| 8 | balancing_swap | `0x1fc5c6282c688a482ccd37e82b8842cb8196d3867074e2c3dc387ec247a9bdce` | 295,303 | 1,787,925,302,135 |
+| 9 | nfpm_stock_allowance | `0xa6150472e748a6ecf7e9278f1f8feafe8a4da6056358f1339e64276f004f9a77` | 84,972 | 509,832,000,000 |
+| 10 | nfpm_usdc_allowance | `0x65aca1a813a675b7baf99657bf309aa527ae3516331185cb88eb209a20145316` | 77,859 | 467,154,000,000 |
+| 11 | nfpm_usdc_allowance | `0xe962b3baa2dbb19b465123f709154f864b89ca09e8dad116187d72779b013256` | 77,847 | 467,082,000,000 |
+| 12 | nfpm_usdc_allowance | `0x87f437aa2c2e8060666f5d997a49991aa74431a4b72c5903c6e9016cf13da6d3` | 77,859 | 467,154,000,000 |
+
+The mint step itself never broadcast: its fresh estimate refused honestly four times as `estimate_reverted` with the inner `PSC` revert, which the campaign's minima evidence (in the canary campaign data folder) traces to the 0.1-percent-of-amount minima convention on a 20-tick range - a measurement-backed calibration gap awaiting the captain's ruling, not a machinery fault.
+The AERO token address recorded in the campaign brief also carried a one-character typo; the executor resolves the reward token from the gauge's own `rewardToken()` view instead.
 
 ### Live real-key dry-run evidence (verbatim, 2026-09-08)
 
 The captures below ran against Base mainnet with the real Keychain key (`bot-signing-key` / `aero-bot`, the relayer EOA `0x0c49...c5c9`) and the real canary Safe.
-Nothing was broadcast: this release has no broadcast path, and each capture's only chain writes are local audit appends.
+Nothing was broadcast in these captures: dry runs never broadcast, and each capture's only chain writes are local audit appends.
 
 The plan, read-only:
 

@@ -1,6 +1,7 @@
 """Behavior tests for the capped manual LP lifecycle execution module."""
 
 import json
+from collections.abc import Callable
 from datetime import UTC, date, datetime
 from decimal import ROUND_FLOOR, Decimal, localcontext
 from pathlib import Path
@@ -308,6 +309,15 @@ class LpRpcScript:
         collect_gas_estimate: int | None = 90_000,
         burn_gas_estimate: int | None = 60_000,
         get_reward_gas_estimate: int | None = 110_000,
+        allow_broadcasts: bool = False,
+        relayer_eth_wei: int = 10**15,
+        relayer_starting_nonce: int = 3,
+        receipt_status: int = 1,
+        receipt_present: bool = True,
+        estimate_reverts_after: int | None = None,
+        estimate_revert_message: str = "execution reverted: PSC",
+        estimate_gs026_lag_calls: int = 0,
+        estimate_gs026_lag_from: int = 1,
     ) -> None:
         """Configure every scripted answer the LP executor's calls receive.
 
@@ -353,6 +363,22 @@ class LpRpcScript:
                 estimate revert.
             get_reward_gas_estimate: Gas served for gauge getReward, or None
                 to make that estimate revert.
+            allow_broadcasts: Whether eth_sendRawTransaction is served; the
+                default keeps the no-broadcast trap for every dry-run path.
+            relayer_eth_wei: Balance served for the relaying EOA address.
+            relayer_starting_nonce: First pending nonce served per send.
+            receipt_status: Status word served for included deliveries.
+            receipt_present: Whether receipts are served at all; False keeps
+                every poll empty so the bounded wait can time out.
+            estimate_reverts_after: Make every estimateGas call past this
+                count revert with estimate_revert_message, counting both the
+                build-time and execute-time estimates.
+            estimate_revert_message: The revert message for the cap above.
+            estimate_gs026_lag_calls: How many estimateGas calls revert with
+                a GS026 lag marker before resuming the scripted answers.
+            estimate_gs026_lag_from: The 1-based estimateGas call the GS026
+                lag window starts at, so tests can target execute-time
+                estimates behind the build-time ones.
         """
         self.gas_price_wei = gas_price_wei
         self.safe_eth_wei = safe_eth_wei
@@ -383,6 +409,16 @@ class LpRpcScript:
         self.get_reward_gas_estimate = get_reward_gas_estimate
         self.broadcasts: list[str] = []
         self.estimate_requests: list[str] = []
+        self.allow_broadcasts = allow_broadcasts
+        self.relayer_eth_wei = relayer_eth_wei
+        self.relayer_next_nonce = relayer_starting_nonce
+        self.receipt_status = receipt_status
+        self.receipt_present = receipt_present
+        self.estimate_reverts_after = estimate_reverts_after
+        self.estimate_revert_message = estimate_revert_message
+        self.estimate_gs026_lag_remaining = estimate_gs026_lag_calls
+        self.estimate_gs026_lag_from = estimate_gs026_lag_from
+        self.inclusion_blocks = 51_000_000
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         """Answer one JSON-RPC request from the scripted state."""
@@ -393,7 +429,13 @@ class LpRpcScript:
         if method == "eth_gasPrice":
             result = hex(self.gas_price_wei)
         elif method == "eth_getBalance":
-            result = hex(self.safe_eth_wei)
+            if str(params[0]).lower() == SAFE_ADDRESS:
+                result = hex(self.safe_eth_wei)
+            else:
+                result = hex(self.relayer_eth_wei)
+        elif method == "eth_getTransactionCount":
+            result = hex(self.relayer_next_nonce)
+            self.relayer_next_nonce += 1
         elif method == "eth_call":
             result = self._eth_call(str(params[0]["to"]).lower(), str(params[0]["data"]))
         elif method == "eth_estimateGas":
@@ -401,9 +443,24 @@ class LpRpcScript:
             self.estimate_requests.append(calldata)
             result = self._estimate(calldata)
         elif method == "eth_sendRawTransaction":
-            # A broadcast attempt is a containment failure and fails the test.
+            if not self.allow_broadcasts:
+                # A broadcast attempt without the confirmed execute path is a
+                # containment failure and fails the test.
+                self.broadcasts.append(str(params[0]))
+                raise AssertionError("the LP executor must never broadcast anything")
             self.broadcasts.append(str(params[0]))
-            raise AssertionError("the LP executor must never broadcast anything")
+            result = "0x" + f"{len(self.broadcasts):064x}"
+        elif method == "eth_getTransactionReceipt":
+            if not self.receipt_present:
+                result = None
+            else:
+                self.inclusion_blocks += 1
+                result = {
+                    "status": hex(self.receipt_status),
+                    "blockNumber": hex(self.inclusion_blocks),
+                    "gasUsed": hex(80_000),
+                    "effectiveGasPrice": hex(self.gas_price_wei),
+                }
         else:
             raise AssertionError(f"unexpected LP executor RPC method {method}")
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
@@ -472,6 +529,19 @@ class LpRpcScript:
 
     def _estimate(self, calldata: str) -> str:
         """Answer one gas estimate by the inner call embedded in the exec data."""
+        if (
+            self.estimate_gs026_lag_remaining > 0
+            and len(self.estimate_requests) >= self.estimate_gs026_lag_from
+        ):
+            self.estimate_gs026_lag_remaining -= 1
+            raise _ScriptedRevertError("GS026")
+        if (
+            self.estimate_reverts_after is not None
+            and len(self.estimate_requests) > self.estimate_reverts_after
+        ):
+            raise _ScriptedRevertError(
+                self.estimate_revert_message.removeprefix("execution reverted: ")
+            )
         inner = self._inner_calldata(calldata)
         selector = inner[:4].hex()
         if selector == "095ea7b3":
@@ -595,6 +665,9 @@ def make_lp_executor(
     rpc_script: LpRpcScript | None = None,
     safe_script: SafeRpcScript | None = None,
     audit_path: Path | None = None,
+    sleep: Callable[[float], None] | None = None,
+    timer: Callable[[], float] | None = None,
+    receipt_script: LpRpcScript | None = None,
 ) -> tuple[LpLifecycleExecutor, LpRpcScript, SafeRpcScript]:
     """Assemble one LP executor over fully scripted transport boundaries.
 
@@ -603,6 +676,11 @@ def make_lp_executor(
         rpc_script: LP RPC script, defaulting to a clean five-step entry.
         safe_script: Safe RPC script, matching nonces and accepted signatures.
         audit_path: Optional real audit-store path for persistence tests.
+        sleep: Optional injected delay for the execute path's bounded waits.
+        timer: Optional injected monotonic clock for the execute path's
+            bounded receipt wait.
+        receipt_script: Optional second RPC script polled for receipts; when
+            present it joins the receipt-backend rotation behind the primary.
 
     Returns:
         The executor plus both scripts so tests can inspect the exchanges.
@@ -613,6 +691,15 @@ def make_lp_executor(
     if safe_script is None:
         safe_script = SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * expected_steps)
     audit_sink = AuditStore(audit_path) if audit_path is not None else None
+    receipt_backends = [
+        ExecutorRpcBackend(rpc_url="https://fixture.example", transport=rpc_script.transport())
+    ]
+    if receipt_script is not None:
+        receipt_backends.append(
+            ExecutorRpcBackend(
+                rpc_url="https://receipts.example", transport=receipt_script.transport()
+            )
+        )
     executor = LpLifecycleExecutor(
         policy=LpSafeExecutionPolicy(),
         plan_policy=LpExecutionPolicy(),
@@ -626,6 +713,9 @@ def make_lp_executor(
         ),
         audit_sink=audit_sink,
         now=lambda: BASE_NOW,
+        sleep=sleep if sleep is not None else (lambda _seconds: None),
+        **({"timer": timer} if timer is not None else {}),
+        receipt_backends=receipt_backends,
     )
     return executor, rpc_script, safe_script
 
@@ -2443,3 +2533,366 @@ def test_cli_unavailable_reads_exit_one(tmp_path: Path, capsys: pytest.CaptureFi
 
     assert exit_code == EXIT_FAILURE
     assert "failed:" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Execute path (broadcast behind the explicit confirmation flag)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_mint_refuses_without_broadcast_confirmation(tmp_path: Path) -> None:
+    """Without the explicit flag the execute path refuses before building."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, rpc_script, _ = make_lp_executor(audit_path=audit_path)
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.execute_mint(
+            "FIXc",
+            MINT_BUDGET_USDC,
+            MINT_WIDTH_SPACINGS,
+            bytes(Account.create().key),
+            confirm_broadcast=False,
+        )
+
+    assert raised.value.code is LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING
+    assert rpc_script.broadcasts == []
+    records = AuditStore(audit_path).read_records(10)
+    assert [record.event_type for record in records] == [AuditEventType.LP_REFUSED]
+    refusal = json.loads(records[0].payload_json)
+    assert refusal["code"] == "broadcast_confirmation_missing"
+    assert refusal["mode"] == "execute"
+    assert refusal["action"] == "mint"
+
+
+def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> None:
+    """A confirmed execute broadcasts one delivery per Safe nonce, audited."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=LpRpcScript(allow_broadcasts=True),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 10),
+    )
+
+    report = executor.execute_mint(
+        "FIXc",
+        MINT_BUDGET_USDC,
+        MINT_WIDTH_SPACINGS,
+        bytes(Account.create().key),
+        confirm_broadcast=True,
+    )
+
+    assert report.completed is True
+    assert report.halted_reason == ""
+    assert [step.role for step in report.steps] == [
+        LpExecutionRole.ROUTER_ALLOWANCE,
+        LpExecutionRole.BALANCING_SWAP,
+        LpExecutionRole.NFPM_USDC_ALLOWANCE,
+        LpExecutionRole.NFPM_STOCK_ALLOWANCE,
+        LpExecutionRole.MINT,
+    ]
+    assert [step.nonce for step in report.steps] == [4, 5, 6, 7, 8]
+    assert [step.relayer_nonce for step in report.steps] == [3, 4, 5, 6, 7]
+    assert all(step.status == "confirmed" for step in report.steps)
+    assert all(step.fee_wei == 80_000 * FIXTURE_GAS_PRICE_WEI for step in report.steps)
+    # The delivery gas limit buffers each fresh estimate by a fifth.
+    for step, estimate in zip(
+        report.steps, (60_000, 200_000, 60_000, 60_000, 400_000), strict=True
+    ):
+        assert step.delivery_gas_limit == int(estimate * 1.2)
+    assert len(rpc_script.broadcasts) == 5
+
+    records = AuditStore(audit_path).read_records(100)
+    assert [record.event_type for record in records] == [
+        AuditEventType.LP_MINT_PLANNED,
+        *([AuditEventType.LP_TRANSACTION_BUILT] * 5),
+        *([AuditEventType.LP_EXECUTE_SENT, AuditEventType.LP_EXECUTE_CONFIRMED] * 5),
+    ]
+    planned = json.loads(records[0].payload_json)
+    assert planned["mode"] == "execute"
+    first_sent = json.loads(records[6].payload_json)
+    assert first_sent["action"] == "mint"
+    assert first_sent["role"] == "router_allowance"
+    assert first_sent["nonce"] == 4
+    first_receipt = json.loads(records[7].payload_json)
+    assert first_receipt["outcome"] == "confirmed"
+    assert first_receipt["gas_used"] == 80_000
+    assert AuditStore(audit_path).verify_chain().status.value == "verified"
+
+
+def make_execute_stake_executor(
+    audit_path: Path | None = None,
+    *,
+    script_kwargs: dict[str, object] | None = None,
+    **executor_kwargs: object,
+) -> tuple[LpLifecycleExecutor, LpRpcScript]:
+    """Assemble a two-step stake executor over a broadcast-serving script."""
+    script = LpRpcScript(
+        owner_addresses={77: SAFE_ADDRESS},
+        position_words=make_position_words(),
+        allow_broadcasts=True,
+        **(script_kwargs or {}),  # type: ignore[arg-type]
+    )
+    executor, _, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=script,
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+        **executor_kwargs,  # type: ignore[arg-type]
+    )
+    return executor, script
+
+
+def test_execute_halts_at_an_execute_time_estimate_revert(tmp_path: Path) -> None:
+    """A fresh-estimate revert stops the sequence at the completed prefix."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, rpc_script = make_execute_stake_executor(
+        audit_path=audit_path, script_kwargs={"estimate_reverts_after": 3}
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert raised.value.code is LpExecutionRefusalCode.ESTIMATE_REVERTED
+    assert "stopping honestly" in str(raised.value)
+    assert "PSC" in str(raised.value)
+    # Two build estimates and one execute estimate succeeded; the second
+    # execute estimate reverted, so exactly one step broadcast.
+    assert len(rpc_script.broadcasts) == 1
+    records = AuditStore(audit_path).read_records(100)
+    assert [record.event_type for record in records] == [
+        AuditEventType.LP_STAKE_PLANNED,
+        AuditEventType.LP_TRANSACTION_BUILT,
+        AuditEventType.LP_TRANSACTION_BUILT,
+        AuditEventType.LP_EXECUTE_SENT,
+        AuditEventType.LP_EXECUTE_CONFIRMED,
+        AuditEventType.LP_REFUSED,
+    ]
+    refusal = json.loads(records[-1].payload_json)
+    assert refusal["code"] == "estimate_reverted"
+    assert refusal["mode"] == "execute"
+
+
+def test_execute_refuses_when_the_relayer_floor_is_short(tmp_path: Path) -> None:
+    """A relayer below the floor never reaches a broadcast."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, rpc_script = make_execute_stake_executor(
+        audit_path=audit_path, script_kwargs={"relayer_eth_wei": 1}
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert raised.value.code is LpExecutionRefusalCode.RELAYER_ETH_INSUFFICIENT
+    assert rpc_script.broadcasts == []
+
+
+def test_execute_refuses_a_signature_rejected_at_execute_time(tmp_path: Path) -> None:
+    """A live signature rejection at execute time halts before broadcasting."""
+    audit_path = tmp_path / "audit.sqlite3"
+    script = LpRpcScript(
+        owner_addresses={77: SAFE_ADDRESS},
+        position_words=make_position_words(),
+        allow_broadcasts=True,
+    )
+    executor, _, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=script,
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True, True, True, False]),
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert raised.value.code is LpExecutionRefusalCode.SIGNATURE_REJECTED
+    # The first step broadcast and confirmed; the second refused pre-send.
+    assert len(script.broadcasts) == 1
+
+
+def test_execute_reports_a_failed_delivery_and_halts(tmp_path: Path) -> None:
+    """An on-chain revert marks the step failed and stops the sequence."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, rpc_script = make_execute_stake_executor(
+        audit_path=audit_path, script_kwargs={"receipt_status": 0}
+    )
+
+    report = executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert report.completed is False
+    assert report.steps[0].status == "failed"
+    assert len(report.steps) == 1
+    assert "reverted on-chain" in report.steps[0].diagnostic
+    assert len(rpc_script.broadcasts) == 1
+    records = AuditStore(audit_path).read_records(100)
+    assert records[4].event_type is AuditEventType.LP_EXECUTE_FAILED
+    failed = json.loads(records[4].payload_json)
+    assert failed["outcome"] == "failed"
+
+
+def test_execute_reports_an_unconfirmed_delivery_as_a_warning(tmp_path: Path) -> None:
+    """An exhausted receipt wait is a warning, never a failure relabel."""
+    audit_path = tmp_path / "audit.sqlite3"
+    clock_values = iter(float(value) for value in range(0, 10**7, 10_000))
+    executor, rpc_script = make_execute_stake_executor(
+        audit_path=audit_path,
+        script_kwargs={"receipt_present": False},
+        timer=lambda: next(clock_values),
+    )
+
+    report = executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert report.completed is False
+    assert report.steps[0].status == "unconfirmed"
+    assert "may still land" in report.steps[0].diagnostic
+    assert len(rpc_script.broadcasts) == 1
+    records = AuditStore(audit_path).read_records(100)
+    # The send record exists; no confirmed or failed record was invented.
+    assert records[3].event_type is AuditEventType.LP_EXECUTE_SENT
+    assert not any(
+        record.event_type in (AuditEventType.LP_EXECUTE_CONFIRMED, AuditEventType.LP_EXECUTE_FAILED)
+        for record in records
+    )
+
+
+def test_execute_rotates_receipt_polling_across_backends() -> None:
+    """A receipt found on the second endpoint completes the delivery."""
+    primary = LpRpcScript(
+        owner_addresses={77: SAFE_ADDRESS},
+        position_words=make_position_words(),
+        allow_broadcasts=True,
+        receipt_present=False,
+    )
+    secondary = LpRpcScript(receipt_present=True)
+    executor, _, _ = make_lp_executor(
+        rpc_script=primary,
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+        receipt_script=secondary,
+    )
+
+    report = executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert report.completed is True
+    assert all(step.status == "confirmed" for step in report.steps)
+
+
+def test_execute_re_reads_a_lagging_gs026_estimate() -> None:
+    """A transient endpoint-lag GS026 earns bounded fresh re-reads."""
+    sleeps: list[float] = []
+    executor, rpc_script = make_execute_stake_executor(
+        script_kwargs={"estimate_gs026_lag_calls": 2, "estimate_gs026_lag_from": 3},
+        sleep=sleeps.append,
+    )
+
+    report = executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert report.completed is True
+    assert sleeps == [4.0, 4.0]
+    assert len(rpc_script.broadcasts) == 2
+
+
+def test_cli_execute_refuses_without_the_confirmation_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The execute CLI refuses with exit two unless the flag is present."""
+    executor, _, _ = make_lp_executor()
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "execute",
+                "mint",
+                "--symbol",
+                "FIXc",
+                "--amount",
+                "7",
+                "--width-ticks",
+                "1",
+                "--ephemeral-key",
+            ]
+        )
+
+    assert exit_code == EXIT_REFUSED
+    assert "refused [broadcast_confirmation_missing]" in capsys.readouterr().err
+
+
+def test_cli_execute_mint_broadcasts_and_exits_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A confirmed execute CLI run prints every broadcast hash and exits zero."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(allow_broadcasts=True),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 10),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "execute",
+                "mint",
+                "--symbol",
+                "FIXc",
+                "--amount",
+                "7",
+                "--width-ticks",
+                "1",
+                "--ephemeral-key",
+                "--confirm-broadcast",
+                "--json",
+            ]
+        )
+
+    assert exit_code == EXIT_OK
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["mode"] == "execute"
+    assert printed["completed"] is True
+    assert [step["status"] for step in printed["steps"]] == ["confirmed"] * 5
+
+
+def test_cli_execute_with_a_failed_delivery_exits_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A delivery that reverts on-chain exits one after printing the failure."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: SAFE_ADDRESS},
+            position_words=make_position_words(),
+            allow_broadcasts=True,
+            receipt_status=0,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+    ):
+        exit_code = main(
+            [
+                "execute",
+                "stake",
+                "--symbol",
+                "FIXc",
+                "--token-id",
+                "77",
+                "--ephemeral-key",
+                "--confirm-broadcast",
+            ]
+        )
+
+    assert exit_code == EXIT_FAILURE
+    output = capsys.readouterr().out
+    assert "failed" in output
+    assert "halted:" in output
