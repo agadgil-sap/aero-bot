@@ -13,7 +13,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - Live Base reads use the app settings' public RPC; heavy sweeps (Sugar discovery ~3 min, rehearsal price paths) get rate-limited - space them out and expect 429 backoff.
 - Real signing keys live in the macOS Keychain (`AERO_BOT_KEYCHAIN_SERVICE`/`AERO_BOT_KEYCHAIN_ACCOUNT`); never print or persist key material - public addresses only.
 - `run/` and `data/` hold campaign artifacts: `data/aero-bot-lp-canary-campaign/timing-report.md` is the canonical canary evidence.
-- The canary's residual empty NFT 5703026 sits at the Safe and refuses every `execute mint` (`untracked_existing_positions`) until a burn path ships (recenter is dry-run-only); `data/aero-bot-live-cycle-2/report.md` documents the blocked 2026-09-08 cycle and the read-only evidence.
+- The 2026-09-08 live matrix (timed cycle + five scenarios, 72 receipt-verified broadcasts, chapters gnhf 12-16) is fully evidenced in `data/aero-bot-live-cycle-2/report.md`; the LP lifecycle now ends with `execute burn` then `execute swap-back`, and every refusal code there was proven live or documented untriggerable.
 
 ## Maintaining this file
 
