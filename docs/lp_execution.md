@@ -208,6 +208,9 @@ These gates run before anything is signed, in order, and each appends its label 
 | Safe ETH floor | 0.00005 ETH | `safe_eth_below_floor` |
 | Relayer ETH floor (execute) | 0.0002 ETH plus twice the bounded gas cost | `relayer_eth_insufficient` |
 | Broadcast confirmation (execute) | explicit `--confirm-broadcast` flag | `broadcast_confirmation_missing` |
+| Exit-swap stock balance (exit-swap) | a positive stock balance exists | `stock_balance_zero` |
+| Exit-swap output cap (exit-swap) | quoted output at or below the 100 USDC per-pool pilot cap | `exit_output_above_pool_cap` |
+| Held-NFT enumeration | every balanceOf/tokenOfOwnerByIndex/positions read succeeds | `enumeration_unreadable` |
 | Rebuilt hash pin (execute) | byte-exact against the report | `rebuild_hash_mismatch` |
 | Execute-time signature | live `checkSignatures` accepts again | `signature_rejected` |
 | Fresh estimate (execute) | succeeds with predecessors mined | `estimate_reverted` |
@@ -326,6 +329,18 @@ Status takes no key at all, because nothing is signed, and requires the AERO pri
 
 The `execute` subcommands productize the canary driver's proven send loop as a first-class CLI surface with the same containment posture as the swap executor: read-only by default, broadcast only behind the explicit `--confirm-broadcast` flag, and a refusal - `broadcast_confirmation_missing` - audited and exited as code two without it before anything is built.
 The recenter action has no execute form: its restake is a documented follow-up command by design, so it stays a dry-run-only batch until that composition changes.
+
+### The exit swap (stock to USDC)
+
+`aero-bot-lp execute exit-swap --symbol AAPLc` is the canary campaign's captain-authorized exit swap productized into the lifecycle: it converts the Safe's ENTIRE stock balance back to USDC through the same whitelisted router every balancing swap uses, in the reverse direction (exact-input stock, minimum-output USDC, recipient Safe; the 2026-09-08 live run realized 99.95 percent of quote through exactly this path).
+The sequence is one optional exact stock approval (skipped when the standing router allowance suffices) plus the reverse swap; the quote comes from the block-pinned pool snapshot's sqrt price, the minimum output floors at the locked one-percent tolerance, and the quoted output may never exceed the 100 USDC per-pool pilot cap - a larger inventory refuses as `exit_output_above_pool_cap` instead of moving, so the surface stays inside the pilot envelope whatever the balance.
+A dry-run form (`dry-run exit-swap`) builds and validates the same sequence without broadcasting.
+
+### Held-position inventory and the relaxed untracked gate
+
+`safe_position_inventory` (the `inventory` action behind the cycle's reconciliation) enumerates every position NFT the Safe holds on one pool's NFPM - `balanceOf`, then `tokenOfOwnerByIndex` per index, then each position's live liquidity and owed fees - and classifies each as live or an empty residual.
+Accordingly, the mint and recenter gates now refuse only on LIVE untracked positions (nonzero liquidity or owed fees, named by token id in the refusal); empty residual NFTs - like the campaign Safe's leftover 5703026 - carry no exposure and no longer block entry.
+Any mid-enumeration revert refuses fail-closed as `enumeration_unreadable`.
 
 Each execute runs the complete dry-run build first - every cap, refusal, live `checkSignatures` validation, and audit record, carrying `mode: execute` - and then broadcasts one Safe nonce at a time:
 

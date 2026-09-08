@@ -1,0 +1,18 @@
+[Unit]
+Description=Run the Aero Bot decision cycle for one symbol hourly
+Documentation=file:/opt/aero-bot/docs/cycle.md
+
+[Timer]
+# The default cadence is one cycle per hour; drop-ins override OnCalendar
+# for a different cadence (systemctl edit aero-bot-cycle@AAPLc.timer).
+OnCalendar=hourly
+# A missed start (host asleep or down) runs the cycle promptly on wake.
+Persistent=true
+# Bounded jitter keeps the cycle off the exact top of the hour, avoiding
+# the public RPC endpoints' synchronized load spikes.
+RandomizedDelaySec=180
+# A still-running cycle is never overlapped; the next tick waits.
+Unit=aero-bot-cycle@%i.service
+
+[Install]
+WantedBy=timers.target
