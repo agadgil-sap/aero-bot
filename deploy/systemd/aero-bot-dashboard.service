@@ -1,0 +1,27 @@
+[Unit]
+Description=Aero Bot loopback-only dashboard
+Documentation=file:/opt/aero-bot/docs/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The dedicated unprivileged service user; the dashboard is read-only.
+User=aero-bot
+Group=aero-bot
+WorkingDirectory=/var/lib/aero-bot
+StateDirectory=aero-bot
+Environment=UMASK=0077
+# The application settings validate bind_host as loopback before the server
+# starts; the operator reaches the dashboard through an SSH tunnel only.
+ExecStart=/opt/aero-bot/.venv/bin/aero-bot
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aero-bot
+
+[Install]
+WantedBy=multi-user.target
