@@ -168,3 +168,4 @@ Every exact-allowance planning response is persisted with its public request, ac
 Every read-only simulation response is persisted with its submitted unsigned plan, active revalidation policy, and complete result before it is returned.
 Every capped swap attempt persists its quote, each fully built Safe transaction, each broadcast submission, and each inclusion receipt before the command reports, with no key material in any event.
 See [the audit log design](docs/audit-log.md) for guarantees, limitations, and integration status.
+The chain leaves the host daily as an encrypted bundle on a private git branch through a deploy key; see [the audit backup documentation](docs/audit-backup.md) for the verify-export-encrypt-push order and the sealed configuration.

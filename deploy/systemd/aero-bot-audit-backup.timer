@@ -1,0 +1,16 @@
+[Unit]
+Description=Run the Aero Bot audit-chain backup daily
+Documentation=file:/opt/aero-bot/docs/audit-backup.md
+
+[Timer]
+# One encrypted bundle per day; drop-ins override OnCalendar for a different
+# cadence (systemctl edit aero-bot-audit-backup.timer).
+OnCalendar=daily
+# A missed start (host asleep or down) runs the backup promptly on wake.
+Persistent=true
+# Bounded jitter avoids synchronized midnight load on the git host.
+RandomizedDelaySec=600
+Unit=aero-bot-audit-backup.service
+
+[Install]
+WantedBy=timers.target

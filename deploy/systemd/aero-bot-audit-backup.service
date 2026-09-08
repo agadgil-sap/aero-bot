@@ -1,0 +1,29 @@
+[Unit]
+Description=Aero Bot audit-chain backup (verify, encrypt, push)
+Documentation=file:/opt/aero-bot/docs/audit-backup.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/aero-bot/backup.env
+
+[Service]
+Type=oneshot
+User=aero-bot
+Group=aero-bot
+# Sealed environment: the 0600 file carries the AES backup key, the private
+# git remote, the deploy key path, and the branch; nothing secret is ever
+# stored in the repository or echoed in logs.
+EnvironmentFile=/etc/aero-bot/backup.env
+WorkingDirectory=/var/lib/aero-bot
+StateDirectory=aero-bot
+Environment=UMASK=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aero-bot
+# The push side is bounded generously; verification and encryption are fast.
+TimeoutStartSec=600
+ExecStart=/opt/aero-bot/.venv/bin/aero-bot-audit-backup --json
+# A failed backup is visible through systemctl and the email hook's absence
+# of a success line; it retries on the next daily tick.
+Restart=no
