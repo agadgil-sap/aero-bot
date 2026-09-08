@@ -37,8 +37,15 @@ from aero_bot.ranging import TICK_PRICE_RATIO
 MATH_PRECISION = 60
 # The locked safety ceiling half width mirrors the ranging solver's ceiling.
 DEFAULT_MAX_RANGE_HALF_WIDTH_FRACTION = Decimal("0.003")
-# The default mint min-amount tolerance mirrors the swap executor's slippage.
-DEFAULT_MINT_SLIPPAGE_TOLERANCE = Decimal("0.001")
+# The default mint min-amount tolerance. Raised from 0.1 percent to
+# 1 percent by the captain's calibration ruling (2026-09-08):
+# 0.1-percent-of-amount minima on a width-1 (20-tick) range leave a
+# ~0.005-tick price tolerance on the near-bound side, which the measured
+# pool wobble (0.265 ticks per 180 seconds on AAPLc) always exceeds before
+# the capped pipeline's observation-to-execution latency can complete.
+# Mint minima guard position composition, not principal, so 1 percent
+# restores fillability at a bounded composition drift.
+DEFAULT_MINT_SLIPPAGE_TOLERANCE = Decimal("0.01")
 # The balancing swap buys the shortfall plus this fraction so the mint's
 # stock pull never exceeds the realized swap output through small adverse
 # moves; the executor re-derives the mint amounts from realized output.

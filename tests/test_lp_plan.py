@@ -14,6 +14,7 @@ from aero_bot.lp_calldata import (
     build_lp_mint_calldata,
 )
 from aero_bot.lp_plan import (
+    DEFAULT_MINT_SLIPPAGE_TOLERANCE,
     MATH_PRECISION,
     QUOTE_TOKEN_DECIMALS,
     X96_SCALE,
@@ -403,7 +404,7 @@ def test_mint_composition_splits_the_budget_into_both_sides() -> None:
         observation.stock_is_token0,
         observation.stock_decimals,
         observation.quote_decimals,
-        Decimal("0.001"),
+        DEFAULT_MINT_SLIPPAGE_TOLERANCE,
     )
 
     total_value = amounts.token0_value_usdc + amounts.token1_value_usdc
@@ -416,8 +417,10 @@ def test_mint_composition_splits_the_budget_into_both_sides() -> None:
     # carries roughly a third of the budget and the stock side the rest.
     assert Decimal("0.2") < amounts.token0_value_usdc / Decimal(7) < Decimal("0.45")
     assert Decimal("0.55") < amounts.token1_value_usdc / Decimal(7) < Decimal("0.8")
-    # The minima sit exactly one tolerance below the desired amounts.
-    tolerance = Decimal("0.001")
+    # The minima sit exactly one tolerance below the desired amounts; the
+    # 1-percent convention is the captain's approved calibration ruling, and
+    # the plan call above consumes the same default being pinned here.
+    tolerance = Decimal("0.01")
     assert amounts.amount0_min_units == int(
         Decimal(amounts.amount0_desired_units) * (1 - tolerance)
     )
