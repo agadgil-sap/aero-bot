@@ -23,6 +23,11 @@ DEFAULT_BIND_PORT = 8765
 DEFAULT_AUDIT_DATABASE_PATH = (
     Path.home() / "Library" / "Application Support" / "Aero Bot" / "audit.sqlite3"
 )
+# The default pool-pin cache lives beside the audit store: local state, never
+# inside the source repository.
+DEFAULT_LP_POOL_PINS_PATH = (
+    Path.home() / "Library" / "Application Support" / "Aero Bot" / "lp_pool_pins.json"
+)
 # Loopback host names are the only names permitted with plaintext HTTP RPC endpoints.
 PLAINTEXT_HTTP_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
@@ -43,6 +48,9 @@ class Settings(BaseSettings):
     bind_port: Annotated[int, Field(ge=1024, le=65535)] = DEFAULT_BIND_PORT
     # The audit path keeps durable evidence outside the source repository by default.
     audit_database_path: Path = DEFAULT_AUDIT_DATABASE_PATH
+    # The pool-pin cache stores Sugar-verified pool identities for the
+    # known-pool fast path; it is a local cache, never a trust root.
+    lp_pool_pins_path: Path = DEFAULT_LP_POOL_PINS_PATH
     # The Base JSON-RPC endpoint used only for read-only eth_call enumeration.
     base_rpc_url: str = DEFAULT_BASE_RPC_URL
     # The LP Sugar contract is the authoritative complete Aerodrome pool inventory.
@@ -68,6 +76,17 @@ class Settings(BaseSettings):
         expanded_path = value.expanduser()
         if not expanded_path.is_absolute():
             raise ValueError("audit_database_path must be absolute")
+        return expanded_path
+
+    @field_validator("lp_pool_pins_path")
+    @classmethod
+    def require_absolute_pool_pins_path(cls, value: Path) -> Path:
+        """Expand and require an absolute path for the pool-pin cache."""
+        # The pin cache is local application state and follows the audit path
+        # convention of an expanded, absolute, operator-configurable path.
+        expanded_path = value.expanduser()
+        if not expanded_path.is_absolute():
+            raise ValueError("lp_pool_pins_path must be absolute")
         return expanded_path
 
     @field_validator("base_rpc_url")

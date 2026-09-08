@@ -605,6 +605,11 @@ class LiveExecutionSources:
         self._sleep = sleep
         # Token decimals are pure metadata, so one read per token is cached.
         self._decimals_cache: dict[str, int] = {}
+        # One Sugar sweep per run: the first discovery is pinned (its pages
+        # share one snapshot block by construction) and every later call in
+        # the same process reuses that block-pinned batch, mirroring the
+        # decimals cache.
+        self._discovery_cache: PoolDiscoveryResult | None = None
 
     def load_registry(self) -> B20RegistryResult:
         """Return the packaged official B20 registry.
@@ -617,6 +622,13 @@ class LiveExecutionSources:
     def discover_pools(self) -> PoolDiscoveryResult:
         """Return the accepted B20/USDC pools in one block-pinned snapshot.
 
+        The first call runs the full Sugar enumeration and pins its result
+        for the lifetime of this sources object, so every subsequent
+        discovery in the same run reuses the same block-pinned sweep instead
+        of re-enumerating; per-action freshness comes from the executor's
+        staleness gate and the known-pool fast path, never from repeat
+        sweeps.
+
         Returns:
             The venue adapter's verified discovery result.
 
@@ -624,6 +636,8 @@ class LiveExecutionSources:
             PoolDiscoveryUnavailableError: If the Sugar enumeration cannot
                 complete with bounded retries.
         """
+        if self._discovery_cache is not None:
+            return self._discovery_cache
         registry = load_official_b20_registry()
         b20_addresses = frozenset(asset.address for asset in registry.assets)
         backend = LpSugarRpcBackend(
@@ -632,7 +646,9 @@ class LiveExecutionSources:
             transport=self._transport,
             sleep=self._sleep,
         )
-        return AerodromeVenueAdapter(backend).discover_pools(b20_addresses)
+        result = AerodromeVenueAdapter(backend).discover_pools(b20_addresses)
+        self._discovery_cache = result
+        return result
 
     def read_token_decimals(self, token_address: str) -> int:
         """Read one ERC20 token's decimal count, cached per token.
@@ -887,7 +903,7 @@ class ExecutorRpcBackend:
         self._timer = timer
 
     def eth_call(self, to_address: str, calldata: str) -> str:
-        """Perform one read-only eth_call and return its raw hex result.
+        """Perform one read-only eth_call against the latest block.
 
         Args:
             to_address: The contract being called.
@@ -901,13 +917,49 @@ class ExecutorRpcBackend:
                 response is unusable.
             ExecutorRpcRevertError: If the call reverted inside the contract.
         """
+        return self.eth_call_at(to_address, calldata, "latest")
+
+    def eth_call_at(self, to_address: str, calldata: str, block_tag: str) -> str:
+        """Perform one read-only eth_call pinned to an explicit block tag.
+
+        Pinning every read of one observation to a single block keeps the
+        snapshot coherent exactly like the Sugar backend's own pagination,
+        which shares one pinned block tag across every page.
+
+        Args:
+            to_address: The contract being called.
+            calldata: Complete 0x-prefixed call payload.
+            block_tag: The block tag the call is evaluated against, a hex
+                quantity like ``0x30a9973`` or the literal ``latest``.
+
+        Returns:
+            The 0x-prefixed return bytes.
+
+        Raises:
+            ExecutionUnavailableError: If retries are exhausted or the
+                response is unusable.
+            ExecutorRpcRevertError: If the call reverted inside the contract.
+        """
         return cast(
             "str",
             self._rpc_call(
                 "eth_call",
-                [{"to": normalize_evm_address(to_address), "data": calldata}, "latest"],
+                [{"to": normalize_evm_address(to_address), "data": calldata}, block_tag],
             ),
         )
+
+    def fetch_block_number(self) -> int:
+        """Read the endpoint's latest block number.
+
+        Returns:
+            The latest block number.
+
+        Raises:
+            ExecutionUnavailableError: If the read cannot complete or is
+                malformed.
+        """
+        result = cast("str", self._rpc_call("eth_blockNumber", []))
+        return self._decode_hex_quantity(result, "eth_blockNumber")
 
     def fetch_usdc_allowance(self, owner_address: str, spender_address: str) -> int:
         """Read the owner's standing USDC allowance to one spender.

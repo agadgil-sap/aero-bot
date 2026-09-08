@@ -197,7 +197,7 @@ These gates run before anything is signed, in order, and each appends its label 
 | --- | --- | --- |
 | Registry verified | official B20 registry validates | `registry_unverified` |
 | Symbol in registry | USDC plus the registry whitelist only | `symbol_not_in_registry` |
-| Pool from live discovery | Sugar-verified pool required | `pool_not_discovered` |
+| Pool from live discovery | Sugar-verified pool, or the known-pool fast path below | `pool_not_discovered` |
 | Snapshot evidence | observation time and pin block present | `snapshot_evidence_missing` |
 | NFPM and gauge present | Sugar record carries both | `pool_missing_nfpm_or_gauge` |
 | Snapshot staleness | 120 seconds | `snapshot_stale` |
@@ -211,6 +211,41 @@ These gates run before anything is signed, in order, and each appends its label 
 | Rebuilt hash pin (execute) | byte-exact against the report | `rebuild_hash_mismatch` |
 | Execute-time signature | live `checkSignatures` accepts again | `signature_rejected` |
 | Fresh estimate (execute) | succeeds with predecessors mined | `estimate_reverted` |
+
+### Known-pool fast path and per-run discovery pinning
+
+The 2026-09-08 canary measured each LP action at roughly 200 seconds, about 85 percent of it the full Sugar pool enumeration re-running before every action; the captain rejected that speed (manual is about 30 seconds), and this section records the fix.
+Two layers remove the repeated enumeration without weakening a single gate.
+
+**Per-run discovery pinning.** `LiveExecutionSources.discover_pools()` runs the Sugar sweep once per run and pins its block-stamped batch for the object's lifetime, mirroring the decimals cache: every later discovery call in the same process reuses the same sweep instead of re-enumerating.
+Per-action freshness never depends on that cache - the executor's staleness gate still refuses any snapshot older than 120 seconds - it only stops a single run from paying for the same sweep twice.
+
+**The known-pool fast path.** A pool's identity is immutable contract state, so after one full sweep verifies a pool, that identity is pinned in a local cache file (`lp_pool_pins.json` beside the audit store; override with `AERO_BOT_LP_POOL_PINS_PATH`).
+When a pinned pool is requested, the executor skips enumeration entirely and instead:
+
+1. re-verifies the pinned identity live against the pool contract's own views - `token0()`, `token1()`, `tickSpacing()`, `gauge()`, `factory()`, and the gauge factory's `nft()` (the Sugar's own NFPM resolution path) - refusing nothing silently: any mismatch or unreadable view falls back to the full enumeration, which re-verifies everything the slow way and rewrites the pin;
+2. reads the pool's live state at one freshly pinned block - `slot0()` for price and tick, `liquidity()` for the depth-cap base, `stakedLiquidity()`, the pool's USDC `balanceOf` for the swap-impact base, and the gauge's `rewardToken()` and per-second `rewardRate()`;
+3. builds the observation with that block and the read time, so the 120-second staleness gate applies exactly as before.
+
+The safety invariant is unchanged: planning still re-prices at execution with fresh on-chain estimates and slippage minima - speed comes from not re-enumerating, never from skipping verification.
+Every registry gate, cap, and refusal fires identically on both paths, pinned by the tests: budget caps, depth share, swap impact, USDC coverage, staleness, untracked positions, and the registry refusals.
+The pin file is a cache of verified facts, never a trust root: a corrupted, stale, or hand-edited file can only ever cost speed, because identity is re-derived from the chain before any pin is trusted and every failed fast path falls back to the sweep.
+The full sweep refreshes the pin after every verified resolution, and `--full-discovery` bypasses pins for one run when an operator wants the slow path explicitly.
+
+One documented information gap: the cheap read set cannot reproduce the Sugar's staked-reserve sides (`staked0`/`staked1`), so a fast-path status run reports the emissions APR as absent rather than quoting it; a `--full-discovery` status run quotes it as before.
+
+#### Before and after (live, read-only)
+
+The BEFORE wall times are the canary's measured per-action markers from `run/exec_markers.log` (2026-09-08, campaign endpoint); the docs' own captured builds corroborate them (mint dry-run `build took 200482.542 ms`, stake dry-run `build took 188123.104 ms`).
+The AFTER numbers are live read-only probes of the same action shapes on Base mainnet over `base.publicnode.com`, with probe-local audit and pin state, run on 2026-09-08 after the speed pass:
+
+| Action shape | BEFORE (full sweep each action) | AFTER (known-pool fast path) |
+| --- | --- | --- |
+| Mint plan (`plan mint --symbol AAPLc --amount 7 --width-ticks 1`) | 201 s (canary marker; 109 s fresh reproduction on the probe endpoint) | 3.8 s |
+| Position action (`status --symbol AAPLc --token-id ...`) | 199 s stake marker (canary); 100 s status sweep on the probe endpoint | 3.8 s |
+
+Both AFTER probes refused honestly at the same downstream gates as their full-sweep twins on the same live state - the mint at `untracked_existing_positions` (the campaign Safe held a position NFT) and the status at `penalty_state_unreadable` (the foreign-staked token's `NA`) - proving the speedup changes only how the pool resolves, never what the gates enforce.
+The fast path's reads are the pool's own contract views, all verified live on the AAPLc pool during the speed pass: `slot0()` returned `sqrtPriceX96 44332337155365311163694903540` at tick `-11613`, `liquidity()` and `stakedLiquidity()` answered alongside, `tickSpacing() 10`, `factory() 0xf8f2eb4940cfe7d13603dddd87f123820fc061ef`, `gauge()`, the gauge's `rewardToken() 0x940181a94a35a4569e4529a3cdfb74e38fd98631` and `rewardRate() 103143109344970222` raw per second, and the gauge factory's `nft() 0xe1f8cd9ac4e4a65f54f38a5cdafca44f6dd68b53`.
 
 The untracked-positions gate is deliberately fail-closed: once the Safe holds any position NFT, the total-exposure cap cannot be evaluated honestly without a live position-value read, so entry refuses until that read exists.
 The `derived_width_unavailable` gate stands until the emissions-APR convention fix lands, because the solver's APR input is known understated; no solver-derived width can masquerade as an operator override in the meantime.
@@ -256,7 +291,7 @@ Refusal records carry the executor catalog code plus the planner's own code when
 The CLI exits zero on success, one on failures, and two on any refusal, with the catalog code printed to stderr as `refused [<code>]`.
 
 ```text
-aero-bot-lp plan mint --symbol AAPLc --amount 7 --width-ticks 1
+aero-bot-lp [--full-discovery] plan mint --symbol AAPLc --amount 7 --width-ticks 1
 aero-bot-lp dry-run mint --symbol AAPLc --amount 7 --width-ticks 1
 aero-bot-lp dry-run stake --symbol AAPLc --token-id 0
 aero-bot-lp dry-run unstake --symbol AAPLc --token-id 0

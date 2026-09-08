@@ -2,7 +2,7 @@
 
 import json
 from collections.abc import Callable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal, localcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,6 +49,7 @@ from aero_bot.lp_executor import (
     LpSafeExecutionPolicy,
     main,
 )
+from aero_bot.lp_pins import LpPoolPin, LpPoolPinStore
 from aero_bot.lp_plan import (
     DEFAULT_MINT_SLIPPAGE_TOLERANCE,
     LpExecutionPolicy,
@@ -116,6 +117,8 @@ FIXTURE_GAS_PRICE_WEI = 100_000_000
 FIXTURE_SAFE_ETH_WEI = 10**16
 # The canary mint budget for every fixture dry run.
 MINT_BUDGET_USDC = Decimal("7")
+# One whole USDC in raw six-decimal units.
+ONE_USDC_UNITS = 1_000_000
 # The explicit one-spacing half width every fixture directive carries.
 MINT_WIDTH_SPACINGS = 1
 # The whole-word allowance fixtures that satisfy every skip condition.
@@ -185,6 +188,33 @@ def make_candidate(**overrides: object) -> PoolCandidate:
     }
     values.update(overrides)
     return PoolCandidate.model_validate(values)
+
+
+def make_pool_pin(**overrides: object) -> LpPoolPin:
+    """Build one fixture pool pin matching the scripted pool identity.
+
+    Args:
+        **overrides: Pin fields changed for one behavior test.
+
+    Returns:
+        A validated immutable pin over the fixture pool's exact identity.
+    """
+    values: dict[str, object] = {
+        "symbol": "FIXc",
+        "pool_address": POOL_ADDRESS,
+        "factory_address": SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS,
+        "token0_address": BASE_USDC_ADDRESS,
+        "token1_address": B20_ADDRESS,
+        "tick_spacing": LP_TICK_SPACING,
+        "gauge_address": GAUGE_ADDRESS,
+        "nfpm_address": NFPM_ADDRESS,
+        "stock_decimals": STOCK_DECIMALS,
+        "pinned_at": BASE_NOW,
+        "pinned_block": 100,
+        "discovery_source": "lp-sugar:fixture@block:100",
+    }
+    values.update(overrides)
+    return LpPoolPin.model_validate(values)
 
 
 def make_discovery(
@@ -262,13 +292,16 @@ class FakeSources:
         self._registry = registry if registry is not None else make_registry()
         self._discovery = discovery if discovery is not None else make_discovery()
         self._decimals = decimals if decimals is not None else {B20_ADDRESS: STOCK_DECIMALS}
+        # Counting serves proves the fast path never enumerates.
+        self.discover_calls = 0
 
     def load_registry(self) -> B20RegistryResult:
         """Return the configured registry result."""
         return self._registry
 
     def discover_pools(self) -> PoolDiscoveryResult:
-        """Return the configured discovery result."""
+        """Return the configured discovery result, counting every call."""
+        self.discover_calls += 1
         return self._discovery
 
     def read_token_decimals(self, token_address: str) -> int:
@@ -318,6 +351,15 @@ class LpRpcScript:
         estimate_revert_message: str = "execution reverted: PSC",
         estimate_gs026_lag_calls: int = 0,
         estimate_gs026_lag_from: int = 1,
+        fast_block_number: int = 51_000_000,
+        fast_sqrt_ratio: int | None = None,
+        fast_current_tick: int | None = None,
+        fast_active_liquidity: int = LP_ACTIVE_LIQUIDITY,
+        fast_staked_liquidity: int = 9_999,
+        fast_usdc_reserve_units: int = FIXTURE_USDC_RESERVE,
+        fast_reward_rate_units: int = 4_494_371_922_759_724,
+        fast_token1_address: str | None = None,
+        fast_views_revert: bool = False,
     ) -> None:
         """Configure every scripted answer the LP executor's calls receive.
 
@@ -379,6 +421,19 @@ class LpRpcScript:
             estimate_gs026_lag_from: The 1-based estimateGas call the GS026
                 lag window starts at, so tests can target execute-time
                 estimates behind the build-time ones.
+            fast_block_number: Block served to the fast path's eth_blockNumber.
+            fast_sqrt_ratio: Live sqrtPriceX96 served in the pool's slot0;
+                defaults to the discovery fixture's price so both paths agree.
+            fast_current_tick: Live tick served in the pool's slot0 word.
+            fast_active_liquidity: Live liquidity() answer for the depth cap.
+            fast_staked_liquidity: Live stakedLiquidity() answer.
+            fast_usdc_reserve_units: USDC balanceOf(pool) answer, the swap
+                impact base on the fast path.
+            fast_reward_rate_units: The gauge's live rewardRate() answer.
+            fast_token1_address: Overrides the pool's token1 identity answer
+                to script a stale pin's identity mismatch.
+            fast_views_revert: Every fast-path pool view reverts, scripting an
+                unreadable known pool.
         """
         self.gas_price_wei = gas_price_wei
         self.safe_eth_wei = safe_eth_wei
@@ -418,6 +473,15 @@ class LpRpcScript:
         self.estimate_revert_message = estimate_revert_message
         self.estimate_gs026_lag_remaining = estimate_gs026_lag_calls
         self.estimate_gs026_lag_from = estimate_gs026_lag_from
+        self.fast_block_number = fast_block_number
+        self.fast_sqrt_ratio = LP_SQRT_RATIO if fast_sqrt_ratio is None else fast_sqrt_ratio
+        self.fast_current_tick = LP_CURRENT_TICK if fast_current_tick is None else fast_current_tick
+        self.fast_active_liquidity = fast_active_liquidity
+        self.fast_staked_liquidity = fast_staked_liquidity
+        self.fast_usdc_reserve_units = fast_usdc_reserve_units
+        self.fast_reward_rate_units = fast_reward_rate_units
+        self.fast_token1_address = fast_token1_address
+        self.fast_views_revert = fast_views_revert
         self.inclusion_blocks = 51_000_000
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -436,6 +500,8 @@ class LpRpcScript:
         elif method == "eth_getTransactionCount":
             result = hex(self.relayer_next_nonce)
             self.relayer_next_nonce += 1
+        elif method == "eth_blockNumber":
+            result = hex(self.fast_block_number)
         elif method == "eth_call":
             result = self._eth_call(str(params[0]["to"]).lower(), str(params[0]["data"]))
         elif method == "eth_estimateGas":
@@ -468,6 +534,8 @@ class LpRpcScript:
     def _eth_call(self, to_address: str, data: str) -> str:
         """Answer one read-only contract call from the scripted token state."""
         usdc_token = BASE_USDC_ADDRESS.lower()
+        if to_address == POOL_ADDRESS:
+            return self._pool_view(data)
         if data.startswith(f"0x{ERC20_ALLOWANCE_SELECTOR}"):
             spender = address_argument(data, 1)
             if to_address == usdc_token:
@@ -480,6 +548,9 @@ class LpRpcScript:
             raise AssertionError(f"unexpected allowance read to {to_address} for {spender}")
         if data.startswith(f"0x{ERC20_BALANCE_OF_SELECTOR}"):
             if to_address == usdc_token:
+                balance_owner = address_argument(data, 0)
+                if balance_owner == POOL_ADDRESS:
+                    return word_hex(self.fast_usdc_reserve_units)
                 return word_hex(self.usdc_balance_units)
             if to_address == B20_ADDRESS:
                 return word_hex(self.stock_balance_units)
@@ -510,6 +581,14 @@ class LpRpcScript:
             if data.startswith("0x0d52333c"):
                 self._require_penalty_reads()
                 return word_hex(int(GAUGE_FACTORY_ADDRESS, 16))
+            if data.startswith("0xf7c618c1"):
+                if self.fast_views_revert:
+                    raise _ScriptedRevertError("gauge views unavailable")
+                return word_hex(int(AERO_TOKEN_ADDRESS, 16))
+            if data.startswith("0x7b0a47ee"):
+                if self.fast_views_revert:
+                    raise _ScriptedRevertError("gauge views unavailable")
+                return word_hex(self.fast_reward_rate_units)
             if data.startswith("0x4ede8c85"):
                 self._require_penalty_reads()
                 return word_hex(self.deposit_timestamp)
@@ -520,7 +599,36 @@ class LpRpcScript:
             if data.startswith("0xe782453b"):
                 self._require_penalty_reads()
                 return word_hex(self.min_stake_seconds)
+            if data.startswith("0x47ccca02"):
+                return word_hex(int(NFPM_ADDRESS, 16))
         raise AssertionError(f"unexpected LP eth_call payload {data[:10]}")
+
+    def _pool_view(self, data: str) -> str:
+        """Answer one fast-path identity or state view on the fixture pool."""
+        if self.fast_views_revert:
+            raise _ScriptedRevertError("pool views unavailable")
+        if data.startswith("0x0dfe1681"):
+            return word_hex(int(BASE_USDC_ADDRESS, 16))
+        if data.startswith("0xd21220a7"):
+            token1 = B20_ADDRESS if self.fast_token1_address is None else self.fast_token1_address
+            return word_hex(int(token1, 16))
+        if data.startswith("0xd0c93a7c"):
+            return word_hex(LP_TICK_SPACING)
+        if data.startswith("0xa6f19c84"):
+            return word_hex(int(GAUGE_ADDRESS, 16))
+        if data.startswith("0xc45a0155"):
+            return word_hex(int(SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS, 16))
+        if data.startswith("0x3850c7bd"):
+            return (
+                "0x"
+                + word_hex(self.fast_sqrt_ratio)[2:]
+                + signed_word(self.fast_current_tick).hex()
+            )
+        if data.startswith("0x1a686502"):
+            return word_hex(self.fast_active_liquidity)
+        if data.startswith("0x3ab04b20"):
+            return word_hex(self.fast_staked_liquidity)
+        raise AssertionError(f"unexpected pool view payload {data[:10]}")
 
     def _require_penalty_reads(self) -> None:
         """Raise the scripted revert when penalty-state reads must fail."""
@@ -668,6 +776,8 @@ def make_lp_executor(
     sleep: Callable[[float], None] | None = None,
     timer: Callable[[], float] | None = None,
     receipt_script: LpRpcScript | None = None,
+    pool_pin_store: LpPoolPinStore | None = None,
+    now: Callable[[], datetime] | None = None,
 ) -> tuple[LpLifecycleExecutor, LpRpcScript, SafeRpcScript]:
     """Assemble one LP executor over fully scripted transport boundaries.
 
@@ -681,6 +791,8 @@ def make_lp_executor(
             bounded receipt wait.
         receipt_script: Optional second RPC script polled for receipts; when
             present it joins the receipt-backend rotation behind the primary.
+        pool_pin_store: Optional pin store arming the known-pool fast path.
+        now: Optional injected wall clock; defaults to the fixture instant.
 
     Returns:
         The executor plus both scripts so tests can inspect the exchanges.
@@ -712,10 +824,11 @@ def make_lp_executor(
             transport=safe_script.transport(),
         ),
         audit_sink=audit_sink,
-        now=lambda: BASE_NOW,
+        now=now if now is not None else (lambda: BASE_NOW),
         sleep=sleep if sleep is not None else (lambda _seconds: None),
         **({"timer": timer} if timer is not None else {}),
         receipt_backends=receipt_backends,
+        pool_pin_store=pool_pin_store,
     )
     return executor, rpc_script, safe_script
 
@@ -906,6 +1019,192 @@ def test_dry_run_mint_labels_a_first_transaction_estimate_revert_plainly() -> No
     assert mint_transaction.gas_estimate is None
     assert "estimate reverted" in mint_transaction.gas_estimate_diagnostic
     assert "predecessors" not in mint_transaction.gas_estimate_diagnostic
+
+
+# ---------------------------------------------------------------------------
+# Known-pool fast path
+# ---------------------------------------------------------------------------
+
+
+def test_full_sweeps_persist_the_verified_pool_pin(tmp_path: Path) -> None:
+    """A sweep-resolved pool is pinned so the next run skips enumeration."""
+    store = LpPoolPinStore(tmp_path / "lp_pool_pins.json")
+    sources = FakeSources()
+    executor, _, _ = make_lp_executor(sources=sources, pool_pin_store=store)
+
+    executor.plan_mint("FIXc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS)
+
+    assert sources.discover_calls == 1
+    pins = store.load()
+    assert set(pins) == {"fixc"}
+    pin = pins["fixc"]
+    assert pin.pool_address == POOL_ADDRESS
+    assert pin.factory_address == SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS.lower()
+    assert pin.token0_address == BASE_USDC_ADDRESS.lower()
+    assert pin.token1_address == B20_ADDRESS
+    assert pin.tick_spacing == LP_TICK_SPACING
+    assert pin.gauge_address == GAUGE_ADDRESS
+    assert pin.nfpm_address == NFPM_ADDRESS
+    assert pin.stock_decimals == STOCK_DECIMALS
+    assert pin.pinned_block == 123
+    assert pin.discovery_source == "lp-sugar:fixture@block:123"
+
+
+def test_known_pool_skips_enumeration_entirely(tmp_path: Path) -> None:
+    """A pinned pool dry-runs with zero discovery calls and the fast-path label."""
+    store = LpPoolPinStore(tmp_path / "lp_pool_pins.json")
+    store.save_pin(make_pool_pin())
+    sources = FakeSources()
+    executor, _, _ = make_lp_executor(
+        sources=sources,
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 5),
+        pool_pin_store=store,
+    )
+
+    report = executor.dry_run_mint(
+        "FIXc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS, bytes(Account.create().key)
+    )
+
+    assert sources.discover_calls == 0
+    assert report.plan.pool_address == POOL_ADDRESS
+    assert any("known-pool fast path" in cap for cap in report.caps_enforced)
+    assert any(
+        "token within the USDC-plus-registry whitelist" in cap for cap in report.caps_enforced
+    )
+
+
+def test_known_pool_prices_from_live_state_reads(tmp_path: Path) -> None:
+    """The fast path's plan derives from the live slot0 tick, not the sweep."""
+    store = LpPoolPinStore(tmp_path / "lp_pool_pins.json")
+    store.save_pin(make_pool_pin())
+    # A live tick of -25 anchors at -30, so the range spans [-40, -20) -
+    # distinct from the sweep fixture's -15 tick and its [-30, -10) range.
+    # The sqrt price follows the fixture convention (1.0001**t * 2**96),
+    # which sits strictly inside that range's bound ratios.
+    with localcontext() as live_context:
+        live_context.prec = 60
+        live_sqrt_ratio = int((Decimal("1.0001") ** Decimal(-15) * (1 << 96)).to_integral_value())
+    executor, _, _ = make_lp_executor(
+        sources=FakeSources(),
+        rpc_script=LpRpcScript(fast_current_tick=-25, fast_sqrt_ratio=live_sqrt_ratio),
+        pool_pin_store=store,
+    )
+
+    plan = executor.plan_mint("FIXc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS)
+
+    assert plan.position_range.tick_lower == -40
+    assert plan.position_range.tick_upper == -20
+    assert plan.snapshot_block == 51_000_000
+
+
+def test_known_pool_identity_mismatch_falls_back_and_rewrites_the_pin(
+    tmp_path: Path,
+) -> None:
+    """A stale pin re-enumerates, still resolves, and refreshes the pin."""
+    store = LpPoolPinStore(tmp_path / "lp_pool_pins.json")
+    store.save_pin(make_pool_pin(pinned_block=100))
+    sources = FakeSources()
+    executor, _, _ = make_lp_executor(
+        sources=sources,
+        rpc_script=LpRpcScript(fast_token1_address=SAFE_ADDRESS),
+        pool_pin_store=store,
+    )
+
+    plan = executor.plan_mint("FIXc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS)
+
+    assert sources.discover_calls == 1
+    assert plan.pool_address == POOL_ADDRESS
+    # The sweep's snapshot block proves the full path rebuilt the observation.
+    assert plan.snapshot_block == 123
+    refreshed = store.load()["fixc"]
+    assert refreshed.pinned_block == 123
+    assert refreshed.discovery_source == "lp-sugar:fixture@block:123"
+
+
+def test_known_pool_unreadable_views_fall_back_to_discovery(tmp_path: Path) -> None:
+    """Reverting pool views fail safe into the full sweep."""
+    store = LpPoolPinStore(tmp_path / "lp_pool_pins.json")
+    store.save_pin(make_pool_pin())
+    sources = FakeSources()
+    executor, _, _ = make_lp_executor(
+        sources=sources,
+        rpc_script=LpRpcScript(fast_views_revert=True),
+        pool_pin_store=store,
+    )
+
+    plan = executor.plan_mint("FIXc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS)
+
+    assert sources.discover_calls == 1
+    assert plan.pool_address == POOL_ADDRESS
+
+
+def test_known_pool_keeps_every_registry_refusal(tmp_path: Path) -> None:
+    """Registry gates run before the fast path and still refuse with codes."""
+    store = LpPoolPinStore(tmp_path / "lp_pool_pins.json")
+    store.save_pin(make_pool_pin())
+    unverified_sources = FakeSources(registry=make_registry(status=RegistryStatus.UNAVAILABLE))
+    unverified_executor, _, _ = make_lp_executor(sources=unverified_sources, pool_pin_store=store)
+    with pytest.raises(LpExecutionRefusalError) as unverified:
+        unverified_executor.plan_mint("FIXc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS)
+    assert unverified.value.code is LpExecutionRefusalCode.REGISTRY_UNVERIFIED
+
+    unknown_executor, _, _ = make_lp_executor(pool_pin_store=store)
+    with pytest.raises(LpExecutionRefusalError) as unknown:
+        unknown_executor.plan_mint("NOPEc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS)
+    assert unknown.value.code is LpExecutionRefusalCode.SYMBOL_NOT_IN_REGISTRY
+    assert unverified_sources.discover_calls == 0
+
+
+def test_known_pool_enforces_every_planner_cap(tmp_path: Path) -> None:
+    """The fast path refuses through the same planner caps as the sweep."""
+    store = LpPoolPinStore(tmp_path / "lp_pool_pins.json")
+    store.save_pin(make_pool_pin())
+
+    over_budget, _, _ = make_lp_executor(pool_pin_store=store)
+    with pytest.raises(LpPlanRefusalError) as pool_cap:
+        over_budget.plan_mint("FIXc", Decimal("100.01"), MINT_WIDTH_SPACINGS)
+    assert pool_cap.value.code.value == "budget_above_pool_cap"
+
+    shallow_pool, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(fast_active_liquidity=10**9), pool_pin_store=store
+    )
+    with pytest.raises(LpPlanRefusalError) as depth:
+        shallow_pool.plan_mint("FIXc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS)
+    assert depth.value.code.value == "position_above_pool_depth_fraction"
+
+    thin_reserve, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(fast_usdc_reserve_units=1_000_000_000),
+        pool_pin_store=store,
+    )
+    with pytest.raises(LpPlanRefusalError) as impact:
+        thin_reserve.plan_mint("FIXc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS)
+    assert impact.value.code.value == "swap_impact_above_ceiling"
+
+    broke_safe, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(usdc_balance_units=ONE_USDC_UNITS), pool_pin_store=store
+    )
+    with pytest.raises(LpPlanRefusalError) as coverage:
+        broke_safe.plan_mint("FIXc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS)
+    assert coverage.value.code.value == "insufficient_usdc_for_entry"
+
+
+def test_known_pool_stale_snapshot_refuses(tmp_path: Path) -> None:
+    """A fast-path read older than the staleness bound refuses honestly."""
+    store = LpPoolPinStore(tmp_path / "lp_pool_pins.json")
+    store.save_pin(make_pool_pin())
+    first_call = [True]
+
+    def stepping_clock() -> datetime:
+        # The first read stamps the observation fresh; every later read ages.
+        if first_call[0]:
+            first_call[0] = False
+            return BASE_NOW
+        return BASE_NOW + timedelta(seconds=300)
+
+    executor, _, _ = make_lp_executor(pool_pin_store=store, now=stepping_clock)
+    with pytest.raises(LpExecutionRefusalError) as stale:
+        executor.plan_mint("FIXc", MINT_BUDGET_USDC, MINT_WIDTH_SPACINGS)
+    assert stale.value.code is LpExecutionRefusalCode.SNAPSHOT_STALE
 
 
 # ---------------------------------------------------------------------------
@@ -1992,6 +2291,7 @@ def make_cli_settings(tmp_path: Path) -> SimpleNamespace:
         base_rpc_url="https://fixture.example",
         lp_sugar_address="0x27fc745390d1f4baf8d184fbd97748340f786634",
         audit_database_path=tmp_path / "audit.sqlite3",
+        lp_pool_pins_path=tmp_path / "lp_pool_pins.json",
     )
 
 
@@ -2896,3 +3196,32 @@ def test_cli_execute_with_a_failed_delivery_exits_one(
     output = capsys.readouterr().out
     assert "failed" in output
     assert "halted:" in output
+
+
+def test_cli_full_discovery_flag_bypasses_the_pin_store(tmp_path: Path) -> None:
+    """--full-discovery skips pin construction; normal runs construct it."""
+    executor, _, _ = make_lp_executor()
+    mint_arguments = [
+        "plan",
+        "mint",
+        "--symbol",
+        "FIXc",
+        "--amount",
+        "7",
+        "--width-ticks",
+        "1",
+    ]
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=executor),
+        patch("aero_bot.lp_executor.LpPoolPinStore") as pin_store_factory,
+    ):
+        assert main(["--full-discovery", *mint_arguments]) == EXIT_OK
+        pin_store_factory.assert_not_called()
+
+        assert main(mint_arguments) == EXIT_OK
+        pin_store_factory.assert_called_once_with(make_cli_settings(tmp_path).lp_pool_pins_path)

@@ -36,6 +36,7 @@ from aero_bot.executor import (
     ExecutionUnavailableError,
     ExecutorRpcBackend,
     ExecutorRpcRevertError,
+    LiveExecutionSources,
     SwapExecutor,
     SwapQuote,
     build_allowance_calldata,
@@ -1687,3 +1688,64 @@ def test_cli_rejects_non_positive_amounts(tmp_path: Path) -> None:
     ):
         main(["quote", "--symbol", "FIXc", "--amount", "0"])
     assert excinfo.value.code == 2
+
+
+def test_rpc_backend_reads_the_block_number_and_pins_calls_to_one_block() -> None:
+    """fetch_block_number answers eth_blockNumber and eth_call_at pins its tag."""
+    calls: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call = json.loads(request.content)
+        calls.append(call)
+        result: str
+        if call["method"] == "eth_blockNumber":
+            result = hex(51_000_000)
+        elif call["method"] == "eth_call":
+            # A pinned read must carry exactly the requested block tag.
+            assert call["params"][1] == hex(51_000_000)
+            result = word_hex(7)
+        else:
+            raise AssertionError(f"unexpected method {call['method']}")
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    backend = ExecutorRpcBackend(
+        rpc_url="https://fixture.example", transport=httpx.MockTransport(handler)
+    )
+
+    assert backend.fetch_block_number() == 51_000_000
+    assert backend.eth_call_at(SAFE_ADDRESS, "0xabcdef01", hex(51_000_000)) == word_hex(7)
+    assert [call["method"] for call in calls] == ["eth_blockNumber", "eth_call"]
+
+
+def test_rpc_backend_eth_call_defaults_to_latest() -> None:
+    """The convenience eth_call still evaluates against the latest block."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call = json.loads(request.content)
+        assert call["method"] == "eth_call"
+        assert call["params"][1] == "latest"
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": word_hex(1)})
+
+    backend = ExecutorRpcBackend(
+        rpc_url="https://fixture.example", transport=httpx.MockTransport(handler)
+    )
+
+    assert backend.eth_call(SAFE_ADDRESS, "0xabcdef01") == word_hex(1)
+
+
+def test_live_sources_pin_one_discovery_sweep_per_run() -> None:
+    """The first discovery is cached and later calls reuse the pinned batch."""
+    from test_sugar import FixtureRpcTransport, encode_lp_page, lp_record, no_sleep
+
+    transport = FixtureRpcTransport(pages_by_offset={0: encode_lp_page([lp_record()])})
+    sources = LiveExecutionSources(transport=transport, sleep=no_sleep)
+
+    first = sources.discover_pools()
+    second = sources.discover_pools()
+
+    # One batch object serves every call: the sweep runs exactly once per run.
+    assert first is second
+    assert first.status.value == "verified"
+    assert len(first.pools) == 1
+    # The endpoint saw one block pin and one short page, nothing more.
+    assert [call["method"] for call in transport.calls] == ["eth_blockNumber", "eth_call"]
