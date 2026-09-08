@@ -16,6 +16,8 @@ from aero_bot.lp_calldata import (
 from aero_bot.lp_plan import (
     DEFAULT_MINT_SLIPPAGE_TOLERANCE,
     MATH_PRECISION,
+    MAX_POSITION_USDC_PER_POOL,
+    MAX_TOTAL_PILOT_EXPOSURE_USDC,
     QUOTE_TOKEN_DECIMALS,
     X96_SCALE,
     LpExecutionPolicy,
@@ -653,7 +655,7 @@ def test_plan_mint_entry_refuses_budgets_above_each_cap() -> None:
         plan_mint_entry(
             LpExecutionPolicy(),
             pool_observation(),
-            mint_directive(budget_usdc=Decimal("50.01")),
+            mint_directive(budget_usdc=Decimal("100.01")),
             safe_inventory(usdc_units=10**9),
         )
     assert pool_cap.value.code is LpPlanRefusalCode.BUDGET_ABOVE_POOL_CAP
@@ -694,7 +696,7 @@ def test_plan_mint_entry_refuses_insufficient_usdc_for_entry() -> None:
 def test_execution_policy_refuses_configuration_above_its_ceilings() -> None:
     """No configuration may raise any pilot cap above its documented ceiling."""
     for overrides in (
-        {"max_position_usdc_per_pool": Decimal("50.01")},
+        {"max_position_usdc_per_pool": Decimal("100.01")},
         {"max_total_pilot_exposure_usdc": Decimal("100.01")},
         {"max_position_fraction_of_pool_depth": Decimal("0.02")},
         {"swap_impact_ceiling_fraction": Decimal("0.002")},
@@ -705,3 +707,30 @@ def test_execution_policy_refuses_configuration_above_its_ceilings() -> None:
             pass
         else:
             raise AssertionError(f"{overrides} did not refuse")
+
+
+def test_pilot_caps_pin_the_calibrated_bounds() -> None:
+    """The constants and defaults carry the captain-calibrated 100/100 bounds.
+
+    The captain's calibration ruling (2026-09-07 ~23:45, reconfirmed
+    2026-09-08) raised the per-pool cap from 50 to 100 USDC while the
+    fleet-wide total stayed 100 USDC, so one pool may now commit the whole
+    pilot envelope and no more.
+    """
+    assert Decimal("100") == MAX_POSITION_USDC_PER_POOL
+    assert Decimal("100") == MAX_TOTAL_PILOT_EXPOSURE_USDC
+    policy = LpExecutionPolicy()
+    assert policy.max_position_usdc_per_pool == MAX_POSITION_USDC_PER_POOL
+    assert policy.max_total_pilot_exposure_usdc == MAX_TOTAL_PILOT_EXPOSURE_USDC
+    # A budget at exactly the per-pool cap passes it; only strictly above refuses.
+    plan = plan_mint_entry(
+        policy,
+        pool_observation(),
+        mint_directive(budget_usdc=Decimal("100")),
+        safe_inventory(usdc_units=200 * ONE_USDC_UNITS),
+    )
+    assert plan.caps_enforced[0] == "budget at or below the 100 USDC per-pool cap"
+    assert any(
+        cap == "budget at or below the remaining 100 USDC of the 100 USDC total pilot cap"
+        for cap in plan.caps_enforced
+    )

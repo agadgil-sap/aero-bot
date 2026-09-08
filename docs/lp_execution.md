@@ -106,7 +106,7 @@ Caps are enforced in a fixed order by `plan_mint_entry`, and each evaluation is 
 
 | Cap | Default bound | Refusal code |
 | --- | --- | --- |
-| Per-pool position | 50 USDC | `budget_above_pool_cap` |
+| Per-pool position | 100 USDC | `budget_above_pool_cap` |
 | Total pilot exposure | 100 USDC | `budget_above_total_exposure_cap` |
 | Share of pool in-range depth | 1 percent | `position_above_pool_depth_fraction` |
 | Snapshot price containment | strictly inside range | `price_outside_range` |
@@ -116,6 +116,8 @@ Caps are enforced in a fixed order by `plan_mint_entry`, and each evaluation is 
 
 The depth base values the pool's active liquidity over one tick spacing per side of the current tick, which is deliberately conservative: the true range-wide depth is always larger.
 The policy model itself refuses construction above any documented ceiling, so no configuration can raise the pilot caps.
+The per-pool bound was raised from 50 to 100 USDC by the captain's calibration ruling (2026-09-07 ~23:45, reconfirmed 2026-09-08), so one pool may now commit the whole pilot envelope; the fleet-wide total stays 100 USDC, and every refusal code and the enforcement order are unchanged.
+The verbatim canary captures further down this page predate the raise and still read the 50 USDC per-pool bound.
 
 ### Balancing swap policy
 

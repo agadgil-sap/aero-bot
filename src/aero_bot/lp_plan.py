@@ -55,7 +55,10 @@ QUOTE_TOKEN_DECIMALS = 6
 # One tick spacing per side is the tightest range the planner accepts.
 MIN_HALF_WIDTH_SPACINGS = 1
 # The hard pilot cap on one pool's committed position value, in USDC.
-MAX_POSITION_USDC_PER_POOL = Decimal("50")
+# Raised from 50 to 100 USDC by the captain's calibration ruling (2026-09-07
+# ~23:45, reconfirmed 2026-09-08): one pool may now commit the whole pilot
+# envelope, while the fleet-wide total below stays 100 USDC.
+MAX_POSITION_USDC_PER_POOL = Decimal("100")
 # The hard pilot cap on the fleet's total committed value, in USDC.
 MAX_TOTAL_PILOT_EXPOSURE_USDC = Decimal("100")
 # A position may commit at most this fraction of the pool's in-range depth.
