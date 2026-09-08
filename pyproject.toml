@@ -20,6 +20,7 @@ dependencies = [
   "eth-account>=0.13,<1",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
+  "pycryptodome>=3.23,<4",
   "pydantic-settings>=2.10,<3",
   "uvicorn[standard]>=0.35,<1",
 ]
@@ -50,6 +51,9 @@ aero-bot-decide = "aero_bot.strategy:main"
 # systemd timer decides when cycles run, and every broadcast flows through
 # the audited capped executor surfaces.
 aero-bot-cycle = "aero_bot.cycle:main"
+# The backup command verifies, encrypts, and pushes the audit chain to a
+# private git branch through a deploy key once per day.
+aero-bot-audit-backup = "aero_bot.audit_backup:main"
 
 [tool.hatch.build.targets.wheel]
 # The wheel contains only the application package under the src layout.
@@ -95,6 +99,9 @@ ignore = ["D104"]
 "tests/test_risk.py" = ["S105", "S106"]
 # Policy fixtures use public contract addresses that security lint misclassifies as secrets.
 "tests/test_policy.py" = ["S105", "S106"]
+# The backup tests drive the real git binary through its absolute path with
+# test-controlled arguments against throwaway local bare remotes.
+"tests/test_audit_backup.py" = ["S603"]
 
 [tool.ruff.lint.pydocstyle]
 # Google-style docstrings are readable in source and generated documentation.
