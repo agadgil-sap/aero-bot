@@ -1,6 +1,7 @@
 """Behavior tests for the Slipstream LP lifecycle calldata layer."""
 
 import pytest
+from eth_utils.crypto import keccak
 
 from aero_bot.lp_calldata import (
     GAUGE_DEPOSIT_SELECTOR,
@@ -377,3 +378,127 @@ def test_param_models_are_immutable() -> None:
     view = decode_lp_positions_view(LIVE_POSITIONS_RETURN)
     with pytest.raises(ValueError):
         view.liquidity = 1
+
+
+# The live AAPLc slot0() return captured read-only on Base during the 2026-09
+# speed pass: word zero is sqrtPriceX96, word one the signed current tick.
+LIVE_SLOT0_RESULT = (
+    "0x00000000000000000000000000000000000000008f3ed98cc2a6077676b0f0f4"
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd2a3"
+    "0000000000000000000000000000000000000000000000000000000000000366"
+    "0000000000000000000000000000000000000000000000000000000000000800"
+    "0000000000000000000000000000000000000000000000000000000000000800"
+    "0000000000000000000000000000000000000000000000000000000000000001"
+)
+
+
+def test_pool_state_read_selectors_are_pinned() -> None:
+    """Every fast-path read selector carries its exact canonical bytes."""
+    from aero_bot.lp_calldata import (
+        GAUGE_FACTORY_NFT_READ_SELECTOR,
+        GAUGE_REWARD_RATE_READ_SELECTOR,
+        GAUGE_REWARD_TOKEN_READ_SELECTOR,
+        POOL_FACTORY_READ_SELECTOR,
+        POOL_GAUGE_READ_SELECTOR,
+        POOL_LIQUIDITY_READ_SELECTOR,
+        POOL_SLOT0_READ_SELECTOR,
+        POOL_STAKED_LIQUIDITY_READ_SELECTOR,
+        POOL_TICK_SPACING_READ_SELECTOR,
+        POOL_TOKEN0_READ_SELECTOR,
+        POOL_TOKEN1_READ_SELECTOR,
+        build_gauge_factory_nft_read_calldata,
+        build_gauge_reward_rate_read_calldata,
+        build_gauge_reward_token_read_calldata,
+        build_pool_factory_read_calldata,
+        build_pool_gauge_read_calldata,
+        build_pool_liquidity_read_calldata,
+        build_pool_slot0_read_calldata,
+        build_pool_staked_liquidity_read_calldata,
+        build_pool_tick_spacing_read_calldata,
+        build_pool_token0_read_calldata,
+        build_pool_token1_read_calldata,
+    )
+
+    selectors = {
+        "slot0()": POOL_SLOT0_READ_SELECTOR,
+        "liquidity()": POOL_LIQUIDITY_READ_SELECTOR,
+        "stakedLiquidity()": POOL_STAKED_LIQUIDITY_READ_SELECTOR,
+        "token0()": POOL_TOKEN0_READ_SELECTOR,
+        "token1()": POOL_TOKEN1_READ_SELECTOR,
+        "tickSpacing()": POOL_TICK_SPACING_READ_SELECTOR,
+        "factory()": POOL_FACTORY_READ_SELECTOR,
+        "gauge()": POOL_GAUGE_READ_SELECTOR,
+        "rewardToken()": GAUGE_REWARD_TOKEN_READ_SELECTOR,
+        "rewardRate()": GAUGE_REWARD_RATE_READ_SELECTOR,
+        "nft()": GAUGE_FACTORY_NFT_READ_SELECTOR,
+    }
+    for signature, selector in selectors.items():
+        assert selector == keccak(text=signature)[:4].hex(), signature
+
+    builders = (
+        build_pool_slot0_read_calldata,
+        build_pool_liquidity_read_calldata,
+        build_pool_staked_liquidity_read_calldata,
+        build_pool_token0_read_calldata,
+        build_pool_token1_read_calldata,
+        build_pool_tick_spacing_read_calldata,
+        build_pool_factory_read_calldata,
+        build_pool_gauge_read_calldata,
+        build_gauge_reward_token_read_calldata,
+        build_gauge_reward_rate_read_calldata,
+        build_gauge_factory_nft_read_calldata,
+    )
+    for builder in builders:
+        calldata = builder()
+        assert calldata.startswith("0x") and len(calldata) == 2 + 8
+
+
+def test_decode_pool_slot0_view_reproduces_the_live_capture() -> None:
+    """The live AAPLc slot0 return decodes to its captured price and tick."""
+    from aero_bot.lp_calldata import decode_pool_slot0_view
+
+    sqrt_ratio, tick = decode_pool_slot0_view(LIVE_SLOT0_RESULT)
+
+    assert sqrt_ratio == 44332337155365311163694903540
+    assert tick == -11613
+
+
+def test_decode_view_results_reject_malformed_returns() -> None:
+    """Every decoder refuses non-hex, short, and non-word payloads."""
+    from aero_bot.lp_calldata import (
+        decode_address_view_result,
+        decode_pool_slot0_view,
+        decode_uint_view_result,
+    )
+
+    for malformed in ("", "deadbeef", "0x", "0x1234"):
+        for decode in (
+            decode_pool_slot0_view,
+            decode_address_view_result,
+            decode_uint_view_result,
+        ):
+            try:
+                decode(malformed)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{decode.__name__} accepted {malformed!r}")
+
+    # A negative-out-of-int24 tick word refuses even with enough words.
+    poisoned = "0x" + "00" * 32 + ("%064x" % (2**255))
+    try:
+        decode_pool_slot0_view(poisoned)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an int24-overflowing tick did not refuse")
+
+
+def test_decode_address_and_uint_view_results_round_trip() -> None:
+    """Single-word views decode addresses and integers exactly."""
+    from aero_bot.lp_calldata import decode_address_view_result, decode_uint_view_result
+
+    address_word = "0x" + "0" * 24 + AAPLC_ADDRESS[2:]
+
+    assert decode_address_view_result(address_word) == AAPLC_ADDRESS.lower()
+    assert decode_uint_view_result("0x" + "f" * 64) == 2**256 - 1

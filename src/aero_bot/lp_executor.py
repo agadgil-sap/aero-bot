@@ -87,10 +87,13 @@ from aero_bot.lp_calldata import (
     build_gauge_deposit_calldata,
     build_gauge_deposit_timestamp_read_calldata,
     build_gauge_earned_read_calldata,
+    build_gauge_factory_nft_read_calldata,
     build_gauge_gauge_factory_read_calldata,
     build_gauge_get_reward_calldata,
     build_gauge_min_stake_times_read_calldata,
     build_gauge_penalty_rate_read_calldata,
+    build_gauge_reward_rate_read_calldata,
+    build_gauge_reward_token_read_calldata,
     build_gauge_rewards_read_calldata,
     build_gauge_withdraw_calldata,
     build_lp_burn_calldata,
@@ -98,9 +101,21 @@ from aero_bot.lp_calldata import (
     build_lp_decrease_liquidity_calldata,
     build_lp_mint_calldata,
     build_lp_positions_read_calldata,
+    build_pool_factory_read_calldata,
+    build_pool_gauge_read_calldata,
+    build_pool_liquidity_read_calldata,
+    build_pool_slot0_read_calldata,
+    build_pool_staked_liquidity_read_calldata,
+    build_pool_tick_spacing_read_calldata,
+    build_pool_token0_read_calldata,
+    build_pool_token1_read_calldata,
     build_set_approval_for_all_calldata,
+    decode_address_view_result,
     decode_lp_positions_view,
+    decode_pool_slot0_view,
+    decode_uint_view_result,
 )
+from aero_bot.lp_pins import LpPoolPin, LpPoolPinStore, build_pool_pin_from_discovery
 from aero_bot.lp_plan import (
     DEFAULT_MINT_SLIPPAGE_TOLERANCE,
     QUOTE_TOKEN_DECIMALS,
@@ -1247,6 +1262,7 @@ class LpLifecycleExecutor:
         timer: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         receipt_backends: Sequence[ExecutorRpcBackend] | None = None,
+        pool_pin_store: LpPoolPinStore | None = None,
     ) -> None:
         """Configure one LP executor with every boundary it consumes.
 
@@ -1265,6 +1281,10 @@ class LpLifecycleExecutor:
                 polling.
             receipt_backends: Backends polled round-robin while awaiting one
                 inclusion; defaults to the primary backend alone.
+            pool_pin_store: Optional local store of Sugar-verified pool
+                identities; when present, known pools skip the full Sugar
+                enumeration through the verified fast path and every
+                successful full sweep refreshes its pin.
         """
         self._policy = policy
         self._plan_policy = plan_policy
@@ -1279,6 +1299,7 @@ class LpLifecycleExecutor:
         self._receipt_backends: tuple[ExecutorRpcBackend, ...] = (
             tuple(receipt_backends) if receipt_backends is not None else (rpc,)
         )
+        self._pool_pin_store = pool_pin_store
 
     @property
     def safe_address(self) -> str:
@@ -3228,6 +3249,39 @@ class LpLifecycleExecutor:
                 f"symbol {symbol!r} is not in the official Coinbase-issued B20 registry; the "
                 "token whitelist is USDC plus that registry only",
             )
+        pin = (
+            self._pool_pin_store.load().get(listing.symbol.strip().lower())
+            if self._pool_pin_store is not None
+            else None
+        )
+        if pin is not None:
+            try:
+                observation = self._known_pool_observation(listing, pin)
+            except (ExecutionUnavailableError, ValueError):
+                # Any unreadable view or identity mismatch falls back to the
+                # full sweep below, which re-verifies everything the slow way
+                # and refreshes the pin: the store is a cache, never a trust
+                # root, so it can only ever cost speed.
+                pass
+            else:
+                observed_at = observation.observed_at
+                age_seconds = max(0, int((self._now() - observed_at).total_seconds()))
+                if age_seconds > self._policy.snapshot_max_age_seconds:
+                    raise LpExecutionRefusalError(
+                        LpExecutionRefusalCode.SNAPSHOT_STALE,
+                        f"the pool snapshot is {age_seconds} seconds old, above the "
+                        f"{self._policy.snapshot_max_age_seconds}-second staleness bound; "
+                        "re-run discovery for a fresh snapshot",
+                    )
+                caps.append("token within the USDC-plus-registry whitelist")
+                caps.append(
+                    f"pool {observation.pool_address} from the known-pool fast path "
+                    f"(identity re-verified live, state at block {observation.snapshot_block})"
+                )
+                caps.append(
+                    f"snapshot fresher than {self._policy.snapshot_max_age_seconds} seconds"
+                )
+                return listing, observation, caps
         discovery = self._sources.discover_pools()
         pool = next(
             (
@@ -3296,7 +3350,175 @@ class LpLifecycleExecutor:
             snapshot_block=discovery.snapshot_block,
             observed_at=observed_at,
         )
+        self._persist_pool_pin(
+            listing=listing,
+            factory_address=pool.factory_address,
+            observation=observation,
+            snapshot_block=discovery.snapshot_block,
+            observed_at=observed_at,
+            discovery_source=discovery.source,
+            existing_pin=pin,
+        )
         return listing, observation, caps
+
+    def _known_pool_observation(
+        self, listing: B20AssetListing, pin: LpPoolPin
+    ) -> LpPoolObservation:
+        """Build one fresh live observation for a pinned known pool.
+
+        The pinned identity is re-verified against the pool contract's own
+        immutable views (token pair, tick spacing, factory, gauge binding,
+        and the gauge factory's NFPM, the Sugar's own resolution path) and the
+        pool's live state - price and tick through ``slot0()``, active and
+        staked liquidity, the USDC reserve balance, and the gauge's emission
+        token and per-second rate - is read at one freshly pinned block, so
+        planning still re-prices against current on-chain state. Speed comes
+        from skipping the full-pool enumeration, never from skipping
+        verification.
+
+        Args:
+            listing: The registry listing the symbol resolved to.
+            pin: The persisted Sugar-verified identity for the pool.
+
+        Returns:
+            The block-pinned live observation of the known pool.
+
+        Raises:
+            ValueError: If any pinned identity fact no longer matches the
+                live pool, or any decoded view fails its coherence checks.
+            ExecutionUnavailableError: If any read cannot complete.
+        """
+        rpc = self._rpc
+        block_number = rpc.fetch_block_number()
+        block_tag = hex(block_number)
+
+        def read(contract_address: str, calldata: str) -> str:
+            return rpc.eth_call_at(contract_address, calldata, block_tag)
+
+        pool_address = pin.pool_address
+        token0 = decode_address_view_result(read(pool_address, build_pool_token0_read_calldata()))
+        token1 = decode_address_view_result(read(pool_address, build_pool_token1_read_calldata()))
+        tick_spacing = decode_uint_view_result(
+            read(pool_address, build_pool_tick_spacing_read_calldata())
+        )
+        gauge = decode_address_view_result(read(pool_address, build_pool_gauge_read_calldata()))
+        factory = decode_address_view_result(read(pool_address, build_pool_factory_read_calldata()))
+        gauge_factory = decode_address_view_result(
+            read(pin.gauge_address, build_gauge_gauge_factory_read_calldata())
+        )
+        nfpm = decode_address_view_result(
+            read(gauge_factory, build_gauge_factory_nft_read_calldata())
+        )
+        listing_stock = normalize_evm_address(listing.address)
+        pinned_identity = (
+            normalize_evm_address(pin.token0_address),
+            normalize_evm_address(pin.token1_address),
+            pin.tick_spacing,
+            normalize_evm_address(pin.gauge_address),
+            normalize_evm_address(pin.factory_address),
+            normalize_evm_address(pin.nfpm_address),
+        )
+        live_identity = (token0, token1, tick_spacing, gauge, factory, nfpm)
+        if live_identity != pinned_identity or listing_stock not in (token0, token1):
+            raise ValueError(
+                f"the pinned identity for {listing.symbol} no longer matches the live "
+                f"pool {pool_address}: pinned {pinned_identity} versus live {live_identity} "
+                f"with registry stock {listing_stock}; falling back to full discovery"
+            )
+        stock_is_token0 = token0 == listing_stock
+        sqrt_ratio, current_tick = decode_pool_slot0_view(
+            read(pool_address, build_pool_slot0_read_calldata())
+        )
+        pool_active_liquidity = decode_uint_view_result(
+            read(pool_address, build_pool_liquidity_read_calldata())
+        )
+        gauge_liquidity = decode_uint_view_result(
+            read(pool_address, build_pool_staked_liquidity_read_calldata())
+        )
+        usdc_reserve = decode_uint_view_result(
+            read(BASE_USDC_ADDRESS, self._erc20_balance_calldata(pool_address))
+        )
+        emissions_token = decode_address_view_result(
+            read(pin.gauge_address, build_gauge_reward_token_read_calldata())
+        )
+        emissions_per_second = decode_uint_view_result(
+            read(pin.gauge_address, build_gauge_reward_rate_read_calldata())
+        )
+        return LpPoolObservation(
+            symbol=listing.symbol,
+            pool_address=pool_address,
+            nfpm_address=nfpm,
+            gauge_address=gauge,
+            token0_address=token0,
+            token1_address=token1,
+            stock_is_token0=stock_is_token0,
+            stock_decimals=pin.stock_decimals,
+            quote_decimals=QUOTE_TOKEN_DECIMALS,
+            tick_spacing=tick_spacing,
+            current_tick=current_tick,
+            sqrt_ratio=sqrt_ratio,
+            pool_active_liquidity=pool_active_liquidity,
+            usdc_reserve_units=usdc_reserve,
+            emissions_per_second_units=emissions_per_second,
+            emissions_token_address=emissions_token,
+            gauge_liquidity_units=gauge_liquidity,
+            staked_reserve0_units=0,
+            staked_reserve1_units=0,
+            snapshot_block=block_number,
+            observed_at=self._now(),
+        )
+
+    def _persist_pool_pin(
+        self,
+        *,
+        listing: B20AssetListing,
+        factory_address: str,
+        observation: LpPoolObservation,
+        snapshot_block: int | None,
+        observed_at: datetime,
+        discovery_source: str,
+        existing_pin: LpPoolPin | None,
+    ) -> None:
+        """Refresh one pool's pin after a successful full-sweep resolution.
+
+        The pin store is a cache of verified facts, so persistence failures
+        are ignored: the action already passed every gate, and the next run
+        simply re-runs the sweep when the pin could not be written.
+
+        Args:
+            listing: The registry listing the symbol resolved to.
+            factory_address: The pool's factory as the sweep validated it.
+            observation: The sweep-built observation carrying the identity.
+            snapshot_block: The sweep's pinned snapshot block.
+            observed_at: The sweep's observation time.
+            discovery_source: The sweep's source provenance string.
+            existing_pin: The pin that failed the fast path, if any, kept for
+                callers that want to compare before rewriting.
+        """
+        if self._pool_pin_store is None or snapshot_block is None:
+            return
+        try:
+            pin = build_pool_pin_from_discovery(
+                symbol=listing.symbol,
+                pool_address=observation.pool_address,
+                factory_address=factory_address,
+                token0_address=observation.token0_address,
+                token1_address=observation.token1_address,
+                tick_spacing=observation.tick_spacing,
+                gauge_address=observation.gauge_address,
+                nfpm_address=observation.nfpm_address,
+                stock_decimals=observation.stock_decimals,
+                snapshot_block=snapshot_block,
+                observed_at=observed_at,
+                discovery_source=discovery_source,
+            )
+            if pin == existing_pin:
+                return
+            self._pool_pin_store.save_pin(pin)
+        except (OSError, ValueError):
+            # The cache never gates the action; a failed write only costs
+            # the next run its fast path.
+            return
 
     def _preflight(self, caps: list[str]) -> tuple[int, int, int]:
         """Run the pre-sign chain gates and return the live preflight state.
@@ -4181,6 +4403,15 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
             "at a time."
         ),
     )
+    parser.add_argument(
+        "--full-discovery",
+        action="store_true",
+        help=(
+            "Ignore persisted pool pins and resolve every pool through the "
+            "full Sugar enumeration this run; the pin cache re-arms on the "
+            "next normal run."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     plan_parser = subparsers.add_parser(
         "plan",
@@ -4800,6 +5031,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     rpc = ExecutorRpcBackend(rpc_url=settings.base_rpc_url)
     safe_rpc = SafeTransactionRpcBackend(rpc_url=settings.base_rpc_url, safe_address=safe_address)
+    # The pin store arms the known-pool fast path; --full-discovery bypasses
+    # it for one run by constructing the executor without pins.
+    pool_pin_store = (
+        None if arguments.full_discovery else LpPoolPinStore(settings.lp_pool_pins_path)
+    )
     try:
         audit_store = AuditStore(settings.audit_database_path)
     except (OSError, RuntimeError, ValueError) as error:
@@ -4819,6 +5055,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         safe_rpc=safe_rpc,
         audit_sink=audit_store,
         receipt_backends=receipt_backends,
+        pool_pin_store=pool_pin_store,
     )
     try:
         if arguments.command == "plan" and arguments.lifecycle == "mint":

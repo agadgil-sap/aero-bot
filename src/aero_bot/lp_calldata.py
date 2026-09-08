@@ -74,6 +74,29 @@ GAUGE_PENALTY_RATE_SELECTOR = "d6b7494f"
 GAUGE_MIN_STAKE_TIMES_SELECTOR = "e782453b"
 # keccak256("depositTimestamp(uint256)")[0:4], the stake-age anchor per token.
 GAUGE_DEPOSIT_TIMESTAMP_SELECTOR = "4ede8c85"
+# keccak256("slot0()")[0:4], the pool's price-and-tick state view.
+POOL_SLOT0_READ_SELECTOR = "3850c7bd"
+# keccak256("liquidity()")[0:4], the pool's active in-range liquidity.
+POOL_LIQUIDITY_READ_SELECTOR = "1a686502"
+# keccak256("stakedLiquidity()")[0:4], the pool's gauge-staked liquidity.
+POOL_STAKED_LIQUIDITY_READ_SELECTOR = "3ab04b20"
+# keccak256("token0()")[0:4], the pool's lower-address token identity.
+POOL_TOKEN0_READ_SELECTOR = "0dfe1681"
+# keccak256("token1()")[0:4], the pool's higher-address token identity.
+POOL_TOKEN1_READ_SELECTOR = "d21220a7"
+# keccak256("tickSpacing()")[0:4], the pool's tick grid spacing.
+POOL_TICK_SPACING_READ_SELECTOR = "d0c93a7c"
+# keccak256("factory()")[0:4], the pool's creating factory identity.
+POOL_FACTORY_READ_SELECTOR = "c45a0155"
+# keccak256("gauge()")[0:4], the pool's live CLGauge binding.
+POOL_GAUGE_READ_SELECTOR = "a6f19c84"
+# keccak256("rewardToken()")[0:4], the gauge's emission token.
+GAUGE_REWARD_TOKEN_READ_SELECTOR = "f7c618c1"  # noqa: S105
+# keccak256("rewardRate()")[0:4], the gauge's per-second emission rate.
+GAUGE_REWARD_RATE_READ_SELECTOR = "7b0a47ee"
+# keccak256("nft()")[0:4], the gauge factory's NFPM, which is the Sugar's
+# own resolution path for every pool's position manager.
+GAUGE_FACTORY_NFT_READ_SELECTOR = "47ccca02"
 # Every ABI word encoded or decoded by this module is exactly 32 bytes.
 WORD_BYTES = 32
 # Solidity int24 spans this signed range; every tick argument must fit it.
@@ -613,3 +636,220 @@ def build_gauge_deposit_timestamp_read_calldata(token_id: int) -> str:
     if token_id < 0:
         raise ValueError("token_id must be non-negative")
     return _selector_and_words(GAUGE_DEPOSIT_TIMESTAMP_SELECTOR, _word(token_id))
+
+
+def build_pool_slot0_read_calldata() -> str:
+    """ABI-encode the pool's price-and-tick state read.
+
+    Live on the AAPLc pool the view returns six words whose first two carry
+    the planning inputs: word zero the raw ``uint160 sqrtPriceX96`` and word
+    one the signed ``int24`` current tick. Verified read-only on Base during
+    the 2026-09 speed pass: the live return decoded to
+    ``sqrtPriceX96 44332337155365311163694903540`` at tick ``-11613``.
+
+    Returns:
+        Complete 0x-prefixed calldata for the pool's slot0 view.
+    """
+    return f"0x{POOL_SLOT0_READ_SELECTOR}"
+
+
+def build_pool_liquidity_read_calldata() -> str:
+    """ABI-encode the pool's active in-range liquidity read.
+
+    The word returned is the raw ``uint128`` L the depth cap measures the
+    position against. Verified live on the AAPLc pool alongside slot0.
+
+    Returns:
+        Complete 0x-prefixed calldata for the pool's liquidity view.
+    """
+    return f"0x{POOL_LIQUIDITY_READ_SELECTOR}"
+
+
+def build_pool_staked_liquidity_read_calldata() -> str:
+    """ABI-encode the pool's gauge-staked liquidity read.
+
+    Slipstream pools carry their own staked-liquidity counter, which mirrors
+    the gauge's staked L. Verified live on the AAPLc pool during the
+    2026-09 speed pass.
+
+    Returns:
+        Complete 0x-prefixed calldata for the pool's stakedLiquidity view.
+    """
+    return f"0x{POOL_STAKED_LIQUIDITY_READ_SELECTOR}"
+
+
+def build_pool_token0_read_calldata() -> str:
+    """ABI-encode the pool's lower-address token identity read.
+
+    Returns:
+        Complete 0x-prefixed calldata for the pool's token0 view.
+    """
+    return f"0x{POOL_TOKEN0_READ_SELECTOR}"
+
+
+def build_pool_token1_read_calldata() -> str:
+    """ABI-encode the pool's higher-address token identity read.
+
+    Returns:
+        Complete 0x-prefixed calldata for the pool's token1 view.
+    """
+    return f"0x{POOL_TOKEN1_READ_SELECTOR}"
+
+
+def build_pool_tick_spacing_read_calldata() -> str:
+    """ABI-encode the pool's tick grid spacing read.
+
+    Returns:
+        Complete 0x-prefixed calldata for the pool's tickSpacing view.
+    """
+    return f"0x{POOL_TICK_SPACING_READ_SELECTOR}"
+
+
+def build_pool_factory_read_calldata() -> str:
+    """ABI-encode the pool's creating factory identity read.
+
+    Returns:
+        Complete 0x-prefixed calldata for the pool's factory view.
+    """
+    return f"0x{POOL_FACTORY_READ_SELECTOR}"
+
+
+def build_pool_gauge_read_calldata() -> str:
+    """ABI-encode the pool's live gauge binding read.
+
+    Returns:
+        Complete 0x-prefixed calldata for the pool's gauge view.
+    """
+    return f"0x{POOL_GAUGE_READ_SELECTOR}"
+
+
+def build_gauge_reward_token_read_calldata() -> str:
+    """ABI-encode the gauge's emission token read.
+
+    Verified live on the AAPLc gauge: ``rewardToken()`` returns the AERO
+    contract ``0x940181a94a35a4569e4529a3cdfb74e38fd98631``.
+
+    Returns:
+        Complete 0x-prefixed calldata for the gauge's rewardToken view.
+    """
+    return f"0x{GAUGE_REWARD_TOKEN_READ_SELECTOR}"
+
+
+def build_gauge_reward_rate_read_calldata() -> str:
+    """ABI-encode the gauge's per-second emission-rate read.
+
+    Verified live on the AAPLc gauge: ``rewardRate()`` returned
+    ``103143109344970222`` raw per second (eighteen decimals) during the
+    2026-09 speed pass.
+
+    Returns:
+        Complete 0x-prefixed calldata for the gauge's rewardRate view.
+    """
+    return f"0x{GAUGE_REWARD_RATE_READ_SELECTOR}"
+
+
+def build_gauge_factory_nft_read_calldata() -> str:
+    """ABI-encode the gauge factory's position-manager read.
+
+    This is the Sugar's own NFPM resolution path: the pool's gauge names its
+    factory, and the factory's ``nft()`` is the NonfungiblePositionManager
+    every position of that generation is minted through. Verified live on the
+    AAPLc chain: the gauge's factory is
+    ``0x385293cae378c813f16f0c1334d774adddf56abb`` and its ``nft()`` is the
+    Gauges V3 NFPM ``0xe1f8cd9ac4e4a65f54f38a5cdafca44f6dd68b53``.
+
+    Returns:
+        Complete 0x-prefixed calldata for the gauge factory's nft view.
+    """
+    return f"0x{GAUGE_FACTORY_NFT_READ_SELECTOR}"
+
+
+def decode_pool_slot0_view(result: str) -> tuple[int, int]:
+    """Decode one slot0() return into its raw price and signed tick.
+
+    The layout was verified against the live AAPLc pool: word zero is the
+    ``uint160 sqrtPriceX96`` and word one the signed ``int24`` tick, with
+    four further protocol words the planner does not consume.
+
+    Args:
+        result: The 0x-prefixed hex return bytes of the slot0 view.
+
+    Returns:
+        The raw square-root price and the signed current tick.
+
+    Raises:
+        ValueError: If the return is not 0x-prefixed hexadecimal of at least
+            two whole ABI words.
+    """
+    words = _decode_view_words(result, "slot0 view", 2)
+    sqrt_ratio = words[0]
+    tick = int.from_bytes(words[1].to_bytes(WORD_BYTES, "big", signed=False), "big", signed=True)
+    if not INT24_MIN <= tick <= INT24_MAX:
+        raise ValueError(f"slot0 view tick {tick} is outside the int24 range")
+    if sqrt_ratio <= 0:
+        raise ValueError("slot0 view sqrtPriceX96 must be positive")
+    return sqrt_ratio, tick
+
+
+def decode_address_view_result(result: str) -> str:
+    """Decode one single-word address view return.
+
+    Args:
+        result: The 0x-prefixed hex return bytes of an address-valued view.
+
+    Returns:
+        The lowercase 0x-prefixed address.
+
+    Raises:
+        ValueError: If the return is not exactly one whole ABI word.
+    """
+    (word,) = _decode_view_words(result, "address view", 1)
+    return normalize_evm_address("0x" + format(word & ((1 << 160) - 1), "040x"))
+
+
+def decode_uint_view_result(result: str) -> int:
+    """Decode one single-word unsigned view return.
+
+    Args:
+        result: The 0x-prefixed hex return bytes of a uint-valued view.
+
+    Returns:
+        The unsigned word value.
+
+    Raises:
+        ValueError: If the return is not exactly one whole ABI word.
+    """
+    (word,) = _decode_view_words(result, "uint view", 1)
+    return word
+
+
+def _decode_view_words(result: str, view_name: str, minimum_words: int) -> list[int]:
+    """Split one view return into its whole ABI words.
+
+    Args:
+        result: The 0x-prefixed hex return bytes.
+        view_name: Human-readable view name for error messages.
+        minimum_words: The smallest word count the view may return.
+
+    Returns:
+        Every decoded unsigned word in return order.
+
+    Raises:
+        ValueError: If the return is not 0x-prefixed hexadecimal of at least
+            the required whole ABI words.
+    """
+    if not result.startswith("0x"):
+        raise ValueError(f"{view_name} result must be 0x-prefixed")
+    try:
+        data = bytes.fromhex(result[2:])
+    except ValueError as error:
+        raise ValueError(f"{view_name} result must be hexadecimal") from error
+    if len(data) < minimum_words * WORD_BYTES or len(data) % WORD_BYTES != 0:
+        raise ValueError(
+            f"{view_name} returned {len(data)} bytes instead of whole "
+            f"{WORD_BYTES}-byte words with at least {minimum_words} words"
+        )
+    return [
+        int.from_bytes(data[index * WORD_BYTES : (index + 1) * WORD_BYTES], "big")
+        for index in range(len(data) // WORD_BYTES)
+    ]
