@@ -50,9 +50,14 @@ from eth_utils.crypto import keccak
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from aero_bot.audit import AuditEventType, AuditStore
-from aero_bot.concentrated import SECONDS_PER_YEAR, PositionRangeState
+from aero_bot.concentrated import PositionRangeState
 from aero_bot.config import Settings
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
+from aero_bot.emissions_apr import (
+    aerodrome_display_emissions_apr,
+    emissions_apr_at_tick_width,
+    staked_value_usdc,
+)
 from aero_bot.executor import (
     AERODROME_ROUTER_ADDRESS,
     APPROVAL_CAP_CEILING_USDC,
@@ -227,6 +232,8 @@ class LpExecutionRefusalCode(StrEnum):
     POSITION_NOT_STAKED = "position_not_staked"
     # A withdraw was requested on a position holding no liquidity and no fees.
     POSITION_EMPTY = "position_empty"
+    # The live AERO price read backing an emissions-APR quote failed.
+    AERO_PRICE_UNREADABLE = "aero_price_unreadable"
     # A claim or withdrawal would land inside the early-exit penalty window.
     WITHIN_PENALTY_WINDOW = "within_penalty_window"
     # The penalty window could not be resolved from live reads, so any claim
@@ -823,12 +830,13 @@ class LpPositionStatusReport(BaseModel):
     accrued_aero_checkpoint_units: Annotated[int, Field(ge=0)] | None = None
     # The resolved penalty window when staked, else None.
     penalty: LpPenaltyWindow | None = None
-    # The quoted emissions APR as a decimal fraction, None when the inputs
-    # are absent; labeled pre-fix until the APR convention fix lands.
+    # The quoted emissions APR as a decimal fraction in Aerodrome's
+    # displayed convention, None when the inputs are absent.
     quoted_emissions_apr: Decimal | None = None
-    # How the quoted APR was derived and labeled.
+    # How the quoted APR was derived, including its width dependence.
     apr_diagnostic: str = ""
-    # The AERO price assumption the quote used, in USDC.
+    # The AERO price the quote used, in USDC - a live read from Aerodrome's
+    # own USDC/AERO pool unless the operator overrode it.
     aero_price_assumption_usdc: Decimal
     # The entry cost basis when one was supplied, else None.
     entry_cost_usdc: Decimal | None = None
@@ -1806,7 +1814,7 @@ class LpLifecycleExecutor:
         self,
         symbol: str,
         token_id: int,
-        aero_price_usdc: Decimal,
+        aero_price_usdc: Decimal | None = None,
         entry_cost_usdc: Decimal | None = None,
     ) -> LpPositionStatusReport:
         """Observe one position read-only; nothing is built or signed.
@@ -1814,9 +1822,9 @@ class LpLifecycleExecutor:
         Args:
             symbol: The registry-matched B20 stock symbol.
             token_id: The position NFT being reported on.
-            aero_price_usdc: The AERO price assumption in USDC the quoted
-                emissions APR uses; labeled pre-fix until the convention fix
-                lands and a live read replaces the assumption.
+            aero_price_usdc: Optional AERO price assumption in USDC; absent
+                means the price is read live from Aerodrome's own USDC/AERO
+                pool at the snapshot block.
             entry_cost_usdc: The optional entry cost basis in USDC for the
                 unrealized P&L; absent means unknown.
 
@@ -1825,7 +1833,7 @@ class LpLifecycleExecutor:
 
         Raises:
             LpExecutionRefusalError: If any registry, discovery, snapshot,
-                or position-resolution gate refuses.
+                position-resolution, or live AERO-price gate refuses.
         """
         try:
             return self._position_status(symbol, token_id, aero_price_usdc, entry_cost_usdc)
@@ -2498,9 +2506,10 @@ class LpLifecycleExecutor:
         if width_spacings is None:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.DERIVED_WIDTH_UNAVAILABLE,
-                "no --width-ticks override was supplied and the solver-derived width path is "
-                "not wired yet (its emissions-APR input is known understated until the APR "
-                "convention fix lands); pass an explicit half width in tick spacings per side",
+                "no --width-ticks override was supplied and the solver-derived width path "
+                "needs a reconstructed price path this manual surface does not yet carry "
+                "(the corrected emissions-APR convention is live); pass an explicit half "
+                "width in tick spacings per side",
             )
         position = context.position
         observation = context.observation
@@ -2746,13 +2755,15 @@ class LpLifecycleExecutor:
         self,
         symbol: str,
         token_id: int,
-        aero_price_usdc: Decimal,
+        aero_price_usdc: Decimal | None,
         entry_cost_usdc: Decimal | None,
     ) -> LpPositionStatusReport:
         """Observe one position read-only and quote its emissions APR."""
         context = self._resolve_position(symbol, token_id)
         position = context.position
         observation = context.observation
+        if aero_price_usdc is None:
+            aero_price_usdc = self._read_live_aero_price(observation)
         amount0, amount1 = self._exit_amounts(observation, position)
         range_state = position_range_state(
             position.tick_lower, position.tick_upper, observation.current_tick
@@ -3089,20 +3100,42 @@ class LpLifecycleExecutor:
         )
         return projected_usdc, projected_stock
 
+    def _read_live_aero_price(self, observation: LpPoolObservation) -> Decimal:
+        """Read the live AERO price at the observation's snapshot block.
+
+        Args:
+            observation: The block-pinned observation anchoring the read.
+
+        Returns:
+            The USDC price of one whole AERO token at that block.
+
+        Raises:
+            LpExecutionRefusalError: If the live read fails closed.
+        """
+        try:
+            return self._rpc.fetch_aero_price_usdc(hex(observation.snapshot_block))
+        except (ExecutorRpcRevertError, ExecutionUnavailableError, ValueError) as error:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.AERO_PRICE_UNREADABLE,
+                f"the live AERO price read from Aerodrome's USDC/AERO pool failed at "
+                f"block {observation.snapshot_block}: {error}; pass --aero-price to "
+                "assume a price explicitly or retry",
+            ) from error
+
     def _quote_emissions_apr(
         self, observation: LpPoolObservation, aero_price_usdc: Decimal
     ) -> tuple[Decimal | None, str]:
-        """Quote the pool's emissions APR under the current bot convention.
+        """Quote the pool's emissions APR in Aerodrome's displayed convention.
 
-        This is the same annual-reward-value-over-staked-value convention the
-        rehearsal reconstruction uses, computed over the Sugar snapshot's
-        staked reserves at the supplied AERO price. The input is explicitly
-        labeled pre-fix: the emissions-APR convention deliverable has not
-        landed, and Aerodrome's own displayed numbers are known to differ.
+        The conversion is the shared, source-cited convention in
+        ``aero_bot.emissions_apr`` - the annualized gauge reward value over
+        the Sugar snapshot's current-cell staked value - plus the width
+        family the same convention generalizes to, so the report shows the
+        concentration dependence explicitly.
 
         Args:
             observation: The block-pinned pool observation.
-            aero_price_usdc: The AERO price assumption in USDC.
+            aero_price_usdc: The AERO price in USDC (live read or override).
 
         Returns:
             The quoted APR as a decimal fraction, or None with its diagnostic
@@ -3119,34 +3152,54 @@ class LpLifecycleExecutor:
                 "no quoted emissions APR: the snapshot carries no emissions rate or staked "
                 "reserves to quote against"
             )
-        price = observation.price_usdc_per_stock
-        token0_scale = (
-            Decimal(10) ** -observation.stock_decimals
-            if observation.stock_is_token0
-            else Decimal(10) ** -observation.quote_decimals
+        apr = aerodrome_display_emissions_apr(
+            observation.emissions_per_second_units,
+            aero_price_usdc,
+            staked0,
+            staked1,
+            observation.stock_is_token0,
+            observation.stock_decimals,
+            observation.quote_decimals,
+            observation.price_usdc_per_stock,
         )
-        token1_scale = (
-            Decimal(10) ** -observation.quote_decimals
-            if observation.stock_is_token0
-            else Decimal(10) ** -observation.stock_decimals
+        staked_value = staked_value_usdc(
+            staked0,
+            staked1,
+            observation.stock_is_token0,
+            observation.stock_decimals,
+            observation.quote_decimals,
+            observation.price_usdc_per_stock,
         )
-        token0_price = price if observation.stock_is_token0 else Decimal(1)
-        token1_price = Decimal(1) if observation.stock_is_token0 else price
-        staked_tvl = +(
-            Decimal(staked0) * token0_scale * token0_price
-            + Decimal(staked1) * token1_scale * token1_price
+        width_notes: list[str] = []
+        if observation.gauge_liquidity_units > 0:
+            anchor = (
+                observation.current_tick // observation.tick_spacing
+            ) * observation.tick_spacing
+            for half_width in (observation.tick_spacing, 3, 10):
+                try:
+                    width_apr = emissions_apr_at_tick_width(
+                        observation.emissions_per_second_units,
+                        aero_price_usdc,
+                        observation.gauge_liquidity_units,
+                        observation.sqrt_ratio,
+                        anchor,
+                        half_width,
+                        observation.stock_is_token0,
+                        observation.stock_decimals,
+                        observation.quote_decimals,
+                    )
+                except ValueError:
+                    continue
+                width_notes.append(f"+/-{half_width} ticks {Decimal(100) * width_apr:.2f}%")
+        width_line = (
+            f"; the same stream at staked widths {' '.join(width_notes)}" if width_notes else ""
         )
-        annual_reward_usd = (
-            Decimal(observation.emissions_per_second_units)
-            * aero_price_usdc
-            * SECONDS_PER_YEAR
-            / Decimal(10) ** AERO_DECIMALS
-        )
-        return +(annual_reward_usd / staked_tvl), (
-            f"annual reward value {annual_reward_usd} USDC over the snapshot's "
-            f"{staked_tvl} USDC of staked reserves at the assumed AERO price "
-            f"{aero_price_usdc}; PRE-FIX APR INPUT: the emissions-APR convention fix has "
-            "not landed and Aerodrome's own displayed numbers use a different base"
+        return apr, (
+            f"annual reward value {Decimal(apr) * staked_value:.4f} USDC over the snapshot's "
+            f"{staked_value:.2f} USDC current-cell staked value at the AERO price "
+            f"{aero_price_usdc} - Aerodrome's displayed convention, a per-cell "
+            "concentration number that inflates as staked value concentrates near "
+            f"the current price{width_line}"
         )
 
     def _resolve_mint_context(self, symbol: str, width_spacings: int | None) -> _LpMintContext:
@@ -3167,9 +3220,10 @@ class LpLifecycleExecutor:
         if width_spacings is None:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.DERIVED_WIDTH_UNAVAILABLE,
-                "no --width-ticks override was supplied and the solver-derived width path is "
-                "not wired yet (its emissions-APR input is known understated until the APR "
-                "convention fix lands); pass an explicit half width in tick spacings per side",
+                "no --width-ticks override was supplied and the solver-derived width path "
+                "needs a reconstructed price path this manual surface does not yet carry "
+                "(the corrected emissions-APR convention is live); pass an explicit half "
+                "width in tick spacings per side",
             )
         usdc_balance = self._rpc.fetch_token_balance(BASE_USDC_ADDRESS, self._safe_address)
         stock_token = (
@@ -4657,11 +4711,11 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
     status_parser.add_argument(
         "--aero-price",
         type=Decimal,
-        required=True,
+        default=None,
         help=(
-            "AERO price assumption in USDC for the quoted emissions APR; the quote "
-            "is labeled pre-fix until the APR convention fix lands and a live read "
-            "replaces the assumption."
+            "Optional AERO price override in USDC for the quoted emissions APR; "
+            "absent means the price is read live from Aerodrome's own "
+            "USDC/AERO pool at the snapshot block."
         ),
     )
     status_parser.add_argument(
@@ -5244,7 +5298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "status":
             if arguments.token_id < 0:
                 parser.error("--token-id must be non-negative")
-            if arguments.aero_price <= 0:
+            if arguments.aero_price is not None and arguments.aero_price <= 0:
                 parser.error("--aero-price must be positive")
             if arguments.entry_cost is not None and arguments.entry_cost < 0:
                 parser.error("--entry-cost must be non-negative")

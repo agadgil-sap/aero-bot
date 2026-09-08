@@ -110,10 +110,9 @@ class WidthSource(StrEnum):
 
     # An explicit operator override in tick spacings per side.
     EXPLICIT_OVERRIDE = "explicit_override"
-    # The ranging solver's derived width; its emissions-APR input is known
-    # understated until the APR convention fix lands, so every derived width
-    # carries the pre-fix label in its diagnostics.
-    SOLVER_PRE_FIX_APR = "solver_pre_fix_apr"
+    # The ranging solver's derived width under the corrected emissions-APR
+    # convention.
+    SOLVER_DERIVED_APR = "solver_derived_apr"
 
 
 class PositionTickRange(BaseModel):
@@ -915,7 +914,7 @@ def plan_mint_entry(
     width_label = (
         "explicit override"
         if position_range.width_source is WidthSource.EXPLICIT_OVERRIDE
-        else "solver-derived (pre-fix APR input)"
+        else "solver-derived (corrected APR convention)"
     )
     if position_range.clamped_to_ceiling:
         caps.append(

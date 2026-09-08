@@ -179,12 +179,12 @@ def test_derived_range_clamps_above_ceiling_to_the_widest_aligned_width() -> Non
 def test_derived_range_accepts_width_exactly_at_the_ceiling() -> None:
     """Two spacings on a ten grid is the unclamped ceiling width."""
     band = derive_position_range(
-        POOL_CURRENT_TICK, POOL_TICK_SPACING, 2, WidthSource.SOLVER_PRE_FIX_APR
+        POOL_CURRENT_TICK, POOL_TICK_SPACING, 2, WidthSource.SOLVER_DERIVED_APR
     )
 
     assert band.half_width_ticks == 20
     assert band.clamped_to_ceiling is False
-    assert band.width_source is WidthSource.SOLVER_PRE_FIX_APR
+    assert band.width_source is WidthSource.SOLVER_DERIVED_APR
 
 
 def test_derived_range_clamps_to_twenty_nine_ticks_on_a_unit_grid() -> None:

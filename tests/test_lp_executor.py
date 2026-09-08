@@ -17,6 +17,7 @@ from eth_account import Account
 from aero_bot.audit import AuditEventType, AuditStore
 from aero_bot.executor import (
     AERODROME_ROUTER_ADDRESS,
+    AERODROME_VOLATILE_FACTORY_ADDRESS,
     DEFAULT_APPROVAL_STANDING_CAP_USDC,
     ERC20_ALLOWANCE_SELECTOR,
     ERC20_BALANCE_OF_SELECTOR,
@@ -130,6 +131,8 @@ PENALTY_MIN_STAKE_SECONDS = 300
 PENALTY_RATE_BPS = 10_000
 # A fixture AERO price for status quotes; one USDC keeps the math readable.
 FIXTURE_AERO_PRICE_USDC = Decimal("1")
+# The scripted canonical USDC/AERO pair: 1 AERO priced at the fixture price.
+AERO_POOL_ADDRESS = "0x" + "ee" * 20
 
 
 def word_hex(value: int) -> str:
@@ -360,6 +363,7 @@ class LpRpcScript:
         fast_reward_rate_units: int = 4_494_371_922_759_724,
         fast_token1_address: str | None = None,
         fast_views_revert: bool = False,
+        aero_price_usdc: Decimal | None = Decimal("0.5"),
     ) -> None:
         """Configure every scripted answer the LP executor's calls receive.
 
@@ -434,6 +438,8 @@ class LpRpcScript:
                 to script a stale pin's identity mismatch.
             fast_views_revert: Every fast-path pool view reverts, scripting an
                 unreadable known pool.
+            aero_price_usdc: Live USDC/AERO price served to the price read;
+                None makes that read revert so the fail-closed path tests.
         """
         self.gas_price_wei = gas_price_wei
         self.safe_eth_wei = safe_eth_wei
@@ -482,6 +488,7 @@ class LpRpcScript:
         self.fast_reward_rate_units = fast_reward_rate_units
         self.fast_token1_address = fast_token1_address
         self.fast_views_revert = fast_views_revert
+        self.aero_price_usdc = aero_price_usdc
         self.inclusion_blocks = 51_000_000
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -533,6 +540,19 @@ class LpRpcScript:
 
     def _eth_call(self, to_address: str, data: str) -> str:
         """Answer one read-only contract call from the scripted token state."""
+        if to_address == AERODROME_VOLATILE_FACTORY_ADDRESS and data.startswith("0x79bc57d5"):
+            if self.aero_price_usdc is None:
+                raise _ScriptedRevertError("AERO price unavailable")
+            return word_hex(int(AERO_POOL_ADDRESS, 16))
+        if to_address == AERO_POOL_ADDRESS:
+            if self.aero_price_usdc is None:
+                raise _ScriptedRevertError("AERO price unavailable")
+            if data.startswith("0x0dfe1681"):
+                return word_hex(int(AERO_TOKEN_ADDRESS, 16))
+            if data.startswith("0x443cb4bc"):
+                return word_hex(10**18)  # one whole AERO
+            if data.startswith("0x5a76f25e"):
+                return word_hex(int(self.aero_price_usdc * 10**6))
         usdc_token = BASE_USDC_ADDRESS.lower()
         if to_address == POOL_ADDRESS:
             return self._pool_view(data)
@@ -1989,7 +2009,8 @@ def test_position_status_reports_a_staked_position_read_only() -> None:
     assert report.accrued_aero_checkpoint_units == 2 * 10**18
     assert report.penalty is not None
     assert report.penalty.remaining_seconds == 0
-    # The pool-level quote mirrors the rehearsal convention, labeled pre-fix.
+    # The pool-level quote is Aerodrome's displayed convention (the shared
+    # conversion), including its width-family context line.
     emissions_per_second = 4_494_371_922_759_724
     annual_reward_usd = (
         Decimal(emissions_per_second)
@@ -1998,8 +2019,9 @@ def test_position_status_reports_a_staked_position_read_only() -> None:
         / Decimal(10) ** 18
     )
     staked_tvl = +(Decimal(250_000_000) * Decimal(10) ** -6 + Decimal(3) * price)
-    assert report.quoted_emissions_apr == +(annual_reward_usd / staked_tvl)
-    assert "PRE-FIX" in report.apr_diagnostic
+    assert report.quoted_emissions_apr is not None
+    assert abs(report.quoted_emissions_apr - (annual_reward_usd / staked_tvl)) < Decimal("1e-20")
+    assert "displayed convention" in report.apr_diagnostic
     assert report.unrealized_pnl_usdc is None
     assert "entry cost unknown" in report.pnl_diagnostic
     # Status is read-only: nothing was signed, estimated, or broadcast. The
@@ -2595,7 +2617,7 @@ def test_cli_status_prints_the_pre_fix_apr(
     assert exit_code == EXIT_OK
     output = capsys.readouterr().out
     assert "quoted emissions APR" in output
-    assert "PRE-FIX APR INPUT" in output
+    assert "displayed convention" in output
     assert "unrealized P&L" in output
     assert "staked in the gauge" in output
 
@@ -3225,3 +3247,37 @@ def test_cli_full_discovery_flag_bypasses_the_pin_store(tmp_path: Path) -> None:
 
         assert main(mint_arguments) == EXIT_OK
         pin_store_factory.assert_called_once_with(make_cli_settings(tmp_path).lp_pool_pins_path)
+
+
+def test_position_status_reads_the_aero_price_live_by_default() -> None:
+    """Without an override the AERO price comes from the live pair read."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            aero_price_usdc=Decimal("0.75"),
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+        )
+    )
+
+    report = executor.position_status("FIXc", 77)
+
+    assert report.aero_price_assumption_usdc == Decimal("0.75")
+    assert report.quoted_emissions_apr is not None
+    # The quote uses the live price: one AERO per second over the staked value
+    # priced at 0.75 rather than an operator assumption.
+    assert "AERO price 0.75" in report.apr_diagnostic
+
+
+def test_position_status_fails_closed_when_the_live_aero_price_is_unreadable() -> None:
+    """An unreadable live price refuses with the dedicated code."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            aero_price_usdc=None,
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as caught:
+        executor.position_status("FIXc", 77)
+    assert caught.value.code is LpExecutionRefusalCode.AERO_PRICE_UNREADABLE

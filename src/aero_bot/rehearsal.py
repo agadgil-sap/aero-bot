@@ -614,7 +614,11 @@ def trailing_ranging_evidence(
                 microseconds=1
             )
             span_days = Decimal(span_micros) / MICROSECONDS_PER_SECOND / Decimal(SECONDS_PER_DAY)
-            realized_volatility = +(squared_return_sum / span_days).sqrt()
+            if span_days > 0:
+                realized_volatility = +(squared_return_sum / span_days).sqrt()
+            # A zero-second span (two observations inside one block) carries no
+            # time basis, so the volatility stays None and the evidence is
+            # honestly incomplete rather than divided by zero.
         # Staked value scales linearly with staked liquidity at the frozen
         # per-unit anchor value, the emissions series' documented convention.
         staked_tvl_usd = (
