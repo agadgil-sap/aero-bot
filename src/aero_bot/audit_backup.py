@@ -443,10 +443,13 @@ def export_chain(store: AuditStore) -> tuple[str, int, str]:
         json.dumps(
             {
                 "sequence": record.sequence,
-                # The store's hash binds the canonical Z-suffixed UTC text, so
-                # the export carries exactly that form - isoformat()'s +00:00
-                # would leave the carried record hashes unverifiable.
-                "created_at": record.created_at.isoformat().replace("+00:00", "Z"),
+                # The store's hash binds the canonical Z-suffixed UTC text
+                # with fixed microsecond precision, so the export carries
+                # exactly that form - isoformat()'s default would leave the
+                # carried record hashes unverifiable.
+                "created_at": record.created_at.isoformat(timespec="microseconds").replace(
+                    "+00:00", "Z"
+                ),
                 "event_type": record.event_type.value,
                 "payload_json": record.payload_json,
                 "previous_hash": record.previous_hash,
