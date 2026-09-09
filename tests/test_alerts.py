@@ -1,7 +1,7 @@
 """Pin the cycle's email alert hook over fake and scripted transports."""
 
 import io
-from datetime import UTC
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
@@ -109,6 +109,50 @@ def halted_report() -> CycleReport:
             "fee_wei": 90_000,
             "halted_reason": "the mint action refused [gas_price_above_cap]",
         }
+    )
+
+
+def captain_sample_report() -> CycleReport:
+    """Rebuild the captain's first real dry-cycle email as a report.
+
+    Every ugly rendering the captain flagged is present verbatim: the
+    microsecond timestamp, the 18-decimal ETH balance, the 0E-8 stock
+    zero, and the 28-digit USDC note.
+    """
+    return CycleReport(
+        started_at=datetime(2026, 9, 9, 3, 15, 32, 294470, tzinfo=UTC),
+        mode=CycleMode.DRY_RUN,
+        symbol="AAPLc",
+        reconciliation=Reconciliation(
+            symbol="AAPLc",
+            safe_usdc_units=8_921_957,
+            relayer_eth_wei=880_720_593_895_162,
+            safe_stock_units=0,
+            inventory_live_token_ids=(),
+            inventory_empty_count=0,
+            held_stock_quantity=Decimal(0).scaleb(-8),
+            out_of_band="",
+            diagnostics=(
+                "Safe holds 8.921957 USDC, relayer holds 0.000880720593895162 ETH, "
+                "Safe holds 0E-8 stock",
+            ),
+        ),
+        decision_action="hold",
+        decision_reason="gas_gate_deferred",
+        decision_diagnostics=("the endpoint's gas price exceeds the gate",),
+        event_window="No scheduled or session event window is active.",
+        actions=(),
+        pnl_vs_entry_usdc=None,
+        pnl_diagnostic="no tracked position",
+        fee_wei=0,
+        input_notes=(
+            "equity defaulted to the Safe's live 8.921957000000000000000000000 USDC "
+            "(8.921957 USDC plus stock valued at the snapshot price)",
+            "fee APR stays zero because a live fee-evidence window needs the "
+            "price-path machinery the rehearsal reconstructs",
+            "oracle staleness is not yet wired live; the oracle-health layer is "
+            "post-reassessment scope",
+        ),
     )
 
 
@@ -227,12 +271,70 @@ class TestEvaluateAlerts:
 class TestComposeCycleEmail:
     """The email composition."""
 
-    def test_calm_subject_carries_the_verdict(self) -> None:
-        """A calm email's subject is the summary form."""
+    def test_calm_subject_and_body_pin_the_readable_layout(self) -> None:
+        """A calm email pins its subject and the full one-screen body."""
         subject, body = compose_cycle_email(calm_report(), ())
         assert subject == "[aero-bot] FIXc cycle hold (open_in_range)"
-        assert "pnl vs entry: 1.25 USDC" in body
-        assert "no active window" in body
+        assert body == (
+            "Aero Bot cycle report - FIXc\n"
+            "============================\n"
+            "\n"
+            "mode:         live\n"
+            "started:      2026-09-08 20:30:00 UTC\n"
+            "decision:     hold (open_in_range)\n"
+            "event window: no active window\n"
+            "\n"
+            "--- state " + "-" * 56 + "\n"
+            "\n"
+            "  Safe:     10 USDC, 0 FIXc\n"
+            "  relayer:  0.001 ETH\n"
+            "\n"
+            "--- outcome " + "-" * 54 + "\n"
+            "\n"
+            "  pnl vs entry:  1.25 USDC\n"
+            "  gas spent:     0 wei\n"
+            "\n"
+            "--- notes " + "-" * 56 + "\n"
+            "\n"
+            "  - fixture note\n"
+        )
+
+    def test_captain_sample_renders_cleanly(self) -> None:
+        """The captain's flagged email renders readable, fact for fact."""
+        subject, body = compose_cycle_email(captain_sample_report(), ())
+        assert subject == "[aero-bot] AAPLc cycle hold (gas_gate_deferred)"
+        assert body == (
+            "Aero Bot cycle report - AAPLc\n"
+            "=============================\n"
+            "\n"
+            "mode:         dry_run\n"
+            "started:      2026-09-09 03:15:32 UTC\n"
+            "decision:     hold (gas_gate_deferred)\n"
+            "event window: No scheduled or session event window is active.\n"
+            "\n"
+            "--- state " + "-" * 56 + "\n"
+            "\n"
+            "  Safe:     8.921957 USDC, 0 AAPLc\n"
+            "  relayer:  0.000881 ETH\n"
+            "\n"
+            "--- outcome " + "-" * 54 + "\n"
+            "\n"
+            "  pnl vs entry:  unavailable (no tracked position)\n"
+            "  gas spent:     0 wei\n"
+            "\n"
+            "--- notes " + "-" * 56 + "\n"
+            "\n"
+            "  - equity defaulted to the Safe's live 8.921957 USDC "
+            "(8.921957 USDC plus stock valued at the snapshot price)\n"
+            "  - fee APR stays zero because a live fee-evidence window needs the "
+            "price-path machinery the rehearsal reconstructs\n"
+            "  - oracle staleness is not yet wired live; the oracle-health layer is "
+            "post-reassessment scope\n"
+        )
+        # The flagged noise is gone without losing a single disclosure.
+        assert "0E-8" not in body
+        assert "294470" not in body
+        assert "8.921957000000000000000000000" not in body
 
     def test_alert_subject_is_truncated_and_prefixed(self) -> None:
         """An alerting email leads its subject with the first alert."""
@@ -263,9 +365,67 @@ class TestComposeCycleEmail:
             }
         )
         _, body = compose_cycle_email(report, ())
-        assert "mint: completed" in body
-        assert MINT_TX_HASH in body
-        assert "fixture note" in body
+        assert "  mint: completed" in body
+        assert f"    tx {MINT_TX_HASH}" in body
+        assert "  - fixture note" in body
+
+    def test_refused_cycle_renders_alerts_actions_and_the_halt(self) -> None:
+        """An alerting email carries every section the halt deserves."""
+        alerts = (
+            "action mint refused [gas_price_above_cap]: the endpoint's gas price exceeds the cap",
+        )
+        subject, body = compose_cycle_email(halted_report(), alerts)
+        assert subject.startswith("[aero-bot][ALERT] FIXc")
+        assert "--- alerts " + "-" * 55 in body
+        assert "  ! " + alerts[0] in body
+        assert "--- actions " + "-" * 54 in body
+        assert "  mint: refused [gas_price_above_cap]" in body
+        assert "    the endpoint's gas price exceeds the cap" in body
+        assert "  halted:        the mint action refused [gas_price_above_cap]" in body
+
+    def test_unread_relayer_keeps_the_honest_line_without_a_zero_row(self) -> None:
+        """A run without a relayer address reports unread, never a zero."""
+        report = calm_report().model_copy(
+            update={
+                "reconciliation": calm_report().reconciliation.model_copy(
+                    update={
+                        "relayer_eth_wei": 0,
+                        "diagnostics": (
+                            "relayer ETH unread: no relayer address configured for this run",
+                            "Safe holds 10 USDC, Safe holds 0 stock",
+                        ),
+                    }
+                )
+            }
+        )
+        _, body = compose_cycle_email(report, ())
+        assert "  relayer ETH unread: no relayer address configured for this run" in body
+        assert "relayer:" not in body
+
+    def test_prose_numbers_render_without_noise_or_lost_precision_claims(self) -> None:
+        """Overlong decimals humanize and dust reads as below the precision."""
+        report = calm_report().model_copy(
+            update={
+                "reconciliation": calm_report().reconciliation.model_copy(
+                    update={
+                        "diagnostics": (
+                            "tracked position 5703026 (staked) valued "
+                            "9.123456789012345678901234 USDC against 9 committed",
+                            "Safe holds 10 USDC",
+                        ),
+                    }
+                ),
+                "pnl_vs_entry_usdc": Decimal("1.250000000000000000000000"),
+                "input_notes": (
+                    "the relayer tank drifted to 0.000000000123 ETH overnight",
+                    "fixture note",
+                ),
+            }
+        )
+        _, body = compose_cycle_email(report, ())
+        assert "valued 9.123457 USDC against 9 committed" in body
+        assert "  pnl vs entry:  1.25 USDC" in body
+        assert "drifted to <0.000001 ETH overnight" in body
 
 
 class TestDeliverCycleAlerts:
@@ -284,7 +444,7 @@ class TestDeliverCycleAlerts:
         assert len(transport.sent) == 1
         subject, body = transport.sent[0]
         assert subject.startswith("[aero-bot] FIXc")
-        assert "pnl vs entry: 1.25 USDC" in body
+        assert "  pnl vs entry:  1.25 USDC" in body
 
     def test_disabled_summaries_still_send_alerts(self) -> None:
         """Alerts override the summary-off setting."""
@@ -484,7 +644,7 @@ class TestCycleWiring:
             assert deliver_cycle_alerts(report) is True
         subject, body = transport.sent[0]
         assert subject.startswith("[aero-bot] FIXc")
-        assert "gas spent: 0 wei" in body
+        assert "  gas spent:     0 wei" in body
 
 
 def test_quiet_instant_fixture_stays_aware() -> None:
