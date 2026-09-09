@@ -80,8 +80,12 @@ chmod -R u=rwX,g=rX,o= "${APP_DIR}"
 
 log "building the virtual environment (uv downloads Python 3.12 when needed)"
 # The venv lives inside the root-owned tree but belongs to the service user,
-# which is the only writer the build and later reinstalls need.
+# which is the only writer the build and later reinstalls need. A re-run's
+# recursive chown above sweeps an existing venv back to root, so ownership
+# is re-asserted here: without it uv cannot replace the entry points and
+# the idempotent reinstall dies halfway.
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 "${VENV}"
+[[ -d "${VENV}" ]] && chown -R "${SERVICE_USER}:${SERVICE_USER}" "${VENV}"
 sudo -u "${SERVICE_USER}" env HOME="${STATE_DIR}" \
     UV_PYTHON_INSTALL_DIR="${STATE_DIR}/.uv-python" \
     uv sync --project "${APP_DIR}" --locked --no-dev

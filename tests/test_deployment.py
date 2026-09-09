@@ -69,6 +69,11 @@ class TestInstallScript:
         assert "--locked" in text
         assert "--no-dev" in text
 
+    def test_a_rerun_reasserts_service_ownership_of_the_venv(self) -> None:
+        """The recursive chown must not cost the service user its venv."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert 'chown -R "${SERVICE_USER}:${SERVICE_USER}" "${VENV}"' in text
+
     def test_the_state_tree_is_service_owned_mode_700(self) -> None:
         """/var/lib/aero-bot belongs to the service user alone."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
