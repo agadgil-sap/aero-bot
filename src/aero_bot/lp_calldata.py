@@ -97,6 +97,22 @@ GAUGE_REWARD_RATE_READ_SELECTOR = "7b0a47ee"
 # keccak256("nft()")[0:4], the gauge factory's NFPM, which is the Sugar's
 # own resolution path for every pool's position manager.
 GAUGE_FACTORY_NFT_READ_SELECTOR = "47ccca02"
+# keccak256("voter()")[0:4], the factory's Voter, holder of the gauge
+# kill switch the Sugar's gauge_alive field reports.
+FACTORY_VOTER_READ_SELECTOR = "46c96aac"
+# keccak256("isAlive(address)")[0:4], the Voter's gauge kill-switch read.
+VOTER_IS_ALIVE_READ_SELECTOR = "1703e5f9"
+# keccak256("isPool(address)")[0:4], the factory's own pool-membership view.
+FACTORY_IS_POOL_READ_SELECTOR = "5b16ebb7"
+# keccak256("getSwapFee(address)")[0:4], the factory's per-pool staked fee
+# tier in ppm, the Sugar record's pool_fee source.
+FACTORY_GET_SWAP_FEE_READ_SELECTOR = "35458dcc"
+# keccak256("getUnstakedFee(address)")[0:4], the factory's per-pool
+# unstaked fee tier in ppm, the Sugar record's unstaked_fee source.
+FACTORY_GET_UNSTAKED_FEE_READ_SELECTOR = "48cf7a43"
+# keccak256("balanceOf(address)")[0:4], the ERC20 balance read backing
+# both derived reserve sides.
+ERC20_BALANCE_OF_READ_SELECTOR = "70a08231"
 # Every ABI word encoded or decoded by this module is exactly 32 bytes.
 WORD_BYTES = 32
 # Solidity int24 spans this signed range; every tick argument must fit it.
@@ -764,6 +780,122 @@ def build_gauge_factory_nft_read_calldata() -> str:
     return f"0x{GAUGE_FACTORY_NFT_READ_SELECTOR}"
 
 
+def build_factory_voter_read_calldata() -> str:
+    """ABI-encode the Slipstream factory's Voter read.
+
+    Verified live read-only on Base against the AAPLc pool's factory
+    (``0xf8f2eb4940cfe7d13603dddd87f123820fc061ef``): ``voter()`` returned
+    ``0x16613524e02ad97edfef371bc883f2f5d6c480a5``, matching the contract
+    catalog's pinned Voter.
+
+    Returns:
+        Complete 0x-prefixed calldata for the factory's voter view.
+    """
+    return f"0x{FACTORY_VOTER_READ_SELECTOR}"
+
+
+def build_voter_is_alive_read_calldata(gauge_address: str) -> str:
+    """ABI-encode the Voter's gauge kill-switch read.
+
+    Verified live read-only on Base: ``isAlive(gauge)`` on the factory's
+    Voter returned true for the AAPLc gauge
+    ``0x43021fbbd01b967704ab2379f6e90e2d367042f3``, matching the same
+    block's Sugar record ``gauge_alive`` field exactly.
+
+    Args:
+        gauge_address: The CLGauge whose kill-switch state is read.
+
+    Returns:
+        Complete 0x-prefixed calldata for the Voter's isAlive view.
+
+    Raises:
+        ValueError: If the address is not a valid EVM address.
+    """
+    return _selector_and_words(
+        VOTER_IS_ALIVE_READ_SELECTOR, _address_word(normalize_evm_address(gauge_address))
+    )
+
+
+def build_factory_is_pool_read_calldata(pool_address: str) -> str:
+    """ABI-encode the factory's pool-membership read.
+
+    Verified live read-only on Base: ``isPool(pool)`` on the AAPLc pool's
+    factory returned true at the same block the Sugar record was read.
+
+    Args:
+        pool_address: The concentrated pool whose factory membership is read.
+
+    Returns:
+        Complete 0x-prefixed calldata for the factory's isPool view.
+
+    Raises:
+        ValueError: If the address is not a valid EVM address.
+    """
+    return _selector_and_words(
+        FACTORY_IS_POOL_READ_SELECTOR, _address_word(normalize_evm_address(pool_address))
+    )
+
+
+def build_factory_get_swap_fee_read_calldata(pool_address: str) -> str:
+    """ABI-encode the factory's per-pool staked fee read.
+
+    Verified live read-only on Base: ``getSwapFee(pool)`` returned ``500``
+    ppm for the AAPLc pool, matching the same block's Sugar record
+    ``pool_fee`` exactly.
+
+    Args:
+        pool_address: The concentrated pool whose staked fee tier is read.
+
+    Returns:
+        Complete 0x-prefixed calldata for the factory's getSwapFee view.
+
+    Raises:
+        ValueError: If the address is not a valid EVM address.
+    """
+    return _selector_and_words(
+        FACTORY_GET_SWAP_FEE_READ_SELECTOR, _address_word(normalize_evm_address(pool_address))
+    )
+
+
+def build_factory_get_unstaked_fee_read_calldata(pool_address: str) -> str:
+    """ABI-encode the factory's per-pool unstaked fee read.
+
+    Verified live read-only on Base: ``getUnstakedFee(pool)`` returned
+    ``100000`` ppm for the AAPLc pool, matching the same block's Sugar
+    record ``unstaked_fee`` exactly.
+
+    Args:
+        pool_address: The concentrated pool whose unstaked fee tier is read.
+
+    Returns:
+        Complete 0x-prefixed calldata for the factory's getUnstakedFee view.
+
+    Raises:
+        ValueError: If the address is not a valid EVM address.
+    """
+    return _selector_and_words(
+        FACTORY_GET_UNSTAKED_FEE_READ_SELECTOR,
+        _address_word(normalize_evm_address(pool_address)),
+    )
+
+
+def build_erc20_balance_of_read_calldata(owner_address: str) -> str:
+    """ABI-encode one ERC20 balanceOf read.
+
+    Args:
+        owner_address: The normalized account whose balance is read.
+
+    Returns:
+        Complete 0x-prefixed calldata for the balanceOf view.
+
+    Raises:
+        ValueError: If the address is not a valid EVM address.
+    """
+    return _selector_and_words(
+        ERC20_BALANCE_OF_READ_SELECTOR, _address_word(normalize_evm_address(owner_address))
+    )
+
+
 def decode_pool_slot0_view(result: str) -> tuple[int, int]:
     """Decode one slot0() return into its raw price and signed tick.
 
@@ -821,6 +953,25 @@ def decode_uint_view_result(result: str) -> int:
     """
     (word,) = _decode_view_words(result, "uint view", 1)
     return word
+
+
+def decode_boolean_view_result(result: str) -> bool:
+    """Decode one single-word boolean view return.
+
+    Solidity ABI never returns a partial boolean word, so any nonzero word
+    reads true exactly as the EVM's own truthiness does.
+
+    Args:
+        result: The 0x-prefixed hex return bytes of a bool-valued view.
+
+    Returns:
+        The decoded boolean.
+
+    Raises:
+        ValueError: If the return is not exactly one whole ABI word.
+    """
+    (word,) = _decode_view_words(result, "boolean view", 1)
+    return word != 0
 
 
 def _decode_view_words(result: str, view_name: str, minimum_words: int) -> list[int]:

@@ -847,12 +847,20 @@ def make_lp_executor(
         safe_script = SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * expected_steps)
     audit_sink = AuditStore(audit_path) if audit_path is not None else None
     receipt_backends = [
-        ExecutorRpcBackend(rpc_url="https://fixture.example", transport=rpc_script.transport())
+        ExecutorRpcBackend(
+            rpc_url="https://fixture.example",
+            transport=rpc_script.transport(),
+            sleep=(lambda _seconds: None),
+            timer=(lambda: 0.0),
+        )
     ]
     if receipt_script is not None:
         receipt_backends.append(
             ExecutorRpcBackend(
-                rpc_url="https://receipts.example", transport=receipt_script.transport()
+                rpc_url="https://receipts.example",
+                transport=receipt_script.transport(),
+                sleep=(lambda _seconds: None),
+                timer=(lambda: 0.0),
             )
         )
     executor = LpLifecycleExecutor(
@@ -860,7 +868,15 @@ def make_lp_executor(
         plan_policy=LpExecutionPolicy(),
         safe_address=SAFE_ADDRESS,
         sources=sources if sources is not None else FakeSources(),
-        rpc=ExecutorRpcBackend(rpc_url="https://fixture.example", transport=rpc_script.transport()),
+        rpc=ExecutorRpcBackend(
+            rpc_url="https://fixture.example",
+            transport=rpc_script.transport(),
+            # The backend's politeness pacing and backoff stay instant and
+            # deterministic under the scripted transport; the executor's own
+            # injected sleep carries the behavioral wait assertions.
+            sleep=(lambda _seconds: None),
+            timer=timer if timer is not None else (lambda: 0.0),
+        ),
         safe_rpc=SafeTransactionRpcBackend(
             rpc_url="https://fixture.example",
             safe_address=SAFE_ADDRESS,

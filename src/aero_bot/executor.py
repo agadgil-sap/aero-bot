@@ -149,6 +149,11 @@ REQUEST_TIMEOUT_SECONDS = 20.0
 MAX_REQUEST_ATTEMPTS = 5
 # Backoff starts at half a second and doubles per retry.
 BASE_BACKOFF_SECONDS = 0.5
+# A small politeness gap between consecutive requests keeps this backend's
+# read bursts under the public endpoint's request-rate limiter, exactly the
+# pacing the Sugar enumeration's own page delay provides; twenty reads cost
+# at most four seconds while a tripped limiter costs eight per request.
+REQUEST_PACING_SECONDS = 0.2
 # One MiB bounds every response far above the fixed-word calls made here.
 MAX_RESPONSE_BYTES = 1024 * 1024
 # Base's public endpoint reports rate limiting with this JSON-RPC error code.
@@ -603,6 +608,7 @@ class LiveExecutionSources:
         sugar_address: str = LP_SUGAR_ADDRESS,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        progress: Callable[[str], None] | None = None,
     ) -> None:
         """Configure the live discovery, registry, and decimals sources.
 
@@ -611,11 +617,15 @@ class LiveExecutionSources:
             sugar_address: LP Sugar contract anchoring pool discovery.
             transport: Optional injected HTTP transport for tests.
             sleep: Injected delay function used for retry backoff.
+            progress: Optional callback receiving one human-readable line per
+                enumerated page and per retried request during a Sugar sweep,
+                so a slow enumeration reports progress instead of silence.
         """
         self._rpc_url = rpc_url
         self._sugar_address = normalize_evm_address(sugar_address)
         self._transport = transport
         self._sleep = sleep
+        self._progress = progress
         # Token decimals are pure metadata, so one read per token is cached.
         self._decimals_cache: dict[str, int] = {}
         # One Sugar sweep per run: the first discovery is pinned (its pages
@@ -658,6 +668,7 @@ class LiveExecutionSources:
             sugar_address=self._sugar_address,
             transport=self._transport,
             sleep=self._sleep,
+            progress=self._progress,
         )
         result = AerodromeVenueAdapter(backend).discover_pools(b20_addresses)
         self._discovery_cache = result
@@ -878,6 +889,7 @@ class ExecutorRpcBackend:
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         timer: Callable[[], float] = time.monotonic,
+        progress: Callable[[str], None] | None = None,
     ) -> None:
         """Configure bounded RPC behavior shared by reads and broadcasts.
 
@@ -891,6 +903,8 @@ class ExecutorRpcBackend:
             transport: Optional injected HTTP transport for deterministic tests.
             sleep: Injected delay function used for retry backoff and polling.
             timer: Injected monotonic clock for the receipt timeout.
+            progress: Optional callback receiving one human-readable line per
+                retried request, so rate-limit backoff never looks like a stall.
 
         Raises:
             ValueError: If any bound is non-positive.
@@ -914,6 +928,31 @@ class ExecutorRpcBackend:
         self._transport = transport
         self._sleep = sleep
         self._timer = timer
+        self._progress = progress
+        # One persistent connection pool serves every request this backend
+        # makes: reusing the keep-alive connection avoids a fresh TCP and TLS
+        # handshake per call, which public endpoints rate-limit far harder
+        # than requests over an established connection.
+        self._client: httpx.Client | None = None
+        # The instant the next request may fire under the politeness pacing.
+        self._next_request_at: float | None = None
+
+    def _http_client(self) -> httpx.Client:
+        """Return the backend's lazily created shared HTTP client.
+
+        Returns:
+            The persistent client bound to this backend's transport and
+            timeouts; created on first use and reused for the backend's
+            lifetime so every request shares one keep-alive connection pool.
+        """
+        if self._client is None:
+            self._client = httpx.Client(
+                timeout=self._timeout_seconds,
+                transport=self._transport,
+                follow_redirects=False,
+                headers={"User-Agent": "aero-bot/0.1 capped-swap-execution"},
+            )
+        return self._client
 
     def eth_call(self, to_address: str, calldata: str) -> str:
         """Perform one read-only eth_call against the latest block.
@@ -1317,52 +1356,58 @@ class ExecutorRpcBackend:
         """
         payload = {"jsonrpc": "2.0", "id": JSON_RPC_ID, "method": method, "params": params}
         failure = "no attempt was made"
-        with httpx.Client(
-            timeout=self._timeout_seconds,
-            transport=self._transport,
-            follow_redirects=False,
-            headers={"User-Agent": "aero-bot/0.1 capped-swap-execution"},
-        ) as client:
-            for attempt in range(self._max_attempts):
-                if attempt > 0:
-                    self._sleep(BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
-                try:
-                    response = client.post(self._rpc_url, json=payload)
-                except httpx.TransportError as error:
-                    failure = f"transport error: {error}"
-                    continue
-                if response.status_code == 429 or response.status_code >= 500:
-                    failure = f"HTTP status {response.status_code}"
-                    continue
-                response_size = len(response.content)
-                if response_size > self._max_response_bytes:
-                    raise ExecutionUnavailableError(
-                        f"RPC response contained {response_size} bytes, above the limit"
+        client = self._http_client()
+        for attempt in range(self._max_attempts):
+            if attempt > 0:
+                backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                if self._progress is not None:
+                    self._progress(
+                        f"rpc {method} attempt {attempt + 1} of {self._max_attempts} "
+                        f"failed ({failure}); backing off {backoff:.1f}s"
                     )
-                if response.status_code != 200:
-                    raise ExecutionUnavailableError(
-                        f"RPC request failed with unexpected HTTP status {response.status_code}"
-                    )
-                try:
-                    body = cast(object, response.json())
-                except ValueError as error:
-                    raise ExecutionUnavailableError("RPC response was not valid JSON") from error
-                if not isinstance(body, dict) or "result" not in body:
-                    error_body = body.get("error") if isinstance(body, dict) else None
-                    if not isinstance(error_body, dict):
-                        raise ExecutionUnavailableError("RPC response had neither result nor error")
-                    error_code = error_body.get("code")
-                    error_message = str(error_body.get("message", ""))
-                    if (
-                        error_code == EXECUTION_REVERT_ERROR_CODE
-                        or "revert" in error_message.lower()
-                    ):
-                        raise ExecutorRpcRevertError(f"RPC call reverted: {error_message}")
-                    if error_code == RATE_LIMIT_ERROR_CODE or "rate limit" in error_message.lower():
-                        failure = f"RPC error {error_code}: {error_message}"
-                        continue
-                    raise ExecutionUnavailableError(f"RPC error {error_code}: {error_message}")
-                return body["result"]
+                self._sleep(backoff)
+            elif self._next_request_at is not None:
+                # The politeness gap keeps back-to-back reads under the
+                # public endpoint's request-rate limiter.
+                wait = self._next_request_at - self._timer()
+                if wait > 0:
+                    self._sleep(wait)
+            try:
+                response = client.post(self._rpc_url, json=payload)
+            except httpx.TransportError as error:
+                failure = f"transport error: {error}"
+                continue
+            finally:
+                self._next_request_at = self._timer() + REQUEST_PACING_SECONDS
+            if response.status_code == 429 or response.status_code >= 500:
+                failure = f"HTTP status {response.status_code}"
+                continue
+            response_size = len(response.content)
+            if response_size > self._max_response_bytes:
+                raise ExecutionUnavailableError(
+                    f"RPC response contained {response_size} bytes, above the limit"
+                )
+            if response.status_code != 200:
+                raise ExecutionUnavailableError(
+                    f"RPC request failed with unexpected HTTP status {response.status_code}"
+                )
+            try:
+                body = cast(object, response.json())
+            except ValueError as error:
+                raise ExecutionUnavailableError("RPC response was not valid JSON") from error
+            if not isinstance(body, dict) or "result" not in body:
+                error_body = body.get("error") if isinstance(body, dict) else None
+                if not isinstance(error_body, dict):
+                    raise ExecutionUnavailableError("RPC response had neither result nor error")
+                error_code = error_body.get("code")
+                error_message = str(error_body.get("message", ""))
+                if error_code == EXECUTION_REVERT_ERROR_CODE or "revert" in error_message.lower():
+                    raise ExecutorRpcRevertError(f"RPC call reverted: {error_message}")
+                if error_code == RATE_LIMIT_ERROR_CODE or "rate limit" in error_message.lower():
+                    failure = f"RPC error {error_code}: {error_message}"
+                    continue
+                raise ExecutionUnavailableError(f"RPC error {error_code}: {error_message}")
+            return body["result"]
         raise ExecutionUnavailableError(
             f"RPC {method} failed after {self._max_attempts} attempts: {failure}"
         )

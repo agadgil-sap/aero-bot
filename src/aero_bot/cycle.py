@@ -89,6 +89,18 @@ RELAYER_ADDRESS_ENV = "AERO_BOT_RELAYER_ADDRESS"
 POLICY_TIMEZONE = ZoneInfo("America/New_York")
 
 
+def _cycle_progress(line: str) -> None:
+    """Print one operator progress line on stderr.
+
+    Progress lines never touch stdout so the machine-readable JSON report
+    stays clean, and they land in the systemd journal beside it.
+
+    Args:
+        line: One human-readable progress line from a long-running phase.
+    """
+    print(f"[aero-bot-cycle] {line}", file=sys.stderr)
+
+
 class CycleMode(StrEnum):
     """Identify whether one cycle may broadcast."""
 
@@ -751,26 +763,8 @@ class CycleRunner:
         return token
 
     def _resolved_pool(self) -> PoolCandidate:
-        """Resolve the cycle symbol's live pool from discovery."""
-        pools, _ = self._sources.discover()
-        return self._pool_from_candidates(pools)
-
-    def _pool_from_candidates(self, pools: Sequence[PoolCandidate]) -> PoolCandidate:
-        """Resolve the cycle symbol's pool from discovered candidates."""
-        token = self._stock_token_address().lower()
-        normalized_usdc = BASE_USDC_ADDRESS.lower()
-        pool = next(
-            (
-                candidate
-                for candidate in pools
-                if normalized_usdc
-                in (candidate.token0_address.lower(), candidate.token1_address.lower())
-                and token in (candidate.token0_address.lower(), candidate.token1_address.lower())
-            ),
-            None,
-        )
-        if pool is None:
-            raise ValueError(f"symbol {self._symbol!r} has no discovered B20/USDC pool")
+        """Resolve the cycle symbol's live pool through the decision sources."""
+        pool, _ = self._sources.resolve_pool(self._symbol)
         return pool
 
     def _adoption_evidence(self, live_ids: tuple[int, ...]) -> int | None:
@@ -921,8 +915,7 @@ class CycleRunner:
             ExecutionUnavailableError: If discovery or a read fails.
             ValueError: If the symbol resolves to no pool.
         """
-        pools, snapshot_block = self._sources.discover()
-        pool = self._pool_from_candidates(pools)
+        pool, snapshot_block = self._sources.resolve_pool(self._symbol)
         assert self._last_reconciliation is not None  # noqa: S101 - set by run()
         state = self._policy_state(book, self._last_reconciliation)
         observation, _, aero_price, notes = assemble_observation(
@@ -1430,13 +1423,20 @@ def build_cycle_runner(
     from aero_bot.safe_tx import SafeTransactionRpcBackend
     from aero_bot.strategy import LiveStrategySources
 
-    rpc = ExecutorRpcBackend(rpc_url=settings.base_rpc_url)
-    sources = LiveStrategySources(
-        rpc_url=settings.base_rpc_url, sugar_address=settings.lp_sugar_address
-    )
-    safe_rpc = SafeTransactionRpcBackend(rpc_url=settings.base_rpc_url, safe_address=safe_address)
+    rpc = ExecutorRpcBackend(rpc_url=settings.base_rpc_url, progress=_cycle_progress)
     audit_store = AuditStore(settings.audit_database_path)
     pin_store = LpPoolPinStore(settings.lp_pool_pins_path)
+    # Every long-running phase (the first full Sugar sweep above all) reports
+    # honest progress on stderr so a slow cycle never looks like a stall; the
+    # JSON report on stdout stays machine-clean.
+    progress = _cycle_progress
+    sources = LiveStrategySources(
+        rpc_url=settings.base_rpc_url,
+        sugar_address=settings.lp_sugar_address,
+        pool_pin_store=pin_store,
+        progress=progress,
+    )
+    safe_rpc = SafeTransactionRpcBackend(rpc_url=settings.base_rpc_url, safe_address=safe_address)
     receipt_backends = [rpc] + [
         ExecutorRpcBackend(rpc_url=url)
         for url in EXECUTE_RECEIPT_ENDPOINT_URLS
@@ -1447,7 +1447,9 @@ def build_cycle_runner(
         plan_policy=LpExecutionPolicy(),
         safe_address=safe_address,
         sources=LiveExecutionSources(
-            rpc_url=settings.base_rpc_url, sugar_address=settings.lp_sugar_address
+            rpc_url=settings.base_rpc_url,
+            sugar_address=settings.lp_sugar_address,
+            progress=progress,
         ),
         rpc=rpc,
         safe_rpc=safe_rpc,

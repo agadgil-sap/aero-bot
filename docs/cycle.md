@@ -49,6 +49,11 @@ A `hold (event_window_flat)` inside a market open/close window, the condition-dr
 
 `--dry-run` reconciles and decides without loading the signing key and without building anything. The report still carries the complete verdict, the reconciliation, and the P&L; relayer ETH reads need `AERO_BOT_RELAYER_ADDRESS` (a public address, never a secret) to be set, otherwise that one line reports unknown.
 
+The decide phase resolves its pool through the known-pool fast path (`src/aero_bot/known_pool.py`): once one verified Sugar sweep has pinned the pool's identity, every later cycle resolves it from sixteen block-pinned contract views in seconds instead of re-enumerating every pool Aerodrome hosts, which the public RPC rate-limits into a multi-minute stall.
+The first run on a clean checkout - or any run whose pin has drifted - pays that one sweep, pins the verified identity beside the audit store, and reports its progress honestly: one stderr line per enumerated page ("lp sugar enumeration: N pools enumerated at block B") and one per rate-limit retry ("rpc eth_call attempt A of 5 failed (HTTP status 429); backing off Xs"), so a slow first sweep is visible progress rather than silence; stdout stays machine-clean JSON for the journal.
+Steady-state pinned cycles complete in tens of seconds end to end (22 s measured live over a healthy public endpoint on 2026-09-09, versus the multi-minute sweep every run before the fast path).
+See [the LP execution fast-path section](docs/lp_execution.md) for the verified read set and the safety invariant.
+
 ## systemd wiring
 
 `deploy/systemd/aero-bot-cycle@.service` and `aero-bot-cycle@.timer` carry the deployment contract, pinned by tests:

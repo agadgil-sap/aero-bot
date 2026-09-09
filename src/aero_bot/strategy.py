@@ -18,11 +18,13 @@ post-reassessment scope.
 import argparse
 import os
 import sys
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Protocol
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from aero_bot.audit import AuditEventType, AuditStore
@@ -37,6 +39,11 @@ from aero_bot.executor import (
     LiveExecutionSources,
 )
 from aero_bot.history import price_usdc_per_stock
+from aero_bot.known_pool import (
+    persist_decision_pool_pin,
+    resolve_known_pool_candidate,
+)
+from aero_bot.lp_pins import LpPoolPinStore
 from aero_bot.lp_plan import estimate_in_range_depth_usdc
 from aero_bot.policy import (
     LOCKED_POLICY_PARAMETERS,
@@ -49,7 +56,12 @@ from aero_bot.policy import (
     load_event_calendar,
 )
 from aero_bot.registry import RegistryStatus
-from aero_bot.venues import BASE_USDC_ADDRESS, PoolCandidate, PoolDiscoveryStatus
+from aero_bot.venues import (
+    BASE_USDC_ADDRESS,
+    PoolCandidate,
+    PoolDiscoveryStatus,
+    aerodrome_contract_evidence,
+)
 
 # The Safe whose live balances default the equity input.
 # One gwei is one billion wei; the observation carries gwei.
@@ -119,8 +131,16 @@ class StrategyDecisionPayload(BaseModel):
 class StrategySources(Protocol):
     """Define the live reads one decision-only run consumes."""
 
-    def discover(self) -> tuple[tuple[PoolCandidate, ...], int]:
-        """Return the verified B20/USDC pools with their snapshot block."""
+    def resolve_pool(self, symbol: str) -> tuple[PoolCandidate, int]:
+        """Return the symbol's verified pool with its snapshot block.
+
+        Args:
+            symbol: The registry-matched stock symbol, like AAPLc.
+
+        Returns:
+            The verified B20/USDC pool candidate for the symbol and the
+            block pinning its snapshot.
+        """
         ...
 
     def registry_paused(self) -> bool:
@@ -155,7 +175,11 @@ class LiveStrategySources:
         self,
         rpc_url: str,
         sugar_address: str,
-        transport: object | None = None,
+        transport: httpx.BaseTransport | None = None,
+        pool_pin_store: LpPoolPinStore | None = None,
+        progress: Callable[[str], None] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        timer: Callable[[], float] = time.monotonic,
     ) -> None:
         """Configure the discovery and RPC sources.
 
@@ -163,20 +187,74 @@ class LiveStrategySources:
             rpc_url: Base JSON-RPC endpoint for reads.
             sugar_address: LP Sugar contract anchoring discovery.
             transport: Optional injected HTTP transport for tests.
+            pool_pin_store: Optional local store of Sugar-verified pool
+                identities arming the known-pool fast path.
+            progress: Optional callback receiving one human-readable line per
+                enumerated page and per retried request during a Sugar sweep.
+            sleep: Optional injected delay for the RPC backend's politeness
+                pacing and retry backoff.
+            timer: Optional injected monotonic clock for the same backend.
         """
-        self._execution_sources = LiveExecutionSources(rpc_url=rpc_url, sugar_address=sugar_address)
-        self._rpc = ExecutorRpcBackend(rpc_url=rpc_url)
+        self._execution_sources = LiveExecutionSources(
+            rpc_url=rpc_url,
+            sugar_address=sugar_address,
+            transport=transport,
+            progress=progress,
+        )
+        self._rpc = ExecutorRpcBackend(
+            rpc_url=rpc_url,
+            transport=transport,
+            progress=progress,
+            sleep=sleep,
+            timer=timer,
+        )
+        self._pool_pin_store = pool_pin_store
+        self._progress = progress
 
-    def discover(self) -> tuple[tuple[PoolCandidate, ...], int]:
-        """Return the verified B20/USDC pools with their snapshot block.
+    def resolve_pool(self, symbol: str) -> tuple[PoolCandidate, int]:
+        """Return the symbol's verified pool with its snapshot block.
+
+        A persisted pool pin takes the known-pool fast path: the identity is
+        re-verified live against the pool contract's own views, the factory
+        is re-checked against the official allowlist, the gauge's kill
+        switch is read through the factory's Voter, and the live state is
+        read at one freshly pinned block - a handful of reads instead of a
+        full Sugar enumeration. Any mismatch or unreadable view falls back
+        to the full sweep, which re-verifies everything the slow way and
+        refreshes the pin. Without a usable pin the sweep itself runs and
+        its verified result is persisted so the next run is fast.
+
+        Args:
+            symbol: The registry-matched stock symbol, like AAPLc.
 
         Returns:
-            The accepted candidates and the block pinning them.
+            The verified B20/USDC pool candidate for the symbol and the
+            block pinning its snapshot.
 
         Raises:
             ExecutionUnavailableError: If discovery cannot complete or does
                 not verify.
+            ValueError: If the symbol is unknown or has no discovered pool.
         """
+        registry = self._execution_sources.load_registry()
+        listing = next(
+            (asset for asset in registry.assets if asset.symbol.lower() == symbol.strip().lower()),
+            None,
+        )
+        if listing is None:
+            raise ValueError(f"symbol {symbol!r} is not in the official B20 registry")
+        if self._pool_pin_store is not None:
+            pin = self._pool_pin_store.load().get(listing.symbol.strip().lower())
+            if pin is not None:
+                try:
+                    candidate, block = resolve_known_pool_candidate(
+                        self._rpc, pin, listing, aerodrome_contract_evidence()
+                    )
+                except (ExecutionUnavailableError, ValueError) as error:
+                    if self._progress is not None:
+                        self._progress(f"known-pool fast path fell back to full discovery: {error}")
+                else:
+                    return candidate, block
         result = self._execution_sources.discover_pools()
         if result.status is not PoolDiscoveryStatus.VERIFIED:
             raise ExecutionUnavailableError(
@@ -184,7 +262,32 @@ class LiveStrategySources:
             )
         if result.snapshot_block is None:
             raise ExecutionUnavailableError("verified discovery carried no snapshot block")
-        return tuple(result.pools), result.snapshot_block
+        normalized_token = listing.address.lower()
+        normalized_usdc = BASE_USDC_ADDRESS.lower()
+        pool = next(
+            (
+                candidate
+                for candidate in result.pools
+                if normalized_usdc
+                in (candidate.token0_address.lower(), candidate.token1_address.lower())
+                and normalized_token
+                in (candidate.token0_address.lower(), candidate.token1_address.lower())
+            ),
+            None,
+        )
+        if pool is None:
+            raise ValueError(f"symbol {symbol!r} has no discovered B20/USDC pool")
+        if self._pool_pin_store is not None:
+            persist_decision_pool_pin(
+                self._pool_pin_store,
+                listing,
+                pool,
+                self._execution_sources.read_token_decimals(listing.address),
+                result.snapshot_block,
+                datetime.now(UTC),
+                result.source,
+            )
+        return pool, result.snapshot_block
 
     def registry_paused(self) -> bool:
         """Return whether the official B20 registry is not verified."""
@@ -352,28 +455,10 @@ def run_decision(
         ValueError: If the symbol has no discovered pool.
         ExecutionUnavailableError: If discovery or a read fails.
     """
-    pools, snapshot_block = sources.discover()
+    pool, snapshot_block = sources.resolve_pool(symbol)
     token = sources.symbol_address(symbol)
     if token is None:
         raise ValueError(f"symbol {symbol!r} is not in the official B20 registry")
-    normalized_token = token.lower()
-    normalized_usdc = BASE_USDC_ADDRESS.lower()
-    pool = next(
-        (
-            candidate
-            for candidate in pools
-            if normalized_usdc
-            in (candidate.token0_address.lower(), candidate.token1_address.lower())
-            and normalized_token
-            in (
-                candidate.token0_address.lower(),
-                candidate.token1_address.lower(),
-            )
-        ),
-        None,
-    )
-    if pool is None:
-        raise ValueError(f"symbol {symbol!r} has no discovered B20/USDC pool")
     now = observed_at if observed_at is not None else datetime.now(UTC)
     observation, emissions_apr, aero_price, notes = assemble_observation(
         sources,
@@ -496,7 +581,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         os.environ.get(SAFE_ADDRESS_ENV, DEFAULT_CANARY_SAFE_ADDRESS)
     )
     sources = LiveStrategySources(
-        rpc_url=settings.base_rpc_url, sugar_address=settings.lp_sugar_address
+        rpc_url=settings.base_rpc_url,
+        sugar_address=settings.lp_sugar_address,
+        pool_pin_store=LpPoolPinStore(settings.lp_pool_pins_path),
+        progress=lambda line: print(line, file=sys.stderr),
     )
     try:
         report = run_decision(

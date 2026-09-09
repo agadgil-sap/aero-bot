@@ -992,7 +992,10 @@ def test_dry_run_builds_and_validates_without_broadcasting(tmp_path: Path) -> No
     assert swap.gas_estimate == 200_000
     assert swap.usdc_units == ONE_USDC_UNITS
     assert swap.to_address == AERODROME_ROUTER_ADDRESS
-    assert report.build_duration_ms == Decimal("0.000")
+    # The scripted clock only advances through the backend's politeness
+    # pacing: three 0.2-second gaps between the dry run's four reads, with
+    # zero retry backoff because every read succeeds first try.
+    assert report.build_duration_ms == Decimal("600.000")
     # Every cap label, quote gates then preflight gates, reached the report.
     assert report.caps_enforced[0].startswith("swap amount at or below")
     assert report.caps_enforced[-1].startswith("Safe ETH balance at or above")
