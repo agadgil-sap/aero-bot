@@ -19,7 +19,7 @@ The engine never signs, broadcasts, or touches a wallet.
 | Downside stop | 0.5 percent below the lower range edge |
 | Re-entry cooldown | 15 minutes after stop or dilution exits |
 | Entry threshold | raw AERO emissions APR of at least 150 percent |
-| Position cap | 20 percent of current equity per pool |
+| Position cap | 80 percent of current equity per pool (raised from 20 percent by the captain's 2026-09-09 sizing ruling, inside the unchanged 100/100 USDC hard ceilings) |
 | Depth hard gate | 1 percent of observed pool depth |
 | Daily loss halt | 5 percent of day-start equity |
 | Starting equity | 200 USDC |
@@ -68,7 +68,7 @@ Held stock inventory from a stale-low burn resolves first, then safety exits are
 2. Dislocation monitor: with a reference at least as fresh as the 300-second entry bound, an AMM at least 0.15 percent above or below the reference triggers the asymmetric actions below, which take precedence over every AMM-anchored rule because the reference market is treated as the true price.
 3. Downside stop: pool price at or below 0.5 percent under the lower range edge burns the position and swaps all inventory back to USDC.
 4. Emissions dilution: while open, the raw emissions APR is re-evaluated at every observation, because other LPs can add sticky staked liquidity that persistently lowers APR per unit of staked liquidity; a fall below the 150 percent threshold exits through the same burn-and-swap path.
-5. Event window: a flat window that opens while a position is open burns and swaps all inventory back to USDC.
+5. Condition-driven flat event: an oracle-stale or registry-pause signal that arrives while a position is open burns and swaps all inventory back to USDC. Scheduled and session-derived event windows no longer force exits since the captain's 2026-09-09 twenty-four-seven ruling (the B20 pools are continuous DeFi markets; nights and weekends are in scope).
 6. Upside recenter: price above the upper edge starts a 15-minute time-based wait; the recenter re-derives the width from the target net daily yield at the current observables and re-mints the range around the current pool price only after the wait elapses and the gas gate allows it.
 7. In-range or below-edge holds keep the position otherwise.
 
@@ -76,8 +76,10 @@ Between the 300-second entry bound and the 900-second open-position bound, the r
 
 Below the range edge but above the stop level, the position holds for recovery.
 
-Entry gates are evaluated in fixed order while flat: daily loss halt, re-entry cooldown, event window, reference staleness, emissions threshold, the size caps, and finally the gas sense-check gate.
-The size is the smaller of 20 percent of current equity and 1 percent of observed pool depth, and only then is the range width derived against the target net daily yield.
+Entry gates are evaluated in fixed order while flat: daily loss halt, re-entry cooldown, condition-driven flat events, reference staleness, emissions threshold, the size caps, and finally the gas sense-check gate.
+Scheduled and session-derived event windows no longer gate entries (the same 2026-09-09 ruling); the calendar machinery stays loaded and the decision surfaces report the active window informationally.
+The size is the smaller of 80 percent of current equity (raised from 20 percent by the captain's 2026-09-09 sizing ruling; roughly 72 USDC on the 90-dollar trial book) and 1 percent of observed pool depth, and only then is the range width derived against the target net daily yield.
+The fraction lives inside the LP executor's unchanged hard ceilings - 100 USDC total exposure and 100 USDC per pool - which still refuse anything above them.
 
 ## Underlying dislocation monitor
 
@@ -90,7 +92,7 @@ Actions are asymmetric and direction-dependent at the 0.15 percent threshold.
    This includes the crash-anticipation case where the real market shows a large imminent permanent loss Aerodrome has not yet reflected, so it is never deferred by the gas gate and outranks the downside stop.
 2. Stale-low (reference above AMM): burn the position and hold the stock tokens unsold, because selling into a stale-low pool realizes the wrong price.
    The tokens sell back to USDC once the AMM converges to within the threshold of a fresh reference, with a 5-minute convergence timeout after which they are sold at market as a safety bound.
-   A flat window (scheduled event, oracle-stale, registry-pause) forces an immediate market sell of held tokens, and a reference stale past the entry bound suspends convergence judgments until the timeout releases them.
+   A condition-driven flat event (oracle-stale, registry-pause) forces an immediate market sell of held tokens, and a reference stale past the entry bound suspends convergence judgments until the timeout releases them.
    While tokens are held, no new entries are possible and no re-entry cooldown applies.
 3. Bounded arbitrage on a stale-low AMM is deliberately out of scope for v1: the spec marks it optional, and the engine only farms emissions rather than trading dislocations.
 
@@ -117,16 +119,17 @@ A zero or vanishing depth cannot bound impact, so such swaps model as a single t
 
 ## Event windows
 
-Event windows mean flat in USDC from 60 minutes before to 30 minutes after each event.
+Since the captain's 2026-09-09 twenty-four-seven ruling, scheduled and session-derived event windows no longer gate anything: the B20 pools are continuous DeFi markets, so nights and weekends are in scope, entries are never blocked by a window, and open positions are never forced flat by one.
+The calendar machinery stays loaded - the window view still evaluates and every decision surface reports it, marked informational - so an operator scheduling an earnings event still sees the window named in the verdict's evidence.
 
-Events come from three sources.
+The window evaluation itself is unchanged for reporting: flat in USDC from 60 minutes before to 30 minutes after each event, from these sources.
 
 1. US equity market open 09:30 and close 16:00 America/New_York, derived for every weekday trading day (the v1 calendar has no holiday source, so weekdays are treated as trading days).
 2. Earnings and ex-dividend dates from the bundled `policy_events.toml`, which starts empty.
    Naive timestamps in that file are interpreted as America/New_York, and an optional `token_address` scopes a window to one B20 pool while omitting it applies the window to every pool.
-3. Oracle-stale and registry-pause signals from the existing oracle health gates, treated as condition-driven flat events that are active while the condition holds.
+3. Oracle-stale and registry-pause signals from the existing oracle health gates: these remain condition-driven flat events that require USDC while the condition holds, exactly as shipped - they are health signals about the inputs, not market-session doctrine.
 
-Event-window exits carry no re-entry cooldown; re-entry simply requires the threshold to clear again once the window has ended.
+Condition-driven flat exits carry no re-entry cooldown; re-entry simply requires the condition to clear.
 
 ## Dilution exits and re-entry
 

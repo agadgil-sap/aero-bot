@@ -1,5 +1,6 @@
 """Behavior tests for the pure emissions-farming policy decision engine."""
 
+import inspect
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 
@@ -56,7 +57,7 @@ def base_observation(**overrides: object) -> PolicyObservation:
         "amm_price_usdc": Decimal("200"),
         "emissions_apr": Decimal("1.5"),
         "fee_apr": Decimal("0.5"),
-        "pool_depth_usd": Decimal("10000"),
+        "pool_depth_usd": Decimal("50000"),
         "equity_usd": Decimal("200"),
         "reference_age_seconds": 10,
         "gas_price_gwei": Decimal("0.002"),
@@ -254,7 +255,9 @@ class TestLockedParameters:
         assert parameters.stop_buffer_fraction == Decimal("0.005")
         assert parameters.reentry_cooldown.total_seconds() == 15 * 60
         assert parameters.min_entry_emissions_apr == Decimal("1.5")
-        assert parameters.max_position_equity_fraction == Decimal("0.20")
+        # Raised from twenty percent by the captain's calibration ruling
+        # (2026-09-09); the provenance test below pins the ruling in source.
+        assert parameters.max_position_equity_fraction == Decimal("0.80")
         assert parameters.max_position_depth_fraction == Decimal("0.01")
         assert parameters.daily_loss_halt_fraction == Decimal("0.05")
         assert parameters.reference_max_age_seconds == 300
@@ -309,6 +312,58 @@ class TestLockedParameters:
         with pytest.raises(ValidationError):
             PolicyParameters(reference_open_position_max_age_seconds=60)
 
+    def test_sizing_ruling_provenance_is_recorded_in_source(self) -> None:
+        """The eighty-percent equity cap carries its ruling as provenance.
+
+        The captain's calibration ruling (2026-09-09) raised the
+        per-position equity-fraction cap from twenty to eighty percent of
+        the book (roughly 72 USDC on the 90-dollar trial book) while the
+        hard ceilings stayed 100 USDC total exposure and 100 USDC per pool;
+        the source comment above the field records exactly that.
+        """
+        source = inspect.getsource(PolicyParameters)
+        assert 'max_position_equity_fraction: Decimal = Decimal("0.80")' in source
+        assert "captain's calibration ruling (2026-09-09)" in source
+        assert "100 USDC total exposure" in source
+
+    def test_session_and_scheduled_windows_no_longer_gate_entries(self) -> None:
+        """Tuesday-night and market-open fixtures produce entry verdicts.
+
+        The captain's 2026-09-09 twenty-four-seven ruling removed the
+        market-session/event-window gate from entry decisions: the B20
+        pools are continuous DeFi markets, so nights and weekends are in
+        scope. These fixtures previously held as event_window_flat - the
+        doctrine test inverted here with the ruling recorded as provenance.
+        """
+        # 2026-09-08 is a Tuesday; 09:40 America/New_York sits inside the
+        # old market-open window.
+        market_open = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(observed_at=datetime(2026, 9, 8, 9, 40, tzinfo=NEW_YORK)),
+        )
+        assert market_open.decision.action is PolicyActionKind.ENTER
+        assert market_open.decision.reason is PolicyReason.ENTRY_THRESHOLD_MET
+        # The same Tuesday at 21:00 America/New_York, inside a scheduled
+        # earnings window scoped to this token.
+        calendar = parse_event_calendar(
+            "[[event]]\n"
+            'kind = "earnings"\n'
+            'scheduled_at = "2026-09-08T21:30:00"\n'
+            f'token_address = "{TOKEN_ADDRESS}"\n'
+        )
+        tuesday_night = PolicyEngine(calendar=calendar).decide(
+            PolicyState(),
+            base_observation(observed_at=datetime(2026, 9, 8, 21, 0, tzinfo=NEW_YORK)),
+        )
+        assert tuesday_night.decision.action is PolicyActionKind.ENTER
+        assert tuesday_night.decision.reason is PolicyReason.ENTRY_THRESHOLD_MET
+        # The window machinery still evaluates and reports, informationally.
+        window = evaluate_event_window(
+            datetime(2026, 9, 8, 21, 0, tzinfo=NEW_YORK), TOKEN_ADDRESS, calendar
+        )
+        assert window.active is True
+        assert "earnings" in window.description
+
 
 class TestRangeConstruction:
     """Tick-grid-aligned range construction behavior."""
@@ -357,11 +412,13 @@ class TestEntryGates:
         outcome = PolicyEngine().decide(PolicyState(), base_observation())
         assert outcome.decision.action is PolicyActionKind.ENTER
         assert outcome.decision.reason is PolicyReason.ENTRY_THRESHOLD_MET
-        assert outcome.decision.size_usd == Decimal("40")
+        # The captain's 2026-09-09 sizing ruling: eighty percent of the
+        # 200-USDC book, 160 USDC, against the 500-USDC depth cap.
+        assert outcome.decision.size_usd == Decimal("160")
         assert outcome.decision.price_range is not None
         position = outcome.next_state.position
         assert position is not None
-        assert position.committed_usd == Decimal("40")
+        assert position.committed_usd == Decimal("160")
         assert position.entered_at == BASE_OBSERVED_AT
 
     def test_entry_blocked_below_emissions_threshold(self) -> None:
@@ -523,8 +580,16 @@ class TestPositionLifecycle:
         assert outcome.next_state.position is None
         assert outcome.next_state.reentry_blocked_until is not None
 
-    def test_event_exit_while_open_has_no_cooldown(self) -> None:
-        """An event-window exit releases immediately once the window ends."""
+    def test_scheduled_windows_no_longer_gate_since_the_ruling(self) -> None:
+        """Scheduled event windows neither exit the position nor block re-entry.
+
+        The captain's 2026-09-09 twenty-four-seven ruling: the B20 pools are
+        continuous DeFi markets - nights and weekends are in scope - so the
+        flat-window doctrine around scheduled events and US equity session
+        boundaries was removed. This test is the inversion of the doctrine
+        test that previously expected an event exit and a blocked entry;
+        the ruling is recorded here as its provenance.
+        """
         calendar = parse_event_calendar(
             "[[event]]\n"
             'kind = "earnings"\n'
@@ -537,16 +602,24 @@ class TestPositionLifecycle:
             base_observation(observed_at=datetime(2026, 8, 19, 10, 15, tzinfo=NEW_YORK)),
         )
         assert entered.decision.action is PolicyActionKind.ENTER
-        exited = engine.decide(
+        during_window = engine.decide(
             entered.next_state,
             base_observation(observed_at=datetime(2026, 8, 19, 11, 30, tzinfo=NEW_YORK)),
         )
-        assert exited.decision.action is PolicyActionKind.EVENT_EXIT
-        assert exited.decision.reason is PolicyReason.EVENT_EXIT_TRIGGERED
-        assert exited.next_state.reentry_blocked_until is None
+        assert during_window.decision.action is PolicyActionKind.HOLD
+        assert during_window.decision.reason is PolicyReason.OPEN_IN_RANGE
+        exited = engine.decide(
+            during_window.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 13, 0, tzinfo=NEW_YORK),
+                amm_price_usdc=stop_level_for(during_window.next_state),
+            ),
+        )
+        assert exited.decision.action is PolicyActionKind.STOP_OUT
+        assert exited.next_state.reentry_blocked_until is not None
         reentered = engine.decide(
             exited.next_state,
-            base_observation(observed_at=datetime(2026, 8, 19, 13, 0, tzinfo=NEW_YORK)),
+            base_observation(observed_at=datetime(2026, 8, 19, 13, 30, tzinfo=NEW_YORK)),
         )
         assert reentered.decision.action is PolicyActionKind.ENTER
 
@@ -670,7 +743,7 @@ class TestDailyLossHalt:
             ),
         )
         assert next_day.decision.action is PolicyActionKind.ENTER
-        assert next_day.decision.size_usd == Decimal("39.8")
+        assert next_day.decision.size_usd == Decimal("159.2")
 
     def test_day_rollover_resets_the_day_start_equity(self) -> None:
         """A new day re-anchors the halt at the current marked equity."""
@@ -691,7 +764,7 @@ class TestDailyLossHalt:
             ),
         )
         assert next_day.decision.action is PolicyActionKind.ENTER
-        assert next_day.decision.size_usd == Decimal("30")
+        assert next_day.decision.size_usd == Decimal("120")
 
 
 class TestEnginePurity:
@@ -787,10 +860,10 @@ class TestGasSenseCheckGate:
 
     def test_entry_deferred_when_batch_cost_exceeds_yield_share(self) -> None:
         """A cheap-but-costly batch defers the entry against the yield bound."""
-        # At 0.005 gwei the 750k-unit entry batch costs 0.01125 USDC, above
-        # five percent of the 40-USDC position's 0.21918 expected daily yield.
+        # At 0.2 gwei the 750k-unit entry batch costs 0.45 USDC, above five
+        # percent of the 160-USDC position's 0.87671 expected daily yield.
         outcome = PolicyEngine().decide(
-            PolicyState(), base_observation(gas_price_gwei=Decimal("0.005"))
+            PolicyState(), base_observation(gas_price_gwei=Decimal("0.2"))
         )
         assert outcome.decision.action is PolicyActionKind.HOLD
         assert outcome.decision.reason is PolicyReason.GAS_GATE_DEFERRED
@@ -807,7 +880,7 @@ class TestGasSenseCheckGate:
             ),
         )
         assert outcome.decision.action is PolicyActionKind.ENTER
-        assert outcome.decision.size_usd == Decimal("200000")
+        assert outcome.decision.size_usd == Decimal("800000")
 
     def test_recenter_deferred_by_gas_then_fires_on_a_cheap_observation(self) -> None:
         """A gas spike defers the elapsed recenter without resetting its wait."""
@@ -894,39 +967,40 @@ class TestSwapExecutionModeling:
         plan = outcome.decision.swap_plan
         assert plan is not None
         assert plan.direction is SwapDirection.BUY_STOCK
-        assert plan.total_usd == Decimal("20")
-        # The 10k-depth pool allows a 5-USDC max tranche, so 20 USDC splits in four.
+        assert plan.total_usd == Decimal("80")
+        # The 50k-depth pool allows a 25-USDC max tranche, so 80 USDC splits
+        # in four 20-USDC tranches.
         assert len(plan.tranches) == 4
-        assert all(tranche.usd_size == Decimal("5") for tranche in plan.tranches)
-        assert plan.max_modeled_impact_fraction == Decimal("0.0005")
+        assert all(tranche.usd_size == Decimal("20") for tranche in plan.tranches)
+        assert plan.max_modeled_impact_fraction == Decimal("0.0004")
 
     def test_tranche_remainder_sums_exactly_to_the_plan_total(self) -> None:
         """A non-terminating split floors every leading tranche to six decimals."""
-        # Depth 5800 gives a 2.9 max tranche, so the 20-USDC entry swap needs
-        # seven tranches and 20/7 floors to 2.857142 with the last absorbing.
+        # Depth 29000 gives a 14.5 max tranche, so the 80-USDC entry swap
+        # needs six tranches and 80/6 floors to 13.333333 with the last absorbing.
         outcome = PolicyEngine().decide(
-            PolicyState(), base_observation(pool_depth_usd=Decimal("5800"))
+            PolicyState(), base_observation(pool_depth_usd=Decimal("29000"))
         )
         assert outcome.decision.action is PolicyActionKind.ENTER
         plan = outcome.decision.swap_plan
         assert plan is not None
-        assert len(plan.tranches) == 7
-        assert plan.tranches[0].usd_size == Decimal("2.857142")
-        assert plan.tranches[-1].usd_size == Decimal("2.857148")
-        assert sum((tranche.usd_size for tranche in plan.tranches), Decimal(0)) == Decimal("20")
+        assert len(plan.tranches) == 6
+        assert plan.tranches[0].usd_size == Decimal("13.333333")
+        assert plan.tranches[-1].usd_size == Decimal("13.333335")
+        assert sum((tranche.usd_size for tranche in plan.tranches), Decimal(0)) == Decimal("80")
         assert plan.max_modeled_impact_fraction is not None
         assert plan.max_modeled_impact_fraction <= Decimal("0.0005")
 
     def test_a_small_swap_against_deep_liquidity_is_one_tranche(self) -> None:
         """A swap under the split bound stays whole with a tiny modeled impact."""
         outcome = PolicyEngine().decide(
-            PolicyState(), base_observation(pool_depth_usd=Decimal("1000000"))
+            PolicyState(), base_observation(pool_depth_usd=Decimal("5000000"))
         )
         plan = outcome.decision.swap_plan
         assert plan is not None
         assert len(plan.tranches) == 1
-        assert plan.tranches[0].usd_size == Decimal("20")
-        assert plan.max_modeled_impact_fraction == Decimal("0.00002")
+        assert plan.tranches[0].usd_size == Decimal("80")
+        assert plan.max_modeled_impact_fraction == Decimal("0.000016")
 
     def test_recenter_swap_buys_half_the_committed_value_back(self) -> None:
         """The above-range all-USDC position buys half its value back into stock."""
@@ -951,7 +1025,7 @@ class TestSwapExecutionModeling:
         plan = recentred.decision.swap_plan
         assert plan is not None
         assert plan.direction is SwapDirection.BUY_STOCK
-        assert plan.total_usd == Decimal("20")
+        assert plan.total_usd == Decimal("80")
 
     def test_stop_out_sells_the_full_stock_inventory_below_range(self) -> None:
         """Below the range the composition is all stock, swapped near committed value."""
@@ -967,7 +1041,7 @@ class TestSwapExecutionModeling:
         plan = stopped.decision.swap_plan
         assert plan is not None
         assert plan.direction is SwapDirection.SELL_STOCK
-        assert Decimal("39") < plan.total_usd < Decimal("40")
+        assert Decimal("156") < plan.total_usd < Decimal("160")
 
     def test_in_range_exit_sells_the_stock_half_of_the_position(self) -> None:
         """A dilution exit in range only swaps the stock half of the composition."""
@@ -983,7 +1057,7 @@ class TestSwapExecutionModeling:
         plan = diluted.decision.swap_plan
         assert plan is not None
         assert plan.direction is SwapDirection.SELL_STOCK
-        assert Decimal("19") < plan.total_usd < Decimal("22")
+        assert Decimal("76") < plan.total_usd < Decimal("88")
 
     def test_zero_depth_exit_models_one_unmodeled_tranche(self) -> None:
         """A vanished depth still exits safely with the impact labeled unmodeled."""

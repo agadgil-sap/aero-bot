@@ -1,6 +1,6 @@
 """Pin the scheduled decision cycle's reconcile-decide-act behavior."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,13 +22,18 @@ from test_lp_executor import (
 from aero_bot.audit import AuditEventType, AuditRecord, AuditStore
 from aero_bot.cycle import (
     CYCLE_REFERENCE_PRICE_ENV,
+    CYCLE_SWITCH_MARGIN_ENV,
+    CYCLE_SYMBOL_ENV,
     CycleMode,
     CycleRunner,
     CycleStateBook,
     CycleStateStore,
     HeldInventoryRecord,
+    ReentryCooldown,
     TrackedPosition,
     _reference_price_from_environment,
+    _switch_margin_from_environment,
+    _symbol_from_arguments_and_environment,
     decode_minted_token_id,
 )
 from aero_bot.history import price_usdc_per_stock
@@ -48,6 +53,7 @@ from aero_bot.policy import (
     PolicyReason,
     PolicyState,
 )
+from aero_bot.strategy import BoardListing
 from aero_bot.venues import BASE_USDC_ADDRESS, PoolCandidate
 
 # 2026-09-08 is a Tuesday; 20:30 UTC is 16:30 New York, past every session
@@ -63,8 +69,9 @@ MINT_TX_HASH = "0x" + "ab" * 32
 FIXTURE_RANGE_LOWER = -11630
 FIXTURE_RANGE_UPPER = -11610
 # The entry size and width the locked engine derives at a ten-USDC
-# equity: the 20-percent equity cap and the ceiling-rounded spacing width.
-EXPECTED_ENTER_SIZE = Decimal("2")
+# equity: the 80-percent equity cap (the captain's 2026-09-09 sizing
+# ruling) and the ceiling-rounded spacing width.
+EXPECTED_ENTER_SIZE = Decimal("8")
 EXPECTED_ENTER_WIDTH = 4
 # The fixture AMM price doubles as a neutral reference quote: equal to the
 # pool price, no dislocation can trigger in either direction.
@@ -90,14 +97,27 @@ class FakePlanPayload(BaseModel):
 class FakeCycleSources:
     """Serve deterministic discovery and reads without any network."""
 
-    def __init__(self, *, usdc_units: int = 10_000_000, stock_units: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        usdc_units: int = 10_000_000,
+        stock_units: int = 0,
+        listings: tuple[BoardListing, ...] | None = None,
+    ) -> None:
         """Configure the fixture pool and the Safe's live balances."""
         self._usdc_units = usdc_units
         self._stock_units = stock_units
+        self._listings = listings
 
     def resolve_pool(self, symbol: str) -> tuple[PoolCandidate, int]:
         """Return the verified fixture pool and its snapshot block."""
         return make_candidate(), 123
+
+    def enumerate_pools(self) -> tuple[tuple[BoardListing, ...], int]:
+        """Return the scripted board and its snapshot block."""
+        if self._listings is not None:
+            return self._listings, 123
+        return (BoardListing(symbol="FIXc", pool=make_candidate()),), 123
 
     def registry_paused(self) -> bool:
         """The fixture registry is verified."""
@@ -400,11 +420,16 @@ def mint_receipt(token_id: int) -> dict[str, object]:
     }
 
 
-def tracked_book(*, owner: str = SAFE_ADDRESS, committed: Decimal = Decimal("7")) -> CycleStateBook:
+def tracked_book(
+    *,
+    owner: str = SAFE_ADDRESS,
+    committed: Decimal = Decimal("7"),
+    symbol: str = "FIXc",
+) -> CycleStateBook:
     """Build one book tracking the fixture position."""
     return CycleStateBook(
         position=TrackedPosition(
-            symbol="FIXc",
+            symbol=symbol,
             token_id=TRACKED_TOKEN_ID,
             pool_address=POOL_ADDRESS,
             committed_usd=committed,
@@ -424,6 +449,7 @@ def make_runner(
     executor: object | None = None,
     audit_seed: bool = False,
     now: datetime = QUIET_INSTANT,
+    symbol: str | None = "FIXc",
 ) -> tuple[CycleRunner, FakeExecutor | None, AuditStore, CycleStateStore]:
     """Assemble one cycle runner over fully scripted boundaries."""
     store_path = tmp_path / "cycle_state.json"
@@ -472,7 +498,7 @@ def make_runner(
                     return tuple(records)
 
     runner = CycleRunner(
-        symbol="FIXc",
+        symbol=symbol,
         safe_address=SAFE_ADDRESS,
         relayer_address=RELAYER_ADDRESS,
         reads=fake_reads,
@@ -555,14 +581,21 @@ class TestDryRunCycles:
         records = audit.read_records(10)
         assert [record.event_type for record in records] == [AuditEventType.CYCLE_REPORTED]
 
-    def test_market_window_flat_verdict_is_reported_as_doctrine(self, tmp_path: Path) -> None:
-        """A session window holds flat inside the cycle too."""
+    def test_market_window_no_longer_flats_the_cycle_since_the_ruling(self, tmp_path: Path) -> None:
+        """A session window inside the cycle no longer gates the verdict.
+
+        The captain's 2026-09-09 twenty-four-seven ruling (the B20 pools
+        are continuous DeFi markets; nights and weekends are in scope)
+        removed the flat-window doctrine: this Tuesday market-open fixture
+        previously held as event_window_flat and now produces the entry
+        verdict, with the window reported informationally.
+        """
         market_open = datetime(2026, 9, 8, 13, 40, tzinfo=UTC)
         runner, _, _, _ = make_runner(tmp_path, now=market_open)
         report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
-        assert report.decision_action == "hold"
-        assert report.decision_reason == "event_window_flat"
-        assert report.event_window != ""
+        assert report.decision_action == "enter"
+        assert report.decision_reason == "entry_threshold_met"
+        assert "market open" in report.event_window
 
 
 class TestLiveCycles:
@@ -635,7 +668,7 @@ class TestLiveCycles:
             ),
             next_state=PolicyState(),
         )
-        actions, halted, book = runner._act(tracked_book(), outcome, b"\x01" * 32)
+        actions, halted, book = runner._act(tracked_book(), outcome, b"\x01" * 32, "FIXc")
         assert halted == ""
         assert [record.action for record in actions] == [
             "unstake",
@@ -663,7 +696,7 @@ class TestLiveCycles:
             ),
             next_state=PolicyState(),
         )
-        actions, halted, book = runner._act(tracked_book(), outcome, b"\x01" * 32)
+        actions, halted, book = runner._act(tracked_book(), outcome, b"\x01" * 32, "FIXc")
         assert [record.action for record in actions] == ["unstake", "withdraw"]
         assert book.position is None
         assert book.held_inventory is not None
@@ -691,7 +724,7 @@ class TestLiveCycles:
             ),
             next_state=PolicyState(),
         )
-        actions, halted, new_book = runner._act(book, outcome, b"\x01" * 32)
+        actions, halted, new_book = runner._act(book, outcome, b"\x01" * 32, "FIXc")
         assert [record.action for record in actions] == ["exit_swap"]
         assert halted == ""
         assert new_book.held_inventory is None
@@ -827,6 +860,7 @@ class TestLiveRelayerGuard:
                 key_bytes: bytes | None = None,
                 reference_price_usdc: object = None,
                 reference_age_seconds: object = None,
+                reference_prices_by_symbol: object = None,
             ) -> object:
                 class _Report:
                     mode = "live"
@@ -864,3 +898,286 @@ class TestLiveRelayerGuard:
         monkeypatch.setattr(cycle_module, "build_cycle_runner", lambda *a, **k: _FakeRunner())
         exit_code = cycle_module.main(["--symbol", "AAPLc", "--json"])
         assert exit_code == 0, "the guard must accept the case-insensitive match"
+
+
+# A second stock token and pool for the cross-board selector fixtures.
+SELECTOR_BBB_TOKEN = "0xbb0000000000000000000078ee7ce2fe4908108c"  # noqa: S105
+SELECTOR_BBB_POOL = "0x2222222222222222222222222222222222222222"
+# Both pools quote the same fixture price, so one reference map serves both.
+SELECTOR_REFERENCES = {"AAAc": FIXTURE_AMM_PRICE, "BBBc": FIXTURE_AMM_PRICE}
+
+
+def selector_listings(bbb_emissions_multiplier: int = 2) -> tuple[BoardListing, ...]:
+    """Build the two-pool scripted board: AAAc plain, BBBc scaled emissions."""
+    return (
+        BoardListing(symbol="AAAc", pool=make_candidate()),
+        BoardListing(
+            symbol="BBBc",
+            pool=make_candidate(
+                pool_address=SELECTOR_BBB_POOL,
+                token1_address=SELECTOR_BBB_TOKEN,
+                emissions_per_second=bbb_emissions_multiplier * 4_494_371_922_759_724,
+            ),
+        ),
+    )
+
+
+class SelectorCycleSources(FakeCycleSources):
+    """Serve the two-pool board with per-symbol registry resolution."""
+
+    def __init__(self, **kwargs: object) -> None:
+        """Configure the scripted board and balances."""
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self._selector_listings = selector_listings()
+
+    def with_listings(self, listings: tuple[BoardListing, ...]) -> "SelectorCycleSources":
+        """Return a copy of these sources serving a different board."""
+        clone = SelectorCycleSources()
+        clone._usdc_units = self._usdc_units
+        clone._stock_units = self._stock_units
+        clone._selector_listings = listings
+        return clone
+
+    def resolve_pool(self, symbol: str) -> tuple[PoolCandidate, int]:
+        """Return the named board pool's candidate."""
+        for listing in self._selector_listings:
+            if listing.symbol.lower() == symbol.strip().lower():
+                return listing.pool, 123
+        raise ValueError(f"symbol {symbol!r} is not on the scripted board")
+
+    def enumerate_pools(self) -> tuple[tuple[BoardListing, ...], int]:
+        """Return the scripted two-pool board and its snapshot block."""
+        return self._selector_listings, 123
+
+    def symbol_address(self, symbol: str) -> str | None:
+        """Resolve the two board symbols to their stock tokens."""
+        if symbol.lower() == "aaac":
+            return B20_ADDRESS
+        if symbol.lower() == "bbbc":
+            return SELECTOR_BBB_TOKEN
+        return None
+
+    def token_balance(self, token_address: str, owner_address: str) -> int:
+        """Serve the Safe's USDC; board stocks carry no stray balance."""
+        if token_address.lower() == BASE_USDC_ADDRESS.lower():
+            return self._usdc_units
+        return 0
+
+
+def selector_runner(
+    tmp_path: Path,
+    *,
+    book: CycleStateBook | None = None,
+    reads: FakeReads | None = None,
+    executor: object | None = None,
+    sources: SelectorCycleSources | None = None,
+) -> tuple[CycleRunner, FakeExecutor | None, CycleStateStore]:
+    """Assemble one selector-mode cycle runner over the scripted board."""
+    runner, fake_executor, _, state_store = make_runner(
+        tmp_path,
+        book=book,
+        reads=reads,
+        sources=sources if sources is not None else SelectorCycleSources(),
+        executor=executor,
+        symbol=None,
+    )
+    return runner, fake_executor, state_store
+
+
+class TestSelectorCycles:
+    """Cross-board selection cycles: entry, hysteresis, and one position."""
+
+    def test_flat_selector_cycle_holds_when_no_pool_qualifies(self, tmp_path: Path) -> None:
+        """Without references every pool blocks and the board holds honestly."""
+        runner, _, _ = selector_runner(tmp_path)
+        report = runner.run(CycleMode.DRY_RUN)
+        assert report.decision_action == "hold"
+        assert report.decision_reason == "no_qualifying_pool"
+        assert "AAAc reference_stale" in report.decision_diagnostics[0]
+        assert "BBBc reference_stale" in report.decision_diagnostics[0]
+        assert any("board [" in note for note in report.input_notes)
+        # The no-qualify report names the closest-call pool (the highest
+        # emissions APR), mirroring the decide surface's fallback.
+        assert report.symbol == "BBBc"
+
+    def test_selector_enters_the_best_qualifying_pool(self, tmp_path: Path) -> None:
+        """The live cycle mints and stakes the higher-APR pool only."""
+        runner, executor, state_store = selector_runner(tmp_path)
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "enter"
+        assert report.decision_reason == "entry_threshold_met"
+        assert report.symbol == "BBBc"
+        assert [call[0] for call in executor.calls] == ["mint", "stake"]
+        assert executor.calls[0][1] == "BBBc"
+        book = state_store.load()
+        assert book.position is not None
+        assert book.position.symbol == "BBBc"
+        assert book.position.committed_usd == EXPECTED_ENTER_SIZE
+
+    def test_selector_holds_below_the_switch_margin(self, tmp_path: Path) -> None:
+        """A funded position stays when no pool clears the thirty percent margin."""
+        sources = SelectorCycleSources().with_listings(selector_listings(1))
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=tracked_book(symbol="AAAc"),
+            reads=_tracked_reads(),
+            sources=sources,
+        )
+        assert executor is not None
+        # BBBc at ten percent over AAAc sits inside the default thirty
+        # percent margin, so no switch fires: hold the funded AAAc position.
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "hold"
+        assert executor.calls == []
+        assert state_store.load().position is not None
+
+    def test_selector_switches_above_the_margin(self, tmp_path: Path) -> None:
+        """A wide-enough margin breach exits the held pool and enters the winner."""
+        # BBBc at double AAAc's APR clears the default thirty percent margin.
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=tracked_book(symbol="AAAc"),
+            reads=_tracked_reads(staked=True),
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "pool_switch"
+        assert report.decision_reason == "pool_switch_triggered"
+        assert [call[0] for call in executor.calls] == [
+            "unstake",
+            "withdraw",
+            "exit_swap",
+            "mint",
+            "stake",
+        ]
+        assert executor.calls[3][1] == "BBBc"
+        book = state_store.load()
+        assert book.position is not None
+        assert book.position.symbol == "BBBc"
+        # Exactly one position is funded after the switch.
+        assert book.position.token_id == TRACKED_TOKEN_ID
+
+    def test_a_failed_switch_exit_halts_before_any_entry(self, tmp_path: Path) -> None:
+        """A refused exit stops the switch with no second position minted."""
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=tracked_book(symbol="AAAc"),
+            reads=_tracked_reads(staked=True),
+        )
+        assert executor is not None
+
+        def refusing_unstake(
+            symbol: str,
+            token_id: int,
+            key_bytes: bytes,
+            *,
+            confirm_broadcast: bool,
+            ephemeral_key: bool = False,
+        ) -> LpActionExecutionReport:
+            """Refuse the unstake so the switch halts on its first step."""
+            executor.calls.append(("unstake", symbol, token_id))
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "scripted unstake refusal",
+            )
+
+        executor.execute_unstake = refusing_unstake  # type: ignore[method-assign]
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert [call[0] for call in executor.calls] == ["unstake"]
+        assert "refused" in report.halted_reason
+        book = state_store.load()
+        assert book.position is not None
+        assert book.position.symbol == "AAAc"
+
+    def test_per_pool_cooldown_blocks_only_its_own_pool(self, tmp_path: Path) -> None:
+        """A BBBc cooldown skips BBBc and lets the cycle enter AAAc."""
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=CycleStateBook(
+                reentry_cooldowns=(
+                    ReentryCooldown(
+                        symbol="BBBc", blocked_until=QUIET_INSTANT + timedelta(hours=1)
+                    ),
+                ),
+                updated_at=QUIET_INSTANT,
+            ),
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "enter"
+        assert report.symbol == "AAAc"
+        assert executor.calls[0][1] == "AAAc"
+        assert state_store.load().position is not None
+
+
+def _tracked_reads(*, staked: bool = False) -> FakeReads:
+    """Serve one live in-range tracked position for the switch fixtures."""
+    reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+    reads.set_status(
+        TRACKED_TOKEN_ID,
+        tracked_status(owner=GAUGE_ADDRESS if staked else SAFE_ADDRESS),
+    )
+    return reads
+
+
+class TestCycleConfiguration:
+    """The sealed-environment symbol, margin, and reference configuration."""
+
+    def test_symbol_resolves_auto_versus_pinned(self) -> None:
+        """Unset, empty, or auto means the selector; anything else pins."""
+        assert _symbol_from_arguments_and_environment(None, {}) is None
+        assert _symbol_from_arguments_and_environment(None, {CYCLE_SYMBOL_ENV: ""}) is None
+        assert _symbol_from_arguments_and_environment(None, {CYCLE_SYMBOL_ENV: "auto"}) is None
+        assert _symbol_from_arguments_and_environment(None, {CYCLE_SYMBOL_ENV: "AUTO"}) is None
+        assert (
+            _symbol_from_arguments_and_environment(None, {CYCLE_SYMBOL_ENV: " AAPLc "}) == "AAPLc"
+        )
+        assert _symbol_from_arguments_and_environment("auto", {CYCLE_SYMBOL_ENV: "AAPLc"}) is None
+        assert (
+            _symbol_from_arguments_and_environment("AAPLc", {CYCLE_SYMBOL_ENV: "FIXc"}) == "AAPLc"
+        )
+
+    def test_switch_margin_defaults_and_overrides(self) -> None:
+        """The margin defaults to the ruling's thirty percent."""
+        assert _switch_margin_from_environment({}) == Decimal("0.30")
+        assert _switch_margin_from_environment({CYCLE_SWITCH_MARGIN_ENV: "0.5"}) == Decimal("0.5")
+        with pytest.raises(ValueError, match="non-negative"):
+            _switch_margin_from_environment({CYCLE_SWITCH_MARGIN_ENV: "-0.1"})
+
+    def test_reference_environment_serves_single_and_map_forms(self) -> None:
+        """A bare number quotes the pinned symbol; pairs map per symbol."""
+        assert _reference_price_from_environment({}) is None
+        assert _reference_price_from_environment({CYCLE_REFERENCE_PRICE_ENV: "318.5"}) == Decimal(
+            "318.5"
+        )
+        quoted = _reference_price_from_environment(
+            {CYCLE_REFERENCE_PRICE_ENV: "AAPLc=318.5, FIXc=100"}
+        )
+        assert quoted == {"AAPLc": Decimal("318.5"), "FIXc": Decimal("100")}
+        with pytest.raises(ValueError, match="positive"):
+            _reference_price_from_environment({CYCLE_REFERENCE_PRICE_ENV: "-1"})
+        with pytest.raises(ValueError, match="SYMBOL=PRICE"):
+            _reference_price_from_environment({CYCLE_REFERENCE_PRICE_ENV: "AAPLc="})
+        with pytest.raises(ValueError, match="more than once"):
+            _reference_price_from_environment({CYCLE_REFERENCE_PRICE_ENV: "A=1,A=2"})
