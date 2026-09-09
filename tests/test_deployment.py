@@ -51,6 +51,11 @@ class TestInstallScript:
         assert 'chmod 0640 "${CONFIG_DIR}/cycle.env"' in text
         assert 'chmod 0640 "${CONFIG_DIR}/backup.env"' in text
 
+    def test_the_config_dir_is_service_group_traversable(self) -> None:
+        """The service user can traverse /etc/aero-bot to reach its sealed files."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert 'install -d -o root -g "${SERVICE_USER}" -m 0750 "${CONFIG_DIR}"' in text
+
     def test_existing_sealed_files_survive_reinstalls(self) -> None:
         """Idempotence never overwrites the operator's sealed values."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")

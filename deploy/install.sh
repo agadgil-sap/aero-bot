@@ -95,8 +95,10 @@ install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0700 "${STATE_DIR}"
 log "installing the sealed environment templates under ${CONFIG_DIR}"
 # root:service 0640: systemd reads these as root before dropping
 # privileges, and the service user may read them for manual operator runs -
-# writes stay root-only, and the only group is the bot itself.
-install -d -o root -g root -m 0750 "${CONFIG_DIR}"
+# writes stay root-only, and the only group is the bot itself. The directory
+# itself is root:service 0750 for the same reason: the cycle service runs as
+# the service user and must traverse it to read the signing-key file.
+install -d -o root -g "${SERVICE_USER}" -m 0750 "${CONFIG_DIR}"
 if [[ ! -f "${CONFIG_DIR}/cycle.env" ]]; then
     cat >"${CONFIG_DIR}/cycle.env" <<'EOF'
 # Aero Bot cycle environment - seal real values here (mode 0600, root-owned).
