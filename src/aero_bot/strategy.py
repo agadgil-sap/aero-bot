@@ -19,7 +19,7 @@ import argparse
 import os
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Protocol
@@ -56,6 +56,15 @@ from aero_bot.policy import (
     load_event_calendar,
 )
 from aero_bot.registry import RegistryStatus
+from aero_bot.selector import (
+    DEFAULT_SWITCH_MARGIN_FRACTION,
+    BoardSelection,
+    PoolBoardOption,
+    PoolEntryEvaluation,
+    SwitchDirective,
+    closest_call_evaluation,
+    select_board,
+)
 from aero_bot.venues import (
     BASE_USDC_ADDRESS,
     PoolCandidate,
@@ -66,6 +75,10 @@ from aero_bot.venues import (
 # The Safe whose live balances default the equity input.
 # One gwei is one billion wei; the observation carries gwei.
 WEI_PER_GWEI = 1_000_000_000
+# The selector mode's reserved symbol: "auto" on the CLI or in the sealed
+# cycle environment means no pool is pinned and the cross-board selector
+# picks the best-qualifying pool each run.
+SELECTOR_SYMBOL = "auto"
 
 
 class StrategyDecisionReport(BaseModel):
@@ -102,6 +115,27 @@ class StrategyDecisionReport(BaseModel):
     outcome: PolicyOutcome
     # Explicit notes on the honest input gaps this run carried.
     input_notes: Annotated[tuple[str, ...], Field(min_length=1)]
+    # True when this verdict came from the cross-board selector rather than
+    # one pinned symbol.
+    selector_mode: bool = False
+    # Every enumerated pool's entry-gate evaluation, selector mode only.
+    board: tuple[PoolEntryEvaluation, ...] = ()
+    # The qualified cross-pool switch directive, selector mode only.
+    switch: SwitchDirective | None = None
+    # One human evidence line summarizing the selector's pass.
+    board_summary: str = ""
+
+
+class BoardListing(BaseModel):
+    """Carry one enumerated board pool with its registry symbol."""
+
+    # Frozen strict fields keep one listing coherent with its snapshot.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The registry-matched stock symbol naming this pool.
+    symbol: str
+    # The verified B20/native-USDC Slipstream pool for that symbol.
+    pool: PoolCandidate
 
 
 class StrategyDecisionPayload(BaseModel):
@@ -140,6 +174,17 @@ class StrategySources(Protocol):
         Returns:
             The verified B20/USDC pool candidate for the symbol and the
             block pinning its snapshot.
+        """
+        ...
+
+    def enumerate_pools(self) -> tuple[tuple[BoardListing, ...], int]:
+        """Return every verified B20 pool with its snapshot block.
+
+        Returns:
+            Every registry-symbolled pool that survived the screener's
+            factory, pair, kind, uniqueness, gauge-liveness, and
+            AERO-emission validation, ordered by symbol, and the block
+            pinning the shared snapshot.
         """
         ...
 
@@ -289,6 +334,67 @@ class LiveStrategySources:
             )
         return pool, result.snapshot_block
 
+    def enumerate_pools(self) -> tuple[tuple[BoardListing, ...], int]:
+        """Return every verified B20 pool with its snapshot block.
+
+        One verified Sugar sweep enumerates the whole board: every pool that
+        passes the venue adapter's factory, pair, kind, uniqueness,
+        gauge-liveness, and AERO-emission validation is mapped to its
+        registry symbol, ordered lexicographically for deterministic
+        selection, and pinned so later pinned-symbol runs resolve through
+        the known-pool fast path. Duplicate pools for one symbol keep the
+        discovery order's first match, mirroring the pinned resolver.
+
+        Returns:
+            The ordered board listings and the block pinning the snapshot.
+
+        Raises:
+            ExecutionUnavailableError: If discovery cannot complete or does
+                not verify.
+        """
+        registry = self._execution_sources.load_registry()
+        listing_by_address = {asset.address.lower(): asset for asset in registry.assets}
+        symbol_by_token = {
+            address: asset.symbol.strip() for address, asset in listing_by_address.items()
+        }
+        result = self._execution_sources.discover_pools()
+        if result.status is not PoolDiscoveryStatus.VERIFIED:
+            raise ExecutionUnavailableError(
+                "pool discovery did not verify: " + " ".join(result.diagnostics)
+            )
+        if result.snapshot_block is None:
+            raise ExecutionUnavailableError("verified discovery carried no snapshot block")
+        normalized_usdc = BASE_USDC_ADDRESS.lower()
+        existing_pins = self._pool_pin_store.load() if self._pool_pin_store is not None else {}
+        listings: list[BoardListing] = []
+        seen_symbols: set[str] = set()
+        for pool in result.pools:
+            stock_token = (
+                pool.token1_address
+                if pool.token0_address.lower() == normalized_usdc
+                else pool.token0_address
+            )
+            listing = listing_by_address.get(stock_token.lower())
+            symbol = symbol_by_token.get(stock_token.lower())
+            if listing is None or symbol is None or symbol.lower() in seen_symbols:
+                continue
+            seen_symbols.add(symbol.lower())
+            # Only missing pins are written: the warm store keeps one pin per
+            # symbol and a board sweep rewrites nothing it already knows.
+            if self._pool_pin_store is not None and symbol.lower() not in existing_pins:
+                persist_decision_pool_pin(
+                    self._pool_pin_store,
+                    listing,
+                    pool,
+                    self._execution_sources.read_token_decimals(stock_token),
+                    result.snapshot_block,
+                    datetime.now(UTC),
+                    result.source,
+                )
+            listings.append(BoardListing(symbol=symbol, pool=pool))
+        listings.sort(key=lambda listing: listing.symbol)
+        return tuple(listings), result.snapshot_block
+
     def registry_paused(self) -> bool:
         """Return whether the official B20 registry is not verified."""
         registry = self._execution_sources.load_registry()
@@ -333,6 +439,10 @@ def assemble_observation(
     reference_price_usdc: Decimal | None,
     reference_age_seconds: int | None,
     safe_address: str,
+    stock_decimals: int | None = None,
+    aero_price: Decimal | None = None,
+    gas_price_gwei: Decimal | None = None,
+    registry_paused: bool | None = None,
 ) -> tuple[PolicyObservation, Decimal, Decimal, tuple[str, ...]]:
     """Assemble one complete policy observation from live pool state.
 
@@ -347,6 +457,13 @@ def assemble_observation(
         reference_price_usdc: Optional injected real-market quote.
         reference_age_seconds: Age of the injected quote; defaults to zero.
         safe_address: The Safe whose balances default the equity input.
+        stock_decimals: Pre-read stock decimals; None reads them live. The
+            board assembler hoists one read per token for every pool.
+        aero_price: Pre-read AERO price at the snapshot block; None reads it
+            live. The board assembler hoists one read for every pool.
+        gas_price_gwei: Pre-read Base gas price; None reads it live. The
+            board assembler hoists one reading for every pool.
+        registry_paused: Pre-read registry pause state; None reads it live.
 
     Returns:
         The observation, the corrected emissions APR, the live AERO price,
@@ -363,9 +480,9 @@ def assemble_observation(
         else pool.token0_address
     )
     stock_is_token0 = pool.token0_address.lower() != normalized_usdc
-    decimals = sources.token_decimals(stock_token)
+    decimals = stock_decimals if stock_decimals is not None else sources.token_decimals(stock_token)
     price = price_usdc_per_stock(pool.sqrt_ratio, stock_is_token0, decimals, 6)
-    aero_price = sources.aero_price(snapshot_block)
+    aero_price = aero_price if aero_price is not None else sources.aero_price(snapshot_block)
     emissions_apr = aerodrome_display_emissions_apr(
         pool.emissions_per_second,
         aero_price,
@@ -421,8 +538,10 @@ def assemble_observation(
         reference_price_usdc=reference_price_usdc,
         reference_age_seconds=reference_age_seconds,
         oracle_stale=False,
-        registry_paused=sources.registry_paused(),
-        gas_price_gwei=sources.gas_price_gwei(),
+        registry_paused=(
+            registry_paused if registry_paused is not None else sources.registry_paused()
+        ),
+        gas_price_gwei=(gas_price_gwei if gas_price_gwei is not None else sources.gas_price_gwei()),
         ranging=None,
     )
     return observation, emissions_apr, aero_price, tuple(notes)
@@ -494,6 +613,314 @@ def run_decision(
     )
 
 
+def parse_reference_quotes(raw: str) -> Decimal | dict[str, Decimal]:
+    """Parse one injected reference quote or per-symbol quote map.
+
+    The single form (``318.5``) is one real-market quote for the symbol
+    being decided; the map form (``AAPLc=318.5,FIXc=100``) carries one
+    quote per symbol for the cross-board selector. Every value must be
+    positive.
+
+    Args:
+        raw: The raw configured text; empty means no quote was injected.
+
+    Returns:
+        One Decimal for the single form, or the per-symbol mapping.
+
+    Raises:
+        ValueError: If any entry is not a positive number, a pair is
+            malformed, or a symbol repeats.
+    """
+    text = raw.strip()
+    if not text:
+        return {}
+    if "=" not in text:
+        try:
+            value = Decimal(text)
+        except ArithmeticError as error:
+            raise ValueError(f"reference quotes must be numbers, not {text!r}") from error
+        if value <= 0:
+            raise ValueError(f"reference quotes must be positive, not {text!r}")
+        return value
+    quotes: dict[str, Decimal] = {}
+    for entry in text.split(","):
+        symbol, separator, raw_value = entry.partition("=")
+        symbol = symbol.strip()
+        if not separator or not symbol or not raw_value.strip():
+            raise ValueError(f"reference quote entries must be SYMBOL=PRICE, not {entry!r}")
+        try:
+            value = Decimal(raw_value.strip())
+        except ArithmeticError as error:
+            raise ValueError(f"reference quotes must be numbers, not {raw_value!r}") from error
+        if value <= 0:
+            raise ValueError(f"reference quotes must be positive, not {raw_value!r}")
+        if symbol in quotes:
+            raise ValueError(f"reference quote for {symbol!r} appears more than once")
+        quotes[symbol] = value
+    return quotes
+
+
+def assemble_board(
+    sources: StrategySources,
+    listings: Sequence[BoardListing],
+    snapshot_block: int,
+    observed_at: datetime,
+    equity_usd: Decimal | None,
+    reference_prices: Mapping[str, Decimal],
+    reference_age_seconds: int | None,
+    safe_address: str,
+) -> tuple[tuple[PoolBoardOption, ...], Decimal, Decimal | None, tuple[str, ...]]:
+    """Assemble one complete observation per board pool from one snapshot.
+
+    Shared inputs are hoisted and read once - the AERO price at the pinned
+    block, the gas price, the registry state, and the Safe's equity - while
+    per-pool reads (decimals, stock balances) stay per pool. A pool without
+    a fresh injected reference quote still assembles, and its entry gate
+    then blocks fail-closed as reference_stale exactly as shipped.
+
+    Args:
+        sources: The live reads backing every input.
+        listings: The enumerated board listings in deterministic order.
+        snapshot_block: The block pinning the discovery snapshot.
+        observed_at: The assembly instant, timezone-aware.
+        equity_usd: Optional equity override; the default is the Safe's live
+            USDC plus every enumerated stock's value at the snapshot prices.
+        reference_prices: The per-symbol injected real-market quotes.
+        reference_age_seconds: Age of the injected quotes; defaults to zero.
+        safe_address: The Safe whose balances default the equity input.
+
+    Returns:
+        The board options in listing order, the pinned AERO price, the gas
+        price reading (None when unavailable), and the honest input notes.
+    """
+    normalized_usdc = BASE_USDC_ADDRESS.lower()
+    gas_price = sources.gas_price_gwei()
+    registry_paused = sources.registry_paused()
+    aero_price = sources.aero_price(snapshot_block)
+    notes: list[str] = []
+    stock_price_by_token: dict[str, Decimal] = {}
+    stock_decimals_by_token: dict[str, int] = {}
+    for listing in listings:
+        pool = listing.pool
+        stock_token = (
+            pool.token1_address
+            if pool.token0_address.lower() == normalized_usdc
+            else pool.token0_address
+        )
+        stock_is_token0 = pool.token0_address.lower() != normalized_usdc
+        decimals = sources.token_decimals(stock_token)
+        stock_decimals_by_token[stock_token.lower()] = decimals
+        stock_price_by_token[stock_token.lower()] = price_usdc_per_stock(
+            pool.sqrt_ratio, stock_is_token0, decimals, 6
+        )
+    if equity_usd is None:
+        usdc_balance = Decimal(sources.token_balance(BASE_USDC_ADDRESS, safe_address)) / Decimal(
+            10**6
+        )
+        stock_value = Decimal("0")
+        for token, price in stock_price_by_token.items():
+            balance = Decimal(sources.token_balance(token, safe_address)) / Decimal(
+                10 ** stock_decimals_by_token[token]
+            )
+            stock_value += balance * price
+        equity_usd = +(usdc_balance + stock_value)
+        notes.append(
+            f"equity defaulted to the Safe's live {equity_usd} USDC "
+            f"({usdc_balance} USDC plus every enumerated stock valued at the snapshot prices)"
+        )
+    options: list[PoolBoardOption] = []
+    for listing in listings:
+        pool = listing.pool
+        stock_token = (
+            pool.token1_address
+            if pool.token0_address.lower() == normalized_usdc
+            else pool.token0_address
+        )
+        reference = reference_prices.get(listing.symbol)
+        observation, _, _, _ = assemble_observation(
+            sources,
+            listing.symbol,
+            pool,
+            snapshot_block,
+            observed_at,
+            equity_usd,
+            reference,
+            reference_age_seconds if reference is not None else None,
+            safe_address,
+            stock_decimals=stock_decimals_by_token[stock_token.lower()],
+            aero_price=aero_price,
+            gas_price_gwei=gas_price,
+            registry_paused=registry_paused,
+        )
+        options.append(
+            PoolBoardOption(
+                symbol=listing.symbol,
+                pool_address=pool.pool_address,
+                token_address=stock_token,
+                observation=observation,
+            )
+        )
+    if not any(listing.symbol in reference_prices for listing in listings):
+        notes.append(
+            "no live real-market reference quote is wired yet; every entry blocks "
+            "fail-closed as reference_stale unless per-symbol quotes are injected"
+        )
+    notes.append(
+        "fee APR stays zero because a live fee-evidence window needs the "
+        "price-path machinery the rehearsal reconstructs"
+    )
+    notes.append(
+        "oracle staleness is not yet wired live; the oracle-health layer is post-reassessment scope"
+    )
+    return tuple(options), aero_price, gas_price, tuple(notes)
+
+
+def _decision_pool(selection: BoardSelection, listings: Sequence[BoardListing]) -> BoardListing:
+    """Resolve the listing the selection's decision covers.
+
+    Args:
+        selection: The selector's complete verdict.
+        listings: The enumerated board listings in deterministic order.
+
+    Returns:
+        The held, selected, or closest-call listing the report names.
+
+    Raises:
+        ValueError: If no listing matches the selection (unreachable when
+            the board carried at least one listing).
+    """
+    symbol = selection.selected_symbol
+    if symbol is not None:
+        for listing in listings:
+            if listing.symbol == symbol:
+                return listing
+    # Nothing qualified or was selected: name the closest-call pool - the
+    # highest emissions APR on the board, ties lexicographic - so the
+    # report still names a concrete pool, mirroring the cycle's fallback.
+    closest = closest_call_evaluation(selection.evaluations)
+    if closest is not None:
+        for listing in listings:
+            if listing.symbol == closest.symbol:
+                return listing
+    return listings[0]
+
+
+def _decision_observation(
+    selection: BoardSelection, options: Sequence[PoolBoardOption]
+) -> PolicyObservation:
+    """Resolve the observation the selection's decision ran over.
+
+    Args:
+        selection: The selector's complete verdict.
+        options: The assembled board options in listing order.
+
+    Returns:
+        The held or selected pool's observation.
+
+    Raises:
+        ValueError: If no option matches the selection (unreachable when
+            the board carried at least one option).
+    """
+    symbol = selection.selected_symbol
+    if symbol is not None:
+        for option in options:
+            if option.symbol == symbol:
+                return option.observation
+    pool_address = (
+        selection.switch.to_pool_address
+        if selection.switch is not None
+        else next(iter(options)).pool_address
+    )
+    for option in options:
+        if option.pool_address == pool_address:
+            return option.observation
+    return next(iter(options)).observation
+
+
+def run_selection(
+    sources: LiveStrategySources | StrategySources,
+    equity_usd: Decimal | None,
+    reference_prices: Mapping[str, Decimal],
+    reference_age_seconds: int | None,
+    safe_address: str,
+    observed_at: datetime | None = None,
+    switch_margin_fraction: Decimal = DEFAULT_SWITCH_MARGIN_FRACTION,
+    state: PolicyState | None = None,
+    reentry_blocked_until_by_symbol: Mapping[str, datetime] | None = None,
+) -> StrategyDecisionReport:
+    """Run one cross-board selection verdict over every verified pool.
+
+    Args:
+        sources: The live reads backing every input.
+        equity_usd: Optional equity override.
+        reference_prices: The per-symbol injected real-market quotes.
+        reference_age_seconds: Age of the injected quotes.
+        safe_address: The Safe whose balances default the equity input.
+        observed_at: Optional fixed instant for tests; defaults to now.
+        switch_margin_fraction: The relative APR switch margin, as a fraction.
+        state: Optional threaded engine state; a fresh session otherwise.
+        reentry_blocked_until_by_symbol: Optional per-pool re-entry cooldowns.
+
+    Returns:
+        The complete decision report for the selected (or held) pool.
+
+    Raises:
+        ValueError: If the board enumerates no pools or the held state names
+            a pool that is not on the board.
+        ExecutionUnavailableError: If discovery or a read fails.
+    """
+    listings, snapshot_block = sources.enumerate_pools()
+    if not listings:
+        raise ValueError("no verified B20 pools were enumerated for the board")
+    now = observed_at if observed_at is not None else datetime.now(UTC)
+    options, aero_price, gas_price, notes = assemble_board(
+        sources,
+        listings,
+        snapshot_block,
+        now,
+        equity_usd,
+        reference_prices,
+        reference_age_seconds,
+        safe_address,
+    )
+    engine = PolicyEngine(LOCKED_POLICY_PARAMETERS, load_event_calendar())
+    selection = select_board(
+        engine,
+        state if state is not None else PolicyState(),
+        options,
+        reentry_blocked_until_by_symbol or {},
+        switch_margin_fraction,
+    )
+    decision_pool = _decision_pool(selection, listings)
+    decision_observation = _decision_observation(selection, options)
+    window = evaluate_event_window(
+        now,
+        decision_observation.token_address,
+        engine.calendar,
+    )
+    notes = notes + (selection.summary,)
+    return StrategyDecisionReport(
+        symbol=decision_pool.symbol,
+        pool_address=decision_pool.pool.pool_address,
+        snapshot_block=snapshot_block,
+        observed_at=now,
+        amm_price_usdc=decision_observation.amm_price_usdc,
+        emissions_apr=decision_observation.emissions_apr,
+        aero_price_usdc=aero_price,
+        pool_depth_usd=decision_observation.pool_depth_usd,
+        equity_usd=decision_observation.equity_usd,
+        gas_price_gwei=gas_price,
+        reference_price_usdc=reference_prices.get(decision_pool.symbol),
+        event_window=window,
+        outcome=selection.outcome,
+        input_notes=tuple(notes),
+        selector_mode=True,
+        board=selection.evaluations,
+        switch=selection.switch,
+        board_summary=selection.summary,
+    )
+
+
 def _print_report(report: StrategyDecisionReport) -> None:
     """Print one decision report's human summary.
 
@@ -510,10 +937,11 @@ def _print_report(report: StrategyDecisionReport) -> None:
         f"{Decimal(100) * report.emissions_apr:.2f}% (AERO {report.aero_price_usdc:.4f}), "
         f"depth {report.pool_depth_usd} USDC, equity {report.equity_usd} USDC"
     )
-    print(
-        f"event window: {report.event_window.description}"
-        + ("" if not report.event_window.active else " (flat verdict is correct behavior)")
-    )
+    # Since the captain's 2026-09-09 twenty-four-seven ruling the window view
+    # is informational only: continuous DeFi markets never gate on sessions.
+    print(f"event window (informational): {report.event_window.description}")
+    if report.selector_mode:
+        print(f"selector: {report.board_summary}")
     print(f"verdict: {decision.action.value} ({decision.reason.value})")
     for diagnostic in decision.diagnostics:
         print(f"  - {diagnostic}")
@@ -539,7 +967,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "decision-only - nothing is built, signed, or broadcast."
         ),
     )
-    parser.add_argument("--symbol", required=True, help="Registry symbol like AAPLc.")
+    parser.add_argument(
+        "--symbol",
+        default=SELECTOR_SYMBOL,
+        help=(
+            "Registry symbol like AAPLc, or auto (the default) to run the "
+            "cross-board selector over every verified B20 pool."
+        ),
+    )
     parser.add_argument(
         "--equity-usdc",
         type=Decimal,
@@ -551,10 +986,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--reference-price",
-        type=Decimal,
+        type=str,
         default=None,
         help=(
-            "Optional injected real-market quote in USDC per stock; without it "
+            "Optional injected real-market quote in USDC per stock - either "
+            "one price for the pinned symbol or per-symbol SYMBOL=PRICE "
+            "pairs (AAPLc=318.5,FIXc=100) for selector mode; without it "
             "entries block fail-closed as reference_stale because no live "
             "reference feed is wired yet."
         ),
@@ -573,10 +1010,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if arguments.equity_usdc is not None and arguments.equity_usdc <= 0:
         parser.error("--equity-usdc must be positive")
-    if arguments.reference_price is not None and arguments.reference_price <= 0:
-        parser.error("--reference-price must be positive")
     if arguments.reference_age_seconds < 0:
         parser.error("--reference-age-seconds must be non-negative")
+    try:
+        parsed_reference = (
+            parse_reference_quotes(arguments.reference_price)
+            if arguments.reference_price is not None
+            else {}
+        )
+    except (ValueError, ArithmeticError) as error:
+        parser.error(f"--reference-price is invalid: {error}")
+    selector_mode = arguments.symbol.strip().lower() == SELECTOR_SYMBOL
+    single_quote: Decimal | None = None
+    reference_map: dict[str, Decimal] = {}
+    if isinstance(parsed_reference, Decimal):
+        if selector_mode:
+            parser.error(
+                "selector mode needs per-symbol reference quotes: pass "
+                "--reference-price SYMBOL=PRICE pairs"
+            )
+        single_quote = parsed_reference
+    else:
+        reference_map = parsed_reference
+    symbol = None if selector_mode else arguments.symbol.strip()
+    if not selector_mode and (symbol is None or not symbol):
+        parser.error("--symbol must name a registry symbol or auto")
     safe_address = normalize_evm_address(
         os.environ.get(SAFE_ADDRESS_ENV, DEFAULT_CANARY_SAFE_ADDRESS)
     )
@@ -587,13 +1045,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         progress=lambda line: print(line, file=sys.stderr),
     )
     try:
-        report = run_decision(
-            sources,
-            arguments.symbol,
-            arguments.equity_usdc,
-            arguments.reference_price,
-            arguments.reference_age_seconds,
-            safe_address,
+        report = (
+            run_selection(
+                sources,
+                arguments.equity_usdc,
+                reference_map,
+                arguments.reference_age_seconds,
+                safe_address,
+            )
+            if selector_mode
+            else run_decision(
+                sources,
+                symbol or "",
+                arguments.equity_usdc,
+                single_quote,
+                arguments.reference_age_seconds,
+                safe_address,
+            )
         )
     except (ExecutionUnavailableError, ValueError) as error:
         print(f"decision unavailable: {error}", file=sys.stderr)

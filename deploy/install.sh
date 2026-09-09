@@ -127,8 +127,19 @@ AERO_BOT_CYCLE_STATE_PATH=/var/lib/aero-bot/cycle_state.json
 AERO_BOT_BASE_RPC_URL=https://base.publicnode.com
 # The injected real-market reference quote, in USDC per share. The operator
 # owns its freshness honestly: an open position defensively exits without a
-# quote, and a stale constant is a stale quote.
+# quote, and a stale constant is a stale quote. Pinned cycles take one bare
+# number; selector mode takes per-symbol SYMBOL=PRICE pairs.
 #AERO_BOT_CYCLE_REFERENCE_PRICE_USDC=318.5
+#AERO_BOT_CYCLE_REFERENCE_PRICE_USDC=AAPLc=318.5,FIXc=100
+# The cycle's symbol scope: unset or "auto" runs the cross-board selector
+# over every verified B20 pool (the default); an explicit symbol pins one
+# pool for operator runs. The systemd template's instance name (--symbol %i)
+# feeds the same resolution, so aero-bot-cycle@auto.timer selects too.
+#AERO_BOT_CYCLE_SYMBOL=auto
+# The cross-board switch margin: another pool must beat the held pool's
+# qualifying emissions APR by more than this fraction before a switch fires
+# (default 0.30, the captain's 2026-09-09 trial ruling).
+#AERO_BOT_CYCLE_SWITCH_MARGIN_FRACTION=0.30
 # Email alerts (see docs/alerts.md); provider none stays silent.
 #AERO_BOT_ALERT_PROVIDER=smtp
 #AERO_BOT_ALERT_FROM=aero-bot@example.com

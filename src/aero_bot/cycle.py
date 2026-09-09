@@ -1,7 +1,8 @@
 """One scheduled decision cycle: reconcile, decide, act within the locked caps.
 
-The ``aero-bot-cycle`` command runs exactly one decision cycle for one
-registry symbol and exits - the systemd timer (not an in-process scheduler)
+The ``aero-bot-cycle`` command runs exactly one decision cycle - for one
+pinned registry symbol, or for the whole verified B20 board in selector
+mode - and exits - the systemd timer (not an in-process scheduler)
 decides when cycles happen. One cycle, in fixed order:
 
 1. **Reconcile first.** The Safe's live USDC, stock, and relayer-ETH
@@ -15,8 +16,11 @@ decides when cycles happen. One cycle, in fixed order:
 2. **Decide.** The complete locked policy engine runs over one live
    observation assembled exactly like ``aero-bot-decide``, threading the
    reconciled policy state (open position, held inventory, cooldowns, the
-   daily-loss anchor). Flat verdicts inside closed-market windows are the
-   doctrine working, not failures.
+   daily-loss anchor). Selector mode evaluates every verified B20 pool
+   through the complete entry gate chain and selects the best-qualifying
+   pool by qualifying emissions APR under the captain's 2026-09-09
+   cross-board ruling; market windows no longer gate entries since the
+   same date's twenty-four-seven ruling.
 3. **Act.** Only when the policy authorizes an action does the cycle execute
    it, and only through the proven audited executor surfaces (mint, stake,
    unstake, withdraw, exit swap) inside the existing caps and refusal
@@ -41,7 +45,7 @@ from pathlib import Path
 from typing import Annotated, Protocol
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from aero_bot.audit import AuditEventType, AuditRecord, AuditStore
 from aero_bot.config import Settings
@@ -76,7 +80,23 @@ from aero_bot.policy import (
     evaluate_event_window,
     load_event_calendar,
 )
-from aero_bot.strategy import StrategyDecisionReport, StrategySources, assemble_observation
+from aero_bot.selector import (
+    DEFAULT_SWITCH_MARGIN_FRACTION,
+    BoardSelection,
+    PoolBoardOption,
+    SwitchDirective,
+    closest_call_evaluation,
+    select_board,
+)
+from aero_bot.strategy import (
+    SELECTOR_SYMBOL,
+    BoardListing,
+    StrategyDecisionReport,
+    StrategySources,
+    assemble_board,
+    assemble_observation,
+    parse_reference_quotes,
+)
 from aero_bot.venues import BASE_USDC_ADDRESS, PoolCandidate
 
 # Environment variable carrying an explicit cycle-state path override.
@@ -85,6 +105,13 @@ CYCLE_STATE_PATH_ENV = "AERO_BOT_CYCLE_STATE_PATH"
 CYCLE_REFERENCE_PRICE_ENV = "AERO_BOT_CYCLE_REFERENCE_PRICE_USDC"
 # Environment variable carrying the relayer's public address for dry runs.
 RELAYER_ADDRESS_ENV = "AERO_BOT_RELAYER_ADDRESS"
+# Environment variable optionally pinning one registry symbol for the cycle.
+# Unset or "auto" runs the cross-board selector (the default); an explicit
+# symbol pins one pool for operator runs.
+CYCLE_SYMBOL_ENV = "AERO_BOT_CYCLE_SYMBOL"
+# Environment variable carrying the cross-board switch margin as a fraction
+# (default 0.30, the captain's 2026-09-09 trial ruling).
+CYCLE_SWITCH_MARGIN_ENV = "AERO_BOT_CYCLE_SWITCH_MARGIN_FRACTION"
 # The policy day boundary follows the engine's America/New_York convention.
 POLICY_TIMEZONE = ZoneInfo("America/New_York")
 
@@ -144,6 +171,18 @@ class HeldInventoryRecord(BaseModel):
     held_since: datetime
 
 
+class ReentryCooldown(BaseModel):
+    """Carry one pool's re-entry cooldown from a stop or dilution exit."""
+
+    # Frozen strict fields keep one cooldown record coherent.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The registry-matched stock symbol the cooldown applies to.
+    symbol: str
+    # Re-entry into this pool stays blocked until this instant.
+    blocked_until: datetime
+
+
 class CycleStateBook(BaseModel):
     """Carry every engine-owned fact the next cycle must thread forward."""
 
@@ -151,8 +190,9 @@ class CycleStateBook(BaseModel):
     position: TrackedPosition | None = None
     # Stock held unsold after a stale-low burn, or None.
     held_inventory: HeldInventoryRecord | None = None
-    # Re-entry stays blocked until this instant after stop or dilution exits.
-    reentry_blocked_until: datetime | None = None
+    # Re-entry cooldowns, one per pool: an exit from one pool never blocks
+    # another pool's entry (the captain's 2026-09-09 cross-board ruling).
+    reentry_cooldowns: tuple[ReentryCooldown, ...] = ()
     # The America/New_York day the day-start equity anchor belongs to.
     day: date | None = None
     # Day-start equity anchors the five-percent daily loss halt.
@@ -161,6 +201,31 @@ class CycleStateBook(BaseModel):
     halted_day: date | None = None
     # When this book was last persisted, timezone-aware.
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @model_validator(mode="before")
+    @classmethod
+    def fold_legacy_cooldown(cls, data: object) -> object:
+        """Fold a legacy single-pool cooldown field into the per-pool map.
+
+        Books persisted before the cross-board ruling carried one global
+        ``reentry_blocked_until``; the upgrade applies it to the tracked
+        position's pool when one exists and drops it otherwise.
+
+        Args:
+            data: Raw model input mapping or value.
+
+        Returns:
+            Input with the legacy field folded into ``reentry_cooldowns``.
+        """
+        if not isinstance(data, dict) or "reentry_cooldowns" in data:
+            return data
+        legacy = data.get("reentry_blocked_until")
+        tracked = data.get("position")
+        symbol = tracked.get("symbol") if isinstance(tracked, dict) else None
+        if legacy is not None and isinstance(symbol, str):
+            data = {key: value for key, value in data.items() if key != "reentry_blocked_until"}
+            data["reentry_cooldowns"] = [{"symbol": symbol, "blocked_until": legacy}]
+        return data
 
 
 class CycleStateStore:
@@ -282,6 +347,9 @@ class CycleReconciliation(BaseModel):
     tracked_staked: bool = False
     # The held-inventory quantity in whole stock tokens, zero when none.
     held_stock_quantity: Annotated[Decimal, Field(ge=0)] = Decimal("0")
+    # The symbol whose stock balance held_stock_quantity measures; None
+    # when no stock is held or the balance is not one pool's inventory.
+    held_symbol: str | None = None
     # Nonempty when an out-of-band condition refuses the whole cycle.
     out_of_band: str = ""
     # Human-readable evidence lines covering the reconciliation.
@@ -535,12 +603,54 @@ def _price_at_tick(tick: int) -> Decimal:
         return +(TICK_PRICE_RATIO**tick)
 
 
+def _cooldown_until(book: CycleStateBook, symbol: str) -> datetime | None:
+    """Read one pool's re-entry cooldown from the book.
+
+    Args:
+        book: The persisted cycle book.
+        symbol: The registry-matched stock symbol being looked up.
+
+    Returns:
+        The pool's blocked-until instant, or None when clear.
+    """
+    for cooldown in book.reentry_cooldowns:
+        if cooldown.symbol.lower() == symbol.lower():
+            return cooldown.blocked_until
+    return None
+
+
+def _book_with_cooldowns(
+    book: CycleStateBook, updates: Mapping[str, datetime | None]
+) -> CycleStateBook:
+    """Merge per-pool cooldown updates into the book.
+
+    A None update clears its pool's cooldown; pools not named keep theirs.
+
+    Args:
+        book: The book being updated.
+        updates: The per-symbol blocked-until instants to merge.
+
+    Returns:
+        The book carrying the merged cooldown map.
+    """
+    lowered = {symbol.lower(): until for symbol, until in updates.items()}
+    kept = tuple(
+        cooldown for cooldown in book.reentry_cooldowns if cooldown.symbol.lower() not in lowered
+    )
+    fresh = tuple(
+        ReentryCooldown(symbol=symbol, blocked_until=until)
+        for symbol, until in lowered.items()
+        if until is not None
+    )
+    return book.model_copy(update={"reentry_cooldowns": kept + fresh})
+
+
 class CycleRunner:
     """Run one complete reconcile-decide-act cycle."""
 
     def __init__(
         self,
-        symbol: str,
+        symbol: str | None,
         safe_address: str,
         relayer_address: str | None,
         reads: CycleReadBoundary,
@@ -551,11 +661,13 @@ class CycleRunner:
         audit_sink: AuditStore | None,
         state_store: CycleStateStore,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        switch_margin_fraction: Decimal = DEFAULT_SWITCH_MARGIN_FRACTION,
     ) -> None:
         """Configure one cycle runner over every injectable boundary.
 
         Args:
-            symbol: The registry-matched symbol this cycle manages.
+            symbol: The registry-matched symbol this cycle manages, or None
+                to run the cross-board selector over every verified pool.
             safe_address: The Safe whose positions and balances reconcile.
             relayer_address: The relaying EOA's public address for balance
                 reads; None leaves the relayer ETH read unreported.
@@ -568,8 +680,10 @@ class CycleRunner:
             audit_sink: The store receiving the cycle-summary audit record.
             state_store: The self-healing cycle-book store.
             now: Injected clock producing timezone-aware instants.
+            switch_margin_fraction: The relative APR margin another pool
+                must beat the held pool by before a switch fires.
         """
-        self._symbol = symbol
+        self._symbol = symbol.strip() if symbol is not None else None
         self._safe_address = normalize_evm_address(safe_address)
         self._relayer_address = normalize_evm_address(relayer_address) if relayer_address else None
         self._reads = reads
@@ -580,7 +694,41 @@ class CycleRunner:
         self._audit_sink = audit_sink
         self._state_store = state_store
         self._now = now
+        self._switch_margin_fraction = switch_margin_fraction
         self._last_reconciliation: CycleReconciliation | None = None
+        # One cycle process enumerates the board at most once; reconcile and
+        # decide share the cached listing and its snapshot block.
+        self._board: tuple[BoardListing, ...] | None = None
+        self._board_block: int | None = None
+
+    @property
+    def selector_mode(self) -> bool:
+        """Return whether this runner selects across the whole B20 board."""
+        return self._symbol is None
+
+    def _ensure_board(self) -> None:
+        """Enumerate the verified board once per runner unless cached.
+
+        Raises:
+            ExecutionUnavailableError: If discovery cannot complete or does
+                not verify.
+        """
+        if self._board is None or self._board_block is None:
+            self._board, self._board_block = self._sources.enumerate_pools()
+
+    def _board_listings(self) -> tuple[BoardListing, ...]:
+        """Enumerate the verified board once per runner, cached.
+
+        Returns:
+            Every registry-symbolled verified pool, ordered by symbol.
+
+        Raises:
+            ExecutionUnavailableError: If discovery cannot complete or does
+                not verify.
+        """
+        self._ensure_board()
+        assert self._board is not None  # noqa: S101 - populated by _ensure_board
+        return self._board
 
     def run(
         self,
@@ -588,6 +736,7 @@ class CycleRunner:
         key_bytes: bytes | None = None,
         reference_price_usdc: Decimal | None = None,
         reference_age_seconds: int | None = None,
+        reference_prices_by_symbol: Mapping[str, Decimal] | None = None,
     ) -> CycleReport:
         """Run one complete cycle.
 
@@ -595,8 +744,11 @@ class CycleRunner:
             mode: Dry runs decide without acting; live cycles may broadcast.
             key_bytes: The signing key for live cycles; loaded by the caller
                 from the sealed source and never persisted here.
-            reference_price_usdc: Optional injected real-market quote.
+            reference_price_usdc: Optional injected real-market quote for the
+                pinned symbol.
             reference_age_seconds: Age of the injected quote.
+            reference_prices_by_symbol: Optional per-symbol injected quotes;
+                selector mode consumes these and ignores the single quote.
 
         Returns:
             The complete structured cycle report.
@@ -614,6 +766,8 @@ class CycleRunner:
         # only an absent quote leaves the reference unset.
         if reference_price_usdc is not None and reference_age_seconds is None:
             reference_age_seconds = 0
+        if reference_prices_by_symbol and reference_age_seconds is None:
+            reference_age_seconds = 0
         decision_report: StrategyDecisionReport | None = None
         actions: list[CycleActionRecord] = []
         halted_reason = ""
@@ -621,17 +775,27 @@ class CycleRunner:
             halted_reason = reconciliation.out_of_band
         else:
             book = self._adopt_into_book(book, reconciliation)
-            decision_report = self._decide(book, reference_price_usdc, reference_age_seconds)
+            decision_report = self._decide(
+                book,
+                reference_price_usdc,
+                reference_age_seconds,
+                reference_prices_by_symbol or {},
+            )
             outcome = decision_report.outcome
             if mode is CycleMode.LIVE and outcome.decision.action is not PolicyActionKind.HOLD:
                 if self._executor is None or key_bytes is None:
                     raise ValueError("a live cycle requires its signing key and executor")
-                actions, halted_reason, book = self._act(book, outcome, key_bytes)
+                actions, halted_reason, book = self._act(
+                    book, outcome, key_bytes, decision_report.symbol, decision_report.switch
+                )
             final_reconciliation = self._reconcile(book)
             self._last_reconciliation = final_reconciliation
             if not final_reconciliation.out_of_band:
                 book = self._rebuild_book(
-                    book, final_reconciliation, decision_report.outcome.next_state
+                    book,
+                    final_reconciliation,
+                    decision_report.outcome.next_state,
+                    decision_report.symbol,
                 )
             elif not halted_reason:
                 halted_reason = final_reconciliation.out_of_band
@@ -647,6 +811,30 @@ class CycleRunner:
     # Reconciliation
     # ------------------------------------------------------------------
 
+    def _reconcile_symbol(self, book: CycleStateBook) -> str:
+        """Resolve the symbol this reconciliation anchors its reads on.
+
+        Pinned cycles always anchor on the pinned symbol. Selector cycles
+        anchor on the tracked position's symbol, then the held inventory's,
+        and finally on the deterministic first board listing so a flat cycle
+        still enumerates the Safe's NFPM inventory through a concrete pool.
+
+        Args:
+            book: The persisted book whose tracked state names the anchor.
+
+        Returns:
+            The anchor symbol, or the selector's reserved name when the
+            board enumerated nothing.
+        """
+        if self._symbol is not None:
+            return self._symbol
+        if book.position is not None:
+            return book.position.symbol
+        if book.held_inventory is not None:
+            return book.held_inventory.symbol
+        listings = self._board_listings()
+        return listings[0].symbol if listings else SELECTOR_SYMBOL
+
     def _reconcile(self, book: CycleStateBook) -> CycleReconciliation:
         """Read the complete on-chain state one cycle acts on.
 
@@ -658,7 +846,7 @@ class CycleRunner:
 
         Raises:
             ExecutionUnavailableError: If a live read cannot complete.
-            ValueError: If the symbol resolves to nothing.
+            ValueError: If the anchor symbol resolves to nothing.
         """
         diagnostics: list[str] = []
         safe_usdc = self._balances.fetch_token_balance(BASE_USDC_ADDRESS, self._safe_address)
@@ -669,8 +857,15 @@ class CycleRunner:
         )
         if self._relayer_address is None:
             diagnostics.append("relayer ETH unread: no relayer address configured for this run")
-        inventory = self._reads.safe_position_inventory(self._symbol)
-        live_ids = tuple(position.token_id for position in inventory.live_positions)
+        anchor = self._reconcile_symbol(book)
+        empty_count = 0
+        if anchor == SELECTOR_SYMBOL:
+            live_ids: tuple[int, ...] = ()
+            diagnostics.append("the board enumerated no verified pools; no inventory read ran")
+        else:
+            inventory = self._reads.safe_position_inventory(anchor)
+            live_ids = tuple(position.token_id for position in inventory.live_positions)
+            empty_count = inventory.empty_count
         tracked_status: LpPositionStatusReport | None = None
         tracked_token_id: int | None = None
         tracked_staked = False
@@ -678,7 +873,7 @@ class CycleRunner:
         tracked = book.position
         if tracked is not None:
             tracked_status = self._reads.position_status(
-                self._symbol, tracked.token_id, entry_cost_usdc=tracked.committed_usd
+                tracked.symbol, tracked.token_id, entry_cost_usdc=tracked.committed_usd
             )
             owner = normalize_evm_address(tracked_status.token_owner_address)
             gauge = normalize_evm_address(tracked_status.gauge_address)
@@ -715,22 +910,58 @@ class CycleRunner:
                     f"adopting live position {adopted} proven ours by the audit chain's "
                     "confirmed mint evidence"
                 )
-        stock_address = self._stock_token_address()
-        stock_units = self._balances.fetch_token_balance(stock_address, self._safe_address)
-        stock_decimals = self._sources.token_decimals(stock_address)
-        held_quantity = Decimal(stock_units).scaleb(-stock_decimals)
-        if (
-            book.held_inventory is None
-            and held_quantity > 0
-            and tracked_token_id is None
-            and not out_of_band
-        ):
-            diagnostics.append(
-                f"adopting unrecorded stock balance {held_quantity} as held inventory; "
-                "the policy's convergence machinery will unwind it"
-            )
-        if book.held_inventory is not None and held_quantity == 0 and tracked_token_id is None:
-            diagnostics.append("recorded held inventory no longer exists on-chain; clearing")
+        # The stock sweep finds stray stock the book does not record: pinned
+        # cycles read the one anchor token, selector cycles sweep every board
+        # token so unsold stock in any pool is adopted with its own symbol.
+        stock_units = 0
+        held_quantity = Decimal("0")
+        held_symbol: str | None = None
+        stray_stocks: list[tuple[str, str, int]] = []
+        if book.held_inventory is not None:
+            held_token = book.held_inventory.token_address
+            held_units = self._balances.fetch_token_balance(held_token, self._safe_address)
+            held_quantity = Decimal(held_units).scaleb(-self._sources.token_decimals(held_token))
+            stock_units = held_units
+            held_symbol = book.held_inventory.symbol
+            if held_quantity == 0 and tracked_token_id is None:
+                diagnostics.append("recorded held inventory no longer exists on-chain; clearing")
+        elif self.selector_mode and book.position is None:
+            for listing in self._board_listings():
+                token = self._stock_token_of_pool(listing.pool)
+                units = self._balances.fetch_token_balance(token, self._safe_address)
+                if units > 0:
+                    stray_stocks.append((listing.symbol, token, units))
+        elif anchor != SELECTOR_SYMBOL:
+            stock_address = self._stock_token_address_for(anchor)
+            stock_units = self._balances.fetch_token_balance(stock_address, self._safe_address)
+            if stock_units > 0:
+                stray_stocks.append((anchor, stock_address, stock_units))
+        stray = stray_stocks[0] if len(stray_stocks) == 1 else None
+        if len(stray_stocks) > 1:
+            if not out_of_band:
+                out_of_band = (
+                    "the Safe holds unrecorded stock in multiple pools ("
+                    + ", ".join(symbol for symbol, _, _ in stray_stocks)
+                    + "); refusing the cycle until reconciled"
+                )
+        elif stray is not None and not out_of_band:
+            stray_symbol, stray_token, stray_units = stray
+            stray_quantity = Decimal(stray_units).scaleb(-self._sources.token_decimals(stray_token))
+            if tracked_token_id is None and book.held_inventory is None:
+                held_quantity = stray_quantity
+                held_symbol = stray_symbol
+                stock_units = stray_units
+                diagnostics.append(
+                    f"adopting unrecorded {stray_symbol} stock balance "
+                    f"{stray_quantity} as held inventory; the policy's convergence "
+                    "machinery will unwind it"
+                )
+            else:
+                stock_units = stray_units
+                diagnostics.append(
+                    f"Safe holds {stray_quantity} {stray_symbol} stock beside the "
+                    "tracked position; the exit swap will convert it"
+                )
         diagnostics.append(
             f"Safe holds {Decimal(safe_usdc).scaleb(-6)} USDC"
             + (
@@ -741,30 +972,72 @@ class CycleRunner:
             + f", Safe holds {held_quantity} stock"
         )
         return CycleReconciliation(
-            symbol=self._symbol,
+            symbol=anchor,
             safe_usdc_units=safe_usdc,
             relayer_eth_wei=relayer_eth,
             safe_stock_units=stock_units,
             inventory_live_token_ids=live_ids,
-            inventory_empty_count=inventory.empty_count,
+            inventory_empty_count=empty_count,
             tracked_status=tracked_status,
             tracked_token_id=tracked_token_id,
             tracked_staked=tracked_staked,
             held_stock_quantity=held_quantity,
+            held_symbol=held_symbol,
             out_of_band=out_of_band,
             diagnostics=tuple(diagnostics),
         )
 
-    def _stock_token_address(self) -> str:
-        """Resolve the cycle symbol's stock token address from the registry."""
-        token = self._sources.symbol_address(self._symbol)
+    def _stock_token_address_for(self, symbol: str) -> str:
+        """Resolve one symbol's stock token address from the registry.
+
+        Args:
+            symbol: The registry-matched stock symbol.
+
+        Returns:
+            The B20 contract address for that symbol.
+
+        Raises:
+            ValueError: If the symbol is outside the official registry.
+        """
+        token = self._sources.symbol_address(symbol)
         if token is None:
-            raise ValueError(f"symbol {self._symbol!r} is not in the official B20 registry")
+            raise ValueError(f"symbol {symbol!r} is not in the official B20 registry")
         return token
 
-    def _resolved_pool(self) -> PoolCandidate:
-        """Resolve the cycle symbol's live pool through the decision sources."""
-        pool, _ = self._sources.resolve_pool(self._symbol)
+    def _stock_token_of_pool(self, pool: PoolCandidate) -> str:
+        """Read one pool's non-USDC side, the B20 stock token.
+
+        Args:
+            pool: The verified pool whose stock side is needed.
+
+        Returns:
+            The stock token contract address.
+        """
+        normalized_usdc = BASE_USDC_ADDRESS.lower()
+        return (
+            pool.token1_address
+            if pool.token0_address.lower() == normalized_usdc
+            else pool.token0_address
+        )
+
+    def _pool_for_symbol(self, symbol: str) -> PoolCandidate:
+        """Resolve one symbol's live pool through the cached board or sources.
+
+        Selector cycles serve the decision symbol straight from the cached
+        board listing (the same snapshot the decision ran over); pinned
+        cycles resolve through the known-pool fast path as before.
+
+        Args:
+            symbol: The registry-matched stock symbol.
+
+        Returns:
+            The symbol's verified pool candidate.
+        """
+        if self._board is not None:
+            for listing in self._board:
+                if listing.symbol.lower() == symbol.lower():
+                    return listing.pool
+        pool, _ = self._sources.resolve_pool(symbol)
         return pool
 
     def _adoption_evidence(self, live_ids: tuple[int, ...]) -> int | None:
@@ -812,11 +1085,20 @@ class CycleRunner:
             and not reconciliation.out_of_band
         ):
             status = reconciliation.tracked_status
-            pool = status.pool_address if status is not None else self._resolved_pool().pool_address
-            committed = self._last_mint_budget()
+            committed, planned_symbol = self._last_mint_plan()
+            adopted_symbol = planned_symbol or (
+                self._symbol if self._symbol is not None else reconciliation.symbol
+            )
+            if adopted_symbol == SELECTOR_SYMBOL:
+                adopted_symbol = reconciliation.symbol
+            pool = (
+                status.pool_address
+                if status is not None
+                else self._pool_for_symbol(adopted_symbol).pool_address
+            )
             if committed is not None:
                 updates["position"] = TrackedPosition(
-                    symbol=self._symbol,
+                    symbol=adopted_symbol,
                     token_id=reconciliation.tracked_token_id,
                     pool_address=pool,
                     committed_usd=committed,
@@ -825,12 +1107,13 @@ class CycleRunner:
         if (
             book.held_inventory is None
             and reconciliation.held_stock_quantity > 0
+            and reconciliation.held_symbol is not None
             and reconciliation.tracked_token_id is None
             and not reconciliation.out_of_band
         ):
             updates["held_inventory"] = HeldInventoryRecord(
-                symbol=self._symbol,
-                token_address=self._stock_token_address(),
+                symbol=reconciliation.held_symbol,
+                token_address=self._stock_token_address_for(reconciliation.held_symbol),
                 stock_quantity=reconciliation.held_stock_quantity,
                 held_since=self._now(),
             )
@@ -838,18 +1121,24 @@ class CycleRunner:
             return book
         return book.model_copy(update=updates)
 
-    def _last_mint_budget(self) -> Decimal | None:
-        """Read the newest audited mint budget, the adoption cost basis."""
+    def _last_mint_plan(self) -> tuple[Decimal | None, str | None]:
+        """Read the newest audited mint plan, the adoption cost basis.
+
+        Returns:
+            The newest mint budget (or None) and the symbol that plan named
+            (or None when the record carries no symbol).
+        """
         if self._audit_reader is None:
-            return None
+            return None, None
         for record in reversed(self._audit_reader.recent_records()):
             if record.event_type is not AuditEventType.LP_MINT_PLANNED:
                 continue
             payload = json.loads(record.payload_json)
             budget = payload.get("budget_usdc")
+            symbol = payload.get("symbol")
             if isinstance(budget, str) and Decimal(budget) > 0:
-                return Decimal(budget)
-        return None
+                return Decimal(budget), symbol if isinstance(symbol, str) else None
+        return None, None
 
     # ------------------------------------------------------------------
     # Decision
@@ -864,7 +1153,7 @@ class CycleRunner:
             status = reconciliation.tracked_status
             position = PolicyPosition(
                 pool_address=status.pool_address,
-                token_address=self._stock_token_address(),
+                token_address=self._stock_token_address_for(book.position.symbol),
                 price_range=AlignedPriceRange(
                     lower_tick=status.position.tick_lower,
                     upper_tick=status.position.tick_upper,
@@ -877,7 +1166,7 @@ class CycleRunner:
         held: HeldInventory | None = None
         if book.held_inventory is not None:
             held = HeldInventory(
-                pool_address=self._resolved_pool().pool_address,
+                pool_address=self._pool_for_symbol(book.held_inventory.symbol).pool_address,
                 token_address=book.held_inventory.token_address,
                 stock_quantity=book.held_inventory.stock_quantity,
                 held_since=book.held_inventory.held_since,
@@ -892,32 +1181,56 @@ class CycleRunner:
             halted_day=book.halted_day,
             position=position,
             held_inventory=held,
-            reentry_blocked_until=book.reentry_blocked_until,
+            reentry_blocked_until=None,
         )
+
+    def _cooldown_map(self, book: CycleStateBook) -> dict[str, datetime]:
+        """Read the book's per-pool re-entry cooldowns as a mapping.
+
+        Args:
+            book: The persisted cycle book.
+
+        Returns:
+            Every pool's blocked-until instant keyed by symbol.
+        """
+        return {cooldown.symbol: cooldown.blocked_until for cooldown in book.reentry_cooldowns}
 
     def _decide(
         self,
         book: CycleStateBook,
         reference_price_usdc: Decimal | None,
         reference_age_seconds: int | None,
+        reference_prices_by_symbol: Mapping[str, Decimal],
     ) -> StrategyDecisionReport:
         """Run the complete locked engine over one live observation.
 
+        Pinned cycles decide one symbol's observation exactly as before;
+        selector cycles hand the whole enumerated board to the cross-board
+        selector, whose verdict this same report shape carries.
+
         Args:
             book: The reconciled book threading the engine state.
-            reference_price_usdc: Optional injected real-market quote.
+            reference_price_usdc: Optional injected real-market quote for
+                the pinned symbol.
             reference_age_seconds: Age of the injected quote.
+            reference_prices_by_symbol: Per-symbol injected quotes for
+                selector mode; the pinned quote is ignored there.
 
         Returns:
             The complete decision report with its typed outcome.
 
         Raises:
             ExecutionUnavailableError: If discovery or a read fails.
-            ValueError: If the symbol resolves to no pool.
+            ValueError: If the symbol resolves to no pool, or the selector's
+                board enumerates nothing.
         """
-        pool, snapshot_block = self._sources.resolve_pool(self._symbol)
         assert self._last_reconciliation is not None  # noqa: S101 - set by run()
-        state = self._policy_state(book, self._last_reconciliation)
+        if self._symbol is None:
+            return self._decide_selector(book, reference_prices_by_symbol, reference_age_seconds)
+        pool, snapshot_block = self._sources.resolve_pool(self._symbol)
+        state = self._policy_state(book, self._last_reconciliation).model_copy(
+            update={"reentry_blocked_until": _cooldown_until(book, self._symbol)}
+        )
         observation, _, aero_price, notes = assemble_observation(
             self._sources,
             self._symbol,
@@ -951,12 +1264,118 @@ class CycleRunner:
             input_notes=notes,
         )
 
+    def _decide_selector(
+        self,
+        book: CycleStateBook,
+        reference_prices_by_symbol: Mapping[str, Decimal],
+        reference_age_seconds: int | None,
+    ) -> StrategyDecisionReport:
+        """Run the cross-board selector over every verified B20 pool.
+
+        Args:
+            book: The reconciled book threading the engine state.
+            reference_prices_by_symbol: Per-symbol injected real-market
+                quotes; pools without one block fail-closed as usual.
+            reference_age_seconds: Age of the injected quotes.
+
+        Returns:
+            The complete decision report for the selected or held pool.
+
+        Raises:
+            ExecutionUnavailableError: If discovery or a read fails.
+            ValueError: If the board enumerates nothing.
+        """
+        assert self._last_reconciliation is not None  # noqa: S101 - set by run()
+        self._ensure_board()
+        listings = self._board or ()
+        snapshot_block = self._board_block
+        if not listings or snapshot_block is None:
+            raise ValueError("no verified B20 pools were enumerated for the board")
+        options, aero_price, gas_price, notes = assemble_board(
+            self._sources,
+            listings,
+            snapshot_block,
+            self._now(),
+            None,
+            reference_prices_by_symbol,
+            reference_age_seconds,
+            self._safe_address,
+        )
+        engine = PolicyEngine(LOCKED_POLICY_PARAMETERS, load_event_calendar())
+        selection = select_board(
+            engine,
+            self._policy_state(book, self._last_reconciliation),
+            options,
+            self._cooldown_map(book),
+            self._switch_margin_fraction,
+        )
+        decision_option = self._option_for_selection(selection, options)
+        window = evaluate_event_window(self._now(), decision_option.token_address, engine.calendar)
+        switch = selection.switch
+        return StrategyDecisionReport(
+            symbol=decision_option.symbol,
+            pool_address=decision_option.pool_address,
+            snapshot_block=snapshot_block,
+            observed_at=self._now(),
+            amm_price_usdc=decision_option.observation.amm_price_usdc,
+            emissions_apr=decision_option.observation.emissions_apr,
+            aero_price_usdc=aero_price,
+            pool_depth_usd=decision_option.observation.pool_depth_usd,
+            equity_usd=decision_option.observation.equity_usd,
+            gas_price_gwei=gas_price,
+            reference_price_usdc=reference_prices_by_symbol.get(decision_option.symbol),
+            event_window=window,
+            outcome=selection.outcome,
+            input_notes=notes + (selection.summary,),
+            selector_mode=True,
+            board=selection.evaluations,
+            switch=switch,
+            board_summary=selection.summary,
+        )
+
+    def _option_for_selection(
+        self, selection: "BoardSelection", options: tuple[PoolBoardOption, ...]
+    ) -> PoolBoardOption:
+        """Resolve the board option the selection's decision covers.
+
+        Args:
+            selection: The selector's complete verdict.
+            options: The assembled board options in listing order.
+
+        Returns:
+            The held, selected, or closest-call option; the report names its
+            pool, mirroring the decide surface's fallback.
+        """
+        symbol = selection.selected_symbol
+        if symbol is not None:
+            for option in options:
+                if option.symbol == symbol:
+                    return option
+        if selection.switch is not None:
+            for option in options:
+                if option.pool_address == selection.switch.to_pool_address:
+                    return option
+        # Nothing qualified: name the closest-call pool - the highest
+        # emissions APR on the board, ties lexicographic - so both surfaces
+        # report the same pool for the same board.
+        closest = closest_call_evaluation(selection.evaluations)
+        if closest is not None:
+            for option in options:
+                if option.symbol == closest.symbol:
+                    return option
+        return options[0]
+
     # ------------------------------------------------------------------
     # Action
     # ------------------------------------------------------------------
 
-    def _act(  # noqa: PLR0915 - one fixed policy mapping, explicit branches
-        self, book: CycleStateBook, outcome: PolicyOutcome, key_bytes: bytes
+    def _act(  # noqa: PLR0915, PLR0912 - one fixed policy mapping, explicit branches
+        self,
+        book: CycleStateBook,
+        outcome: PolicyOutcome,
+        key_bytes: bytes,
+        decision_symbol: str,
+        switch: SwitchDirective | None = None,
     ) -> tuple[list[CycleActionRecord], str, CycleStateBook]:
         """Execute the policy-authorized action through audited surfaces."""
         executor = self._executor
@@ -965,7 +1384,7 @@ class CycleRunner:
         action = decision.action
         records: list[CycleActionRecord] = []
         halted = ""
-        symbol = self._symbol
+        tracked_symbol = book.position.symbol if book.position is not None else None
 
         def run(name: str, call: Callable[[], LpActionExecutionReport]) -> bool:
             """Run one audited action, recording its outcome.
@@ -1014,7 +1433,7 @@ class CycleRunner:
                 halted = "the engine authorized an entry while a position is tracked"
                 return records, halted, book
             size = decision.size_usd
-            width = self._width_from_range(decision.price_range)
+            width = self._width_from_range(decision.price_range, decision_symbol)
             if size is None or size <= 0 or width is None:
                 halted = "the enter decision carried no positive size or tick-aligned width"
                 return records, halted, book
@@ -1023,7 +1442,7 @@ class CycleRunner:
             if not run(
                 "mint",
                 lambda: executor.execute_mint(
-                    symbol, budget, mint_width, key_bytes, confirm_broadcast=True
+                    decision_symbol, budget, mint_width, key_bytes, confirm_broadcast=True
                 ),
             ):
                 return records, halted, book
@@ -1035,11 +1454,62 @@ class CycleRunner:
             if not run(
                 "stake",
                 lambda: executor.execute_stake(
-                    symbol, minted_id, key_bytes, confirm_broadcast=True
+                    decision_symbol, minted_id, key_bytes, confirm_broadcast=True
                 ),
             ):
                 return records, halted, book
-            return records, halted, self._book_with_position(book, minted_id, budget)
+            return (
+                records,
+                halted,
+                self._book_with_position(book, decision_symbol, minted_id, budget),
+            )
+
+        if action is PolicyActionKind.POOL_SWITCH:
+            # A qualified cross-pool switch: exit the tracked position first,
+            # then mint and stake the better pool - one position at every
+            # intermediate instant, and a failed exit halts before any entry.
+            if switch is None:
+                halted = "the pool switch carried no qualified directive"
+                return records, halted, book
+            if book.position is None or tracked_symbol is None:
+                halted = "the selector authorized a switch while flat"
+                return records, halted, book
+            if not self._exit_position(executor, book, key_bytes, run):
+                return records, halted, book
+            switched_book = book.model_copy(update={"position": None, "held_inventory": None})
+            size = decision.size_usd
+            width = self._width_from_range(decision.price_range, switch.to_symbol)
+            if size is None or size <= 0 or width is None:
+                halted = "the switch decision carried no positive size or tick-aligned width"
+                return records, halted, switched_book
+            switch_budget: Decimal = size
+            switch_width: int = width
+            if not run(
+                "mint",
+                lambda: executor.execute_mint(
+                    switch.to_symbol, switch_budget, switch_width, key_bytes, confirm_broadcast=True
+                ),
+            ):
+                return records, halted, switched_book
+            token_id = self._decode_mint_token_id(records[-1])
+            if token_id is None:
+                halted = "the switched position id could not be decoded from the receipt"
+                return records, halted, switched_book
+            switched_id: int = token_id
+            if not run(
+                "stake",
+                lambda: executor.execute_stake(
+                    switch.to_symbol, switched_id, key_bytes, confirm_broadcast=True
+                ),
+            ):
+                return records, halted, switched_book
+            return (
+                records,
+                halted,
+                self._book_with_position(
+                    switched_book, switch.to_symbol, switched_id, switch_budget
+                ),
+            )
 
         if action in (
             PolicyActionKind.STOP_OUT,
@@ -1056,8 +1526,8 @@ class CycleRunner:
                 return records, halted, book
             if action is PolicyActionKind.RECENTER:
                 size = decision.size_usd
-                width = self._width_from_range(decision.price_range)
-                if size is None or size <= 0 or width is None:
+                width = self._width_from_range(decision.price_range, tracked_symbol)
+                if size is None or size <= 0 or width is None or tracked_symbol is None:
                     halted = "the recenter decision carried no complete fresh entry"
                     return (
                         records,
@@ -1069,7 +1539,11 @@ class CycleRunner:
                 if not run(
                     "mint",
                     lambda: executor.execute_mint(
-                        symbol, recenter_budget, recenter_width, key_bytes, confirm_broadcast=True
+                        tracked_symbol,
+                        recenter_budget,
+                        recenter_width,
+                        key_bytes,
+                        confirm_broadcast=True,
                     ),
                 ):
                     return (
@@ -1088,7 +1562,7 @@ class CycleRunner:
                 if not run(
                     "stake",
                     lambda: executor.execute_stake(
-                        symbol, token_id, key_bytes, confirm_broadcast=True
+                        tracked_symbol, token_id, key_bytes, confirm_broadcast=True
                     ),
                 ):
                     return (
@@ -1096,7 +1570,11 @@ class CycleRunner:
                         halted,
                         book.model_copy(update={"position": None, "held_inventory": None}),
                     )
-                return records, halted, self._book_with_position(book, token_id, size)
+                return (
+                    records,
+                    halted,
+                    self._book_with_position(book, tracked_symbol, token_id, size),
+                )
             return (
                 records,
                 halted,
@@ -1104,12 +1582,12 @@ class CycleRunner:
             )
 
         if action is PolicyActionKind.STALE_LOW_BURN:
-            if book.position is None:
+            if book.position is None or tracked_symbol is None:
                 halted = "the engine authorized a stale-low burn while flat"
                 return records, halted, book
             if not self._burn_without_swap(executor, book, key_bytes, run):
                 return records, halted, book
-            held_quantity = self._live_stock_quantity()
+            held_quantity = self._live_stock_quantity(tracked_symbol)
             if held_quantity <= 0:
                 halted = "the stale-low burn left no stock balance to hold"
                 return records, halted, book.model_copy(update={"position": None})
@@ -1120,8 +1598,8 @@ class CycleRunner:
                     update={
                         "position": None,
                         "held_inventory": HeldInventoryRecord(
-                            symbol=symbol,
-                            token_address=self._stock_token_address(),
+                            symbol=tracked_symbol,
+                            token_address=self._stock_token_address_for(tracked_symbol),
                             stock_quantity=held_quantity,
                             held_since=self._now(),
                         ),
@@ -1133,9 +1611,10 @@ class CycleRunner:
             if book.held_inventory is None:
                 halted = "the engine authorized an inventory sale with nothing held"
                 return records, halted, book
+            held_symbol = book.held_inventory.symbol
             if not run(
                 "exit_swap",
-                lambda: executor.execute_exit_swap(symbol, key_bytes, confirm_broadcast=True),
+                lambda: executor.execute_exit_swap(held_symbol, key_bytes, confirm_broadcast=True),
             ):
                 return records, halted, book
             return records, halted, book.model_copy(update={"held_inventory": None})
@@ -1144,15 +1623,15 @@ class CycleRunner:
         return records, halted, book
 
     def _book_with_position(
-        self, book: CycleStateBook, token_id: int, committed: Decimal
+        self, book: CycleStateBook, symbol: str, token_id: int, committed: Decimal
     ) -> CycleStateBook:
         """Return the book carrying one freshly entered tracked position."""
         return book.model_copy(
             update={
                 "position": TrackedPosition(
-                    symbol=self._symbol,
+                    symbol=symbol,
                     token_id=token_id,
-                    pool_address=self._resolved_pool().pool_address,
+                    pool_address=self._pool_for_symbol(symbol).pool_address,
                     committed_usd=committed,
                     entered_at=self._now(),
                 ),
@@ -1170,7 +1649,7 @@ class CycleRunner:
         """Unstake, withdraw, and swap one tracked position fully to USDC."""
         tracked = book.position
         assert tracked is not None  # noqa: S101 - the caller verified a tracked position
-        symbol = self._symbol
+        symbol = tracked.symbol
         assert self._last_reconciliation is not None  # noqa: S101 - set by run()
         if self._last_reconciliation.tracked_staked and not run(
             "unstake",
@@ -1201,7 +1680,7 @@ class CycleRunner:
         """Unstake and withdraw while holding the stock unsold."""
         tracked = book.position
         assert tracked is not None  # noqa: S101 - the caller verified a tracked position
-        symbol = self._symbol
+        symbol = tracked.symbol
         assert self._last_reconciliation is not None  # noqa: S101 - set by run()
         if self._last_reconciliation.tracked_staked and not run(
             "unstake",
@@ -1227,13 +1706,15 @@ class CycleRunner:
         except (ValueError, ExecutionUnavailableError):
             return None
 
-    def _live_stock_quantity(self) -> Decimal:
+    def _live_stock_quantity(self, symbol: str) -> Decimal:
         """Read the Safe's whole-token stock balance right now."""
-        stock_address = self._stock_token_address()
+        stock_address = self._stock_token_address_for(symbol)
         units = self._balances.fetch_token_balance(stock_address, self._safe_address)
         return Decimal(units).scaleb(-self._sources.token_decimals(stock_address))
 
-    def _width_from_range(self, price_range: AlignedPriceRange | None) -> int | None:
+    def _width_from_range(
+        self, price_range: AlignedPriceRange | None, symbol: str | None
+    ) -> int | None:
         """Derive the explicit half width in tick spacings from a policy range.
 
         The engine's grid alignment can leave a non-integral spacing half
@@ -1241,9 +1722,9 @@ class CycleRunner:
         up: the executed range always carries at least the policy's width,
         and the planner's own ceiling clamps anything wider.
         """
-        if price_range is None:
+        if price_range is None or symbol is None:
             return None
-        pool = self._resolved_pool()
+        pool = self._pool_for_symbol(symbol)
         half_ticks = (price_range.upper_tick - price_range.lower_tick) // 2
         if half_ticks < 1:
             return None
@@ -1254,6 +1735,7 @@ class CycleRunner:
         book: CycleStateBook,
         reconciliation: CycleReconciliation,
         next_state: PolicyState,
+        decision_symbol: str | None = None,
     ) -> CycleStateBook:
         """Rebuild the book from post-action chain truth plus engine state."""
         position = book.position
@@ -1266,14 +1748,24 @@ class CycleRunner:
         held = book.held_inventory
         if held is not None and reconciliation.held_stock_quantity == 0:
             held = None
-        return CycleStateBook(
-            position=position,
-            held_inventory=held,
-            reentry_blocked_until=next_state.reentry_blocked_until,
-            day=next_state.day,
-            day_start_equity_usd=next_state.day_start_equity_usd,
-            halted_day=next_state.halted_day,
-            updated_at=self._now(),
+        # The engine's successor state names at most one pool's cooldown -
+        # the pool the decision ran over - so only that pool's entry merges.
+        cooldown_symbol = decision_symbol or (position.symbol if position is not None else None)
+        rebuilt = _book_with_cooldowns(
+            book,
+            {cooldown_symbol: next_state.reentry_blocked_until}
+            if cooldown_symbol is not None
+            else {},
+        )
+        return rebuilt.model_copy(
+            update={
+                "position": position,
+                "held_inventory": held,
+                "day": next_state.day,
+                "day_start_equity_usd": next_state.day_start_equity_usd,
+                "halted_day": next_state.halted_day,
+                "updated_at": self._now(),
+            }
         )
 
     # ------------------------------------------------------------------
@@ -1290,6 +1782,9 @@ class CycleRunner:
         halted_reason: str,
     ) -> CycleReport:
         """Assemble the structured cycle report from its complete evidence."""
+        report_symbol = (
+            decision_report.symbol if decision_report is not None else reconciliation.symbol
+        )
         if decision_report is not None:
             decision_action = decision_report.outcome.decision.action.value
             decision_reason = decision_report.outcome.decision.reason.value
@@ -1301,7 +1796,11 @@ class CycleRunner:
             decision_reason = "out_of_band"
             decision_diagnostics = (reconciliation.out_of_band,)
             event_window = evaluate_event_window(
-                started_at, self._stock_token_address(), load_event_calendar()
+                started_at,
+                self._stock_token_address_for(report_symbol)
+                if report_symbol != SELECTOR_SYMBOL
+                else BASE_USDC_ADDRESS,
+                load_event_calendar(),
             ).description
             input_notes = ("the cycle refused out-of-band before deciding",)
         status = reconciliation.tracked_status
@@ -1310,7 +1809,7 @@ class CycleRunner:
         return CycleReport(
             started_at=started_at,
             mode=mode,
-            symbol=self._symbol,
+            symbol=report_symbol,
             reconciliation=reconciliation,
             decision_action=decision_action,
             decision_reason=decision_reason,
@@ -1399,30 +1898,91 @@ def _print_report(report: CycleReport) -> None:
         print(f"  note: {note}")
 
 
-def _reference_price_from_environment(environ: Mapping[str, str]) -> Decimal | None:
-    """Read the optional injected reference quote from the environment."""
+def _reference_price_from_environment(
+    environ: Mapping[str, str],
+) -> Decimal | dict[str, Decimal] | None:
+    """Read the optional injected reference quote(s) from the environment.
+
+    The single form (``318.5``) quotes the pinned symbol; the map form
+    (``AAPLc=318.5,FIXc=100``) carries one quote per symbol for the
+    cross-board selector.
+
+    Args:
+        environ: The environment mapping carrying the optional quote.
+
+    Returns:
+        One Decimal, the per-symbol mapping, or None when unset.
+
+    Raises:
+        ValueError: If any configured value is not a positive number.
+    """
     raw = environ.get(CYCLE_REFERENCE_PRICE_ENV, "").strip()
     if not raw:
         return None
+    return parse_reference_quotes(raw)
+
+
+def _symbol_from_arguments_and_environment(
+    argument_symbol: str | None, environ: Mapping[str, str]
+) -> str | None:
+    """Resolve the cycle's symbol scope from the flag and sealed environment.
+
+    The CLI flag wins; the sealed ``AERO_BOT_CYCLE_SYMBOL`` variable is the
+    deployment's pin. Unset, empty, or ``auto`` runs the cross-board
+    selector (the default); any other value pins one pool.
+
+    Args:
+        argument_symbol: The optional --symbol flag value.
+        environ: The environment mapping carrying the optional pin.
+
+    Returns:
+        The pinned symbol, or None for selector mode.
+    """
+    raw = argument_symbol if argument_symbol is not None else environ.get(CYCLE_SYMBOL_ENV, "")
+    symbol = raw.strip()
+    if not symbol or symbol.lower() == SELECTOR_SYMBOL:
+        return None
+    return symbol
+
+
+def _switch_margin_from_environment(environ: Mapping[str, str]) -> Decimal:
+    """Read the cross-board switch margin from the sealed environment.
+
+    Args:
+        environ: The environment mapping carrying the optional margin.
+
+    Returns:
+        The configured fraction, or the locked default.
+
+    Raises:
+        ValueError: If the configured margin is negative or not a number.
+    """
+    raw = environ.get(CYCLE_SWITCH_MARGIN_ENV, "").strip()
+    if not raw:
+        return DEFAULT_SWITCH_MARGIN_FRACTION
     value = Decimal(raw)
-    if value <= 0:
-        raise ValueError(f"{CYCLE_REFERENCE_PRICE_ENV} must be positive, not {raw!r}")
+    if value < 0:
+        raise ValueError(f"{CYCLE_SWITCH_MARGIN_ENV} must be non-negative, not {raw!r}")
     return value
 
 
 def build_cycle_runner(
     settings: Settings,
-    symbol: str,
+    symbol: str | None,
     safe_address: str,
     relayer_address: str | None,
+    switch_margin_fraction: Decimal = DEFAULT_SWITCH_MARGIN_FRACTION,
 ) -> CycleRunner:
     """Assemble the live cycle runner from the application settings.
 
     Args:
         settings: The application settings backing every boundary.
-        symbol: The registry symbol this cycle manages.
+        symbol: The registry symbol this cycle manages, or None for the
+            cross-board selector.
         safe_address: The Safe whose positions and balances reconcile.
         relayer_address: The relayer's public address, or None.
+        switch_margin_fraction: The relative APR margin another pool must
+            beat the held pool by before a switch fires.
 
     Returns:
         The fully wired runner; nothing has been read yet.
@@ -1483,6 +2043,7 @@ def build_cycle_runner(
         audit_reader=AuditStoreReader(audit_store),
         audit_sink=audit_store,
         state_store=CycleStateStore.from_environment(settings=settings),
+        switch_margin_fraction=switch_margin_fraction,
     )
 
 
@@ -1507,7 +2068,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             "an in-process scheduler - decides when cycles run."
         ),
     )
-    parser.add_argument("--symbol", required=True, help="Registry symbol like AAPLc.")
+    parser.add_argument(
+        "--symbol",
+        default=None,
+        help=(
+            "Registry symbol like AAPLc, auto, or unset: unset or auto (also "
+            "the sealed AERO_BOT_CYCLE_SYMBOL default) runs the cross-board "
+            "selector over every verified B20 pool; an explicit symbol pins "
+            "one pool for operator runs."
+        ),
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -1518,10 +2088,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--reference-price",
-        type=Decimal,
         default=None,
         help=(
-            "Optional injected real-market quote in USDC per stock; the "
+            "Optional injected real-market quote in USDC per stock - either "
+            "one price for the pinned symbol or per-symbol SYMBOL=PRICE "
+            "pairs (AAPLc=318.5,FIXc=100) for selector mode; the "
             "AERO_BOT_CYCLE_REFERENCE_PRICE_USDC variable supplies the same "
             "value when the flag is absent."
         ),
@@ -1533,24 +2104,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Age of the injected reference quote in seconds (default: 0).",
     )
     parser.add_argument(
+        "--switch-margin",
+        type=Decimal,
+        default=None,
+        help=(
+            "The relative emissions-APR margin another pool must beat the "
+            "held pool by before a switch fires, as a fraction (default "
+            "0.30; the sealed AERO_BOT_CYCLE_SWITCH_MARGIN_FRACTION "
+            "variable supplies the same value when the flag is absent)."
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print the complete report as JSON instead of a summary.",
     )
     arguments = parser.parse_args(argv)
-    if arguments.reference_price is not None and arguments.reference_price <= 0:
-        parser.error("--reference-price must be positive")
     if arguments.reference_age_seconds < 0:
         parser.error("--reference-age-seconds must be non-negative")
+    if arguments.switch_margin is not None and arguments.switch_margin < 0:
+        parser.error("--switch-margin must be non-negative")
+    symbol = _symbol_from_arguments_and_environment(arguments.symbol, os.environ)
     try:
-        reference = (
-            arguments.reference_price
+        switch_margin = (
+            arguments.switch_margin
+            if arguments.switch_margin is not None
+            else _switch_margin_from_environment(os.environ)
+        )
+        configured_reference = (
+            parse_reference_quotes(arguments.reference_price)
             if arguments.reference_price is not None
             else _reference_price_from_environment(os.environ)
         )
-    except ValueError as error:
-        print(f"invalid reference price: {error}", file=sys.stderr)
+    except (ValueError, ArithmeticError) as error:
+        print(f"invalid configuration: {error}", file=sys.stderr)
         return EXIT_FAILURE
+    single_reference: Decimal | None = None
+    reference_map: dict[str, Decimal] = {}
+    if isinstance(configured_reference, Decimal):
+        if symbol is None:
+            print(
+                f"selector mode needs per-symbol reference quotes in {CYCLE_REFERENCE_PRICE_ENV} "
+                "or --reference-price (SYMBOL=PRICE pairs)",
+                file=sys.stderr,
+            )
+            return EXIT_FAILURE
+        single_reference = configured_reference
+    elif configured_reference is not None:
+        reference_map = configured_reference
     safe_address = os.environ.get(SAFE_ADDRESS_ENV, DEFAULT_CANARY_SAFE_ADDRESS)
     raw_relayer = os.environ.get(RELAYER_ADDRESS_ENV, "").strip()
     # Both sides normalize before comparison: a checksummed environment
@@ -1580,7 +2181,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return EXIT_REFUSED
         configured_relayer = derived_relayer
     try:
-        runner = build_cycle_runner(settings, arguments.symbol, safe_address, configured_relayer)
+        runner = build_cycle_runner(
+            settings, symbol, safe_address, configured_relayer, switch_margin
+        )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"the cycle runner is unavailable: {error}", file=sys.stderr)
         return EXIT_FAILURE
@@ -1588,8 +2191,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = runner.run(
             mode,
             key_bytes=key_bytes,
-            reference_price_usdc=reference,
+            reference_price_usdc=single_reference,
             reference_age_seconds=arguments.reference_age_seconds,
+            reference_prices_by_symbol=reference_map or None,
         )
     except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
         print(f"cycle failed: {error}", file=sys.stderr)

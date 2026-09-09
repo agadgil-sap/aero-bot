@@ -175,6 +175,12 @@ def evaluate_event_window(
     Operator-scheduled earnings and ex-dividend events may be scoped to one
     token or apply to every pool when no token address is configured.
 
+    Since the captain's 2026-09-09 ruling this view is informational only:
+    the B20 pools are continuous DeFi markets, so nights and weekends are in
+    scope and no scheduled or session-derived window gates entries or forces
+    exits anymore. The decision surfaces still report the active window for
+    operator awareness.
+
     Args:
         observed_at: Aware observation instant.
         token_address: B20 contract evaluated by the calling decision.
@@ -337,8 +343,13 @@ class PolicyParameters(BaseModel):
     # per day simple); swap fees are credited on top and the haircut is applied
     # only inside the P&L forecast, never to this gate.
     min_entry_emissions_apr: Decimal = Decimal("1.5")
-    # A position commits at most twenty percent of current equity.
-    max_position_equity_fraction: Decimal = Decimal("0.20")
+    # A position commits at most eighty percent of current equity. Raised
+    # from twenty percent by the captain's calibration ruling (2026-09-09):
+    # the ninety-dollar trial book sizes roughly seventy-two USDC per
+    # position, and the fraction stays inside the pilot's unchanged hard
+    # ceilings (100 USDC total exposure and 100 USDC per pool, enforced by
+    # the LP executor's caps) rather than replacing them.
+    max_position_equity_fraction: Decimal = Decimal("0.80")
     # A position is hard-gated to one percent of observed pool depth.
     max_position_depth_fraction: Decimal = Decimal("0.01")
     # A five percent same-day equity loss halts new entries until the next day.
@@ -562,6 +573,11 @@ class PolicyActionKind(StrEnum):
     # Sell inventory swaps held stock tokens back to USDC on convergence,
     # timeout, or a forced flat window.
     SELL_INVENTORY = "sell_inventory"
+    # Switch pools exits the held position and enters a better-qualifying
+    # one in the same cycle. Composed only by the cross-board selector
+    # (aero_bot.selector); the per-pool engine never emits it, because a
+    # switch is a cross-pool judgment the single-pool fold cannot see.
+    POOL_SWITCH = "pool_switch"
 
 
 class PolicyReason(StrEnum):
@@ -582,7 +598,9 @@ class PolicyReason(StrEnum):
     ENTRY_COOLDOWN_ACTIVE = "entry_cooldown_active"
     # The five-percent daily loss halt blocks new entries for the day.
     DAILY_LOSS_HALT_ACTIVE = "daily_loss_halt_active"
-    # A scheduled or condition-driven event window requires being flat.
+    # A condition-driven flat event (a stale oracle observation or a paused
+    # registry) requires being flat; scheduled windows no longer gate since
+    # the captain's 2026-09-09 twenty-four-seven ruling.
     EVENT_WINDOW_FLAT = "event_window_flat"
     # The real-market reference quote is missing or stale, blocking entry.
     REFERENCE_STALE = "reference_stale"
@@ -594,8 +612,9 @@ class PolicyReason(StrEnum):
     DOWNSIDE_STOP_TRIGGERED = "downside_stop_triggered"
     # The pool's raw emissions APR fell below the threshold while open.
     DILUTION_EXIT_TRIGGERED = "dilution_exit_triggered"
-    # A scheduled or condition-driven event window arrived while a position
-    # was open.
+    # A condition-driven flat event arrived while a position was open;
+    # scheduled windows no longer force exits since the captain's
+    # 2026-09-09 twenty-four-seven ruling.
     EVENT_EXIT_TRIGGERED = "event_exit_triggered"
     # The reference quote went missing or stale beyond the open-position bound.
     REFERENCE_STALE_DEFENSIVE_EXIT = "reference_stale_defensive_exit"
@@ -607,7 +626,8 @@ class PolicyReason(StrEnum):
     INVENTORY_CONVERGENCE_REACHED = "inventory_convergence_reached"
     # Held stock tokens are sold at market because the convergence timeout hit.
     INVENTORY_CONVERGENCE_TIMEOUT = "inventory_convergence_timeout"
-    # Held stock tokens are sold because a flat window requires being in USDC.
+    # Held stock tokens are sold because a condition-driven flat event
+    # requires being in USDC.
     INVENTORY_FLAT_WINDOW_SELL = "inventory_flat_window_sell"
     # Held stock tokens wait for convergence inside the timeout bound.
     HOLDING_INVENTORY_AWAITING_CONVERGENCE = "holding_inventory_awaiting_convergence"
@@ -616,6 +636,15 @@ class PolicyReason(StrEnum):
     INVENTORY_UNWIND_PENDING = "inventory_unwind_pending"
     # A non-urgent entry or recenter is deferred by the gas sense-check gate.
     GAS_GATE_DEFERRED = "gas_gate_deferred"
+    # Another pool's qualifying emissions APR exceeded the held pool's by
+    # the relative switch margin and the exit-plus-entry gas economics
+    # passed. Composed only by the cross-board selector
+    # (aero_bot.selector); the per-pool engine never emits it.
+    POOL_SWITCH_TRIGGERED = "pool_switch_triggered"
+    # No pool on the enumerated board qualified through the complete entry
+    # gate chain. Composed only by the cross-board selector; the per-pool
+    # engine never emits it.
+    NO_QUALIFYING_POOL = "no_qualifying_pool"
 
 
 class PolicyDecision(BaseModel):
@@ -714,9 +743,10 @@ class PolicyEngine:
 
         Decision precedence is fixed: held stock inventory from a stale-low
         burn is unwound first, then safety exits (reference-stale defensive
-        exit, dislocation monitor, downside stop, emissions dilution, event
-        windows), then position maintenance (upside recenter wait behind the
-        gas gate), then the ordered entry gates behind the same gas gate.
+        exit, dislocation monitor, downside stop, emissions dilution,
+        condition-driven flat events), then position maintenance (upside
+        recenter wait behind the gas gate), then the ordered entry gates
+        behind the same gas gate.
 
         Args:
             state: Engine state threaded from the previous decision.
@@ -727,18 +757,14 @@ class PolicyEngine:
         """
         # Day rollover and the daily loss halt are evaluated before any gate.
         working_state = self._observe_day(state, observation)
-        # Condition-driven flat events combine with scheduled event windows.
-        flat_reason = self._flat_reason(observation)
-        window_view = evaluate_event_window(
-            observation.observed_at, observation.token_address, self._calendar
-        )
-        # A description exists only when some window or condition is active.
-        if flat_reason is not None:
-            flat_description: str | None = flat_reason
-        elif window_view.active:
-            flat_description = window_view.description
-        else:
-            flat_description = None
+        # Captain's ruling (2026-09-09): the B20 pools are continuous DeFi
+        # markets - nights and weekends are in scope - so the scheduled and
+        # session-derived event windows no longer gate entries or force
+        # exits. The calendar machinery stays loaded for reporting (the
+        # decision surfaces still print the window view), and only the
+        # condition-driven flats below (a stale oracle observation or a
+        # paused registry) still require the policy to be flat in USDC.
+        flat_description = self._flat_reason(observation)
 
         # Held inventory is a mid-unwind safety posture and resolves before any
         # new exposure; the engine never holds inventory and a position at once.
@@ -996,7 +1022,7 @@ class PolicyEngine:
                 ),
                 with_cooldown=True,
             )
-        # Event windows require being flat in USDC while they are active.
+        # Condition-driven flat events require being flat in USDC.
         if flat_description is not None:
             return self._safety_exit(
                 state,
@@ -1672,7 +1698,7 @@ class PolicyEngine:
                 PolicyReason.ENTRY_COOLDOWN_ACTIVE,
                 (f"Re-entry cooldown runs until {state.reentry_blocked_until}.",),
             )
-        # Scheduled and condition-driven event windows require being flat.
+        # Condition-driven flat events require being flat.
         if flat_description is not None:
             return self._hold(
                 hold_state,

@@ -382,11 +382,12 @@ class TestReplayLifecycle:
         assert ledger.action_counts.stop_outs == 1
         assert ledger.actions[0].action == PolicyActionKind.ENTER
         assert ledger.actions[1].action == PolicyActionKind.STOP_OUT
-        # The committed size is the twenty-percent equity cap.
-        assert ledger.actions[0].size_usd == Decimal("40")
+        # The committed size is the eighty-percent equity cap (the
+        # captain's 2026-09-09 sizing ruling).
+        assert ledger.actions[0].size_usd == Decimal("160")
         # The stop-out swap converts the whole stock inventory back to USDC.
         assert ledger.actions[1].swap_total_usd is not None
-        assert ledger.actions[1].swap_total_usd > Decimal("35")
+        assert ledger.actions[1].swap_total_usd > Decimal("140")
         assert ledger.actions[1].swap_impact_cost_usd > 0
         # The stop batch burns, unstakes, and swaps at the documented assumptions.
         assert ledger.actions[1].estimated_gas_cost_usd == Decimal("0.00135")

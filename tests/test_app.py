@@ -642,11 +642,12 @@ async def test_policy_endpoint_persists_reproducible_decision_evidence(
     assert decision_response.status_code == 200
     assert body["decision"]["action"] == "enter"
     assert body["decision"]["reason"] == "entry_threshold_met"
-    # Size is the 20-percent equity cap, smaller than the 1-percent depth cap here.
-    assert Decimal(body["decision"]["size_usd"]) == Decimal("40")
+    # Size is the one-percent depth cap, now below the eighty-percent
+    # equity cap (the captain's 2026-09-09 sizing ruling) on this fixture.
+    assert Decimal(body["decision"]["size_usd"]) == Decimal("100.00")
     # The entry swap buys half the committed value, split at the tranche bound.
-    assert Decimal(body["decision"]["swap_plan"]["total_usd"]) == Decimal("20")
-    assert len(body["decision"]["swap_plan"]["tranches"]) == 4
+    assert Decimal(body["decision"]["swap_plan"]["total_usd"]) == Decimal("50.00")
+    assert len(body["decision"]["swap_plan"]["tranches"]) == 10
     assert len(records) == 1
     assert records[0].event_type is AuditEventType.POLICY_DECISION
     assert records[0].created_at == fixed_clock()

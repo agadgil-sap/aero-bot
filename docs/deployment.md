@@ -44,7 +44,7 @@ sudo install -o aero-bot -g aero-bot -m 600 <deploy-key> /etc/aero-bot/backup-de
 
 The env files are `root:aero-bot 0640`: systemd reads them as root, the service user can source them for manual operator runs, and writes stay root-only.
 
-Discipline, enforced in code: the key file refuses any group/other permission bit; the env files are root-owned 0600; nothing secrets-shaped is ever committed, logged, or echoed - public addresses only. The reference quote (`AERO_BOT_CYCLE_REFERENCE_PRICE_USDC`) is the operator's honest duty: an open position defensively exits without a quote, and a stale constant is a stale quote - update it on the cadence the captain sets until the live oracle feed lands.
+Discipline, enforced in code: the key file refuses any group/other permission bit; the env files are root-owned 0600; nothing secrets-shaped is ever committed, logged, or echoed - public addresses only. The reference quote (`AERO_BOT_CYCLE_REFERENCE_PRICE_USDC`) is the operator's honest duty: an open position defensively exits without a quote, and a stale constant is a stale quote - update it on the cadence the captain sets until the live oracle feed lands. Pinned cycles seal one bare number; the cross-board selector (see [the cycle documentation](docs/cycle.md)) seals per-symbol `SYMBOL=PRICE` pairs.
 
 ## Arm
 

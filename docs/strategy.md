@@ -4,7 +4,7 @@ The `aero-bot-decide` command runs the complete policy engine - the same locked 
 It is decision-only by construction: nothing is built, signed, estimated for broadcast, or executed, and the run's single side effect is one `policy_decision` record on the audit chain.
 
 ```
-uv run aero-bot-decide --symbol AAPLc [--equity-usdc 200] [--reference-price 318.5] [--json]
+uv run aero-bot-decide [--symbol AAPLc | auto] [--equity-usdc 200] [--reference-price 318.5 | SYM=PRICE,...] [--json]
 ```
 
 Exit codes: zero on any verdict (a hold is a decision, not a failure), one when live inputs cannot be assembled.
@@ -19,12 +19,22 @@ Exit codes: zero on any verdict (a hold is a decision, not a failure), one when 
 - The Base gas price in gwei, `None` (gas gate defers fail-closed) when the read is unavailable.
 - The registry's pause state.
 - The event-window view over the operator calendar and the derived weekday market open/close windows (sixty minutes before through thirty minutes after each session boundary in America/New_York).
+  Since the captain's 2026-09-09 twenty-four-seven ruling this view is informational only - see below.
 
-## Flat verdicts during event windows are correct behavior
+## Pinned symbol versus the cross-board selector
 
-When any scheduled or session-derived window is active - a market open or close window on a weekday, or an operator-scheduled earnings or ex-dividend event - the engine returns `hold (event_window_flattened)` with the window's description, and the report marks the window active.
-This is the strategy working exactly as designed, not a failure: the v1 doctrine is to be flat in USDC around US equity session boundaries and volatility events, so a flat verdict inside a window is the correct answer even when every other gate would pass.
-The same doctrine holds for the condition-driven flats (a stale oracle observation or a paused registry), and for `hold (reference_stale)` - see below.
+An explicit `--symbol AAPLc` pins one pool and decides exactly that pool, as this surface always has.
+`auto` - which is also the default when `--symbol` is omitted - runs the cross-board selector over every verified B20 pool: the same complete locked entry gate chain evaluates each pool, the best-qualifying pool by qualifying emissions APR wins (ties break on the lexicographically smallest symbol so runs are reproducible), and while a position is held another pool only displaces it past the relative switch margin with the exit-plus-entry gas economics passing.
+The selector's pure mathematics live in `src/aero_bot/selector.py`; [the cycle documentation](docs/cycle.md) carries the full selector doctrine (margin, per-pool cooldowns, the single-position invariant).
+
+Selector mode needs per-symbol reference quotes: `--reference-price AAPLc=318.5,FIXc=100` (or the same grammar in `AERO_BOT_CYCLE_REFERENCE_PRICE_USDC`).
+The single-number form still quotes one pinned symbol.
+
+## Twenty-four-seven operation (captain's ruling 2026-09-09)
+
+The B20 pools are continuous DeFi markets - nights and weekends are in scope - so the market-session/event-window gate no longer blocks entries and no longer forces exits.
+The event-calendar machinery stays loaded and the report still prints the active window, marked informational: an active window is operator awareness, never a verdict.
+The condition-driven flats - a stale oracle observation or a paused registry - still require the policy to be flat in USDC exactly as shipped, as does the `hold (reference_stale)` fail-closed posture below.
 
 ## The two honest input gaps
 
@@ -36,6 +46,6 @@ Both gaps are visible in every report's `input_notes` rather than hidden, becaus
 ## Live proofs (2026-09-08)
 
 - `aero-bot-decide --symbol AAPLc` (no reference): `hold (reference_stale)` at block 51033468 - the honest fail-closed default, with the corrected emissions APR 1,581.80 percent at a live AERO price of 0.6322 USDC on the same observation.
-- `aero-bot-decide --symbol AAPLc --equity-usdc 200 --reference-price 318.5`: `enter (entry_threshold_met)` at block 51033570 - the full gate chain ran: raw emissions APR 712.40 percent cleared the 150 percent gate, size 40.00 USDC took the equity cap against a 5,774 USDC depth cap, the range aligned to tick spacing 10 at the fallback ceiling width (no live ranging evidence yet - the width solver fails toward the locked ceiling with its label), and the gas gate passed at 13.5 gwei.
+- `aero-bot-decide --symbol AAPLc --equity-usdc 200 --reference-price 318.5`: `enter (entry_threshold_met)` at block 51033570 - the full gate chain ran: raw emissions APR 712.40 percent cleared the 150 percent gate, size 40.00 USDC took the then-twenty-percent equity cap against a 5,774 USDC depth cap, the range aligned to tick spacing 10 at the fallback ceiling width (no live ranging evidence yet - the width solver fails toward the locked ceiling with its label), and the gas gate passed at 13.5 gwei. The captain's 2026-09-09 sizing ruling later raised the equity-fraction cap to eighty percent, so the same pool's depth cap (57.74 USDC at one percent) now binds below the equity cap there.
 
 Nothing in either run was built, signed, or broadcast.
