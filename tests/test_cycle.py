@@ -794,3 +794,73 @@ class TestSystemdUnits:
         assert "NoNewPrivileges=true" in service
         assert "Restart=no" in service
         assert "aero-bot-cycle --symbol %i --json" in service
+
+
+class TestLiveRelayerGuard:
+    """The live-mode relayer guard compares addresses, not casing."""
+
+    def test_checksummed_relayer_matches_the_derived_address(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A checksummed environment relayer is the same relayer.
+
+        The first armed scheduled cycle refused the correct signing source
+        because the raw environment string (checksummed) compared unequal to
+        the lowercase derived address; both sides now normalize first.
+        """
+        from eth_account import Account
+
+        from aero_bot import cycle as cycle_module
+
+        account = Account.from_key("0x" + "22" * 32)
+        checksummed = account.address
+        assert checksummed != checksummed.lower()
+
+        class _FakeKeySource:
+            def load_signing_key(self) -> bytes:
+                return bytes(account.key)
+
+        class _FakeRunner:
+            def run(
+                self,
+                mode: object,
+                key_bytes: bytes | None = None,
+                reference_price_usdc: object = None,
+                reference_age_seconds: object = None,
+            ) -> object:
+                class _Report:
+                    mode = "live"
+                    symbol = "AAPLc"
+                    decision_action = "hold"
+                    decision_reason = "reference_stale"
+                    decision_diagnostics: tuple[str, ...] = ()
+                    event_window = "none"
+                    actions: tuple[object, ...] = ()
+                    pnl_vs_entry_usdc = None
+                    pnl_diagnostic = "no tracked position"
+                    fee_wei = 0
+                    halted_reason = ""
+                    input_notes: tuple[str, ...] = ()
+                    reconciliation = None
+
+                    def model_dump_json(self, indent: int = 2) -> str:
+                        return "{}"
+
+                return _Report()
+
+        environment = {
+            "AERO_BOT_SAFE_ADDRESS": "0xB69ab6C7E73F711D5f2d10feD8f0d09B1D028C28",
+            "AERO_BOT_RELAYER_ADDRESS": checksummed,
+            "AERO_BOT_AUDIT_DATABASE_PATH": str(tmp_path / "audit.sqlite3"),
+            "AERO_BOT_LP_POOL_PINS_PATH": str(tmp_path / "pins.json"),
+            "AERO_BOT_CYCLE_STATE_PATH": str(tmp_path / "state.json"),
+        }
+        import os as _os
+
+        monkeypatch.setattr(_os, "environ", environment)
+        monkeypatch.setattr(
+            "aero_bot.signing_key.load_signing_key_source", lambda: _FakeKeySource()
+        )
+        monkeypatch.setattr(cycle_module, "build_cycle_runner", lambda *a, **k: _FakeRunner())
+        exit_code = cycle_module.main(["--symbol", "AAPLc", "--json"])
+        assert exit_code == 0, "the guard must accept the case-insensitive match"
