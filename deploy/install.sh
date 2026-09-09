@@ -120,9 +120,11 @@ AERO_BOT_SIGNING_KEY_FILE=/etc/aero-bot/signing-key.hex
 AERO_BOT_AUDIT_DATABASE_PATH=/var/lib/aero-bot/audit.sqlite3
 AERO_BOT_LP_POOL_PINS_PATH=/var/lib/aero-bot/lp_pool_pins.json
 AERO_BOT_CYCLE_STATE_PATH=/var/lib/aero-bot/cycle_state.json
-# The Base RPC endpoint (the default public endpoint works; a paid endpoint
-# raises the rate limits).
-#AERO_BOT_BASE_RPC_URL=https://mainnet.base.org
+# The Base RPC endpoint: base.publicnode.com tolerates the Sugar
+# pagination sweeps where the official mainnet.base.org throttles small
+# hosts into 429 cascades (verified live on an e2-micro deploy); a paid
+# endpoint raises the rate limits further.
+AERO_BOT_BASE_RPC_URL=https://base.publicnode.com
 # The injected real-market reference quote, in USDC per share. The operator
 # owns its freshness honestly: an open position defensively exits without a
 # quote, and a stale constant is a stale quote.

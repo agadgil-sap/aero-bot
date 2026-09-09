@@ -27,7 +27,7 @@ sudo bash deploy/install.sh
 
 The installer is idempotent and does, in order: Ubuntu check; base packages (git, curl, ufw, unattended-upgrades) with automatic security updates confirmed; uv installed system-wide; the dedicated `aero-bot` system user; the application tree into `/opt/aero-bot` (from the committed tree - run it from a clean checkout); the venv at `/opt/aero-bot/.venv` built with `uv sync --locked` (uv downloads Python 3.12 itself when the image lacks it); the state tree `/var/lib/aero-bot` (mode 0700, service-owned); the sealed environment templates under `/etc/aero-bot` (mode 0600, root-owned, never overwritten on re-run); every systemd unit installed and `daemon-reload`ed; and the firewall - default deny inbound, OpenSSH allowed, then enabled only with the SSH allow already in place so a session can never be locked out.
 
-The installer does NOT enable any timer: nothing runs until Phase 2 arms it.
+The installer does NOT enable any timer: nothing runs until Phase 2 arms it. The sealed cycle template defaults `AERO_BOT_BASE_RPC_URL` to `base.publicnode.com` because the official `mainnet.base.org` throttles the Sugar discovery sweeps into 429 cascades on small hosts (verified live on the e2-micro deploy); a paid endpoint raises the rate limits further.
 
 ## Seal the secrets (captain present)
 
