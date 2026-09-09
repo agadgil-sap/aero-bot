@@ -237,6 +237,14 @@ The full sweep refreshes the pin after every verified resolution, and `--full-di
 
 One documented information gap: the cheap read set cannot reproduce the Sugar's staked-reserve sides (`staked0`/`staked1`), so a fast-path status run reports the emissions APR as absent rather than quoting it; a `--full-discovery` status run quotes it as before.
 
+**The decision surfaces share the fast path (2026-09-09).** `aero-bot-decide` and every `aero-bot-cycle` decide phase - dry runs included - resolve their pool through the same pin store (`src/aero_bot/known_pool.py`): a pinned symbol resolves from sixteen block-pinned views instead of the full enumeration, and an unpinned one runs the sweep once and persists the pin so every later cycle is fast.
+The decision fast path closes the executor status gap's decision-side twin by deriving the staked sides with the exact math the Sugar itself applies - one grid cell of the gauge's staked liquidity over the tick truncated toward zero onto the spacing grid (EVM signed-remainder semantics, so a negative unaligned tick selects the cell above the price) - and it derives the remaining Sugar-record fields from views verified live against the record at the same block on 2026-09-09: the factory's `getSwapFee(pool)` and `getUnstakedFee(pool)` (500 and 100000 ppm, exact), the factory's `voter()` then the Voter's `isAlive(gauge)` (true, exact), and the derived staked sides (117114415165 and 0 raw units at tick -11557, spacing 10, integer-exact).
+The factory's own `isPool(pool)` view additionally proves pool membership - a pool's self-reported `factory()` is not trustworthy alone - and any identity drift, dead gauge, non-AERO emission, or unreadable view falls back to the full sweep, which re-verifies everything the slow way and refreshes the pin.
+Every gate the venue adapter enforces on a swept candidate has its fast-path twin: the pair scope, the factory allowlist, gauge liveness, and the AERO emission check; the policy consumes the same `PoolCandidate` either way.
+
+**Read pacing and progress.** The executor RPC backend serves every request over one persistent keep-alive connection with a 0.2-second politeness gap between consecutive requests, mirroring the Sugar enumeration's own page delay, so the fast path's read burst stays under the public endpoint's request-rate limiter; retries report their attempt and backoff on stderr, and the Sugar sweep reports one line per enumerated page.
+A dry cycle's stdout stays machine-clean for the journal's JSON consumers.
+
 #### Before and after (live, read-only)
 
 The BEFORE wall times are the canary's measured per-action markers from `run/exec_markers.log` (2026-09-08, campaign endpoint); the docs' own captured builds corroborate them (mint dry-run `build took 200482.542 ms`, stake dry-run `build took 188123.104 ms`).

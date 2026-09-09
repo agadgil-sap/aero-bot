@@ -35,8 +35,11 @@ LP_SUGAR_ABI_RESOURCE = "lp_sugar_abi.json"
 ALL_FUNCTION_SELECTOR = "b10daf7b"
 # The sugar contract rejects any page larger than MAX_LPS pools.
 MAX_POOLS_PER_PAGE = 500
-# A small page size stays well under the contract cap and bounds each response.
-DEFAULT_PAGE_SIZE = 250
+# The contract cap itself: one page enumerates five hundred pools, halving
+# the request count (and so the public endpoint's rate-limit pressure) a
+# full sweep pays versus smaller pages, while each bounded response stays
+# far under the accepted byte ceiling.
+DEFAULT_PAGE_SIZE = 500
 # Twenty seconds bounds a failed request without blocking local startup indefinitely.
 REQUEST_TIMEOUT_SECONDS = 20.0
 # Five attempts with exponential backoff absorb public-RPC rate limiting.
@@ -339,6 +342,7 @@ class LpSugarRpcBackend:
         max_response_bytes: int = MAX_RESPONSE_BYTES,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        progress: Callable[[str], None] | None = None,
     ) -> None:
         """Configure bounded read-only enumeration behavior.
 
@@ -352,6 +356,9 @@ class LpSugarRpcBackend:
             max_response_bytes: Maximum accepted size of one RPC response body.
             transport: Optional injected HTTP transport for deterministic tests.
             sleep: Injected delay function used for backoff and politeness waits.
+            progress: Optional callback receiving one human-readable line per
+                enumerated page and per retried request, so a slow sweep never
+                looks like a stall to the operator watching stderr.
 
         Raises:
             ValueError: If any bound is non-positive or above its documented cap.
@@ -377,6 +384,8 @@ class LpSugarRpcBackend:
         # An injected transport keeps unit tests completely off the network.
         self._transport = transport
         self._sleep = sleep
+        # Progress lines are pure operator feedback; None keeps the backend silent.
+        self._progress = progress
 
     def discover(
         self,
@@ -473,6 +482,11 @@ class LpSugarRpcBackend:
                     f"LP Sugar page at offset {offset} failed decoding: {error}"
                 ) from error
             records.extend(page)
+            if self._progress is not None:
+                self._progress(
+                    f"lp sugar enumeration: {len(records)} pools enumerated "
+                    f"at block {int(block_number_hex, 16)}"
+                )
             if len(page) < self._page_size:
                 return tuple(records)
             offset += self._page_size
@@ -502,7 +516,13 @@ class LpSugarRpcBackend:
         for attempt in range(self._max_attempts):
             if attempt > 0:
                 # Exponential backoff absorbs public-endpoint rate limiting.
-                self._sleep(BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+                backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                if self._progress is not None:
+                    self._progress(
+                        f"rpc {method} attempt {attempt + 1} of {self._max_attempts} "
+                        f"failed ({failure}); backing off {backoff:.1f}s"
+                    )
+                self._sleep(backoff)
             try:
                 response = client.post(self._rpc_url, json=payload)
             except httpx.TransportError as error:

@@ -11,7 +11,7 @@ Exit codes: zero on any verdict (a hold is a decision, not a failure), one when 
 
 ## What one run assembles
 
-- The pool from live Sugar discovery, pinned to its snapshot block.
+- The pool from the known-pool fast path when a verified Sugar sweep has pinned it (sixteen block-pinned contract views; see [the LP execution fast-path section](docs/lp_execution.md)), otherwise from live Sugar discovery pinned to its snapshot block - and that first sweep persists the pin so the next run is fast.
 - The AMM price from the snapshot's sqrt ratio.
 - The emissions APR in Aerodrome's displayed convention (the shared conversion in `aero_bot.emissions_apr`), priced at a live AERO read from the canonical USDC/AERO pair at the same snapshot block.
 - The executable in-range depth from the planner's estimator.

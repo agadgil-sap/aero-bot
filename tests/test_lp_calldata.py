@@ -395,6 +395,11 @@ LIVE_SLOT0_RESULT = (
 def test_pool_state_read_selectors_are_pinned() -> None:
     """Every fast-path read selector carries its exact canonical bytes."""
     from aero_bot.lp_calldata import (
+        ERC20_BALANCE_OF_READ_SELECTOR,
+        FACTORY_GET_SWAP_FEE_READ_SELECTOR,
+        FACTORY_GET_UNSTAKED_FEE_READ_SELECTOR,
+        FACTORY_IS_POOL_READ_SELECTOR,
+        FACTORY_VOTER_READ_SELECTOR,
         GAUGE_FACTORY_NFT_READ_SELECTOR,
         GAUGE_REWARD_RATE_READ_SELECTOR,
         GAUGE_REWARD_TOKEN_READ_SELECTOR,
@@ -406,6 +411,7 @@ def test_pool_state_read_selectors_are_pinned() -> None:
         POOL_TICK_SPACING_READ_SELECTOR,
         POOL_TOKEN0_READ_SELECTOR,
         POOL_TOKEN1_READ_SELECTOR,
+        VOTER_IS_ALIVE_READ_SELECTOR,
         build_gauge_factory_nft_read_calldata,
         build_gauge_reward_rate_read_calldata,
         build_gauge_reward_token_read_calldata,
@@ -431,6 +437,12 @@ def test_pool_state_read_selectors_are_pinned() -> None:
         "rewardToken()": GAUGE_REWARD_TOKEN_READ_SELECTOR,
         "rewardRate()": GAUGE_REWARD_RATE_READ_SELECTOR,
         "nft()": GAUGE_FACTORY_NFT_READ_SELECTOR,
+        "voter()": FACTORY_VOTER_READ_SELECTOR,
+        "isAlive(address)": VOTER_IS_ALIVE_READ_SELECTOR,
+        "isPool(address)": FACTORY_IS_POOL_READ_SELECTOR,
+        "getSwapFee(address)": FACTORY_GET_SWAP_FEE_READ_SELECTOR,
+        "getUnstakedFee(address)": FACTORY_GET_UNSTAKED_FEE_READ_SELECTOR,
+        "balanceOf(address)": ERC20_BALANCE_OF_READ_SELECTOR,
     }
     for signature, selector in selectors.items():
         assert selector == keccak(text=signature)[:4].hex(), signature
@@ -467,6 +479,7 @@ def test_decode_view_results_reject_malformed_returns() -> None:
     """Every decoder refuses non-hex, short, and non-word payloads."""
     from aero_bot.lp_calldata import (
         decode_address_view_result,
+        decode_boolean_view_result,
         decode_pool_slot0_view,
         decode_uint_view_result,
     )
@@ -476,6 +489,7 @@ def test_decode_view_results_reject_malformed_returns() -> None:
             decode_pool_slot0_view,
             decode_address_view_result,
             decode_uint_view_result,
+            decode_boolean_view_result,
         ):
             try:
                 decode(malformed)
@@ -502,3 +516,12 @@ def test_decode_address_and_uint_view_results_round_trip() -> None:
 
     assert decode_address_view_result(address_word) == AAPLC_ADDRESS.lower()
     assert decode_uint_view_result("0x" + "f" * 64) == 2**256 - 1
+
+
+def test_decode_boolean_view_result_matches_evm_truthiness() -> None:
+    """Boolean views decode zero as false and any nonzero word as true."""
+    from aero_bot.lp_calldata import decode_boolean_view_result
+
+    assert decode_boolean_view_result("0x" + "00" * 32) is False
+    assert decode_boolean_view_result("0x" + "00" * 31 + "01") is True
+    assert decode_boolean_view_result("0x" + "f" * 64) is True

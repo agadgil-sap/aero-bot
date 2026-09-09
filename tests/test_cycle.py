@@ -95,9 +95,9 @@ class FakeCycleSources:
         self._usdc_units = usdc_units
         self._stock_units = stock_units
 
-    def discover(self) -> tuple[tuple[PoolCandidate, ...], int]:
+    def resolve_pool(self, symbol: str) -> tuple[PoolCandidate, int]:
         """Return the verified fixture pool and its snapshot block."""
-        return (make_candidate(),), 123
+        return make_candidate(), 123
 
     def registry_paused(self) -> bool:
         """The fixture registry is verified."""

@@ -5337,6 +5337,18 @@ def _print_execution_report(report: LpActionExecutionReport) -> None:
         print(f"halted: {report.halted_reason}")
 
 
+def _lp_progress(line: str) -> None:
+    """Print one operator progress line on stderr.
+
+    Progress lines never touch stdout so the machine-readable JSON output
+    stays clean for scripted consumers.
+
+    Args:
+        line: One human-readable progress line from a long-running phase.
+    """
+    print(f"[aero-bot-lp] {line}", file=sys.stderr)
+
+
 def _print_lp_plan(plan: LpMintPlan) -> None:
     """Print one mint plan's human summary.
 
@@ -5692,8 +5704,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     sources = LiveExecutionSources(
         rpc_url=settings.base_rpc_url,
         sugar_address=settings.lp_sugar_address,
+        progress=_lp_progress,
     )
-    rpc = ExecutorRpcBackend(rpc_url=settings.base_rpc_url)
+    rpc = ExecutorRpcBackend(rpc_url=settings.base_rpc_url, progress=_lp_progress)
     safe_rpc = SafeTransactionRpcBackend(rpc_url=settings.base_rpc_url, safe_address=safe_address)
     # The pin store arms the known-pool fast path; --full-discovery bypasses
     # it for one run by constructing the executor without pins.
