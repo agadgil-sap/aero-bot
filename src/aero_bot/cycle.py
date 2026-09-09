@@ -1328,25 +1328,40 @@ class CycleRunner:
         """Append the cycle-summary audit record when a sink is configured."""
         if self._audit_sink is None:
             return
-        status = report.reconciliation.tracked_status
-        self._audit_sink.append(
-            AuditEventType.CYCLE_REPORTED,
-            CycleReportPayload(
-                mode=report.mode.value,
-                symbol=report.symbol,
-                action=report.decision_action,
-                reason=report.decision_reason,
-                tracked_token_id=report.reconciliation.tracked_token_id,
-                position_value_usdc=str(status.position_value_usdc) if status is not None else None,
-                pnl_vs_entry_usdc=str(report.pnl_vs_entry_usdc)
-                if report.pnl_vs_entry_usdc is not None
-                else None,
-                fee_wei=report.fee_wei,
-                action_count=len(report.actions),
-                halted_reason=report.halted_reason,
-            ),
-            self._now(),
-        )
+        record_cycle_report(self._audit_sink, report, self._now())
+
+
+def record_cycle_report(audit_sink: AuditStore, report: CycleReport, created_at: datetime) -> None:
+    """Append one cycle-summary audit record to the chain.
+
+    The payload never carries credential fields; the audited summary is the
+    shared shape every cycle-shaped surface records - the scheduled cycle
+    and the range watchtower alike.
+
+    Args:
+        audit_sink: The store receiving the cycle-summary record.
+        report: The complete cycle report being recorded.
+        created_at: The record's timestamp, timezone-aware.
+    """
+    status = report.reconciliation.tracked_status
+    audit_sink.append(
+        AuditEventType.CYCLE_REPORTED,
+        CycleReportPayload(
+            mode=report.mode.value,
+            symbol=report.symbol,
+            action=report.decision_action,
+            reason=report.decision_reason,
+            tracked_token_id=report.reconciliation.tracked_token_id,
+            position_value_usdc=str(status.position_value_usdc) if status is not None else None,
+            pnl_vs_entry_usdc=str(report.pnl_vs_entry_usdc)
+            if report.pnl_vs_entry_usdc is not None
+            else None,
+            fee_wei=report.fee_wei,
+            action_count=len(report.actions),
+            halted_reason=report.halted_reason,
+        ),
+        created_at,
+    )
 
 
 def _print_report(report: CycleReport) -> None:
