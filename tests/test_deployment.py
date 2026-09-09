@@ -67,9 +67,7 @@ class TestInstallScript:
     def test_backup_env_template_pins_the_deploy_key_path(self) -> None:
         """Without the deploy-key path the runner never pins GIT_SSH_COMMAND."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
-        assert (
-            "AERO_BOT_BACKUP_DEPLOY_KEY_PATH=/etc/aero-bot/backup-deploy.key" in text
-        )
+        assert "AERO_BOT_BACKUP_DEPLOY_KEY_PATH=/etc/aero-bot/backup-deploy.key" in text
 
     def test_existing_sealed_files_survive_reinstalls(self) -> None:
         """Idempotence never overwrites the operator's sealed values."""
