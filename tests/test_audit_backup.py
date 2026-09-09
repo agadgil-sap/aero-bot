@@ -205,6 +205,25 @@ class TestChainExport:
         with pytest.raises(BackupRefusedError, match="empty"):
             export_chain(store)
 
+    def test_exported_records_revalidate_verbatim(self, tmp_path: Path) -> None:
+        """Each carried hash recomputes from the exported line as written."""
+        store = seeded_store(tmp_path, records=3)
+        hasher = AuditStore.__new__(AuditStore)
+        export, _, _ = export_chain(store)
+        previous = "0" * 64
+        for row_text in export.strip().splitlines():
+            row = json.loads(row_text)
+            assert row["previous_hash"] == previous
+            recomputed = hasher._calculate_hash(
+                row["sequence"],
+                row["created_at"],
+                AuditEventType(row["event_type"]),
+                row["payload_json"],
+                row["previous_hash"],
+            )
+            assert recomputed == row["record_hash"]
+            previous = row["record_hash"]
+
 
 class TestCorruptChainRefusal:
     """A tampered chain never reaches the backup."""
