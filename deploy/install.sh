@@ -80,8 +80,12 @@ chmod -R u=rwX,g=rX,o= "${APP_DIR}"
 
 log "building the virtual environment (uv downloads Python 3.12 when needed)"
 # The venv lives inside the root-owned tree but belongs to the service user,
-# which is the only writer the build and later reinstalls need.
+# which is the only writer the build and later reinstalls need. A re-run's
+# recursive chown above sweeps an existing venv back to root, so ownership
+# is re-asserted here: without it uv cannot replace the entry points and
+# the idempotent reinstall dies halfway.
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 "${VENV}"
+[[ -d "${VENV}" ]] && chown -R "${SERVICE_USER}:${SERVICE_USER}" "${VENV}"
 sudo -u "${SERVICE_USER}" env HOME="${STATE_DIR}" \
     UV_PYTHON_INSTALL_DIR="${STATE_DIR}/.uv-python" \
     uv sync --project "${APP_DIR}" --locked --no-dev
@@ -95,8 +99,10 @@ install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0700 "${STATE_DIR}"
 log "installing the sealed environment templates under ${CONFIG_DIR}"
 # root:service 0640: systemd reads these as root before dropping
 # privileges, and the service user may read them for manual operator runs -
-# writes stay root-only, and the only group is the bot itself.
-install -d -o root -g root -m 0750 "${CONFIG_DIR}"
+# writes stay root-only, and the only group is the bot itself. The directory
+# itself is root:service 0750 for the same reason: the cycle service runs as
+# the service user and must traverse it to read the signing-key file.
+install -d -o root -g "${SERVICE_USER}" -m 0750 "${CONFIG_DIR}"
 if [[ ! -f "${CONFIG_DIR}/cycle.env" ]]; then
     cat >"${CONFIG_DIR}/cycle.env" <<'EOF'
 # Aero Bot cycle environment - seal real values here (mode 0600, root-owned).
@@ -114,9 +120,11 @@ AERO_BOT_SIGNING_KEY_FILE=/etc/aero-bot/signing-key.hex
 AERO_BOT_AUDIT_DATABASE_PATH=/var/lib/aero-bot/audit.sqlite3
 AERO_BOT_LP_POOL_PINS_PATH=/var/lib/aero-bot/lp_pool_pins.json
 AERO_BOT_CYCLE_STATE_PATH=/var/lib/aero-bot/cycle_state.json
-# The Base RPC endpoint (the default public endpoint works; a paid endpoint
-# raises the rate limits).
-#AERO_BOT_BASE_RPC_URL=https://mainnet.base.org
+# The Base RPC endpoint: base.publicnode.com tolerates the Sugar
+# pagination sweeps where the official mainnet.base.org throttles small
+# hosts into 429 cascades (verified live on an e2-micro deploy); a paid
+# endpoint raises the rate limits further.
+AERO_BOT_BASE_RPC_URL=https://base.publicnode.com
 # The injected real-market reference quote, in USDC per share. The operator
 # owns its freshness honestly: an open position defensively exits without a
 # quote, and a stale constant is a stale quote.

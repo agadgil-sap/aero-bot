@@ -51,6 +51,11 @@ class TestInstallScript:
         assert 'chmod 0640 "${CONFIG_DIR}/cycle.env"' in text
         assert 'chmod 0640 "${CONFIG_DIR}/backup.env"' in text
 
+    def test_the_config_dir_is_service_group_traversable(self) -> None:
+        """The service user can traverse /etc/aero-bot to reach its sealed files."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert 'install -d -o root -g "${SERVICE_USER}" -m 0750 "${CONFIG_DIR}"' in text
+
     def test_existing_sealed_files_survive_reinstalls(self) -> None:
         """Idempotence never overwrites the operator's sealed values."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
@@ -63,6 +68,11 @@ class TestInstallScript:
         assert "uv sync --project" in text
         assert "--locked" in text
         assert "--no-dev" in text
+
+    def test_a_rerun_reasserts_service_ownership_of_the_venv(self) -> None:
+        """The recursive chown must not cost the service user its venv."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert 'chown -R "${SERVICE_USER}:${SERVICE_USER}" "${VENV}"' in text
 
     def test_the_state_tree_is_service_owned_mode_700(self) -> None:
         """/var/lib/aero-bot belongs to the service user alone."""
