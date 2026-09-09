@@ -143,9 +143,15 @@ fi
 if [[ ! -f "${CONFIG_DIR}/backup.env" ]]; then
     cat >"${CONFIG_DIR}/backup.env" <<'EOF'
 # Aero Bot audit-backup environment - seal real values here (mode 0600).
+# The audit chain the job verifies and ships lives under the service state
+# tree; without this line Settings falls back to its platform default and
+# the service sees an empty store.
+AERO_BOT_AUDIT_DATABASE_PATH=/var/lib/aero-bot/audit.sqlite3
 #AERO_BOT_BACKUP_KEY_HEX=<openssl rand -hex 32>
 #AERO_BOT_BACKUP_GIT_REMOTE=git@github.com:org/aero-bot-audit-backup.git
-#AERO_BOT_BACKUP_DEPLOY_KEY_PATH=/etc/aero-bot/backup-deploy.key
+# The deploy key for the SSH push ships at the documented path; without
+# this line the runner sets no GIT_SSH_COMMAND and git offers no identity.
+AERO_BOT_BACKUP_DEPLOY_KEY_PATH=/etc/aero-bot/backup-deploy.key
 #AERO_BOT_BACKUP_WORKTREE_PATH=/var/lib/aero-bot/audit-backup-repo
 EOF
     chown root:"${SERVICE_USER}" "${CONFIG_DIR}/backup.env"

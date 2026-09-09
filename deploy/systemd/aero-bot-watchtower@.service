@@ -19,6 +19,9 @@ EnvironmentFile=/etc/aero-bot/cycle.env
 # paths; no new privileges, a tight umask, and a private /tmp.
 WorkingDirectory=/var/lib/aero-bot
 StateDirectory=aero-bot
+# The installer and the audit store both require the state tree owner-only;
+# without this systemd re-applies its 0755 default at every start.
+StateDirectoryMode=0700
 Environment=UMASK=0077
 NoNewPrivileges=true
 PrivateTmp=true

@@ -56,6 +56,19 @@ class TestInstallScript:
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
         assert 'install -d -o root -g "${SERVICE_USER}" -m 0750 "${CONFIG_DIR}"' in text
 
+    def test_backup_env_template_pins_the_service_audit_path(self) -> None:
+        """The backup unit must read the same audit chain the cycle writes."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "AERO_BOT_AUDIT_DATABASE_PATH=/var/lib/aero-bot/audit.sqlite3" in text
+        assert text.index("AERO_BOT_AUDIT_DATABASE_PATH=/var/lib/aero-bot") < text.index(
+            "AERO_BOT_BACKUP_KEY_HEX"
+        )
+
+    def test_backup_env_template_pins_the_deploy_key_path(self) -> None:
+        """Without the deploy-key path the runner never pins GIT_SSH_COMMAND."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "AERO_BOT_BACKUP_DEPLOY_KEY_PATH=/etc/aero-bot/backup-deploy.key" in text
+
     def test_existing_sealed_files_survive_reinstalls(self) -> None:
         """Idempotence never overwrites the operator's sealed values."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
@@ -78,6 +91,13 @@ class TestInstallScript:
         """/var/lib/aero-bot belongs to the service user alone."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
         assert 'install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0700' in text
+
+    def test_units_pin_the_state_directory_mode(self) -> None:
+        """StateDirectory= never re-widens the installer's 0700 state tree."""
+        for unit in sorted(Path("deploy/systemd").glob("*.service")):
+            text = unit.read_text(encoding="utf-8")
+            if "StateDirectory=aero-bot" in text:
+                assert "StateDirectoryMode=0700" in text, unit.name
 
     def test_unattended_upgrades_are_configured(self) -> None:
         """Automatic security updates stay on."""

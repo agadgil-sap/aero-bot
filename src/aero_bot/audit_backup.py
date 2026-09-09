@@ -381,7 +381,13 @@ class AuditBackupRunner:
             GitBackupError: When ``check`` is set and git exits nonzero.
         """
         environment = dict(os.environ)
-        if self._deploy_key_path is not None and self._git_remote.startswith("ssh"):
+        # Any non-HTTP remote reaches git over SSH - the ssh:// scheme and
+        # the SCP-style git@host:path form alike - so the deploy key is
+        # pinned for both; a startswith("ssh") check silently skipped the
+        # documented SCP form and left git offering no identity at all.
+        if self._deploy_key_path is not None and not self._git_remote.startswith(
+            ("http://", "https://")
+        ):
             environment["GIT_SSH_COMMAND"] = (
                 f"ssh -i {self._deploy_key_path} -o IdentitiesOnly=yes "
                 "-o StrictHostKeyChecking=accept-new"
@@ -437,7 +443,13 @@ def export_chain(store: AuditStore) -> tuple[str, int, str]:
         json.dumps(
             {
                 "sequence": record.sequence,
-                "created_at": record.created_at.isoformat(),
+                # The store's hash binds the canonical Z-suffixed UTC text
+                # with fixed microsecond precision, so the export carries
+                # exactly that form - isoformat()'s default would leave the
+                # carried record hashes unverifiable.
+                "created_at": record.created_at.isoformat(timespec="microseconds").replace(
+                    "+00:00", "Z"
+                ),
                 "event_type": record.event_type.value,
                 "payload_json": record.payload_json,
                 "previous_hash": record.previous_hash,
