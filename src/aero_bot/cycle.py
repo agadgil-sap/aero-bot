@@ -1552,7 +1552,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"invalid reference price: {error}", file=sys.stderr)
         return EXIT_FAILURE
     safe_address = os.environ.get(SAFE_ADDRESS_ENV, DEFAULT_CANARY_SAFE_ADDRESS)
-    configured_relayer = os.environ.get(RELAYER_ADDRESS_ENV, "").strip() or None
+    raw_relayer = os.environ.get(RELAYER_ADDRESS_ENV, "").strip()
+    # Both sides normalize before comparison: a checksummed environment
+    # value and the lowercase derived address are the same relayer, and a
+    # case-sensitive compare refused the correct key on the first armed
+    # scheduled cycle (2026-09-09).
+    configured_relayer = normalize_evm_address(raw_relayer) if raw_relayer else None
     mode = CycleMode.DRY_RUN if arguments.dry_run else CycleMode.LIVE
     key_bytes: bytes | None = None
     if mode is CycleMode.LIVE:
