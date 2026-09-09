@@ -19,10 +19,13 @@ crashing the cycle they describe.
 """
 
 import os
+import re
 import smtplib
 import ssl
 import sys
 from collections.abc import Mapping
+from datetime import UTC
+from decimal import ROUND_HALF_UP, Decimal
 from email.message import EmailMessage
 from enum import StrEnum
 from typing import Protocol, TextIO, runtime_checkable
@@ -61,6 +64,20 @@ DEFAULT_SAFE_USDC_FLOOR_UNITS = 5_000_000
 # One email bound: the server gets its seconds, the cycle gets its exit.
 SMTP_TIMEOUT_SECONDS = 30.0
 HTTP_TIMEOUT_SECONDS = 20.0
+
+# The display precision every token quantity in an email renders at: plain
+# decimal notation, at most six fractional digits, trailing zeros stripped.
+# Six decimals keeps USDC (a six-decimal token) exact and reads ETH and stock
+# holdings at full pilot significance without 28-digit Decimal noise.
+_QUANTITY_QUANTUM = Decimal("0.000001")
+# Decimal tokens that read badly in email prose: Python's scientific
+# notation (like 0E-8) and any decimal longer than the display precision.
+# Short decimals, integers, hashes, and addresses never match, so sentence
+# wording around a rewritten token is preserved verbatim.
+_AWKWARD_DECIMAL = re.compile(r"(?<![\w.])(?:\d+(?:\.\d+)?[eE][+-]?\d+|\d+\.\d{7,})(?![\w.])")
+# The width every dashed section separator fills to; one calm email stays
+# on a single screen.
+_SECTION_WIDTH = 66
 
 
 class AlertTransportError(RuntimeError):
@@ -458,8 +475,94 @@ def evaluate_alerts(report: CycleReport, config: AlertConfig) -> tuple[str, ...]
     return tuple(alerts)
 
 
+def _format_quantity(value: Decimal) -> str:
+    """Render one token quantity for humans: plain, at most six decimals.
+
+    Args:
+        value: The quantity as a scaled Decimal, any exponent.
+
+    Returns:
+        The readable plain-decimal rendering; a nonzero quantity below the
+        display precision renders as ``<0.000001`` (never a silent zero).
+    """
+    if value == 0:
+        return "0"
+    if value.adjusted() > 21:
+        # Absurdly large for a token quantity; keep every digit, plainly.
+        return format(value, "f")
+    quantized = value.quantize(_QUANTITY_QUANTUM, rounding=ROUND_HALF_UP)
+    if quantized == 0:
+        return "<0.000001" if value > 0 else ">-0.000001"
+    return format(quantized, "f").rstrip("0").rstrip(".")
+
+
+def _humanize_numbers(text: str) -> str:
+    """Rewrite every awkward decimal token in one prose line for humans.
+
+    Args:
+        text: A diagnostic, alert, action, or note line as produced.
+
+    Returns:
+        The same line with scientific notation and overlong decimals
+        rendered at the display precision; every word around a rewritten
+        token is kept verbatim.
+    """
+    return _AWKWARD_DECIMAL.sub(lambda match: _format_quantity(Decimal(match.group(0))), text)
+
+
+def _section(title: str) -> str:
+    """Build one dashed separator line carrying its section title."""
+    return f"--- {title} ".ljust(_SECTION_WIDTH, "-")
+
+
+def _state_lines(report: CycleReport) -> list[str]:
+    """Render the reconciliation as scannable balance rows plus its story.
+
+    The structured rows rebuild the reconciliation's closing balance
+    summary from the raw fields so the numbers carry units and the stock
+    carries its symbol; every other diagnostic line follows verbatim
+    (numbers humanized), so no honest observation is dropped.
+
+    Args:
+        report: The cycle report whose reconciliation is rendered.
+
+    Returns:
+        The indented state lines, in report order after the balances.
+    """
+    reconciliation = report.reconciliation
+    # The one unread case: a run without a relayer address reports zero wei
+    # and says so; that honest line stays and no zero row is invented.
+    relayer_readable = not any(
+        line.startswith("relayer ETH unread") for line in reconciliation.diagnostics
+    )
+    safe_usdc = Decimal(reconciliation.safe_usdc_units).scaleb(-6)
+    lines = [
+        f"  {'Safe:':<10}{_format_quantity(safe_usdc)} USDC, "
+        f"{_format_quantity(reconciliation.held_stock_quantity)} {report.symbol}"
+    ]
+    if relayer_readable:
+        relayer_eth = Decimal(reconciliation.relayer_eth_wei).scaleb(-18)
+        lines.append(f"  {'relayer:':<10}{_format_quantity(relayer_eth)} ETH")
+    for line in reconciliation.diagnostics:
+        # The closing "Safe holds ..." summary is the balance row rebuilt
+        # above from the same raw fields; matching its exact producer
+        # prefix keeps every other diagnostic line flowing through.
+        if line.startswith("Safe holds "):
+            continue
+        lines.append(f"  {_humanize_numbers(line)}")
+    return lines
+
+
 def compose_cycle_email(report: CycleReport, alerts: tuple[str, ...]) -> tuple[str, str]:
     """Compose one cycle's email subject and plain-text body.
+
+    The body is one scannable screen: a titled header over the cycle's
+    mode, start (UTC, microsecond-free), decision, and event window, then
+    dashed sections for the reconciled state, any alerts and actions, the
+    outcome (P&L vs entry, gas spent, a halt when one happened), and the
+    honest-input notes as a bullet list. Quantities render at the display
+    precision and the stock carries its symbol, but every fact and every
+    disclosure keeps its wording.
 
     Args:
         report: The complete cycle report being summarized.
@@ -468,7 +571,6 @@ def compose_cycle_email(report: CycleReport, alerts: tuple[str, ...]) -> tuple[s
     Returns:
         The subject line and the plain-text body.
     """
-    reconciliation = report.reconciliation
     if alerts:
         subject = f"[aero-bot][ALERT] {report.symbol} cycle {report.decision_action}: {alerts[0]}"
         if len(subject) > 120:
@@ -477,43 +579,45 @@ def compose_cycle_email(report: CycleReport, alerts: tuple[str, ...]) -> tuple[s
         subject = (
             f"[aero-bot] {report.symbol} cycle {report.decision_action} ({report.decision_reason})"
         )
+    title = f"Aero Bot cycle report - {report.symbol}"
+    started = report.started_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     lines: list[str] = [
-        f"Aero Bot cycle report - {report.symbol}",
+        title,
+        "=" * len(title),
         "",
-        f"mode: {report.mode.value}",
-        f"started: {report.started_at.isoformat()}",
-        f"decision: {report.decision_action} ({report.decision_reason})",
-        f"event window: {report.event_window}",
+        f"{'mode:':<14}{report.mode.value}",
+        f"{'started:':<14}{started}",
+        f"{'decision:':<14}{report.decision_action} ({report.decision_reason})",
+        f"{'event window:':<14}{report.event_window}",
         "",
-        "state:",
+        _section("state"),
+        "",
+        *_state_lines(report),
     ]
-    lines.extend(f"  {line}" for line in reconciliation.diagnostics)
     if alerts:
-        lines.append("")
-        lines.append("alerts:")
-        lines.extend(f"  ! {line}" for line in alerts)
+        lines.extend(["", _section("alerts"), ""])
+        lines.extend(f"  ! {_humanize_numbers(line)}" for line in alerts)
     if report.actions:
-        lines.append("")
-        lines.append("actions:")
+        lines.extend(["", _section("actions"), ""])
         for action in report.actions:
             suffix = f" [{action.refusal_code}]" if action.refusal_code else ""
             lines.append(f"  {action.action}: {action.status}{suffix}")
             for transaction_hash in action.transaction_hashes:
                 lines.append(f"    tx {transaction_hash}")
             if action.diagnostic:
-                lines.append(f"    {action.diagnostic}")
-    lines.append("")
+                lines.append(f"    {_humanize_numbers(action.diagnostic)}")
+    lines.extend(["", _section("outcome"), ""])
     if report.pnl_vs_entry_usdc is not None:
-        lines.append(f"pnl vs entry: {report.pnl_vs_entry_usdc} USDC")
+        pnl = f"{_format_quantity(report.pnl_vs_entry_usdc)} USDC"
     else:
-        lines.append(f"pnl vs entry: unavailable ({report.pnl_diagnostic})")
-    lines.append(f"gas spent: {report.fee_wei} wei")
+        pnl = f"unavailable ({_humanize_numbers(report.pnl_diagnostic)})"
+    lines.append(f"  {'pnl vs entry:':<15}{pnl}")
+    lines.append(f"  {'gas spent:':<15}{report.fee_wei} wei")
     if report.halted_reason:
-        lines.append(f"halted: {report.halted_reason}")
+        lines.append(f"  {'halted:':<15}{report.halted_reason}")
     if report.input_notes:
-        lines.append("")
-        lines.append("notes:")
-        lines.extend(f"  {note}" for note in report.input_notes)
+        lines.extend(["", _section("notes"), ""])
+        lines.extend(f"  - {_humanize_numbers(note)}" for note in report.input_notes)
     return subject, "\n".join(lines) + "\n"
 
 
