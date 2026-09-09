@@ -1,0 +1,35 @@
+[Unit]
+Description=Aero Bot range watchtower (seconds-level defensive exit on range trips)
+Documentation=file:/opt/aero-bot/docs/watchtower.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/aero-bot/cycle.env
+
+[Service]
+Type=simple
+# The dedicated unprivileged service user owns the state, audit, and pin
+# files under /var/lib/aero-bot and nothing else on the host.
+User=aero-bot
+Group=aero-bot
+# Sealed environment: the same 0600 file the cycle units read - the Safe,
+# the relayer address, the key-source selection, the alert transport, and
+# the watchtower's own enable flag, poll interval, and cooldown.
+EnvironmentFile=/etc/aero-bot/cycle.env
+# Hardening: the service sees only its own state tree and read-only system
+# paths; no new privileges, a tight umask, and a private /tmp.
+WorkingDirectory=/var/lib/aero-bot
+StateDirectory=aero-bot
+Environment=UMASK=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aero-bot
+# The watcher is read-only until a verified range trip; a crash restarts
+# into the persisted cooldown and never re-fires at once.
+ExecStart=/opt/aero-bot/.venv/bin/aero-bot-watchtower --symbol %i
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

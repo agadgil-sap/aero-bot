@@ -67,6 +67,10 @@ See [the LP execution fast-path section](docs/lp_execution.md) for the verified 
 
 See `docs/deployment.md` (the deployment kit) for the full Ubuntu install and smoke checklist.
 
+## The range watchtower complement
+
+Between cycles, the always-on range watchtower (`aero-bot-watchtower`, [docs/watchtower.md](docs/watchtower.md)) polls the tracked pool's tick every few seconds and fires this same defensive exit the moment a verified trip leaves the earning range - never gated by market windows or the reference quote, and dark until the sealed enable flag arms it.
+
 ## Email alerts
 
 Every cycle can email its summary and its alerts - position state, P&L vs entry, gas and balance floors (relayer ETH, Safe USDC), and any refusal, failure, or out-of-band condition - through a provider-agnostic SMTP transport or a Resend-style HTTP adapter, with credentials sealed in the environment and a delivery failure that never crashes the cycle.

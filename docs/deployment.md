@@ -56,6 +56,9 @@ systemctl list-timers | grep aero-bot
 
 The cycle timer defaults to hourly (`OnCalendar=hourly`, `Persistent=true`, 180 s jitter); a drop-in changes it (`systemctl edit aero-bot-cycle@AAPLc.timer`). The backup runs daily. Cycles are hardened oneshots: they never overlap, never auto-retry - the next tick reconciles.
 
+The range watchtower ships dark and arms separately, on its own explicit decision: set `AERO_BOT_WATCHTOWER_ENABLED=1` in `/etc/aero-bot/cycle.env`, then `sudo systemctl enable --now aero-bot-watchtower@AAPLc.service`.
+See [the watchtower documentation](docs/watchtower.md) for the trip semantics, the fail-safe posture, and the day-two triage.
+
 ## Smoke checklist (captain present, every line green before departure)
 
 1. **Dry cycle decides.** `sudo -u aero-bot bash -c 'set -a; . /etc/aero-bot/cycle.env; set +a; /opt/aero-bot/.venv/bin/aero-bot-cycle --symbol AAPLc --dry-run --json'` - exit 0, a complete report with balances, custody, and the honest verdict (a `hold (reference_stale)` without a sealed quote is correct behavior; with `AERO_BOT_CYCLE_REFERENCE_PRICE_USDC` sealed, the full gate chain runs). The first run on a fresh install pays one full Sugar sweep - several minutes over the public RPC - while printing one `lp sugar enumeration: N pools` progress line per page on stderr; it pins the verified pool, and every later cycle resolves in seconds through the known-pool fast path. Wait for the report; the progress lines mean it is working, not hung.

@@ -106,6 +106,7 @@ class TestDashboardUnit:
             "aero-bot-cycle@.service",
             "aero-bot-cycle@.timer",
             "aero-bot-dashboard.service",
+            "aero-bot-watchtower@.service",
         ]
 
 

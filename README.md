@@ -106,6 +106,11 @@ A crashed cycle reconciles toward chain truth and never double-acts, adopting a 
 See [the cycle command documentation](docs/cycle.md) for the fixed cycle order, the action mapping, the crash discipline, and the systemd wiring.
 Each cycle can email its summary and alerts through a sealed-credential SMTP or Resend-style transport; see [the alerts documentation](docs/alerts.md) for the configuration and semantics.
 
+## Watchtower command
+
+The `aero-bot-watchtower` command is the always-on range watcher: one cheap tick poll every few seconds against the tracked position's range bounds, and the audited defensive close the moment a verified trip leaves the earning range - never gated by market windows or the reference quote, fail-safe on unreadable state, dark until the sealed enable flag arms it.
+See [the watchtower documentation](docs/watchtower.md) for the trip semantics, the latch and cooldown, the configuration, and the arming path.
+
 ## Wallet-free transaction planning
 
 The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.

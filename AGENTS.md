@@ -14,7 +14,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - Real signing keys live in the macOS Keychain (`AERO_BOT_KEYCHAIN_SERVICE`/`AERO_BOT_KEYCHAIN_ACCOUNT`) on dev machines and in sealed sources on Linux (`AERO_BOT_KEY_SOURCE` selecting keychain/env/file - see `src/aero_bot/signing_key.py`); never print or persist key material - public addresses only.
 - `run/` and `data/` hold campaign artifacts: `data/aero-bot-lp-canary-campaign/timing-report.md` is the canonical canary evidence.
 - The scheduled loop is `aero-bot-cycle` (`docs/cycle.md`): reconcile-decide-act per run, the systemd timer decides when; the empty residual NFT 5703026 no longer blocks entry (only LIVE untracked positions refuse), and exits close through `execute exit-swap`.
-- The deployed surfaces: cycle + alerts (`docs/alerts.md`), encrypted daily audit backup (`docs/audit-backup.md`), and the Ubuntu kit (`deploy/install.sh`, `docs/deployment.md` - the installer never arms a timer; Phase 2 does).
+- The deployed surfaces: cycle + alerts (`docs/alerts.md`), the always-on range watchtower (`docs/watchtower.md` - dark until `AERO_BOT_WATCHTOWER_ENABLED` arms it), encrypted daily audit backup (`docs/audit-backup.md`), and the Ubuntu kit (`deploy/install.sh`, `docs/deployment.md` - the installer never arms a timer; Phase 2 does).
 
 ## Maintaining this file
 
