@@ -56,6 +56,14 @@ class TestInstallScript:
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
         assert 'install -d -o root -g "${SERVICE_USER}" -m 0750 "${CONFIG_DIR}"' in text
 
+    def test_backup_env_template_pins_the_service_audit_path(self) -> None:
+        """The backup unit must read the same audit chain the cycle writes."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "AERO_BOT_AUDIT_DATABASE_PATH=/var/lib/aero-bot/audit.sqlite3" in text
+        assert text.index("AERO_BOT_AUDIT_DATABASE_PATH=/var/lib/aero-bot") < text.index(
+            "AERO_BOT_BACKUP_KEY_HEX"
+        )
+
     def test_existing_sealed_files_survive_reinstalls(self) -> None:
         """Idempotence never overwrites the operator's sealed values."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
