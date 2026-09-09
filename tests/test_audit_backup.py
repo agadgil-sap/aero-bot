@@ -5,6 +5,7 @@ import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pydantic import BaseModel
@@ -288,6 +289,56 @@ class TestGitPushFlow:
         second = second_runner.run()
         assert second.bundle_name == "audit-chain-20260910.bin"
         assert sorted(remote_tree(remote)) == sorted({first.bundle_name, second.bundle_name})
+
+
+class TestSshRemoteKeyPinning:
+    """GIT_SSH_COMMAND must cover every non-HTTP remote form."""
+
+    def test_scp_style_remote_pins_the_deploy_key(self, tmp_path: Path) -> None:
+        """The documented git@host:path remote carries the key pin."""
+        key = tmp_path / "deploy.key"
+        key.write_text("fixture", encoding="ascii")
+        environments: list[dict[str, str]] = []
+
+        def fake_runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            environments.append(dict(cast("dict[str, str]", kwargs.get("env"))))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        runner = AuditBackupRunner(
+            store=AuditStore(tmp_path / "audit.sqlite3"),
+            worktree_path=tmp_path / "worktree",
+            git_remote="git@github.com:agadgil-sap/aero-bot.git",
+            branch="audit-backup",
+            key_bytes=BACKUP_KEY,
+            deploy_key_path=key,
+            runner=fake_runner,
+        )
+        runner._git("status")
+        assert environments[-1]["GIT_SSH_COMMAND"] == (
+            f"ssh -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+        )
+
+    def test_https_remote_never_pins_ssh(self, tmp_path: Path) -> None:
+        """An HTTPS remote ignores the deploy key entirely."""
+        key = tmp_path / "deploy.key"
+        key.write_text("fixture", encoding="ascii")
+        environments: list[dict[str, str]] = []
+
+        def fake_runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            environments.append(dict(cast("dict[str, str]", kwargs.get("env"))))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        runner = AuditBackupRunner(
+            store=AuditStore(tmp_path / "audit.sqlite3"),
+            worktree_path=tmp_path / "worktree",
+            git_remote="https://github.com/agadgil-sap/aero-bot.git",
+            branch="audit-backup",
+            key_bytes=BACKUP_KEY,
+            deploy_key_path=key,
+            runner=fake_runner,
+        )
+        runner._git("status")
+        assert "GIT_SSH_COMMAND" not in environments[-1]
 
 
 class TestDeployKeyDiscipline:

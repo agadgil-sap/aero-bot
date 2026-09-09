@@ -381,7 +381,13 @@ class AuditBackupRunner:
             GitBackupError: When ``check`` is set and git exits nonzero.
         """
         environment = dict(os.environ)
-        if self._deploy_key_path is not None and self._git_remote.startswith("ssh"):
+        # Any non-HTTP remote reaches git over SSH - the ssh:// scheme and
+        # the SCP-style git@host:path form alike - so the deploy key is
+        # pinned for both; a startswith("ssh") check silently skipped the
+        # documented SCP form and left git offering no identity at all.
+        if self._deploy_key_path is not None and not self._git_remote.startswith(
+            ("http://", "https://")
+        ):
             environment["GIT_SSH_COMMAND"] = (
                 f"ssh -i {self._deploy_key_path} -o IdentitiesOnly=yes "
                 "-o StrictHostKeyChecking=accept-new"
