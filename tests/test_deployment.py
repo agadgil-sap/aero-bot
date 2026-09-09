@@ -87,6 +87,13 @@ class TestInstallScript:
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
         assert 'install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0700' in text
 
+    def test_units_pin_the_state_directory_mode(self) -> None:
+        """StateDirectory= never re-widens the installer's 0700 state tree."""
+        for unit in sorted(Path("deploy/systemd").glob("*.service")):
+            text = unit.read_text(encoding="utf-8")
+            if "StateDirectory=aero-bot" in text:
+                assert "StateDirectoryMode=0700" in text, unit.name
+
     def test_unattended_upgrades_are_configured(self) -> None:
         """Automatic security updates stay on."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
