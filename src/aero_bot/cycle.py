@@ -55,6 +55,7 @@ from aero_bot.executor import (
     SAFE_ADDRESS_ENV,
     ExecutionUnavailableError,
 )
+from aero_bot.history import price_usdc_per_stock
 from aero_bot.lp_executor import (
     EXIT_FAILURE,
     EXIT_OK,
@@ -600,11 +601,31 @@ def _action_hashes_and_fees(report: LpActionExecutionReport) -> tuple[tuple[str,
     return hashes, fees
 
 
-def _price_at_tick(tick: int) -> Decimal:
-    """Return the exact pool price at one tick-grid boundary."""
+def _price_at_tick(
+    tick: int,
+    *,
+    stock_is_token0: bool,
+    stock_decimals: int,
+) -> Decimal:
+    """Return one Slipstream tick boundary in human USDC per stock.
+
+    Args:
+        tick: The pool tick boundary.
+        stock_is_token0: Whether the stock is token0 rather than token1.
+        stock_decimals: Decimal count of the stock token.
+
+    Returns:
+        The boundary price in USDC per whole stock token.
+    """
     with localcontext() as context:
         context.prec = MATH_PRECISION
-        return +(TICK_PRICE_RATIO**tick)
+        sqrt_ratio = int((TICK_PRICE_RATIO**tick).sqrt() * Decimal(1 << 96))
+    return price_usdc_per_stock(
+        sqrt_ratio,
+        stock_is_token0,
+        stock_decimals,
+        6,
+    )
 
 
 def _cooldown_until(book: CycleStateBook, symbol: str) -> datetime | None:
@@ -1156,14 +1177,31 @@ class CycleRunner:
         position: PolicyPosition | None = None
         if book.position is not None and reconciliation.tracked_status is not None:
             status = reconciliation.tracked_status
+            stock_address = self._stock_token_address_for(book.position.symbol)
+            pool = self._pool_for_symbol(book.position.symbol)
+            stock_decimals = self._sources.token_decimals(stock_address)
+            stock_is_token0 = (
+                normalize_evm_address(pool.token0_address)
+                == normalize_evm_address(stock_address)
+            )
+            first_edge_price = _price_at_tick(
+                status.position.tick_lower,
+                stock_is_token0=stock_is_token0,
+                stock_decimals=stock_decimals,
+            )
+            second_edge_price = _price_at_tick(
+                status.position.tick_upper,
+                stock_is_token0=stock_is_token0,
+                stock_decimals=stock_decimals,
+            )
             position = PolicyPosition(
                 pool_address=status.pool_address,
-                token_address=self._stock_token_address_for(book.position.symbol),
+                token_address=stock_address,
                 price_range=AlignedPriceRange(
                     lower_tick=status.position.tick_lower,
                     upper_tick=status.position.tick_upper,
-                    lower_price=_price_at_tick(status.position.tick_lower),
-                    upper_price=_price_at_tick(status.position.tick_upper),
+                    lower_price=min(first_edge_price, second_edge_price),
+                    upper_price=max(first_edge_price, second_edge_price),
                 ),
                 committed_usd=book.position.committed_usd,
                 entered_at=book.position.entered_at,

@@ -11,6 +11,8 @@ from pydantic import BaseModel
 from test_lp_executor import (
     B20_ADDRESS,
     GAUGE_ADDRESS,
+    LP_RANGE_LOWER,
+    LP_RANGE_UPPER,
     LP_SQRT_RATIO,
     NFPM_ADDRESS,
     POOL_ADDRESS,
@@ -66,8 +68,8 @@ RELAYER_ADDRESS = "0x0c49cc4d53423ccd6be2bcf115a25f418649c5c9"
 # A mint delivery hash the fake receipt store resolves.
 MINT_TX_HASH = "0x" + "ab" * 32
 # A stand-in gauge/staked custody shape.
-FIXTURE_RANGE_LOWER = -11630
-FIXTURE_RANGE_UPPER = -11610
+FIXTURE_RANGE_LOWER = LP_RANGE_LOWER
+FIXTURE_RANGE_UPPER = LP_RANGE_UPPER
 # The entry size and width the locked engine derives at a ten-USDC
 # equity: the 80-percent equity cap (the captain's 2026-09-09 sizing
 # ruling) and the ceiling-rounded spacing width.
@@ -737,7 +739,12 @@ class TestReconciliation:
     def test_above_range_wait_survives_across_scheduled_cycles(self, tmp_path: Path) -> None:
         """The fifteen-minute recenter clock never restarts on each cycle."""
         reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
-        reads.set_status(TRACKED_TOKEN_ID, tracked_status())
+        # Explicitly put the token1-stock NFT below the fixture's
+        # USDC/stock price so this test exercises the upside wait path.
+        above_range = tracked_status().model_copy(
+            update={"position": SimpleNamespace(tick_lower=-10, tick_upper=10)}
+        )
+        reads.set_status(TRACKED_TOKEN_ID, above_range)
         runner, _, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
 
         first = runner.run(
@@ -1231,3 +1238,45 @@ class TestCycleConfiguration:
             _reference_price_from_environment({CYCLE_REFERENCE_PRICE_ENV: "AAPLc="})
         with pytest.raises(ValueError, match="more than once"):
             _reference_price_from_environment({CYCLE_REFERENCE_PRICE_ENV: "A=1,A=2"})
+
+
+def test_token1_stock_in_range_clears_stale_recenter_anchor(tmp_path: Path) -> None:
+    """An in-range token1-stock NFT cannot recenter from a stale wait anchor."""
+    book = tracked_book()
+    assert book.position is not None
+    stale_anchor = QUIET_INSTANT - timedelta(minutes=30)
+    book = book.model_copy(
+        update={
+            "position": book.position.model_copy(
+                update={"out_of_range_since": stale_anchor}
+            )
+        }
+    )
+
+    reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+    reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS))
+
+    runner, _, _, state_store = make_runner(
+        tmp_path,
+        book=book,
+        reads=reads,
+    )
+
+    reconciliation = runner._reconcile(book)
+    state = runner._policy_state(book, reconciliation)
+
+    assert state.position is not None
+    assert state.position.price_range.lower_price < FIXTURE_AMM_PRICE
+    assert state.position.price_range.upper_price > FIXTURE_AMM_PRICE
+
+    report = runner.run(
+        CycleMode.DRY_RUN,
+        reference_price_usdc=FIXTURE_AMM_PRICE,
+    )
+
+    assert report.decision_action == "hold"
+    assert report.decision_reason != "recenter_wait_elapsed"
+
+    saved = state_store.load()
+    assert saved.position is not None
+    assert saved.position.out_of_range_since is None
