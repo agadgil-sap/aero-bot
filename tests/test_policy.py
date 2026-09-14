@@ -1245,6 +1245,29 @@ class TestDislocationMonitor:
         )
         assert reentered.decision.action is PolicyActionKind.ENTER
 
+    def test_disabled_reference_enforcement_cannot_trigger_inventory_convergence(self) -> None:
+        """Diagnostic-only references cannot authorize an inventory sale."""
+        engine, state = entered_session()
+        burned = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.6"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        held = engine.decide(
+            burned.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 3, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("205"),
+                reference_price_usdc=Decimal("200"),
+                reference_enforcement_enabled=False,
+            ),
+        )
+        assert held.decision.action is PolicyActionKind.HOLD
+        assert held.decision.reason is PolicyReason.HOLDING_INVENTORY_AWAITING_CONVERGENCE
+
     def test_convergence_timeout_sells_at_market_as_the_safety_bound(self) -> None:
         """Tokens still held five minutes after the burn sell at market."""
         engine, state = entered_session()

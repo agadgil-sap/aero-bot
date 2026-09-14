@@ -1186,7 +1186,8 @@ class PolicyEngine:
         # timeout bound or a flat window can release the held tokens.
         reference = observation.reference_price_usdc
         converged = (
-            reference is not None
+            observation.reference_enforcement_enabled
+            and reference is not None
             and not self._reference_stale(observation)
             and observation.amm_price_usdc
             >= reference * (Decimal(1) - self._parameters.dislocation_threshold_fraction)
