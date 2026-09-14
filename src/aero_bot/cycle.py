@@ -1242,6 +1242,14 @@ class CycleRunner:
             reference_age_seconds,
             self._safe_address,
         )
+        # Production actions are authoritative to the exact resolved Aerodrome
+        # pool. External equity references remain report-only diagnostics and
+        # can never directly trigger a buy, sell, mint, burn, or defensive exit.
+        observation = observation.model_copy(update={"reference_enforcement_enabled": False})
+        notes = notes + (
+            "external reference is diagnostic-only; scheduled actions use the "
+            "resolved Aerodrome pool's on-chain price and state",
+        )
         engine = PolicyEngine(LOCKED_POLICY_PARAMETERS, load_event_calendar())
         outcome = engine.decide(state, observation)
         window = evaluate_event_window(
@@ -1300,6 +1308,21 @@ class CycleRunner:
             reference_prices_by_symbol,
             reference_age_seconds,
             self._safe_address,
+        )
+        # Apply the same pool-authoritative doctrine to every selector option.
+        options = tuple(
+            option.model_copy(
+                update={
+                    "observation": option.observation.model_copy(
+                        update={"reference_enforcement_enabled": False}
+                    )
+                }
+            )
+            for option in options
+        )
+        notes = notes + (
+            "external references are diagnostic-only; selector actions use each "
+            "resolved Aerodrome pool's on-chain price and state",
         )
         engine = PolicyEngine(LOCKED_POLICY_PARAMETERS, load_event_calendar())
         selection = select_board(

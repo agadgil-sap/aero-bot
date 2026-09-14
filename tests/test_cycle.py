@@ -564,12 +564,13 @@ class TestMintReceiptDecoding:
 class TestDryRunCycles:
     """Dry runs reconcile and decide without any key or build."""
 
-    def test_flat_cycle_without_a_reference_holds_fail_closed(self, tmp_path: Path) -> None:
-        """The reference-stale hold is the honest verdict, audited once."""
+    def test_flat_cycle_without_a_reference_uses_pool_authority(self, tmp_path: Path) -> None:
+        """Scheduled cycles use the resolved Aerodrome pool without an external quote."""
         runner, _, audit, state_store = make_runner(tmp_path)
         report = runner.run(CycleMode.DRY_RUN)
-        assert report.decision_action == "hold"
-        assert report.decision_reason == "reference_stale"
+        assert report.decision_action == "enter"
+        assert report.decision_reason == "entry_threshold_met"
+        assert any("diagnostic-only" in note for note in report.input_notes)
         assert report.actions == ()
         assert report.halted_reason == ""
         book = state_store.load()
@@ -742,6 +743,27 @@ class TestReconciliation:
         assert report.reconciliation.tracked_staked is False
         assert report.pnl_vs_entry_usdc == Decimal("1")
         assert report.decision_action == "hold"
+
+    def test_external_reference_cannot_force_scheduled_position_exit(self, tmp_path: Path) -> None:
+        """A divergent external quote is advisory and cannot order an Aerodrome exit."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status())
+        runner, _, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+        report = runner.run(
+            CycleMode.DRY_RUN,
+            reference_price_usdc=Decimal("1"),
+            reference_age_seconds=999999,
+        )
+        assert report.reconciliation.tracked_token_id == TRACKED_TOKEN_ID
+        assert report.decision_action == "hold"
+        assert report.decision_reason in {
+            "open_in_range",
+            "open_above_range_waiting",
+            "open_below_edge_holding",
+        }
+        assert "dislocation" not in report.decision_reason
+        assert "reference_stale" not in report.decision_reason
+        assert any("diagnostic-only" in note for note in report.input_notes)
 
     def test_a_crashed_entry_is_adopted_from_audit_evidence(self, tmp_path: Path) -> None:
         """One live untracked position proven by the audit chain adopts."""
@@ -987,18 +1009,17 @@ def selector_runner(
 class TestSelectorCycles:
     """Cross-board selection cycles: entry, hysteresis, and one position."""
 
-    def test_flat_selector_cycle_holds_when_no_pool_qualifies(self, tmp_path: Path) -> None:
-        """Without references every pool blocks and the board holds honestly."""
+    def test_flat_selector_cycle_uses_pool_authority_without_references(
+        self, tmp_path: Path
+    ) -> None:
+        """External references are not required for Aerodrome pool selection."""
         runner, _, _ = selector_runner(tmp_path)
         report = runner.run(CycleMode.DRY_RUN)
-        assert report.decision_action == "hold"
-        assert report.decision_reason == "no_qualifying_pool"
-        assert "AAAc reference_stale" in report.decision_diagnostics[0]
-        assert "BBBc reference_stale" in report.decision_diagnostics[0]
-        assert any("board [" in note for note in report.input_notes)
-        # The no-qualify report names the closest-call pool (the highest
-        # emissions APR), mirroring the decide surface's fallback.
+        assert report.decision_action == "enter"
+        assert report.decision_reason == "entry_threshold_met"
         assert report.symbol == "BBBc"
+        assert any("diagnostic-only" in note for note in report.input_notes)
+        assert any("board [" in note for note in report.input_notes)
 
     def test_selector_enters_the_best_qualifying_pool(self, tmp_path: Path) -> None:
         """The live cycle mints and stakes the higher-APR pool only."""

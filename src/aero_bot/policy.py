@@ -454,6 +454,10 @@ class PolicyObservation(BaseModel):
     reference_price_usdc: Annotated[Decimal, Field(gt=0)] | None = None
     # Reference age is seconds since that quote; absence means no live quote.
     reference_age_seconds: Annotated[int, Field(ge=0)] | None = None
+    # External references are advisory unless an explicit caller enables
+    # reference enforcement. Scheduled production cycles deliberately disable
+    # it: the resolved Aerodrome pool is authoritative for trading actions.
+    reference_enforcement_enabled: bool = True
     # A stale oracle observation is a condition-driven flat event per policy.
     oracle_stale: bool = False
     # A paused B20 registry is a condition-driven flat event per policy.
@@ -1262,6 +1266,8 @@ class PolicyEngine:
         Raises:
             ValueError: If the state carries no open position.
         """
+        if not observation.reference_enforcement_enabled:
+            return None
         reference = observation.reference_price_usdc
         if reference is None or self._reference_stale(observation):
             return None
@@ -1652,6 +1658,8 @@ class PolicyEngine:
             True when the reference is missing or older than the open-position
             bound.
         """
+        if not observation.reference_enforcement_enabled:
+            return False
         if observation.reference_price_usdc is None or observation.reference_age_seconds is None:
             return True
         return observation.reference_age_seconds > (
@@ -1804,6 +1812,10 @@ class PolicyEngine:
         Returns:
             True when the reference quote is missing or older than the bound.
         """
+        # Scheduled production cycles use the resolved Aerodrome pool as the
+        # trading authority; an external quote is then diagnostic only.
+        if not observation.reference_enforcement_enabled:
+            return False
         # A missing quote or age is treated as unavailable, never as fresh.
         if observation.reference_price_usdc is None or observation.reference_age_seconds is None:
             return True
