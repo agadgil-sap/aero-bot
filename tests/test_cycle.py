@@ -860,12 +860,13 @@ class TestReferenceEnvironment:
 class TestSystemdUnits:
     """The deployment contract the timer and service units pin."""
 
-    def test_the_timer_defaults_hourly_with_persistence_and_jitter(self) -> None:
-        """One cycle per hour, catching up after downtime, never overlapping."""
+    def test_the_timer_defaults_five_minutes_with_persistence_and_jitter(self) -> None:
+        """Five-minute policy cycles honor fifteen-minute persistence rules."""
         timer = Path("deploy/systemd/aero-bot-cycle@.timer").read_text(encoding="utf-8")
-        assert "OnCalendar=hourly" in timer
+        assert "OnCalendar=*:0/5" in timer
         assert "Persistent=true" in timer
-        assert "RandomizedDelaySec=180" in timer
+        assert "AccuracySec=15s" in timer
+        assert "RandomizedDelaySec=15" in timer
         assert "Unit=aero-bot-cycle@%i.service" in timer
 
     def test_the_service_is_a_hardened_oneshot(self) -> None:

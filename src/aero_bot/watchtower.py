@@ -150,6 +150,10 @@ class WatchtowerConfig(BaseModel):
     poll_interval_seconds: Annotated[float, Field(gt=0)] = DEFAULT_WATCHTOWER_POLL_SECONDS
     # Seconds every close attempt waits before another may fire.
     cooldown_seconds: Annotated[float, Field(gt=0)] = DEFAULT_WATCHTOWER_COOLDOWN_SECONDS
+    # Production systemd runs monitor-only: range trips alert but can never
+    # load the signing key or broadcast. The decision cycle is the sole
+    # authority for trading actions.
+    monitor_only: bool = False
 
 
 def _parse_seconds(value: str, variable: str) -> float:
@@ -568,11 +572,40 @@ class RangeWatchtower:
                     f"[{bounds.tick_lower}, {bounds.tick_upper})",
                 )
             return WatchtowerPollOutcome(state=WatchtowerPollState.IN_RANGE, observed_tick=tick)
-        if not latch.tripped:
+        fresh_trip = not latch.tripped
+        if fresh_trip:
             self._save_latch(
                 tripped=True,
                 note=f"range trip latched: tick {tick} is {trip_state.value} the position "
                 f"range [{bounds.tick_lower}, {bounds.tick_upper})",
+            )
+        if self._config.monitor_only:
+            note = (
+                f"monitor-only range trip: tick {tick} is {trip_state.value} the position "
+                f"range [{bounds.tick_lower}, {bounds.tick_upper}); no transaction fired; "
+                "the scheduled policy cycle remains the sole action authority"
+            )
+            self._progress(note)
+            if fresh_trip:
+                self._deliver_notice(
+                    f"{self._symbol} range trip observed - no transaction fired",
+                    "\n".join(
+                        (
+                            f"Aero Bot range monitor - {self._symbol}",
+                            "",
+                            note,
+                            "",
+                            "The monitor cannot load the signing key or broadcast.",
+                            "The scheduled Aero Bot policy cycle decides any hold, recenter,",
+                            "stop, or exit from the resolved Aerodrome pool state.",
+                            "",
+                        )
+                    ),
+                )
+            return WatchtowerPollOutcome(
+                state=WatchtowerPollState.STOOD_DOWN,
+                observed_tick=tick,
+                note=note,
             )
         now = self._now()
         if latch.last_fired_at is not None and (
@@ -1185,6 +1218,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--symbol", required=True, help="Registry symbol like AAPLc.")
     parser.add_argument(
+        "--monitor-only",
+        action="store_true",
+        help=(
+            "Observe and alert on range trips but never load the signing key "
+            "or broadcast; production systemd always uses this mode."
+        ),
+    )
+    parser.add_argument(
         "--poll-seconds",
         type=float,
         default=None,
@@ -1218,6 +1259,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = config.model_copy(update={"poll_interval_seconds": arguments.poll_seconds})
     if arguments.cooldown_seconds is not None:
         config = config.model_copy(update={"cooldown_seconds": arguments.cooldown_seconds})
+    if arguments.monitor_only:
+        config = config.model_copy(update={"monitor_only": True})
     if not config.enabled:
         _watchtower_progress(
             "disabled: set AERO_BOT_WATCHTOWER_ENABLED=1 in the sealed environment to arm it"
@@ -1232,9 +1275,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, RuntimeError, ValueError) as error:
         print(f"the watchtower is unavailable: {error}", file=sys.stderr)
         return EXIT_FAILURE
+    mode_label = "monitor-only" if config.monitor_only else "legacy hard-exit"
     _watchtower_progress(
-        f"armed on {arguments.symbol}: polling every {config.poll_interval_seconds:g}s with a "
-        f"{config.cooldown_seconds:g}s cooldown; read-only until a verified range trip"
+        f"armed on {arguments.symbol}: {mode_label}, polling every "
+        f"{config.poll_interval_seconds:g}s with a {config.cooldown_seconds:g}s cooldown"
     )
 
     def stop(_signum: int, _frame: object) -> None:

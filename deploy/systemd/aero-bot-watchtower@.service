@@ -1,5 +1,5 @@
 [Unit]
-Description=Aero Bot range watchtower (seconds-level defensive exit on range trips)
+Description=Aero Bot range monitor (seconds-level alerts, policy cycle owns actions)
 Documentation=file:/opt/aero-bot/docs/watchtower.md
 After=network-online.target
 Wants=network-online.target
@@ -30,7 +30,7 @@ ProtectHome=true
 ReadWritePaths=/var/lib/aero-bot
 # The watcher is read-only until a verified range trip; a crash restarts
 # into the persisted cooldown and never re-fires at once.
-ExecStart=/opt/aero-bot/.venv/bin/aero-bot-watchtower --symbol %i
+ExecStart=/opt/aero-bot/.venv/bin/aero-bot-watchtower --symbol %i --monitor-only
 Restart=on-failure
 RestartSec=10
 
