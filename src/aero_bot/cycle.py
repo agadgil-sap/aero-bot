@@ -1442,10 +1442,15 @@ class CycleRunner:
                 report = call()
             except (LpExecutionRefusalError, LpPlanRefusalError) as error:
                 code = str(getattr(error, "code", "plan_refused"))
+                completed_steps = tuple(getattr(error, "completed_steps", ()))
+                hashes = tuple(step.transaction_hash for step in completed_steps)
+                fees = sum(step.fee_wei or 0 for step in completed_steps)
                 records.append(
                     CycleActionRecord(
                         action=name,
                         status="refused",
+                        transaction_hashes=hashes,
+                        fee_wei=fees,
                         refusal_code=code,
                         diagnostic=str(error),
                     )

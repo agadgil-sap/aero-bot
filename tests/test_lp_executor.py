@@ -370,6 +370,7 @@ class LpRpcScript:
         fast_token1_address: str | None = None,
         fast_views_revert: bool = False,
         aero_price_usdc: Decimal | None = Decimal("0.5"),
+        post_swap_stock_balance_units: int | None = None,
     ) -> None:
         """Configure every scripted answer the LP executor's calls receive.
 
@@ -451,6 +452,9 @@ class LpRpcScript:
                 unreadable known pool.
             aero_price_usdc: Live USDC/AERO price served to the price read;
                 None makes that read revert so the fail-closed path tests.
+            post_swap_stock_balance_units: Optional stock balance applied after
+                the balancing swap confirms, simulating fresh post-swap Safe
+                inventory for the second-phase mint rebuild.
         """
         self.gas_price_wei = gas_price_wei
         self.safe_eth_wei = safe_eth_wei
@@ -502,6 +506,8 @@ class LpRpcScript:
         self.fast_token1_address = fast_token1_address
         self.fast_views_revert = fast_views_revert
         self.aero_price_usdc = aero_price_usdc
+        self.post_swap_stock_balance_units = post_swap_stock_balance_units
+        self.post_swap_balance_applied = False
         self.inclusion_blocks = 51_000_000
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -541,6 +547,13 @@ class LpRpcScript:
                 result = None
             else:
                 self.inclusion_blocks += 1
+                if (
+                    self.post_swap_stock_balance_units is not None
+                    and not self.post_swap_balance_applied
+                    and len(self.broadcasts) >= 2
+                ):
+                    self.stock_balance_units = self.post_swap_stock_balance_units
+                    self.post_swap_balance_applied = True
                 result = {
                     "status": hex(self.receipt_status),
                     "blockNumber": hex(self.inclusion_blocks),
@@ -3163,8 +3176,13 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
     audit_path = tmp_path / "audit.sqlite3"
     executor, rpc_script, _ = make_lp_executor(
         audit_path=audit_path,
-        rpc_script=LpRpcScript(allow_broadcasts=True),
-        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 10),
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            post_swap_stock_balance_units=10**12,
+        ),
+        safe_script=SafeRpcScript(
+            nonce_reads=[4, 6], signature_verdicts=[True] * 20
+        ),
     )
 
     report = executor.execute_mint(
@@ -3197,9 +3215,17 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
 
     records = AuditStore(audit_path).read_records(100)
     assert [record.event_type for record in records] == [
+        # Phase 1: pre-swap plan/build, then execute only through the swap.
         AuditEventType.LP_MINT_PLANNED,
         *([AuditEventType.LP_TRANSACTION_BUILT] * 5),
-        *([AuditEventType.LP_EXECUTE_SENT, AuditEventType.LP_EXECUTE_CONFIRMED] * 5),
+        AuditEventType.LP_EXECUTE_SENT,
+        AuditEventType.LP_EXECUTE_CONFIRMED,
+        AuditEventType.LP_EXECUTE_SENT,
+        AuditEventType.LP_EXECUTE_CONFIRMED,
+        # Phase 2: fresh post-swap replan/build, then approvals + mint.
+        AuditEventType.LP_MINT_PLANNED,
+        *([AuditEventType.LP_TRANSACTION_BUILT] * 3),
+        *([AuditEventType.LP_EXECUTE_SENT, AuditEventType.LP_EXECUTE_CONFIRMED] * 3),
     ]
     planned = json.loads(records[0].payload_json)
     assert planned["mode"] == "execute"
@@ -3464,8 +3490,13 @@ def test_cli_execute_mint_broadcasts_and_exits_zero(
 ) -> None:
     """A confirmed execute CLI run prints every broadcast hash and exits zero."""
     executor, _, _ = make_lp_executor(
-        rpc_script=LpRpcScript(allow_broadcasts=True),
-        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 10),
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            post_swap_stock_balance_units=10**12,
+        ),
+        safe_script=SafeRpcScript(
+            nonce_reads=[4, 6], signature_verdicts=[True] * 20
+        ),
     )
     with (
         patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),

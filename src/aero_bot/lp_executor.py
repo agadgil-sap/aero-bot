@@ -260,6 +260,8 @@ class LpExecutionRefusalCode(StrEnum):
     SIGNATURE_REJECTED = "signature_rejected"
     # The fresh on-chain estimate reverted with every predecessor mined.
     ESTIMATE_REVERTED = "estimate_reverted"
+    # A confirmed balancing swap still leaves another fresh swap requirement.
+    POST_SWAP_REBALANCE_REQUIRED = "post_swap_rebalance_required"
     # The relaying EOA cannot afford the floor plus the bounded gas cost.
     RELAYER_ETH_INSUFFICIENT = "relayer_eth_insufficient"
     # The exit swap found no stock balance to convert back to USDC.
@@ -1728,28 +1730,10 @@ class LpLifecycleExecutor:
     ) -> LpActionExecutionReport:
         """Build and broadcast one capped mint sequence step by step.
 
-        The build phase enforces every cap, refusal, and audit exactly as the
-        dry run does; the broadcast then proceeds one Safe nonce at a time,
-        with each step rebuilt, hash-pinned, re-validated, freshly estimated,
-        and audited before its receipt is awaited. Nothing is broadcast
-        without the explicit confirmation flag.
-
-        Args:
-            symbol: The registry-matched B20 stock symbol.
-            budget_usdc: The total USDC value the position commits.
-            width_spacings: The explicit half width in tick spacings per side.
-            key_bytes: Exactly 32 raw signing-key bytes used for this attempt.
-            confirm_broadcast: The explicit operator confirmation; without it
-                the attempt refuses before building.
-            ephemeral_key: Whether the key was generated for this attempt.
-
-        Returns:
-            The complete execution report with every broadcast step.
-
-        Raises:
-            LpExecutionRefusalError: If any gate, preflight, or per-step check
-                refuses.
-            LpPlanRefusalError: If any planning cap refuses.
+        When entry needs a balancing swap, execution is deliberately two-phase.
+        The swap is confirmed first, then the pool and Safe inventory are read
+        again and the NFPM mint is rebuilt from that fresh post-swap state.
+        Pre-swap mint calldata is never broadcast after a pool-changing swap.
         """
         if not confirm_broadcast:
             error = LpExecutionRefusalError(
@@ -1760,6 +1744,7 @@ class LpLifecycleExecutor:
             )
             self._record_refusal("mint", ExecutionMode.EXECUTE, error, symbol)
             raise error
+
         try:
             build, steps = self._build_mint_attempt(
                 symbol,
@@ -1769,10 +1754,103 @@ class LpLifecycleExecutor:
                 ephemeral_key,
                 ExecutionMode.EXECUTE,
             )
-            step_reports, halted_reason = self._execute_steps("mint", steps, key_bytes)
+
+            swap_index = next(
+                (
+                    index
+                    for index, step in enumerate(steps)
+                    if step.report.role == LpExecutionRole.BALANCING_SWAP
+                ),
+                None,
+            )
+
+            if swap_index is None:
+                step_reports, halted_reason = self._execute_steps(
+                    "mint", steps, key_bytes
+                )
+            else:
+                # Execute only approvals needed for the swap and the swap itself.
+                prefix_steps = steps[: swap_index + 1]
+                prefix_reports, halted_reason = self._execute_steps(
+                    "mint", prefix_steps, key_bytes
+                )
+
+                if halted_reason:
+                    return LpActionExecutionReport(
+                        action="mint",
+                        build=build,
+                        steps=prefix_reports,
+                        completed=False,
+                        halted_reason=halted_reason,
+                    )
+
+                print(
+                    "[mint] balancing swap confirmed; rebuilding the mint from "
+                    "fresh pool and Safe inventory",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+                # Pool price, Safe balances, allowances and Safe nonce are all
+                # re-read here. This is the execution boundary missing from the
+                # old single-build sequence.
+                try:
+                    fresh_build, fresh_steps = self._build_mint_attempt(
+                        symbol,
+                        budget_usdc,
+                        width_spacings,
+                        key_bytes,
+                        ephemeral_key,
+                        ExecutionMode.EXECUTE,
+                    )
+                except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+                    previous = tuple(getattr(error, "completed_steps", ()))
+                    error.completed_steps = prefix_reports + previous
+                    raise
+
+                # One bounded acquisition is allowed per attempt. If the fresh
+                # state still genuinely needs another balancing swap, stop and
+                # let the next cycle reconcile rather than churn the market.
+                if fresh_build.plan.balancing_swap.required:
+                    error = LpExecutionRefusalError(
+                        LpExecutionRefusalCode.POST_SWAP_REBALANCE_REQUIRED,
+                        "the confirmed balancing swap still leaves a fresh "
+                        "balancing-swap requirement; refusing a second market "
+                        "swap in the same mint attempt so the next cycle can "
+                        "reconcile the acquired inventory from live state",
+                    )
+                    error.completed_steps = prefix_reports
+                    raise error
+
+                try:
+                    tail_reports, halted_reason = self._execute_steps(
+                        "mint", fresh_steps, key_bytes
+                    )
+                except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+                    previous = tuple(getattr(error, "completed_steps", ()))
+                    error.completed_steps = prefix_reports + previous
+                    raise
+
+                # Keep the fresh plan as the authoritative mint plan, while the
+                # build report retains the actually executed swap-prefix builds.
+                build = fresh_build.model_copy(
+                    update={
+                        "transactions": (
+                            tuple(step.report for step in prefix_steps)
+                            + fresh_build.transactions
+                        ),
+                        "build_duration_ms": (
+                            build.build_duration_ms
+                            + fresh_build.build_duration_ms
+                        ),
+                    }
+                )
+                step_reports = prefix_reports + tail_reports
+
         except (LpExecutionRefusalError, LpPlanRefusalError) as error:
             self._record_refusal("mint", ExecutionMode.EXECUTE, error, symbol)
             raise
+
         return LpActionExecutionReport(
             action="mint",
             build=build,
@@ -4227,7 +4305,13 @@ class LpLifecycleExecutor:
         """
         reports: list[LpStepExecutionReport] = []
         for step in steps:
-            report = self._execute_step(action, step, key_bytes)
+            try:
+                report = self._execute_step(action, step, key_bytes)
+            except LpExecutionRefusalError as error:
+                if reports:
+                    previous = tuple(getattr(error, "completed_steps", ()))
+                    error.completed_steps = tuple(reports) + previous
+                raise
             reports.append(report)
             if report.status != "confirmed":
                 reason = f"the {report.role.value} delivery is {report.status}"
