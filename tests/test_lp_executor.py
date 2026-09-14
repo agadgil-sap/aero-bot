@@ -44,6 +44,7 @@ from aero_bot.lp_calldata import (
     build_lp_mint_calldata,
 )
 from aero_bot.lp_executor import (
+    DEFAULT_LP_ROUTER_ALLOWANCE_USDC,
     ERC721_TOKEN_OF_OWNER_BY_INDEX_SELECTOR,
     NFPM_INCREASE_LIQUIDITY_TOPIC0,
     LpExecutionRefusalCode,
@@ -906,6 +907,15 @@ def decode_inner(calldata: str) -> bytes:
 # Mint dry-run composition
 # ---------------------------------------------------------------------------
 
+def test_lp_router_allowance_is_200_without_widening_manual_swap() -> None:
+    """LP entry capacity is 200 USDC while the manual swap allowance stays 20."""
+    assert Decimal("20") == DEFAULT_APPROVAL_STANDING_CAP_USDC
+    assert Decimal("200") == DEFAULT_LP_ROUTER_ALLOWANCE_USDC
+    assert LpSafeExecutionPolicy().router_allowance_standing_cap_usdc == Decimal("200")
+    with pytest.raises(ValueError):
+        LpSafeExecutionPolicy(router_allowance_standing_cap_usdc=Decimal("200.01"))
+
+
 
 def test_dry_run_mint_composes_the_full_entry_sequence() -> None:
     """A cash-poor Safe composes allowance, swap, approvals, and the mint."""
@@ -957,7 +967,7 @@ def test_dry_run_mint_encodes_every_inner_call_from_the_plan() -> None:
     )
     expected = {
         LpExecutionRole.ROUTER_ALLOWANCE: build_approval_calldata(
-            AERODROME_ROUTER_ADDRESS, int(DEFAULT_APPROVAL_STANDING_CAP_USDC * 10**6)
+            AERODROME_ROUTER_ADDRESS, int(DEFAULT_LP_ROUTER_ALLOWANCE_USDC * 10**6)
         ),
         LpExecutionRole.NFPM_USDC_ALLOWANCE: build_approval_calldata(NFPM_ADDRESS, usdc_desired),
         LpExecutionRole.NFPM_STOCK_ALLOWANCE: build_approval_calldata(NFPM_ADDRESS, stock_desired),

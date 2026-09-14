@@ -60,8 +60,6 @@ from aero_bot.emissions_apr import (
 )
 from aero_bot.executor import (
     AERODROME_ROUTER_ADDRESS,
-    APPROVAL_CAP_CEILING_USDC,
-    DEFAULT_APPROVAL_STANDING_CAP_USDC,
     DEFAULT_CANARY_SAFE_ADDRESS,
     DEFAULT_GAS_PRICE_CAP_WEI,
     DEFAULT_QUOTE_MAX_AGE_SECONDS,
@@ -164,6 +162,11 @@ NFPM_INCREASE_LIQUIDITY_TOPIC0 = (
 )
 # The LP deadline sits eight minutes past its build time, mirroring the swap.
 LP_DEADLINE_SECONDS = 8 * 60
+# LP entries may require balancing swaps materially larger than the manual
+# one-shot swap executor's 20 USDC standing allowance. Keep this LP-specific
+# so widening LP capacity cannot widen the unrelated manual swap surface.
+DEFAULT_LP_ROUTER_ALLOWANCE_USDC = Decimal("200")
+LP_ROUTER_ALLOWANCE_CAP_CEILING_USDC = Decimal("200")
 # Fresh-estimate re-reads when a receipt landed on one public endpoint but the
 # estimating endpoint's latest block still predates it (observed live as a
 # transient GS026 with every predecessor already mined).
@@ -317,7 +320,7 @@ class LpSafeExecutionPolicy(BaseModel):
     # The bounded standing USDC allowance for the router, shared with the swap
     # executor's documented bound; never the infinite maximum approval.
     router_allowance_standing_cap_usdc: Annotated[Decimal, Field(gt=0)] = (
-        DEFAULT_APPROVAL_STANDING_CAP_USDC
+        DEFAULT_LP_ROUTER_ALLOWANCE_USDC
     )
     # A relaying EOA balance below this floor refuses any broadcast, separate
     # from the gas-cost check so a cheap delivery still needs real headroom.
@@ -337,10 +340,11 @@ class LpSafeExecutionPolicy(BaseModel):
     @model_validator(mode="after")
     def require_ceiling_compliance(self) -> "LpSafeExecutionPolicy":
         """Enforce the hard ceilings no configuration may exceed."""
-        if self.router_allowance_standing_cap_usdc > APPROVAL_CAP_CEILING_USDC:
+        if self.router_allowance_standing_cap_usdc > LP_ROUTER_ALLOWANCE_CAP_CEILING_USDC:
             raise ValueError(
                 f"router_allowance_standing_cap_usdc {self.router_allowance_standing_cap_usdc}"
-                f" exceeds the documented bound of {APPROVAL_CAP_CEILING_USDC} USDC; the "
+                f" exceeds the documented bound of "
+            f"{LP_ROUTER_ALLOWANCE_CAP_CEILING_USDC} USDC; the "
                 "allowance is bounded and never infinite"
             )
         return self
