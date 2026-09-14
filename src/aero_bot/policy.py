@@ -1107,6 +1107,7 @@ class PolicyEngine:
                         reason=PolicyReason.RECENTER_WAIT_ELAPSED,
                         diagnostics=diagnostics,
                         price_range=new_range,
+                        size_usd=position.committed_usd,
                         swap_plan=swap_plan,
                         estimated_gas_units=gas_units,
                         estimated_gas_cost_usd=gas_cost_usd,

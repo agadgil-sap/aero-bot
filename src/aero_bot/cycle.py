@@ -1178,13 +1178,14 @@ class CycleRunner:
                 held_since=book.held_inventory.held_since,
             )
         day = self._now().astimezone(POLICY_TIMEZONE).date()
-        day_start = book.day_start_equity_usd if book.day == day else None
+        same_day = book.day == day and book.day_start_equity_usd is not None
+        day_start = book.day_start_equity_usd if same_day else None
         if day_start is None:
             day_start = Decimal(reconciliation.safe_usdc_units).scaleb(-6)
         return PolicyState(
-            day=day,
+            day=day if same_day else None,
             day_start_equity_usd=day_start,
-            halted_day=book.halted_day,
+            halted_day=book.halted_day if same_day else None,
             position=position,
             held_inventory=held,
             reentry_blocked_until=None,
@@ -1256,6 +1257,21 @@ class CycleRunner:
             "external reference is diagnostic-only; scheduled actions use the "
             "resolved Aerodrome pool's on-chain price and state",
         )
+        # Include the tracked LP mark in portfolio equity.
+        tracked_status = self._last_reconciliation.tracked_status
+        if (
+            tracked_status is not None
+            and tracked_status.position_value_usdc is not None
+        ):
+            lp_value = tracked_status.position_value_usdc
+            observation = observation.model_copy(
+                update={"equity_usd": observation.equity_usd + lp_value}
+            )
+            notes = notes + (
+                f"equity includes tracked LP marked value {lp_value} USDC; "
+                f"portfolio equity is {observation.equity_usd} USDC",
+            )
+
         engine = PolicyEngine(LOCKED_POLICY_PARAMETERS, load_event_calendar())
         outcome = engine.decide(state, observation)
         window = evaluate_event_window(
@@ -1551,6 +1567,20 @@ class CycleRunner:
             if book.position is None:
                 halted = f"the engine authorized {action.value} while flat"
                 return records, halted, book
+            # Preflight the complete replacement before touching the live LP.
+            if action is PolicyActionKind.RECENTER:
+                if (
+                    tracked_symbol is None
+                    or decision.size_usd is None
+                    or decision.size_usd <= 0
+                    or decision.price_range is None
+                ):
+                    halted = "the recenter decision carried no complete fresh entry"
+                    return records, halted, book
+                if self._width_from_range(decision.price_range, tracked_symbol) is None:
+                    halted = "the recenter decision carried no complete fresh entry"
+                    return records, halted, book
+
             if not self._exit_position(executor, book, key_bytes, run):
                 return records, halted, book
             if action is PolicyActionKind.RECENTER:
