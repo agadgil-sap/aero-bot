@@ -153,6 +153,10 @@ class TrackedPosition(BaseModel):
     committed_usd: Annotated[Decimal, Field(gt=0)]
     # When the position was entered, timezone-aware.
     entered_at: datetime
+    # When the position first moved above its upper range edge. This must
+    # survive scheduled cycles so the fifteen-minute recenter wait cannot
+    # restart from zero on every invocation.
+    out_of_range_since: datetime | None = None
 
 
 class HeldInventoryRecord(BaseModel):
@@ -796,6 +800,7 @@ class CycleRunner:
                     final_reconciliation,
                     decision_report.outcome.next_state,
                     decision_report.symbol,
+                    decision_report.outcome.decision.action,
                 )
             elif not halted_reason:
                 halted_reason = final_reconciliation.out_of_band
@@ -1162,6 +1167,7 @@ class CycleRunner:
                 ),
                 committed_usd=book.position.committed_usd,
                 entered_at=book.position.entered_at,
+                out_of_range_since=book.position.out_of_range_since,
             )
         held: HeldInventory | None = None
         if book.held_inventory is not None:
@@ -1759,6 +1765,7 @@ class CycleRunner:
         reconciliation: CycleReconciliation,
         next_state: PolicyState,
         decision_symbol: str | None = None,
+        decision_action: PolicyActionKind = PolicyActionKind.HOLD,
     ) -> CycleStateBook:
         """Rebuild the book from post-action chain truth plus engine state."""
         position = book.position
@@ -1768,6 +1775,14 @@ class CycleRunner:
             and reconciliation.tracked_token_id != position.token_id
         ):
             position = position.model_copy(update={"token_id": reconciliation.tracked_token_id})
+        if (
+            position is not None
+            and next_state.position is not None
+            and decision_action is PolicyActionKind.HOLD
+        ):
+            position = position.model_copy(
+                update={"out_of_range_since": next_state.position.out_of_range_since}
+            )
         held = book.held_inventory
         if held is not None and reconciliation.held_stock_quantity == 0:
             held = None

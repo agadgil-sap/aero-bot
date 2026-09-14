@@ -734,6 +734,34 @@ class TestLiveCycles:
 class TestReconciliation:
     """The reconcile-first discipline and its out-of-band refusals."""
 
+    def test_above_range_wait_survives_across_scheduled_cycles(self, tmp_path: Path) -> None:
+        """The fifteen-minute recenter clock never restarts on each cycle."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status())
+        runner, _, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        first = runner.run(
+            CycleMode.DRY_RUN,
+            reference_price_usdc=FIXTURE_AMM_PRICE,
+        )
+        assert first.decision_reason == "open_above_range_waiting"
+
+        position = state_store.load().position
+        assert position is not None
+        assert position.out_of_range_since == QUIET_INSTANT
+
+        runner._now = lambda: QUIET_INSTANT + timedelta(minutes=5)
+        second = runner.run(
+            CycleMode.DRY_RUN,
+            reference_price_usdc=FIXTURE_AMM_PRICE,
+        )
+        assert second.decision_reason == "open_above_range_waiting"
+        assert any("0:05:00" in line for line in second.decision_diagnostics)
+
+        position = state_store.load().position
+        assert position is not None
+        assert position.out_of_range_since == QUIET_INSTANT
+
     def test_tracked_position_reports_custody_value_and_pnl(self, tmp_path: Path) -> None:
         """An open tracked position carries its P&L into the report."""
         reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
