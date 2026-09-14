@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field, model_validator
 from aero_bot.audit import AuditEventType, AuditRecord, AuditStore
 from aero_bot.config import Settings
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
+from aero_bot.execution_lock import ExecutionLockUnavailableError, exclusive_execution_lock
 from aero_bot.executor import (
     DEFAULT_CANARY_SAFE_ADDRESS,
     SAFE_ADDRESS_ENV,
@@ -321,6 +322,8 @@ class CycleActionRecord(BaseModel):
     fee_wei: Annotated[int, Field(ge=0)] = 0
     # The refusal's catalog code when status is refused, else empty.
     refusal_code: str = ""
+    # Actual mint budget executed after any post-swap inventory resize.
+    executed_budget_usdc: Decimal | None = None
     # Human-readable evidence for the outcome.
     diagnostic: str = ""
 
@@ -1502,12 +1505,17 @@ class CycleRunner:
                 halted = f"the {name} action failed: {error}"
                 return False
             hashes, fees = _action_hashes_and_fees(report)
+            mint_plan = getattr(report.build, "plan", None) if name == "mint" else None
+            executed_budget = (
+                getattr(mint_plan, "budget_usdc", None) if mint_plan is not None else None
+            )
             records.append(
                 CycleActionRecord(
                     action=name,
                     status="completed" if _action_completed(report) else "failed",
                     transaction_hashes=hashes,
                     fee_wei=fees,
+                    executed_budget_usdc=executed_budget,
                     diagnostic=report.halted_reason,
                 )
             )
@@ -1549,7 +1557,12 @@ class CycleRunner:
             return (
                 records,
                 halted,
-                self._book_with_position(book, decision_symbol, minted_id, budget),
+                self._book_with_position(
+                    book,
+                    decision_symbol,
+                    minted_id,
+                    records[-2].executed_budget_usdc or budget,
+                ),
             )
 
         if action is PolicyActionKind.POOL_SWITCH:
@@ -1595,7 +1608,10 @@ class CycleRunner:
                 records,
                 halted,
                 self._book_with_position(
-                    switched_book, switch.to_symbol, switched_id, switch_budget
+                    switched_book,
+                    switch.to_symbol,
+                    switched_id,
+                    records[-2].executed_budget_usdc or switch_budget,
                 ),
             )
 
@@ -1675,7 +1691,12 @@ class CycleRunner:
                 return (
                     records,
                     halted,
-                    self._book_with_position(book, tracked_symbol, token_id, size),
+                    self._book_with_position(
+                        book,
+                        tracked_symbol,
+                        token_id,
+                        records[-2].executed_budget_usdc or size,
+                    ),
                 )
             return (
                 records,
@@ -2311,13 +2332,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"the cycle runner is unavailable: {error}", file=sys.stderr)
         return EXIT_FAILURE
     try:
-        report = runner.run(
-            mode,
-            key_bytes=key_bytes,
-            reference_price_usdc=single_reference,
-            reference_age_seconds=arguments.reference_age_seconds,
-            reference_prices_by_symbol=reference_map or None,
-        )
+        if mode is CycleMode.LIVE:
+            lock_path = settings.audit_database_path.parent / "execution.lock"
+            with exclusive_execution_lock(lock_path):
+                report = runner.run(
+                    mode,
+                    key_bytes=key_bytes,
+                    reference_price_usdc=single_reference,
+                    reference_age_seconds=arguments.reference_age_seconds,
+                    reference_prices_by_symbol=reference_map or None,
+                )
+        else:
+            report = runner.run(
+                mode,
+                key_bytes=key_bytes,
+                reference_price_usdc=single_reference,
+                reference_age_seconds=arguments.reference_age_seconds,
+                reference_prices_by_symbol=reference_map or None,
+            )
+    except ExecutionLockUnavailableError as error:
+        print(f"cycle refused: {error}", file=sys.stderr)
+        return EXIT_REFUSED
     except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
         print(f"cycle failed: {error}", file=sys.stderr)
         return EXIT_FAILURE

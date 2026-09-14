@@ -58,6 +58,7 @@ from aero_bot.emissions_apr import (
     emissions_apr_at_tick_width,
     staked_value_usdc,
 )
+from aero_bot.execution_lock import ExecutionLockUnavailableError, exclusive_execution_lock
 from aero_bot.executor import (
     AERODROME_ROUTER_ADDRESS,
     DEFAULT_CANARY_SAFE_ADDRESS,
@@ -6001,54 +6002,61 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 key_bytes = load_signing_key_source().load_signing_key()
                 ephemeral = False
-            if arguments.lifecycle == "mint":
-                execution_report = executor.execute_mint(
-                    arguments.symbol,
-                    arguments.amount,
-                    arguments.width_ticks,
-                    key_bytes,
-                    confirm_broadcast=arguments.confirm_broadcast,
-                    ephemeral_key=ephemeral,
-                )
-            elif arguments.lifecycle == "stake":
-                execution_report = executor.execute_stake(
-                    arguments.symbol,
-                    arguments.token_id,
-                    key_bytes,
-                    confirm_broadcast=arguments.confirm_broadcast,
-                    ephemeral_key=ephemeral,
-                )
-            elif arguments.lifecycle == "unstake":
-                execution_report = executor.execute_unstake(
-                    arguments.symbol,
-                    arguments.token_id,
-                    key_bytes,
-                    confirm_broadcast=arguments.confirm_broadcast,
-                    ephemeral_key=ephemeral,
-                )
-            elif arguments.lifecycle == "withdraw":
-                execution_report = executor.execute_withdraw(
-                    arguments.symbol,
-                    arguments.token_id,
-                    key_bytes,
-                    confirm_broadcast=arguments.confirm_broadcast,
-                    ephemeral_key=ephemeral,
-                )
-            elif arguments.lifecycle == "collect":
-                execution_report = executor.execute_collect(
-                    arguments.symbol,
-                    arguments.token_id,
-                    key_bytes,
-                    confirm_broadcast=arguments.confirm_broadcast,
-                    ephemeral_key=ephemeral,
-                )
-            else:
-                execution_report = executor.execute_exit_swap(
-                    arguments.symbol,
-                    key_bytes,
-                    confirm_broadcast=arguments.confirm_broadcast,
-                    ephemeral_key=ephemeral,
-                )
+            try:
+                with exclusive_execution_lock(
+                    settings.audit_database_path.parent / "execution.lock"
+                ):
+                    if arguments.lifecycle == "mint":
+                        execution_report = executor.execute_mint(
+                            arguments.symbol,
+                            arguments.amount,
+                            arguments.width_ticks,
+                            key_bytes,
+                            confirm_broadcast=arguments.confirm_broadcast,
+                            ephemeral_key=ephemeral,
+                        )
+                    elif arguments.lifecycle == "stake":
+                        execution_report = executor.execute_stake(
+                            arguments.symbol,
+                            arguments.token_id,
+                            key_bytes,
+                            confirm_broadcast=arguments.confirm_broadcast,
+                            ephemeral_key=ephemeral,
+                        )
+                    elif arguments.lifecycle == "unstake":
+                        execution_report = executor.execute_unstake(
+                            arguments.symbol,
+                            arguments.token_id,
+                            key_bytes,
+                            confirm_broadcast=arguments.confirm_broadcast,
+                            ephemeral_key=ephemeral,
+                        )
+                    elif arguments.lifecycle == "withdraw":
+                        execution_report = executor.execute_withdraw(
+                            arguments.symbol,
+                            arguments.token_id,
+                            key_bytes,
+                            confirm_broadcast=arguments.confirm_broadcast,
+                            ephemeral_key=ephemeral,
+                        )
+                    elif arguments.lifecycle == "collect":
+                        execution_report = executor.execute_collect(
+                            arguments.symbol,
+                            arguments.token_id,
+                            key_bytes,
+                            confirm_broadcast=arguments.confirm_broadcast,
+                            ephemeral_key=ephemeral,
+                        )
+                    else:
+                        execution_report = executor.execute_exit_swap(
+                            arguments.symbol,
+                            key_bytes,
+                            confirm_broadcast=arguments.confirm_broadcast,
+                            ephemeral_key=ephemeral,
+                        )
+            except ExecutionLockUnavailableError as error:
+                print(f"execute refused: {error}", file=sys.stderr)
+                return EXIT_REFUSED
             if arguments.json:
                 print(execution_report.model_dump_json(indent=2))
             else:

@@ -234,6 +234,7 @@ class FakeExecutor:
         self.calls: list[tuple[object, ...]] = []
         self.refuse_next: str | None = None
         self.mint_receipt_token_id: int | None = TRACKED_TOKEN_ID
+        self.mint_executed_budget: Decimal | None = None
         self.fee_wei_per_step = 90_000
 
     def _complete(self, action: str, hashes: tuple[str, ...]) -> LpActionExecutionReport:
@@ -291,7 +292,16 @@ class FakeExecutor:
             self._now,
         )
         self._reads.set_inventory(inventory_with(TRACKED_TOKEN_ID))
-        return self._complete("mint", (MINT_TX_HASH,))
+        report = self._complete("mint", (MINT_TX_HASH,))
+        if self.mint_executed_budget is not None:
+            report = report.model_copy(
+                update={
+                    "build": SimpleNamespace(
+                        plan=SimpleNamespace(budget_usdc=self.mint_executed_budget)
+                    )
+                }
+            )
+        return report
 
     def execute_stake(
         self,
@@ -625,6 +635,21 @@ class TestLiveCycles:
         assert book.position is not None
         assert book.position.token_id == TRACKED_TOKEN_ID
         assert book.position.committed_usd == EXPECTED_ENTER_SIZE
+
+    def test_enter_records_the_actual_resized_mint_budget(self, tmp_path: Path) -> None:
+        """A post-swap resized mint persists its actual deployed cost basis."""
+        runner, executor, _, state_store = make_runner(tmp_path)
+        assert executor is not None
+        executor.mint_executed_budget = Decimal("63.25")
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_price_usdc=Decimal("100"),
+        )
+        assert [action.status for action in report.actions] == ["completed", "completed"]
+        book = state_store.load()
+        assert book.position is not None
+        assert book.position.committed_usd == Decimal("63.25")
 
     def test_a_refused_mint_halts_the_cycle_before_any_stake(self, tmp_path: Path) -> None:
         """A refused mint records the catalog code and stops the cycle."""
