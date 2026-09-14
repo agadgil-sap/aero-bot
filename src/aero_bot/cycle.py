@@ -1859,6 +1859,18 @@ class CycleRunner:
         held = book.held_inventory
         if held is not None and reconciliation.held_stock_quantity == 0:
             held = None
+        elif (
+            held is None
+            and reconciliation.held_stock_quantity > 0
+            and reconciliation.held_symbol is not None
+            and reconciliation.tracked_token_id is None
+        ):
+            held = HeldInventoryRecord(
+                symbol=reconciliation.held_symbol,
+                token_address=self._stock_token_address_for(reconciliation.held_symbol),
+                stock_quantity=reconciliation.held_stock_quantity,
+                held_since=self._now(),
+            )
         # The engine's successor state names at most one pool's cooldown -
         # the pool the decision ran over - so only that pool's entry merges.
         cooldown_symbol = decision_symbol or (position.symbol if position is not None else None)

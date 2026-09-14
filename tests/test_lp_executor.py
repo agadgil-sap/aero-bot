@@ -3239,6 +3239,34 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
     assert AuditStore(audit_path).verify_chain().status.value == "verified"
 
 
+
+
+def test_execute_mint_resizes_to_fresh_inventory_after_swap(tmp_path: Path) -> None:
+    """A small post-swap stock shortfall shrinks the mint instead of swapping twice."""
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=tmp_path / "audit.sqlite3",
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            post_swap_stock_balance_units=3_492_000,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4, 6], signature_verdicts=[True] * 20),
+    )
+
+    report = executor.execute_mint(
+        "FIXc",
+        MINT_BUDGET_USDC,
+        MINT_WIDTH_SPACINGS,
+        bytes(Account.create().key),
+        confirm_broadcast=True,
+    )
+
+    assert report.completed is True
+    roles = [step.role for step in report.steps]
+    assert roles.count(LpExecutionRole.BALANCING_SWAP) == 1
+    assert roles[-1] is LpExecutionRole.MINT
+    assert report.build.plan.balancing_swap.required is False
+    assert report.build.plan.budget_usdc < MINT_BUDGET_USDC
+
 def make_execute_stake_executor(
     audit_path: Path | None = None,
     *,

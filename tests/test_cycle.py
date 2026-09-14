@@ -847,6 +847,24 @@ class TestReconciliation:
         assert book.held_inventory is not None
         assert book.held_inventory.stock_quantity == Decimal("0.021")
 
+    def test_rebuild_persists_post_action_unrecorded_stock(self, tmp_path: Path) -> None:
+        """Post-action reconciliation persists stock acquired before a failed mint."""
+        runner, _, _, _ = make_runner(tmp_path)
+        reconciliation = runner._reconcile(CycleStateBook()).model_copy(
+            update={
+                "held_stock_quantity": Decimal("0.14296689"),
+                "held_symbol": "FIXc",
+                "safe_stock_units": 14_296_689,
+            }
+        )
+        rebuilt = runner._rebuild_book(
+            CycleStateBook(), reconciliation, PolicyState(), "FIXc", PolicyActionKind.RECENTER
+        )
+        assert rebuilt.position is None
+        assert rebuilt.held_inventory is not None
+        assert rebuilt.held_inventory.symbol == "FIXc"
+        assert rebuilt.held_inventory.stock_quantity == Decimal("0.14296689")
+
 
 class TestReferenceEnvironment:
     """The optional injected reference quote from the environment."""

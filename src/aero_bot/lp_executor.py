@@ -1802,6 +1802,7 @@ class LpLifecycleExecutor:
                         key_bytes,
                         ephemeral_key,
                         ExecutionMode.EXECUTE,
+                        inventory_only=True,
                     )
                 except (LpExecutionRefusalError, LpPlanRefusalError) as error:
                     previous = tuple(getattr(error, "completed_steps", ()))
@@ -2172,11 +2173,36 @@ class LpLifecycleExecutor:
         key_bytes: bytes,
         ephemeral_key: bool,
         mode: ExecutionMode = ExecutionMode.DRY_RUN,
+        *,
+        inventory_only: bool = False,
     ) -> tuple[LpMintDryRunReport, tuple[_BuiltLpStep, ...]]:
         """Build, sign, validate, and estimate the complete mint sequence."""
         build_started = self._timer()
         context = self._resolve_mint_context(symbol, width_spacings)
         plan = self._plan_from_context(context, budget_usdc)
+        if inventory_only and plan.balancing_swap.required:
+            observation = context.observation
+            stock_desired = (
+                plan.amounts.amount0_desired_units
+                if observation.stock_is_token0
+                else plan.amounts.amount1_desired_units
+            )
+            usdc_desired = (
+                plan.amounts.amount1_desired_units
+                if observation.stock_is_token0
+                else plan.amounts.amount0_desired_units
+            )
+            stock_ratio = Decimal(context.inventory.stock_units) / Decimal(stock_desired)
+            usdc_ratio = Decimal(context.inventory.usdc_units) / Decimal(usdc_desired)
+            scale = min(Decimal(1), stock_ratio, usdc_ratio) * Decimal("0.999")
+            constrained_budget = budget_usdc * scale
+            plan = self._plan_from_context(context, constrained_budget)
+            if plan.balancing_swap.required:
+                raise LpExecutionRefusalError(
+                    LpExecutionRefusalCode.POST_SWAP_REBALANCE_REQUIRED,
+                    "fresh post-swap inventory cannot fund a two-sided mint without another "
+                    "market swap even after inventory-constrained resizing",
+                )
         self._record_mint_plan(mode, plan)
         if plan.balancing_swap.required and plan.balancing_swap.tranche_count > 1:
             raise LpExecutionRefusalError(
