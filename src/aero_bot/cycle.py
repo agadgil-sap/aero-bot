@@ -37,12 +37,13 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal, localcontext
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Protocol
+from typing import Annotated, Literal, Protocol
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, model_validator
@@ -114,6 +115,13 @@ CYCLE_SYMBOL_ENV = "AERO_BOT_CYCLE_SYMBOL"
 # Environment variable carrying the cross-board switch margin as a fraction
 # (default 0.30, the captain's 2026-09-09 trial ruling).
 CYCLE_SWITCH_MARGIN_ENV = "AERO_BOT_CYCLE_SWITCH_MARGIN_FRACTION"
+# After a confirmed live action, the primary read endpoint must catch up to
+# the action's inclusion block before final reconciliation. This prevents a
+# load-balanced or briefly lagging RPC from reporting the pre-action balance
+# as if it were the final state.
+POST_ACTION_VISIBILITY_ATTEMPTS = 6
+POST_ACTION_VISIBILITY_BASE_BACKOFF_SECONDS = 0.5
+POST_ACTION_VISIBILITY_MAX_BACKOFF_SECONDS = 4.0
 # The policy day boundary follows the engine's America/New_York convention.
 POLICY_TIMEZONE = ZoneInfo("America/New_York")
 
@@ -155,10 +163,11 @@ class TrackedPosition(BaseModel):
     committed_usd: Annotated[Decimal, Field(gt=0)]
     # When the position was entered, timezone-aware.
     entered_at: datetime
-    # When the position first moved above its upper range edge. This must
-    # survive scheduled cycles so the fifteen-minute recenter wait cannot
-    # restart from zero on every invocation.
+    # When the position first moved outside either range edge. This must
+    # survive scheduled cycles so the recenter wait cannot restart from zero.
     out_of_range_since: datetime | None = None
+    # Which side owns the persisted wait anchor.
+    out_of_range_side: Literal["above", "below"] | None = None
 
 
 class HeldInventoryRecord(BaseModel):
@@ -320,6 +329,10 @@ class CycleActionRecord(BaseModel):
     transaction_hashes: Annotated[tuple[str, ...], Field(min_length=0)] = ()
     # Total delivery fees paid, in wei.
     fee_wei: Annotated[int, Field(ge=0)] = 0
+    # Highest confirmed inclusion block among the action's deliveries. This
+    # lets the cycle prove its final read endpoint has caught up before it
+    # labels post-action balances as final.
+    confirmed_block_number: Annotated[int, Field(ge=0)] | None = None
     # The refusal's catalog code when status is refused, else empty.
     refusal_code: str = ""
     # Actual mint budget executed after any post-swap inventory resize.
@@ -329,7 +342,7 @@ class CycleActionRecord(BaseModel):
 
 
 class CycleReconciliation(BaseModel):
-    """Carry the complete pre-decision on-chain state one cycle acts on."""
+    """Carry one coherent on-chain reconciliation snapshot."""
 
     # Frozen strict fields keep one reconciliation coherent.
     model_config = IMMUTABLE_MODEL_CONFIG
@@ -376,8 +389,14 @@ class CycleReport(BaseModel):
     mode: CycleMode
     # The registry-matched symbol the cycle managed.
     symbol: str
-    # The reconciled on-chain state the decision was made on.
+    # The final reconciled on-chain state after any live action.
     reconciliation: CycleReconciliation
+    # The pre-action snapshot the policy actually decided on. It equals the
+    # final reconciliation for dry runs and no-action cycles.
+    decision_reconciliation: CycleReconciliation | None = None
+    # False only when a live action confirmed but the primary read endpoint
+    # failed to reach its inclusion block within the bounded visibility wait.
+    final_reconciliation_verified: bool = True
     # The engine's chosen action, or hold when the cycle refused out-of-band.
     decision_action: str
     # The engine's stable primary reason, or the out-of-band label.
@@ -597,10 +616,23 @@ def _action_completed(report: LpActionExecutionReport) -> bool:
     return report.completed and all(step.status == "confirmed" for step in report.steps)
 
 
-def _action_hashes_and_fees(report: LpActionExecutionReport) -> tuple[tuple[str, ...], int]:
-    """Collect one action's delivery hashes and total fees."""
+def _action_hashes_fees_and_block(
+    report: LpActionExecutionReport,
+) -> tuple[tuple[str, ...], int, int | None]:
+    """Collect one action's delivery hashes, total fees, and latest confirmed block."""
     hashes = tuple(step.transaction_hash for step in report.steps)
     fees = sum(step.fee_wei or 0 for step in report.steps)
+    blocks = tuple(
+        int(step.block_number)
+        for step in report.steps
+        if step.status == "confirmed" and getattr(step, "block_number", None) is not None
+    )
+    return hashes, fees, max(blocks) if blocks else None
+
+
+def _action_hashes_and_fees(report: LpActionExecutionReport) -> tuple[tuple[str, ...], int]:
+    """Backward-compatible action summary used by the monitor-only watchtower."""
+    hashes, fees, _ = _action_hashes_fees_and_block(report)
     return hashes, fees
 
 
@@ -689,6 +721,7 @@ class CycleRunner:
         audit_sink: AuditStore | None,
         state_store: CycleStateStore,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        sleep: Callable[[float], None] = time.sleep,
         switch_margin_fraction: Decimal = DEFAULT_SWITCH_MARGIN_FRACTION,
     ) -> None:
         """Configure one cycle runner over every injectable boundary.
@@ -708,6 +741,7 @@ class CycleRunner:
             audit_sink: The store receiving the cycle-summary audit record.
             state_store: The self-healing cycle-book store.
             now: Injected clock producing timezone-aware instants.
+            sleep: Injected delay used only for bounded post-action RPC catch-up.
             switch_margin_fraction: The relative APR margin another pool
                 must beat the held pool by before a switch fires.
         """
@@ -722,6 +756,7 @@ class CycleRunner:
         self._audit_sink = audit_sink
         self._state_store = state_store
         self._now = now
+        self._sleep = sleep
         self._switch_margin_fraction = switch_margin_fraction
         self._last_reconciliation: CycleReconciliation | None = None
         # One cycle process enumerates the board at most once; reconcile and
@@ -789,6 +824,8 @@ class CycleRunner:
             raise ValueError("a live cycle requires its signing key and executor")
         book = self._state_store.load()
         reconciliation = self._reconcile(book)
+        decision_reconciliation = reconciliation
+        final_reconciliation_verified = True
         self._last_reconciliation = reconciliation
         # A present quote with an absent age counts as fresh (age zero);
         # only an absent quote leaves the reference unset.
@@ -816,7 +853,26 @@ class CycleRunner:
                 actions, halted_reason, book = self._act(
                     book, outcome, key_bytes, decision_report.symbol, decision_report.switch
                 )
+                final_reconciliation_verified = self._await_post_action_visibility(tuple(actions))
+                if not final_reconciliation_verified and not halted_reason:
+                    target = max(
+                        (action.confirmed_block_number or 0 for action in actions), default=0
+                    )
+                    halted_reason = (
+                        "post-action reconciliation is unverified because the primary RPC "
+                        f"did not reach confirmed block {target} within the bounded wait"
+                    )
             final_reconciliation = self._reconcile(book)
+            if not final_reconciliation_verified:
+                final_reconciliation = final_reconciliation.model_copy(
+                    update={
+                        "diagnostics": final_reconciliation.diagnostics
+                        + (
+                            "WARNING: final balances may lag a confirmed action because the "
+                            "primary RPC did not prove visibility of its inclusion block.",
+                        )
+                    }
+                )
             self._last_reconciliation = final_reconciliation
             if not final_reconciliation.out_of_band:
                 book = self._rebuild_book(
@@ -831,7 +887,14 @@ class CycleRunner:
             reconciliation = final_reconciliation
         self._state_store.save(book)
         report = self._assemble_report(
-            started_at, mode, reconciliation, decision_report, tuple(actions), halted_reason
+            started_at,
+            mode,
+            reconciliation,
+            decision_reconciliation,
+            final_reconciliation_verified,
+            decision_report,
+            tuple(actions),
+            halted_reason,
         )
         self._record(report)
         return report
@@ -1015,6 +1078,47 @@ class CycleRunner:
             out_of_band=out_of_band,
             diagnostics=tuple(diagnostics),
         )
+
+    def _await_post_action_visibility(self, actions: tuple[CycleActionRecord, ...]) -> bool:
+        """Wait until the primary RPC reaches every confirmed action's inclusion block.
+
+        The execution layer can confirm a delivery through a secondary receipt
+        endpoint while the primary read endpoint is temporarily behind. Final
+        reconciliation must not label pre-action balances as post-action truth.
+        """
+        target_block = max((action.confirmed_block_number or 0 for action in actions), default=0)
+        if target_block == 0:
+            return True
+        fetch_block_number = getattr(self._balances, "fetch_block_number", None)
+        if fetch_block_number is None:
+            # Test doubles and legacy boundaries without block reads cannot
+            # prove visibility; production ExecutorRpcBackend always can.
+            return False
+        failure = ""
+        for attempt in range(POST_ACTION_VISIBILITY_ATTEMPTS):
+            try:
+                visible_block = int(fetch_block_number())
+            except (ExecutionUnavailableError, ValueError, TypeError) as error:
+                failure = str(error)
+            else:
+                if visible_block >= target_block:
+                    return True
+                failure = f"latest block {visible_block} is behind target {target_block}"
+            if attempt + 1 < POST_ACTION_VISIBILITY_ATTEMPTS:
+                backoff = min(
+                    POST_ACTION_VISIBILITY_BASE_BACKOFF_SECONDS * (2**attempt),
+                    POST_ACTION_VISIBILITY_MAX_BACKOFF_SECONDS,
+                )
+                _cycle_progress(
+                    f"post-action RPC visibility attempt {attempt + 1} of "
+                    f"{POST_ACTION_VISIBILITY_ATTEMPTS} failed ({failure}); "
+                    f"backing off {backoff:.1f}s"
+                )
+                self._sleep(backoff)
+        _cycle_progress(
+            f"post-action RPC visibility remained behind confirmed block {target_block}: {failure}"
+        )
+        return False
 
     def _stock_token_address_for(self, symbol: str) -> str:
         """Resolve one symbol's stock token address from the registry.
@@ -1209,6 +1313,7 @@ class CycleRunner:
                 committed_usd=book.position.committed_usd,
                 entered_at=book.position.entered_at,
                 out_of_range_since=book.position.out_of_range_since,
+                out_of_range_side=book.position.out_of_range_side,
             )
         held: HeldInventory | None = None
         if book.held_inventory is not None:
@@ -1486,12 +1591,19 @@ class CycleRunner:
                 completed_steps = tuple(getattr(error, "completed_steps", ()))
                 hashes = tuple(step.transaction_hash for step in completed_steps)
                 fees = sum(step.fee_wei or 0 for step in completed_steps)
+                blocks = tuple(
+                    int(step.block_number)
+                    for step in completed_steps
+                    if step.status == "confirmed"
+                    and getattr(step, "block_number", None) is not None
+                )
                 records.append(
                     CycleActionRecord(
                         action=name,
                         status="refused",
                         transaction_hashes=hashes,
                         fee_wei=fees,
+                        confirmed_block_number=max(blocks) if blocks else None,
                         refusal_code=code,
                         diagnostic=str(error),
                     )
@@ -1504,7 +1616,7 @@ class CycleRunner:
                 )
                 halted = f"the {name} action failed: {error}"
                 return False
-            hashes, fees = _action_hashes_and_fees(report)
+            hashes, fees, confirmed_block = _action_hashes_fees_and_block(report)
             mint_plan = getattr(report.build, "plan", None) if name == "mint" else None
             executed_budget = (
                 getattr(mint_plan, "budget_usdc", None) if mint_plan is not None else None
@@ -1515,6 +1627,7 @@ class CycleRunner:
                     status="completed" if _action_completed(report) else "failed",
                     transaction_hashes=hashes,
                     fee_wei=fees,
+                    confirmed_block_number=confirmed_block,
                     executed_budget_usdc=executed_budget,
                     diagnostic=report.halted_reason,
                 )
@@ -1640,7 +1753,12 @@ class CycleRunner:
                     halted = "the recenter decision carried no complete fresh entry"
                     return records, halted, book
 
-            if not self._exit_position(executor, book, key_bytes, run):
+            exit_ok = (
+                self._burn_without_swap(executor, book, key_bytes, run)
+                if action is PolicyActionKind.RECENTER
+                else self._exit_position(executor, book, key_bytes, run)
+            )
+            if not exit_ok:
                 return records, halted, book
             if action is PolicyActionKind.RECENTER:
                 size = decision.size_usd
@@ -1875,7 +1993,10 @@ class CycleRunner:
             and decision_action is PolicyActionKind.HOLD
         ):
             position = position.model_copy(
-                update={"out_of_range_since": next_state.position.out_of_range_since}
+                update={
+                    "out_of_range_since": next_state.position.out_of_range_since,
+                    "out_of_range_side": next_state.position.out_of_range_side,
+                }
             )
         held = book.held_inventory
         if held is not None and reconciliation.held_stock_quantity == 0:
@@ -1921,6 +2042,8 @@ class CycleRunner:
         started_at: datetime,
         mode: CycleMode,
         reconciliation: CycleReconciliation,
+        decision_reconciliation: CycleReconciliation,
+        final_reconciliation_verified: bool,
         decision_report: StrategyDecisionReport | None,
         actions: tuple[CycleActionRecord, ...],
         halted_reason: str,
@@ -1955,6 +2078,8 @@ class CycleRunner:
             mode=mode,
             symbol=report_symbol,
             reconciliation=reconciliation,
+            decision_reconciliation=decision_reconciliation,
+            final_reconciliation_verified=final_reconciliation_verified,
             decision_action=decision_action,
             decision_reason=decision_reason,
             decision_diagnostics=decision_diagnostics,
@@ -2142,7 +2267,11 @@ def build_cycle_runner(
     from aero_bot.safe_tx import SafeTransactionRpcBackend
     from aero_bot.strategy import LiveStrategySources
 
-    rpc = ExecutorRpcBackend(rpc_url=settings.base_rpc_url, progress=_cycle_progress)
+    rpc = ExecutorRpcBackend(
+        rpc_url=settings.base_rpc_url,
+        fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
+        progress=_cycle_progress,
+    )
     audit_store = AuditStore(settings.audit_database_path)
     pin_store = LpPoolPinStore(settings.lp_pool_pins_path)
     # Every long-running phase (the first full Sugar sweep above all) reports
@@ -2152,10 +2281,15 @@ def build_cycle_runner(
     sources = LiveStrategySources(
         rpc_url=settings.base_rpc_url,
         sugar_address=settings.lp_sugar_address,
+        fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
         pool_pin_store=pin_store,
         progress=progress,
     )
-    safe_rpc = SafeTransactionRpcBackend(rpc_url=settings.base_rpc_url, safe_address=safe_address)
+    safe_rpc = SafeTransactionRpcBackend(
+        rpc_url=settings.base_rpc_url,
+        safe_address=safe_address,
+        fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
+    )
     receipt_backends = [rpc] + [
         ExecutorRpcBackend(rpc_url=url)
         for url in EXECUTE_RECEIPT_ENDPOINT_URLS
@@ -2168,6 +2302,7 @@ def build_cycle_runner(
         sources=LiveExecutionSources(
             rpc_url=settings.base_rpc_url,
             sugar_address=settings.lp_sugar_address,
+            fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
             progress=progress,
         ),
         rpc=rpc,

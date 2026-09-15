@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 from enum import StrEnum
 from importlib.resources import files
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, model_validator
@@ -332,8 +332,15 @@ class PolicyParameters(BaseModel):
     max_range_half_width_fraction: Decimal = Decimal("0.003")
     # Range boundaries are aligned to the pool tick grid of spacing ten.
     tick_spacing: Annotated[int, Field(ge=1)] = 10
-    # Upside out-of-range recenters only after a fifteen-minute wait.
+    # Any non-urgent out-of-range recenter waits fifteen minutes before the
+    # economics are evaluated.
     recenter_wait: timedelta = timedelta(minutes=15)
+    # A downside recenter is ignored for tiny edge breaches; the pool must be
+    # at least 0.10 percent below the lower edge before we pay churn costs.
+    downside_recenter_min_distance_fraction: Decimal = Decimal("0.001")
+    # A downside recenter must earn back modeled gas plus price impact within
+    # one day of the current gross emissions-plus-fee yield.
+    downside_recenter_max_payback_days: Decimal = Decimal("1")
     # The downside stop triggers 0.5 percent below the lower range edge.
     stop_buffer_fraction: Decimal = Decimal("0.005")
     # Re-entry is blocked for fifteen minutes after a stop or dilution exit.
@@ -494,8 +501,11 @@ class PolicyPosition(BaseModel):
     committed_usd: Annotated[Decimal, Field(gt=0)]
     # Entry time anchors the wait and cooldown timeline of this position.
     entered_at: datetime
-    # The upside out-of-range wait anchor is set once price exits above range.
+    # The out-of-range wait anchor persists across observations.
     out_of_range_since: datetime | None = None
+    # Which side owns the wait anchor. None preserves backward compatibility
+    # with state written before side-aware downside recenters existed.
+    out_of_range_side: Literal["above", "below"] | None = None
 
     @model_validator(mode="after")
     def require_aware_entry_time(self) -> Self:
@@ -591,9 +601,15 @@ class PolicyReason(StrEnum):
     OPEN_IN_RANGE = "open_in_range"
     # Price exited above the range and the time-based recenter wait is running.
     OPEN_ABOVE_RANGE_WAITING = "open_above_range_waiting"
-    # Price sits below the range edge but above the stop level, so the
-    # position holds and may recover into the range.
+    # Price sits below the range edge but has not yet met both the wait,
+    # distance, and economic recenter gates.
     OPEN_BELOW_EDGE_HOLDING = "open_below_edge_holding"
+    # The downside grace/distance gates elapsed but modeled recenter churn
+    # cannot earn itself back inside the locked payback horizon.
+    DOWNSIDE_RECENTER_UNECONOMIC = "downside_recenter_uneconomic"
+    # The downside grace/distance gates elapsed and modeled recenter churn is
+    # economic inside the locked payback horizon.
+    DOWNSIDE_RECENTER_ECONOMIC = "downside_recenter_economic"
     # Entry is eligible because the raw emissions APR threshold is met.
     ENTRY_THRESHOLD_MET = "entry_threshold_met"
     # The pool's raw emissions APR is below the entry threshold.
@@ -1041,7 +1057,12 @@ class PolicyEngine:
             )
         # Upside out-of-range starts a time-based wait before any recenter.
         if observation.amm_price_usdc >= position.price_range.upper_price:
-            wait_anchor = position.out_of_range_since or observation.observed_at
+            wait_anchor = (
+                position.out_of_range_since
+                if position.out_of_range_since is not None
+                and position.out_of_range_side in {None, "above"}
+                else observation.observed_at
+            )
             waited = observation.observed_at - wait_anchor
             if waited >= self._parameters.recenter_wait:
                 # The gas sense-check gate defers non-urgent recenters.
@@ -1054,7 +1075,7 @@ class PolicyEngine:
                     # The anchor persists so the elapsed wait stays elapsed and
                     # the recenter retries on a cheaper observation.
                     waiting_position = position.model_copy(
-                        update={"out_of_range_since": wait_anchor}
+                        update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
                     )
                     return self._hold(
                         state.model_copy(update={"position": waiting_position}),
@@ -1098,6 +1119,7 @@ class PolicyEngine:
                         "price_range": new_range,
                         "entered_at": observation.observed_at,
                         "out_of_range_since": None,
+                        "out_of_range_side": None,
                     }
                 )
                 next_state = state.model_copy(update={"position": next_position})
@@ -1121,7 +1143,9 @@ class PolicyEngine:
                 f"edge {position.price_range.upper_price}; waited {waited} of the "
                 f"locked recenter wait {self._parameters.recenter_wait}.",
             )
-            next_position = position.model_copy(update={"out_of_range_since": wait_anchor})
+            next_position = position.model_copy(
+                update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
+            )
             next_state = state.model_copy(update={"position": next_position})
             return PolicyOutcome(
                 decision=PolicyDecision(
@@ -1131,35 +1155,124 @@ class PolicyEngine:
                 ),
                 next_state=next_state,
             )
-        # Returning inside the range clears any prior upside wait anchor.
+        if observation.amm_price_usdc < position.price_range.lower_price:
+            # Downside out-of-range is neither an indefinite recovery hold nor
+            # an automatic chase. A grace period and minimum displacement must
+            # pass, then the modeled churn must earn itself back quickly enough.
+            wait_anchor = (
+                position.out_of_range_since
+                if position.out_of_range_since is not None
+                and position.out_of_range_side in {None, "below"}
+                else observation.observed_at
+            )
+            waited = observation.observed_at - wait_anchor
+            distance_fraction = (
+                position.price_range.lower_price - observation.amm_price_usdc
+            ) / position.price_range.lower_price
+            waiting_position = position.model_copy(
+                update={"out_of_range_since": wait_anchor, "out_of_range_side": "below"}
+            )
+            waiting_state = state.model_copy(update={"position": waiting_position})
+            if (
+                waited < self._parameters.recenter_wait
+                or distance_fraction < self._parameters.downside_recenter_min_distance_fraction
+            ):
+                diagnostics = (
+                    f"Pool price {observation.amm_price_usdc} is below the lower range "
+                    f"edge {position.price_range.lower_price} but above the stop level "
+                    f"{stop_level}; waited {waited} of {self._parameters.recenter_wait} "
+                    f"and is {distance_fraction} below the edge versus the locked "
+                    f"{self._parameters.downside_recenter_min_distance_fraction} minimum.",
+                )
+                return self._hold(
+                    waiting_state, PolicyReason.OPEN_BELOW_EDGE_HOLDING, diagnostics
+                )
+            deferred, defer_diagnostics = self._gas_gate_blocks(
+                observation,
+                self._parameters.recenter_batch_gas_units,
+                position.committed_usd,
+            )
+            if deferred:
+                return self._hold(
+                    waiting_state, PolicyReason.GAS_GATE_DEFERRED, defer_diagnostics
+                )
+            # A downside out-of-range position is stock-heavy. Preserving the
+            # withdrawn inventory lets the mint planner sell only the amount
+            # needed to rebalance instead of round-tripping the whole position.
+            swap_plan = self._swap_plan(
+                SwapDirection.SELL_STOCK,
+                position.committed_usd / Decimal(2),
+                observation.pool_depth_usd,
+            )
+            gas_units, gas_cost_usd = self._batch_gas(
+                observation, self._parameters.recenter_batch_gas_units
+            )
+            economic, economics_diagnostics = self._downside_recenter_economics(
+                observation, position.committed_usd, swap_plan, gas_cost_usd
+            )
+            if not economic:
+                return self._hold(
+                    waiting_state,
+                    PolicyReason.DOWNSIDE_RECENTER_UNECONOMIC,
+                    economics_diagnostics,
+                )
+            width_solution = self._solve_range_width(observation, position.committed_usd)
+            new_range = self.build_aligned_range(
+                observation.amm_price_usdc, width_solution.half_width_fraction
+            )
+            next_position = position.model_copy(
+                update={
+                    "price_range": new_range,
+                    "entered_at": observation.observed_at,
+                    "out_of_range_since": None,
+                    "out_of_range_side": None,
+                }
+            )
+            diagnostics = (
+                (
+                    f"Downside out-of-range wait {waited} and displacement "
+                    f"{distance_fraction} passed the locked recenter gates.",
+                    f"New range {new_range.lower_price}..{new_range.upper_price} "
+                    f"USDC per stock around pool price {observation.amm_price_usdc}.",
+                )
+                + economics_diagnostics
+                + width_solution.diagnostics
+                + self._gas_diagnostics(gas_units, gas_cost_usd)
+            )
+            return PolicyOutcome(
+                decision=PolicyDecision(
+                    action=PolicyActionKind.RECENTER,
+                    reason=PolicyReason.DOWNSIDE_RECENTER_ECONOMIC,
+                    diagnostics=diagnostics,
+                    price_range=new_range,
+                    size_usd=position.committed_usd,
+                    swap_plan=swap_plan,
+                    estimated_gas_units=gas_units,
+                    estimated_gas_cost_usd=gas_cost_usd,
+                    width_solution=width_solution,
+                ),
+                next_state=state.model_copy(update={"position": next_position}),
+            )
+        # Returning inside the range clears either side's prior wait anchor.
         updated_position = (
             position
-            if position.out_of_range_since is None
-            else position.model_copy(update={"out_of_range_since": None})
+            if position.out_of_range_since is None and position.out_of_range_side is None
+            else position.model_copy(
+                update={"out_of_range_since": None, "out_of_range_side": None}
+            )
         )
-        next_state = state.model_copy(update={"position": updated_position})
-        if observation.amm_price_usdc < position.price_range.lower_price:
-            # Below the edge but above the stop level, the position holds.
-            diagnostics = (
-                f"Pool price {observation.amm_price_usdc} is below the lower range "
-                f"edge {position.price_range.lower_price} but above the stop level "
-                f"{stop_level}; holding for recovery.",
-            )
-            reason = PolicyReason.OPEN_BELOW_EDGE_HOLDING
-        else:
-            diagnostics = (
-                f"Pool price {observation.amm_price_usdc} is inside the range "
-                f"{position.price_range.lower_price}..{position.price_range.upper_price}; "
-                f"no rule requires action.",
-            )
-            reason = PolicyReason.OPEN_IN_RANGE
+        diagnostics = (
+            f"Pool price {observation.amm_price_usdc} is inside the range "
+            f"{position.price_range.lower_price}..{position.price_range.upper_price}; "
+            f"no rule requires action.",
+        )
         return PolicyOutcome(
             decision=PolicyDecision(
                 action=PolicyActionKind.HOLD,
-                reason=reason,
+                reason=PolicyReason.OPEN_IN_RANGE,
                 diagnostics=diagnostics,
             ),
-            next_state=next_state,
+            next_state=state.model_copy(update={"position": updated_position}),
         )
 
     def _decide_holding_inventory(
@@ -1548,6 +1661,53 @@ class PolicyEngine:
                 ),
                 max_modeled_impact_fraction=max(tranche_impacts),
             )
+
+    def _downside_recenter_economics(
+        self,
+        observation: PolicyObservation,
+        position_value_usd: Decimal,
+        swap_plan: SwapPlan,
+        gas_cost_usd: Decimal | None,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Require downside recenter churn to repay from expected gross yield quickly."""
+        if gas_cost_usd is None:
+            return False, (
+                "Downside recenter economics are unavailable because gas cost is unknown.",
+            )
+        impact = swap_plan.max_modeled_impact_fraction
+        if impact is None:
+            return False, (
+                "Downside recenter impact is unmodeled at the observed pool depth; holding.",
+            )
+        if impact > self._parameters.swap_impact_ceiling_fraction:
+            return False, (
+                f"Downside recenter worst modeled tranche impact {impact} exceeds the "
+                f"{self._parameters.swap_impact_ceiling_fraction} ceiling; holding.",
+            )
+        impact_cost = sum(
+            (
+                tranche.usd_size * (tranche.modeled_impact_fraction or Decimal(0))
+                for tranche in swap_plan.tranches
+            ),
+            Decimal(0),
+        )
+        expected_daily_gross_yield = (
+            position_value_usd * (observation.emissions_apr + observation.fee_apr) / DAYS_PER_YEAR
+        )
+        if expected_daily_gross_yield <= 0:
+            return False, (
+                "Downside recenter has no positive expected daily gross yield to repay churn.",
+            )
+        modeled_cost = gas_cost_usd + impact_cost
+        payback_days = modeled_cost / expected_daily_gross_yield
+        diagnostics = (
+            f"Downside recenter modeled churn is {modeled_cost} USDC "
+            f"({gas_cost_usd} gas + {impact_cost} modeled price impact) against "
+            f"{expected_daily_gross_yield} USDC expected daily gross yield; "
+            f"payback is {payback_days} days versus the locked "
+            f"{self._parameters.downside_recenter_max_payback_days}-day maximum.",
+        )
+        return payback_days <= self._parameters.downside_recenter_max_payback_days, diagnostics
 
     def _batch_gas(
         self,

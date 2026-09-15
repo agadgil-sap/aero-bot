@@ -352,10 +352,12 @@ class LpRpcScript:
         burn_gas_estimate: int | None = 60_000,
         get_reward_gas_estimate: int | None = 110_000,
         allow_broadcasts: bool = False,
+        send_http_status: int = 200,
         relayer_eth_wei: int = 10**15,
         relayer_starting_nonce: int = 3,
         receipt_status: int = 1,
         receipt_present: bool = True,
+        receipt_http_status: int = 200,
         estimate_reverts_after: int | None = None,
         estimate_revert_message: str = "execution reverted: PSC",
         estimate_gs026_lag_calls: int = 0,
@@ -423,11 +425,15 @@ class LpRpcScript:
                 to make that estimate revert.
             allow_broadcasts: Whether eth_sendRawTransaction is served; the
                 default keeps the no-broadcast trap for every dry-run path.
+            send_http_status: HTTP status returned after recording a permitted
+                send attempt, simulating lost/blocked submission acknowledgements.
             relayer_eth_wei: Balance served for the relaying EOA address.
             relayer_starting_nonce: First pending nonce served per send.
             receipt_status: Status word served for included deliveries.
             receipt_present: Whether receipts are served at all; False keeps
                 every poll empty so the bounded wait can time out.
+            receipt_http_status: HTTP status served only for receipt reads;
+                non-200 values simulate one unhealthy receipt endpoint.
             estimate_reverts_after: Make every estimateGas call past this
                 count revert with estimate_revert_message, counting both the
                 build-time and execute-time estimates.
@@ -488,10 +494,12 @@ class LpRpcScript:
         self.broadcasts: list[str] = []
         self.estimate_requests: list[str] = []
         self.allow_broadcasts = allow_broadcasts
+        self.send_http_status = send_http_status
         self.relayer_eth_wei = relayer_eth_wei
         self.relayer_next_nonce = relayer_starting_nonce
         self.receipt_status = receipt_status
         self.receipt_present = receipt_present
+        self.receipt_http_status = receipt_http_status
         self.estimate_reverts_after = estimate_reverts_after
         self.estimate_revert_message = estimate_revert_message
         self.estimate_gs026_lag_remaining = estimate_gs026_lag_calls
@@ -541,8 +549,12 @@ class LpRpcScript:
                 self.broadcasts.append(str(params[0]))
                 raise AssertionError("the LP executor must never broadcast anything")
             self.broadcasts.append(str(params[0]))
+            if self.send_http_status != 200:
+                return httpx.Response(self.send_http_status, json={})
             result = "0x" + f"{len(self.broadcasts):064x}"
         elif method == "eth_getTransactionReceipt":
+            if self.receipt_http_status != 200:
+                return httpx.Response(self.receipt_http_status, json={})
             if not self.receipt_present:
                 result = None
             else:
@@ -3419,6 +3431,61 @@ def test_execute_rotates_receipt_polling_across_backends() -> None:
 
     assert report.completed is True
     assert all(step.status == "confirmed" for step in report.steps)
+
+
+
+def test_execute_survives_a_forbidden_primary_receipt_endpoint() -> None:
+    """A transient 403 on the primary receipt endpoint falls through to a healthy secondary."""
+    primary = LpRpcScript(
+        owner_addresses={77: SAFE_ADDRESS},
+        position_words=make_position_words(),
+        allow_broadcasts=True,
+        receipt_http_status=403,
+    )
+    secondary = LpRpcScript(receipt_present=True)
+    executor, _, _ = make_lp_executor(
+        rpc_script=primary,
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+        receipt_script=secondary,
+    )
+
+    report = executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert report.completed is True
+    assert all(step.status == "confirmed" for step in report.steps)
+
+
+def test_execute_recovers_when_broadcast_ack_is_lost_but_secondary_confirms(
+    tmp_path: Path,
+) -> None:
+    """A lost send acknowledgement keeps the deterministic hash and accepts secondary proof."""
+    audit_path = tmp_path / "audit.sqlite3"
+    primary = LpRpcScript(
+        owner_addresses={77: SAFE_ADDRESS},
+        position_words=make_position_words(),
+        allow_broadcasts=True,
+        send_http_status=403,
+        receipt_http_status=403,
+    )
+    secondary = LpRpcScript(receipt_present=True)
+    executor, _, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=primary,
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+        receipt_script=secondary,
+    )
+
+    report = executor.execute_stake(
+        "FIXc", 77, bytes(Account.create().key), confirm_broadcast=True
+    )
+
+    assert report.completed is True
+    assert all(step.status == "confirmed" for step in report.steps)
+    records = AuditStore(audit_path).read_records(100)
+    assert any(
+        record.event_type is AuditEventType.LP_EXECUTE_BROADCAST_UNKNOWN for record in records
+    )
+    assert any(record.event_type is AuditEventType.LP_EXECUTE_CONFIRMED for record in records)
 
 
 def test_execute_re_reads_a_lagging_gs026_estimate() -> None:

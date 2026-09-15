@@ -606,6 +606,7 @@ class LiveExecutionSources:
         self,
         rpc_url: str = DEFAULT_BASE_RPC_URL,
         sugar_address: str = LP_SUGAR_ADDRESS,
+        fallback_rpc_urls: Sequence[str] = (),
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         progress: Callable[[str], None] | None = None,
@@ -613,8 +614,9 @@ class LiveExecutionSources:
         """Configure the live discovery, registry, and decimals sources.
 
         Args:
-            rpc_url: Base JSON-RPC endpoint used exclusively for reads.
+            rpc_url: Primary Base JSON-RPC endpoint used for reads.
             sugar_address: LP Sugar contract anchoring pool discovery.
+            fallback_rpc_urls: Ordered alternate endpoints for transient read failures.
             transport: Optional injected HTTP transport for tests.
             sleep: Injected delay function used for retry backoff.
             progress: Optional callback receiving one human-readable line per
@@ -622,6 +624,7 @@ class LiveExecutionSources:
                 so a slow enumeration reports progress instead of silence.
         """
         self._rpc_url = rpc_url
+        self._fallback_rpc_urls = tuple(fallback_rpc_urls)
         self._sugar_address = normalize_evm_address(sugar_address)
         self._transport = transport
         self._sleep = sleep
@@ -666,6 +669,7 @@ class LiveExecutionSources:
         backend = LpSugarRpcBackend(
             rpc_url=self._rpc_url,
             sugar_address=self._sugar_address,
+            fallback_rpc_urls=self._fallback_rpc_urls,
             transport=self._transport,
             sleep=self._sleep,
             progress=self._progress,
@@ -881,6 +885,7 @@ class ExecutorRpcBackend:
     def __init__(
         self,
         rpc_url: str,
+        fallback_rpc_urls: Sequence[str] = (),
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         max_attempts: int = MAX_REQUEST_ATTEMPTS,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
@@ -894,7 +899,9 @@ class ExecutorRpcBackend:
         """Configure bounded RPC behavior shared by reads and broadcasts.
 
         Args:
-            rpc_url: Base JSON-RPC endpoint for reads and broadcasts.
+            rpc_url: Primary Base JSON-RPC endpoint for reads and broadcasts.
+            fallback_rpc_urls: Ordered alternate endpoints used only after a
+                transient transport, rate-limit, forbidden, timeout, or 5xx failure.
             timeout_seconds: Complete per-request timeout in seconds.
             max_attempts: Attempts per request before failing closed.
             max_response_bytes: Maximum accepted size of one response body.
@@ -920,6 +927,7 @@ class ExecutorRpcBackend:
         if receipt_timeout_seconds <= 0:
             raise ValueError("receipt_timeout_seconds must be positive")
         self._rpc_url = rpc_url
+        self._rpc_urls = tuple(dict.fromkeys((rpc_url, *fallback_rpc_urls)))
         self._timeout_seconds = timeout_seconds
         self._max_attempts = max_attempts
         self._max_response_bytes = max_response_bytes
@@ -1373,13 +1381,14 @@ class ExecutorRpcBackend:
                 if wait > 0:
                     self._sleep(wait)
             try:
-                response = client.post(self._rpc_url, json=payload)
+                endpoint = self._rpc_urls[attempt % len(self._rpc_urls)]
+                response = client.post(endpoint, json=payload)
             except httpx.TransportError as error:
                 failure = f"transport error: {error}"
                 continue
             finally:
                 self._next_request_at = self._timer() + REQUEST_PACING_SECONDS
-            if response.status_code == 429 or response.status_code >= 500:
+            if response.status_code in {403, 408, 425, 429} or response.status_code >= 500:
                 failure = f"HTTP status {response.status_code}"
                 continue
             response_size = len(response.content)

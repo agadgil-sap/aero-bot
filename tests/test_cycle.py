@@ -49,6 +49,7 @@ from aero_bot.lp_executor import (
     LpSafePositionsSnapshot,
 )
 from aero_bot.policy import (
+    AlignedPriceRange,
     PolicyActionKind,
     PolicyDecision,
     PolicyOutcome,
@@ -193,11 +194,13 @@ class FakeBalances:
         usdc_units: int = 10_000_000,
         stock_units: int = 0,
         relayer_eth_wei: int = 10**15,
+        block_number: int = 99_999_999,
     ) -> None:
         """Configure every served balance."""
         self.usdc_units = usdc_units
         self.stock_units = stock_units
         self.relayer_eth_wei = relayer_eth_wei
+        self.block_number = block_number
         self.receipts: dict[str, dict[str, object]] = {}
 
     def fetch_token_balance(self, token_address: str, owner_address: str) -> int:
@@ -213,6 +216,10 @@ class FakeBalances:
     def fetch_transaction_receipt(self, transaction_hash: str) -> dict[str, object] | None:
         """Serve one scripted receipt when present."""
         return self.receipts.get(transaction_hash)
+
+    def fetch_block_number(self) -> int:
+        """Serve the primary RPC block used by the post-action visibility gate."""
+        return self.block_number
 
 
 class FakeExecutor:
@@ -236,6 +243,7 @@ class FakeExecutor:
         self.mint_receipt_token_id: int | None = TRACKED_TOKEN_ID
         self.mint_executed_budget: Decimal | None = None
         self.fee_wei_per_step = 90_000
+        self.confirmed_block_number = 51_000_000
 
     def _complete(self, action: str, hashes: tuple[str, ...]) -> LpActionExecutionReport:
         """Build one completed execution report over scripted steps."""
@@ -243,7 +251,10 @@ class FakeExecutor:
             cast(
                 object,
                 SimpleNamespace(
-                    transaction_hash=h, fee_wei=self.fee_wei_per_step, status="confirmed"
+                    transaction_hash=h,
+                    fee_wei=self.fee_wei_per_step,
+                    status="confirmed",
+                    block_number=self.confirmed_block_number,
                 ),
             )
             for h in hashes
@@ -462,6 +473,7 @@ def make_runner(
     audit_seed: bool = False,
     now: datetime = QUIET_INSTANT,
     symbol: str | None = "FIXc",
+    sleep: object | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, AuditStore, CycleStateStore]:
     """Assemble one cycle runner over fully scripted boundaries."""
     store_path = tmp_path / "cycle_state.json"
@@ -521,6 +533,7 @@ def make_runner(
         audit_sink=audit,
         state_store=state_store,
         now=lambda: now,
+        **({"sleep": sleep} if sleep is not None else {}),
     )
     return runner, fake_executor, audit, state_store
 
@@ -706,6 +719,45 @@ class TestLiveCycles:
         assert all(record.status == "completed" for record in actions)
         assert book.position is None and book.held_inventory is None
 
+    def test_recenter_preserves_withdrawn_inventory_instead_of_round_tripping_usdc(
+        self, tmp_path: Path
+    ) -> None:
+        """A recenter unstakes/withdraws then lets mint rebalance without a full exit swap."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS))
+        runner, executor, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+        assert executor is not None
+        runner._last_reconciliation = runner._reconcile(tracked_book())
+        outcome = PolicyOutcome(
+            decision=PolicyDecision(
+                action=PolicyActionKind.RECENTER,
+                reason=PolicyReason.DOWNSIDE_RECENTER_ECONOMIC,
+                diagnostics=("fixture economic recenter",),
+                price_range=AlignedPriceRange(
+                    lower_tick=-10,
+                    upper_tick=10,
+                    lower_price=Decimal("99"),
+                    upper_price=Decimal("101"),
+                ),
+                size_usd=Decimal("7"),
+            ),
+            next_state=PolicyState(),
+        )
+
+        actions, halted, book = runner._act(
+            tracked_book(), outcome, b"\x01" * 32, "FIXc"
+        )
+
+        assert halted == ""
+        assert [record.action for record in actions] == [
+            "unstake",
+            "withdraw",
+            "mint",
+            "stake",
+        ]
+        assert "exit_swap" not in [call[0] for call in executor.calls]
+        assert book.position is not None
+
     def test_stale_low_burn_holds_the_returned_stock(self, tmp_path: Path) -> None:
         """A stale-low burn unstakes and withdraws but never swaps."""
         reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
@@ -756,6 +808,62 @@ class TestLiveCycles:
         assert [record.action for record in actions] == ["exit_swap"]
         assert halted == ""
         assert new_book.held_inventory is None
+
+
+class TestPostActionVisibility:
+    """Final reconciliation waits for the primary RPC to observe confirmed actions."""
+
+    def test_live_cycle_waits_for_confirmed_block_before_final_reconcile(
+        self, tmp_path: Path
+    ) -> None:
+        """A live action waits until the primary RPC reaches its confirmed block."""
+        sleeps: list[float] = []
+
+        class LaggingBalances(FakeBalances):
+            def __init__(self) -> None:
+                super().__init__(block_number=100)
+                self.blocks = iter((100, 120, 51_000_000))
+
+            def fetch_block_number(self) -> int:
+                self.block_number = next(self.blocks)
+                return self.block_number
+
+        balances = LaggingBalances()
+        runner, executor, _, _ = make_runner(
+            tmp_path, balances=balances, sleep=sleeps.append
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_price_usdc=Decimal("100"),
+        )
+
+        assert report.final_reconciliation_verified is True
+        assert report.decision_reconciliation is not None
+        assert sleeps == [0.5, 1.0]
+
+    def test_visibility_timeout_marks_final_reconciliation_unverified(
+        self, tmp_path: Path
+    ) -> None:
+        """A bounded catch-up failure is explicit instead of silently reporting stale state."""
+        balances = FakeBalances(block_number=100)
+        runner, executor, _, _ = make_runner(
+            tmp_path, balances=balances, sleep=lambda _seconds: None
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_price_usdc=Decimal("100"),
+        )
+
+        assert report.final_reconciliation_verified is False
+        assert "post-action reconciliation is unverified" in report.halted_reason
+        assert any(
+            "WARNING: final balances may lag" in line
+            for line in report.reconciliation.diagnostics
+        )
 
 
 class TestReconciliation:

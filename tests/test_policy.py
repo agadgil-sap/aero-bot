@@ -537,6 +537,88 @@ class TestPositionLifecycle:
         assert outcome.decision.reason is PolicyReason.OPEN_BELOW_EDGE_HOLDING
         assert outcome.next_state.position is not None
 
+    def test_downside_recenter_waits_for_distance_then_uses_economics(self) -> None:
+        """A sustained material downside breach recenters when churn pays back quickly."""
+        engine, state = entered_session()
+        lower = entered_position_for(state).price_range.lower_price
+        below_price = lower * Decimal("0.998")
+        first = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        assert first.decision.action is PolicyActionKind.HOLD
+        assert first.decision.reason is PolicyReason.OPEN_BELOW_EDGE_HOLDING
+        assert first.next_state.position is not None
+        assert first.next_state.position.out_of_range_side == "below"
+
+        recentred = engine.decide(
+            first.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 17, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        assert recentred.decision.action is PolicyActionKind.RECENTER
+        assert recentred.decision.reason is PolicyReason.DOWNSIDE_RECENTER_ECONOMIC
+        assert recentred.decision.swap_plan is not None
+        assert recentred.decision.swap_plan.direction is SwapDirection.SELL_STOCK
+        assert recentred.next_state.position is not None
+        assert recentred.next_state.position.out_of_range_since is None
+        assert recentred.next_state.position.out_of_range_side is None
+        assert any("payback is" in line for line in recentred.decision.diagnostics)
+
+    def test_downside_recenter_does_not_chase_a_tiny_edge_breach(self) -> None:
+        """Even after the wait, a sub-threshold breach holds rather than churns."""
+        engine, state = entered_session()
+        lower = entered_position_for(state).price_range.lower_price
+        below_price = lower * Decimal("0.9995")
+        first = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        held = engine.decide(
+            first.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 30, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        assert held.decision.action is PolicyActionKind.HOLD
+        assert held.decision.reason is PolicyReason.OPEN_BELOW_EDGE_HOLDING
+        assert any("minimum" in line for line in held.decision.diagnostics)
+
+    def test_downside_recenter_holds_when_modeled_payback_is_too_slow(self) -> None:
+        """The downside path exposes an explicit economic hold instead of blind recentering."""
+        parameters = PolicyParameters(downside_recenter_max_payback_days=Decimal("0.001"))
+        engine = PolicyEngine(parameters=parameters)
+        entered = engine.decide(PolicyState(), base_observation())
+        assert entered.decision.action is PolicyActionKind.ENTER
+        position = entered_position_for(entered.next_state)
+        below_price = position.price_range.lower_price * Decimal("0.998")
+        first = engine.decide(
+            entered.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        held = engine.decide(
+            first.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 17, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        assert held.decision.action is PolicyActionKind.HOLD
+        assert held.decision.reason is PolicyReason.DOWNSIDE_RECENTER_UNECONOMIC
+        assert any("payback is" in line for line in held.decision.diagnostics)
+
     def test_downside_stop_exits_and_sets_reentry_cooldown(self) -> None:
         """A price at the stop level burns and swaps back to USDC, then cools down."""
         engine, state = entered_session()

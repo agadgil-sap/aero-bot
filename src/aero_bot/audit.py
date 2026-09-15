@@ -113,6 +113,9 @@ class AuditEventType(StrEnum):
     # LP execute sent captures one broadcast submission of an LP Safe
     # transaction from the execute path, appended before any receipt wait.
     LP_EXECUTE_SENT = "lp_execute_sent"
+    # LP execute broadcast unknown captures a signed delivery whose deterministic
+    # transaction hash is known but whose submission response was unavailable.
+    LP_EXECUTE_BROADCAST_UNKNOWN = "lp_execute_broadcast_unknown"
     # LP execute confirmed captures one included LP delivery with status one.
     LP_EXECUTE_CONFIRMED = "lp_execute_confirmed"
     # LP execute failed captures one included LP delivery that reverted.

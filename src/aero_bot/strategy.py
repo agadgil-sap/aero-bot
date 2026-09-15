@@ -220,6 +220,7 @@ class LiveStrategySources:
         self,
         rpc_url: str,
         sugar_address: str,
+        fallback_rpc_urls: Sequence[str] = (),
         transport: httpx.BaseTransport | None = None,
         pool_pin_store: LpPoolPinStore | None = None,
         progress: Callable[[str], None] | None = None,
@@ -229,8 +230,9 @@ class LiveStrategySources:
         """Configure the discovery and RPC sources.
 
         Args:
-            rpc_url: Base JSON-RPC endpoint for reads.
+            rpc_url: Primary Base JSON-RPC endpoint for reads.
             sugar_address: LP Sugar contract anchoring discovery.
+            fallback_rpc_urls: Ordered alternate endpoints for transient read failures.
             transport: Optional injected HTTP transport for tests.
             pool_pin_store: Optional local store of Sugar-verified pool
                 identities arming the known-pool fast path.
@@ -243,11 +245,13 @@ class LiveStrategySources:
         self._execution_sources = LiveExecutionSources(
             rpc_url=rpc_url,
             sugar_address=sugar_address,
+            fallback_rpc_urls=fallback_rpc_urls,
             transport=transport,
             progress=progress,
         )
         self._rpc = ExecutorRpcBackend(
             rpc_url=rpc_url,
+            fallback_rpc_urls=fallback_rpc_urls,
             transport=transport,
             progress=progress,
             sleep=sleep,

@@ -27,7 +27,7 @@ module rather than being re-derived:
 """
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Annotated, Literal, cast
 
 import httpx
@@ -385,6 +385,7 @@ class SafeTransactionRpcBackend:
         self,
         rpc_url: str,
         safe_address: str,
+        fallback_rpc_urls: Sequence[str] = (),
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         max_attempts: int = MAX_REQUEST_ATTEMPTS,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
@@ -394,8 +395,9 @@ class SafeTransactionRpcBackend:
         """Configure bounded read-only Safe RPC behavior.
 
         Args:
-            rpc_url: Base JSON-RPC endpoint used exclusively for read-only calls.
+            rpc_url: Primary Base JSON-RPC endpoint used for read-only calls.
             safe_address: The Safe proxy contract whose state is read.
+            fallback_rpc_urls: Ordered alternate endpoints used after transient failures.
             timeout_seconds: Complete per-request timeout in seconds.
             max_attempts: Attempts per request before failing closed.
             max_response_bytes: Maximum accepted size of one RPC response body.
@@ -413,6 +415,7 @@ class SafeTransactionRpcBackend:
             raise ValueError("max_response_bytes must be positive")
         self._safe_address = normalize_evm_address(safe_address)
         self._rpc_url = rpc_url
+        self._rpc_urls = tuple(dict.fromkeys((rpc_url, *fallback_rpc_urls)))
         self._timeout_seconds = timeout_seconds
         self._max_attempts = max_attempts
         self._max_response_bytes = max_response_bytes
@@ -544,11 +547,12 @@ class SafeTransactionRpcBackend:
                 if attempt > 0:
                     self._sleep(BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
                 try:
-                    response = client.post(self._rpc_url, json=payload)
+                    endpoint = self._rpc_urls[attempt % len(self._rpc_urls)]
+                    response = client.post(endpoint, json=payload)
                 except httpx.TransportError as error:
                     failure = f"transport error: {error}"
                     continue
-                if response.status_code == 429 or response.status_code >= 500:
+                if response.status_code in {403, 408, 425, 429} or response.status_code >= 500:
                     failure = f"HTTP status {response.status_code}"
                     continue
                 response_size = len(response.content)

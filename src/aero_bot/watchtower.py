@@ -1151,12 +1151,20 @@ def build_watchtower(
     from aero_bot.safe_tx import SafeTransactionRpcBackend
     from aero_bot.signing_key import load_signing_key_source
 
-    rpc = ExecutorRpcBackend(rpc_url=settings.base_rpc_url, progress=_watchtower_progress)
+    rpc = ExecutorRpcBackend(
+        rpc_url=settings.base_rpc_url,
+        fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
+        progress=_watchtower_progress,
+    )
     audit_store = AuditStore(settings.audit_database_path)
     pin_store = LpPoolPinStore(settings.lp_pool_pins_path)
     pin = pin_store.load().get(symbol.strip().lower())
     reads = RpcWatchtowerReads(rpc)
-    safe_rpc = SafeTransactionRpcBackend(rpc_url=settings.base_rpc_url, safe_address=safe_address)
+    safe_rpc = SafeTransactionRpcBackend(
+        rpc_url=settings.base_rpc_url,
+        safe_address=safe_address,
+        fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
+    )
     receipt_backends = [rpc] + [
         ExecutorRpcBackend(rpc_url=url)
         for url in EXECUTE_RECEIPT_ENDPOINT_URLS
@@ -1169,6 +1177,7 @@ def build_watchtower(
         sources=LiveExecutionSources(
             rpc_url=settings.base_rpc_url,
             sugar_address=settings.lp_sugar_address,
+            fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
             progress=_watchtower_progress,
         ),
         rpc=rpc,

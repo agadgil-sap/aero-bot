@@ -499,8 +499,8 @@ def test_backend_rejects_oversized_response() -> None:
         backend.fetch_live_nonce()
 
 
-def test_backend_rejects_unexpected_http_status() -> None:
-    """A non-retriable HTTP failure surfaces as an explicit error."""
+def test_backend_retries_transient_forbidden_http_status() -> None:
+    """A transient endpoint 403 is retried before surfacing an explicit error."""
 
     def forbidden(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={})
@@ -511,7 +511,10 @@ def test_backend_rejects_unexpected_http_status() -> None:
         transport=httpx.MockTransport(forbidden),
         sleep=lambda seconds: None,
     )
-    with pytest.raises(SafeTransactionUnavailableError, match="unexpected HTTP status 403"):
+    with pytest.raises(
+        SafeTransactionUnavailableError,
+        match="failed after 5 attempts: HTTP status 403",
+    ):
         backend.fetch_live_nonce()
 
 

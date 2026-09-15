@@ -4446,28 +4446,54 @@ class LpLifecycleExecutor:
         raw_transaction = "0x" + bytes(signed.raw_transaction).hex()
         delivery_ms = Decimal(self._milliseconds_since(delivery_started))
 
-        # 5. Broadcast, print the hash immediately, and audit BEFORE any wait.
+        # 5. Broadcast, but derive the transaction hash locally first. The
+        # hash is deterministic from the signed bytes, so a transport/HTTP
+        # failure after the node accepted the transaction can never erase the
+        # identity of the possibly-landed delivery.
         send_started = self._timer()
-        transaction_hash = self._rpc.send_raw_transaction(raw_transaction)
-        print(
-            f"[{action}/{role.value}] broadcast {transaction_hash} "
-            f"(Safe nonce {step.report.nonce}, delivery gas {gas_limit} at "
-            f"{gas_price} wei)",
-            file=sys.stderr,
-            flush=True,
-        )
-        self._record_execute_sent(action, role, step.report, transaction_hash, relayer)
+        local_transaction_hash = "0x" + keccak(bytes(signed.raw_transaction)).hex()
+        send_error = ""
+        try:
+            transaction_hash = self._rpc.send_raw_transaction(raw_transaction)
+        except ExecutionUnavailableError as error:
+            transaction_hash = local_transaction_hash
+            send_error = str(error)
+            print(
+                f"[{action}/{role.value}] WARNING: broadcast response unavailable for "
+                f"{transaction_hash}; submission outcome is unknown ({send_error})",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._record_execute_broadcast_unknown(
+                action, role, step.report, transaction_hash, relayer
+            )
+        else:
+            print(
+                f"[{action}/{role.value}] broadcast {transaction_hash} "
+                f"(Safe nonce {step.report.nonce}, delivery gas {gas_limit} at "
+                f"{gas_price} wei)",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._record_execute_sent(action, role, step.report, transaction_hash, relayer)
         send_ms = Decimal(self._milliseconds_since(send_started))
 
-        # 6. Bounded receipt wait across every configured backend.
+        # 6. Bounded receipt wait across every configured backend. Even when
+        # submission acknowledgement was lost, a secondary endpoint can prove
+        # that the deterministic transaction hash landed successfully.
         receipt = self._await_receipt_multi(transaction_hash)
         inclusion_ms = Decimal(self._milliseconds_since(send_started))
         if receipt is None:
             diagnostic = (
                 f"no receipt for {transaction_hash} within "
                 f"{EXECUTE_RECEIPT_TOTAL_TIMEOUT_SECONDS:.0f}s across "
-                f"{len(self._receipt_backends)} endpoint(s); the broadcast may still "
-                "land and the audit chain records the send"
+                f"{len(self._receipt_backends)} endpoint(s); "
+                + (
+                    f"submission acknowledgement was unavailable ({send_error}), so the "
+                    "transaction may or may not have landed"
+                    if send_error
+                    else "the broadcast may still land and the audit chain records the send"
+                )
             )
             print(
                 f"[{action}/{role.value}] WARNING: {diagnostic}",
@@ -4572,11 +4598,28 @@ class LpLifecycleExecutor:
         """
         started = self._timer()
         while True:
+            endpoint_failures: list[str] = []
             for backend in self._receipt_backends:
-                receipt = backend.fetch_transaction_receipt(transaction_hash)
+                try:
+                    receipt = backend.fetch_transaction_receipt(transaction_hash)
+                except ExecutionUnavailableError as error:
+                    # Receipt visibility is deliberately redundant. One public
+                    # endpoint can rate-limit, reject, or lag after the exact
+                    # transaction has already landed on Base; never relabel
+                    # that landed broadcast as a failed action merely because
+                    # one observer is unavailable.
+                    endpoint_failures.append(str(error))
+                    continue
                 if receipt is not None:
                     return receipt
             if self._timer() - started >= EXECUTE_RECEIPT_TOTAL_TIMEOUT_SECONDS:
+                if endpoint_failures:
+                    print(
+                        f"[receipt] all available endpoints were unreadable in the final "
+                        f"poll for {transaction_hash}: " + "; ".join(endpoint_failures),
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 return None
             self._sleep(EXECUTE_RECEIPT_POLL_SECONDS)
 
@@ -4603,6 +4646,31 @@ class LpLifecycleExecutor:
             return
         self._audit_sink.append(
             AuditEventType.LP_EXECUTE_SENT,
+            LpExecuteSentPayload(
+                action=action,
+                role=role,
+                safe_tx_hash=report.safe_tx_hash,
+                transaction_hash=transaction_hash,
+                nonce=report.nonce,
+                relayer_address=relayer_address,
+                safe_address=self._safe_address,
+            ),
+            self._now(),
+        )
+
+    def _record_execute_broadcast_unknown(
+        self,
+        action: str,
+        role: LpExecutionRole,
+        report: BuiltLpTransaction,
+        transaction_hash: str,
+        relayer_address: str,
+    ) -> None:
+        """Audit a deterministic tx hash when submission acknowledgement is unavailable."""
+        if self._audit_sink is None:
+            return
+        self._audit_sink.append(
+            AuditEventType.LP_EXECUTE_BROADCAST_UNKNOWN,
             LpExecuteSentPayload(
                 action=action,
                 role=role,
@@ -5819,10 +5887,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     sources = LiveExecutionSources(
         rpc_url=settings.base_rpc_url,
         sugar_address=settings.lp_sugar_address,
+        fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
         progress=_lp_progress,
     )
-    rpc = ExecutorRpcBackend(rpc_url=settings.base_rpc_url, progress=_lp_progress)
-    safe_rpc = SafeTransactionRpcBackend(rpc_url=settings.base_rpc_url, safe_address=safe_address)
+    rpc = ExecutorRpcBackend(
+        rpc_url=settings.base_rpc_url,
+        fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
+        progress=_lp_progress,
+    )
+    safe_rpc = SafeTransactionRpcBackend(
+        rpc_url=settings.base_rpc_url,
+        safe_address=safe_address,
+        fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
+    )
     # The pin store arms the known-pool fast path; --full-discovery bypasses
     # it for one run by constructing the executor without pins.
     pool_pin_store = (
