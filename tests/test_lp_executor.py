@@ -57,6 +57,7 @@ from aero_bot.lp_executor import (
 from aero_bot.lp_pins import LpPoolPin, LpPoolPinStore
 from aero_bot.lp_plan import (
     DEFAULT_MINT_SLIPPAGE_TOLERANCE,
+    BalancingSwapDirection,
     LpExecutionPolicy,
     LpPlanRefusalError,
     position_amounts_at_sqrt_ratio,
@@ -373,6 +374,7 @@ class LpRpcScript:
         fast_views_revert: bool = False,
         aero_price_usdc: Decimal | None = Decimal("0.5"),
         post_swap_stock_balance_units: int | None = None,
+        post_swap_usdc_balance_units: int | None = None,
     ) -> None:
         """Configure every scripted answer the LP executor's calls receive.
 
@@ -459,6 +461,8 @@ class LpRpcScript:
             aero_price_usdc: Live USDC/AERO price served to the price read;
                 None makes that read revert so the fail-closed path tests.
             post_swap_stock_balance_units: Optional stock balance applied after
+                the scripted balancing swap confirms.
+            post_swap_usdc_balance_units: Optional USDC balance applied after
                 the balancing swap confirms, simulating fresh post-swap Safe
                 inventory for the second-phase mint rebuild.
         """
@@ -515,6 +519,7 @@ class LpRpcScript:
         self.fast_views_revert = fast_views_revert
         self.aero_price_usdc = aero_price_usdc
         self.post_swap_stock_balance_units = post_swap_stock_balance_units
+        self.post_swap_usdc_balance_units = post_swap_usdc_balance_units
         self.post_swap_balance_applied = False
         self.inclusion_blocks = 51_000_000
 
@@ -560,11 +565,17 @@ class LpRpcScript:
             else:
                 self.inclusion_blocks += 1
                 if (
-                    self.post_swap_stock_balance_units is not None
+                    (
+                        self.post_swap_stock_balance_units is not None
+                        or self.post_swap_usdc_balance_units is not None
+                    )
                     and not self.post_swap_balance_applied
                     and len(self.broadcasts) >= 2
                 ):
-                    self.stock_balance_units = self.post_swap_stock_balance_units
+                    if self.post_swap_stock_balance_units is not None:
+                        self.stock_balance_units = self.post_swap_stock_balance_units
+                    if self.post_swap_usdc_balance_units is not None:
+                        self.usdc_balance_units = self.post_swap_usdc_balance_units
                     self.post_swap_balance_applied = True
                 result = {
                     "status": hex(self.receipt_status),
@@ -2219,6 +2230,33 @@ def test_dry_run_recenter_with_an_explicit_budget_swaps_the_shortfall() -> None:
     assert report.plan.balancing_swap.tranche_count == 1
 
 
+def test_dry_run_recenter_can_sell_excess_stock_to_fund_the_quote_side() -> None:
+    """Projected post-exit excess stock funds a quote deficit without a full exit swap."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+            usdc_balance_units=1_000_000,
+            stock_balance_units=100_000_000,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[2], signature_verdicts=[True] * 10),
+    )
+
+    report = executor.dry_run_recenter(
+        "FIXc", 77, MINT_WIDTH_SPACINGS, Decimal("70"), bytes(Account.create().key)
+    )
+
+    swap = report.plan.balancing_swap
+    roles = tuple(transaction.role for transaction in report.transactions)
+    assert swap.direction is BalancingSwapDirection.STOCK_TO_USDC
+    assert swap.stock_in_units > 0
+    assert swap.expected_usdc_units > swap.usdc_shortfall_units
+    assert LpExecutionRole.STOCK_ROUTER_ALLOWANCE in roles
+    assert LpExecutionRole.BALANCING_SWAP in roles
+    assert LpExecutionRole.EXIT_SWAP not in roles
+    assert roles.index(LpExecutionRole.BALANCING_SWAP) < roles.index(LpExecutionRole.MINT)
+
+
 def test_dry_run_recenter_refuses_without_an_explicit_width() -> None:
     """The recenter needs an explicit width until the solver path lands."""
     executor, _, _ = make_lp_executor(
@@ -3251,6 +3289,41 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
     assert AuditStore(audit_path).verify_chain().status.value == "verified"
 
 
+
+
+def test_execute_mint_can_rebalance_excess_stock_into_usdc_then_mint(tmp_path: Path) -> None:
+    """The live two-phase mint confirms a stock sale, rereads balances, then mints."""
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=tmp_path / "audit.sqlite3",
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            usdc_balance_units=1_000_000,
+            stock_balance_units=100_000_000,
+            post_swap_usdc_balance_units=10_000_000,
+            post_swap_stock_balance_units=90_000_000,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4, 6], signature_verdicts=[True] * 20),
+    )
+
+    report = executor.execute_mint(
+        "FIXc",
+        MINT_BUDGET_USDC,
+        MINT_WIDTH_SPACINGS,
+        bytes(Account.create().key),
+        confirm_broadcast=True,
+    )
+
+    assert report.completed is True
+    assert [step.role for step in report.steps] == [
+        LpExecutionRole.STOCK_ROUTER_ALLOWANCE,
+        LpExecutionRole.BALANCING_SWAP,
+        LpExecutionRole.NFPM_USDC_ALLOWANCE,
+        LpExecutionRole.NFPM_STOCK_ALLOWANCE,
+        LpExecutionRole.MINT,
+    ]
+    assert len(rpc_script.broadcasts) == 5
+    assert report.build.plan.balancing_swap.required is False
+    assert report.build.plan.budget_usdc == MINT_BUDGET_USDC
 
 
 def test_execute_mint_resizes_to_fresh_inventory_after_swap(tmp_path: Path) -> None:

@@ -121,9 +121,9 @@ The verbatim canary captures further down this page predate the raise and still 
 
 ### Balancing swap policy
 
-When the Safe's stock balance cannot cover the stock side, the planner sizes a USDC-to-stock swap over the buffered shortfall (0.1 percent buffer above the raw value at the snapshot price).
-Modeled impact is `units / (reserve + units)` against the pool's USDC reserve: at or above the 0.1 percent ceiling the entry refuses, and above the 0.05 percent threshold the swap splits into enough equal tranches to bring each under it.
-The final cap re-checks that the quote side plus the whole swap fits the Safe's USDC balance.
+The planner rebalances in either direction from the Safe's actual inventory. When stock is short it sizes a USDC-to-stock swap over the buffered stock shortfall; when USDC is short and the Safe holds stock above the mint's required stock side, it sells only enough excess stock to cover the buffered quote-side shortfall. The buffer is 0.1 percent over the raw shortfall at the snapshot price.
+Modeled impact is bounded against the pool's USDC reserve: at or above the 0.1 percent ceiling the entry refuses, and above the 0.05 percent threshold the swap splits into enough equal tranches to bring each under it. A stock-to-USDC rebalance may never consume stock required by the target mint; if total usable inventory cannot fund both sides, planning refuses rather than degrading the position size implicitly.
+After any balancing swap confirms, the execute path rereads the pool and Safe balances and rebuilds the mint from fresh state before broadcasting the NFPM mint. One bounded market rebalance is allowed per mint attempt; a fresh second rebalance requirement refuses and leaves the next cycle to reconcile.
 
 ### Live canary plan (verbatim, 2026-09-08)
 
@@ -167,8 +167,8 @@ There is no loop, scheduler, watcher, or policy-driven trigger anywhere in the m
 
 An entry composes into a sequence of individual Safe transactions, each occupying its own consecutive nonce starting at the live Safe nonce:
 
-1. `router_allowance` - the bounded 20-USDC standing USDC allowance for the router, composed only when the live allowance cannot cover the swap input (shared bound with the swap executor, never the infinite approval).
-2. `balancing_swap` - the planner's exact-input USDC-to-stock swap through the whitelisted router, with `amount_out_min` floored one slippage tolerance below the expected output.
+1. `router_allowance` or `stock_router_allowance` - the bounded USDC allowance for a USDC-to-stock rebalance, or an exact stock allowance for a stock-to-USDC rebalance; each is composed only when the live allowance is short.
+2. `balancing_swap` - the planner's exact-input rebalance through the whitelisted router in the required direction, with `amount_out_min` floored one slippage tolerance below the expected output.
 3. `nfpm_usdc_allowance` - an exact (not standing) USDC approval to the pool's own NFPM, composed only when the live allowance is short.
 4. `nfpm_stock_allowance` - the exact stock approval to the NFPM, likewise skipped when already sufficient.
 5. `mint` - the twelve-field Slipstream mint through the pool's own NFPM with `sqrtPriceX96` zero.
@@ -182,7 +182,7 @@ The exit side completes the lifecycle with five more actions, every one first re
 1. `unstake` requires the gauge's custody, reads `earned` and `rewards` for the accrued emissions, resolves the penalty window, and composes exactly `gauge_withdraw`, whose source-verified behavior auto-sweeps the position's checkpointed fees, auto-claims the accrued emissions, and returns the NFT to the Safe.
 2. `withdraw` requires the Safe's custody (the gauge holding the NFT blocks every NFPM operation) and composes `nfpm_decrease_liquidity` for the position's full liquidity at the snapshot price with slippage-floored minima, then `nfpm_collect` for both fee sides; a position with no liquidity and no fees collapses to the bare collect, and one with neither refuses as empty.
 3. `collect` routes by custody: staked it composes `gauge_get_reward` (checkpointed position fees never flow through the gauge; they arrive on the unstaking withdraw), unstaked it composes the NFPM `collect`.
-4. `recenter` recycles one position into a fresh mint inside a single sequenced batch: the gauge withdraw when staked, the decrease and collect when either liquidity or fees remain, the `nfpm_burn` clearing the emptied NFT, then the planner's full entry composition (bounded router allowance, balancing swap, exact approvals, mint) over a projected inventory that credits the decrease outputs and the collected fees, and finally the gauge operator approval when missing.
+4. `recenter` first proves the complete replacement against projected post-exit inventory before the live cycle touches the old LP. The projection credits the Safe's live balances, full decrease outputs, and collected fees. Only after that preflight passes does the live cycle unstake, decrease, collect, and burn the old NFT, then run the normal mint executor, which can rebalance either direction and rebuild from fresh post-swap state before minting; the confirmed fresh NFT is then staked. If preflight refuses, the existing staked position remains untouched.
 5. `status` composes nothing: it is a completely read-only observation of custody, both sides' amounts and values at the snapshot price, accrued AERO, the penalty window, a quoted emissions APR, and the unrealized P&L against a supplied entry cost.
 
 Each composed step is signed over its EIP-712 SafeTx hash, proven read-only against the live Safe with `checkSignatures`, gas-estimated with `eth_estimateGas`, and appended to the local audit chain before the report returns.
@@ -282,10 +282,10 @@ Every one of the four window reads (gauge factory, penalty rate, minimum stake t
 
 ### Recenter and the restake follow-up
 
-The recenter's mint planning runs over a projected inventory: the Safe's live balances plus the decrease outputs plus both collected fee sides, all floored to raw units.
-The default budget is therefore the recycled position value itself, and an explicit `--amount` may raise it into a balancing swap for the stock side or lower it, with every pilot cap still enforced by the same planner in the same order.
-The fresh mint's gauge deposit cannot be bound into the same pre-execution batch: the NFPM exposes no next-id view (`nextTokenId()` reverts, verified live), so the new token id exists only after the mint confirms.
-The report's `restake_followup` therefore documents the stake command with the confirmed token id as the explicit second step, and the batch's audit record carries that follow-up verbatim.
+The recenter's preflight mint planning runs over projected post-exit inventory: the Safe's live balances plus the decrease outputs plus both collected fee sides, all floored to raw units. The default budget is the recycled position value itself, and an explicit `--amount` may raise or lower it, with every pilot cap enforced by the same planner in the same order.
+The planner may buy stock when stock is short or sell only excess stock when the quote side is short. This specifically prevents an out-of-range position that has become mostly stock from being forced through a full stock-to-USDC-to-stock round trip merely because the new range needs more quote inventory.
+For the scheduled live cycle, this dry-run recenter build is a mandatory preflight before unstake; a refusal leaves the old position untouched. After the old NFT is withdrawn and burned, the normal execute-mint path performs any required one-way rebalance, confirms it, rereads live pool and Safe state, and rebuilds the final mint before broadcast. The fresh token id is decoded from the confirmed mint receipt and then staked as the final lifecycle action.
+The manual `aero-bot-lp dry-run recenter` surface remains a no-broadcast proof of the complete projected replacement. Its `restake_followup` remains useful because the NFPM exposes no next-id view before mint confirmation.
 
 ### Position status and Aerodrome's displayed emissions APR
 
@@ -336,7 +336,7 @@ Status takes no key at all, because nothing is signed, and requires the AERO pri
 ## Execute path (broadcast surface)
 
 The `execute` subcommands productize the canary driver's proven send loop as a first-class CLI surface with the same containment posture as the swap executor: read-only by default, broadcast only behind the explicit `--confirm-broadcast` flag, and a refusal - `broadcast_confirmation_missing` - audited and exited as code two without it before anything is built.
-The recenter action has no execute form: its restake is a documented follow-up command by design, so it stays a dry-run-only batch until that composition changes.
+The manual LP CLI still exposes recenter as a dry-run-only preflight. Scheduled production recentering is executed by `aero-bot-cycle`: it requires that preflight to pass before unstaking, then uses the existing audited unstake/withdraw/mint/stake execute surfaces so every broadcast retains the same receipt, nonce, reconciliation, and refusal handling as ordinary lifecycle actions.
 
 ### The exit swap (stock to USDC)
 

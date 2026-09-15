@@ -123,6 +123,7 @@ from aero_bot.lp_plan import (
     DEFAULT_MINT_SLIPPAGE_TOLERANCE,
     MAX_POSITION_USDC_PER_POOL,
     QUOTE_TOKEN_DECIMALS,
+    BalancingSwapDirection,
     LpExecutionPolicy,
     LpMintPlan,
     LpPlanRefusalError,
@@ -1033,8 +1034,14 @@ class LpMintPlannedPayload(BaseModel):
     amount1_desired_units: Annotated[int, Field(ge=0)]
     # Whether the plan requires a balancing swap before the mint.
     balancing_swap_required: bool
-    # The balancing swap's exact USDC input, zero when absent.
+    # Which side the balancing swap sells, or none when inventory already fits.
+    balancing_swap_direction: BalancingSwapDirection
+    # The balancing swap's exact USDC input, zero unless buying stock.
     swap_usdc_in_units: Annotated[int, Field(ge=0)]
+    # The balancing swap's exact stock input, zero unless selling stock.
+    swap_stock_in_units: Annotated[int, Field(ge=0)]
+    # The quoted USDC output, zero unless selling stock.
+    swap_expected_usdc_units: Annotated[int, Field(ge=0)]
     # The balancing swap's conservative impact bound.
     swap_modeled_impact_fraction: Decimal
     # Every cap the planner enforced, in order.
@@ -2224,6 +2231,9 @@ class LpLifecycleExecutor:
         router_allowance = self._rpc.fetch_erc20_allowance(
             BASE_USDC_ADDRESS, self._safe_address, self._policy.router_address
         )
+        router_stock_allowance = self._rpc.fetch_erc20_allowance(
+            stock_token, self._safe_address, self._policy.router_address
+        )
         nfpm_usdc_allowance = self._rpc.fetch_erc20_allowance(
             BASE_USDC_ADDRESS, self._safe_address, observation.nfpm_address
         )
@@ -2235,6 +2245,7 @@ class LpLifecycleExecutor:
             context,
             plan,
             router_allowance,
+            router_stock_allowance,
             nfpm_usdc_allowance,
             nfpm_stock_allowance,
             deadline,
@@ -2261,6 +2272,7 @@ class LpLifecycleExecutor:
         context: _LpMintContext,
         plan: LpMintPlan,
         router_allowance_units: int,
+        router_stock_allowance_units: int,
         nfpm_usdc_allowance_units: int,
         nfpm_stock_allowance_units: int,
         deadline: int,
@@ -2271,6 +2283,7 @@ class LpLifecycleExecutor:
             context: The resolved observation and inventory context.
             plan: The capped mint plan being composed.
             router_allowance_units: The live USDC allowance to the router.
+            router_stock_allowance_units: The live stock allowance to the router.
             nfpm_usdc_allowance_units: The live USDC allowance to the NFPM.
             nfpm_stock_allowance_units: The live stock allowance to the NFPM.
             deadline: The unix deadline every swap and mint carries.
@@ -2299,44 +2312,90 @@ class LpLifecycleExecutor:
         if plan.balancing_swap.required:
             swap = plan.balancing_swap
             tolerance = plan.amounts.slippage_tolerance_fraction
-            amount_out_min = int(
-                (Decimal(swap.expected_stock_units) * (Decimal(1) - tolerance)).to_integral_value(
-                    rounding=ROUND_FLOOR
+            if swap.direction is BalancingSwapDirection.USDC_TO_STOCK:
+                amount_out_min = int(
+                    (
+                        Decimal(swap.expected_stock_units) * (Decimal(1) - tolerance)
+                    ).to_integral_value(rounding=ROUND_FLOOR)
                 )
-            )
-            if router_allowance_units < swap.usdc_in_units:
+                if router_allowance_units < swap.usdc_in_units:
+                    steps.append(
+                        _LpStepSpec(
+                            role=LpExecutionRole.ROUTER_ALLOWANCE,
+                            to_address=BASE_USDC_ADDRESS,
+                            inner_calldata=build_approval_calldata(
+                                self._policy.router_address,
+                                self._policy.router_allowance_standing_cap_units,
+                            ),
+                            description=(
+                                f"set the {self._policy.router_allowance_standing_cap_usdc} USDC "
+                                "bounded standing router allowance"
+                            ),
+                        )
+                    )
                 steps.append(
                     _LpStepSpec(
-                        role=LpExecutionRole.ROUTER_ALLOWANCE,
-                        to_address=BASE_USDC_ADDRESS,
-                        inner_calldata=build_approval_calldata(
-                            self._policy.router_address,
-                            self._policy.router_allowance_standing_cap_units,
+                        role=LpExecutionRole.BALANCING_SWAP,
+                        to_address=self._policy.router_address,
+                        inner_calldata=build_swap_calldata(
+                            self._safe_address,
+                            swap.usdc_in_units,
+                            amount_out_min,
+                            build_swap_path(
+                                BASE_USDC_ADDRESS, stock_token, observation.tick_spacing
+                            ),
+                            deadline,
                         ),
                         description=(
-                            f"set the {self._policy.router_allowance_standing_cap_usdc} USDC "
-                            "bounded standing router allowance"
+                            f"swap {swap.usdc_in_units} raw USDC for at least "
+                            f"{amount_out_min} raw {context.listing.symbol} covering the "
+                            f"{swap.stock_shortfall_units}-unit stock shortfall"
                         ),
                     )
                 )
-            steps.append(
-                _LpStepSpec(
-                    role=LpExecutionRole.BALANCING_SWAP,
-                    to_address=self._policy.router_address,
-                    inner_calldata=build_swap_calldata(
-                        self._safe_address,
-                        swap.usdc_in_units,
-                        amount_out_min,
-                        build_swap_path(BASE_USDC_ADDRESS, stock_token, observation.tick_spacing),
-                        deadline,
-                    ),
-                    description=(
-                        f"swap {swap.usdc_in_units} raw USDC for at least {amount_out_min} raw "
-                        f"{context.listing.symbol} covering the {swap.stock_shortfall_units}-unit "
-                        "shortfall"
-                    ),
+            elif swap.direction is BalancingSwapDirection.STOCK_TO_USDC:
+                amount_out_min = int(
+                    (
+                        Decimal(swap.expected_usdc_units) * (Decimal(1) - tolerance)
+                    ).to_integral_value(rounding=ROUND_FLOOR)
                 )
-            )
+                if router_stock_allowance_units < swap.stock_in_units:
+                    steps.append(
+                        _LpStepSpec(
+                            role=LpExecutionRole.STOCK_ROUTER_ALLOWANCE,
+                            to_address=stock_token,
+                            inner_calldata=build_approval_calldata(
+                                self._policy.router_address, swap.stock_in_units
+                            ),
+                            description=(
+                                f"approve exactly {swap.stock_in_units} raw "
+                                f"{context.listing.symbol} to the whitelisted router for "
+                                "the quote-side rebalance"
+                            ),
+                        )
+                    )
+                steps.append(
+                    _LpStepSpec(
+                        role=LpExecutionRole.BALANCING_SWAP,
+                        to_address=self._policy.router_address,
+                        inner_calldata=build_swap_calldata(
+                            self._safe_address,
+                            swap.stock_in_units,
+                            amount_out_min,
+                            build_swap_path(
+                                stock_token, BASE_USDC_ADDRESS, observation.tick_spacing
+                            ),
+                            deadline,
+                        ),
+                        description=(
+                            f"swap {swap.stock_in_units} raw {context.listing.symbol} for at "
+                            f"least {amount_out_min} raw USDC covering the "
+                            f"{swap.usdc_shortfall_units}-unit quote-side shortfall"
+                        ),
+                    )
+                )
+            else:
+                raise ValueError("required balancing swap has no executable direction")
         if nfpm_usdc_allowance_units < usdc_desired:
             steps.append(
                 _LpStepSpec(
@@ -3084,6 +3143,9 @@ class LpLifecycleExecutor:
         router_allowance = self._rpc.fetch_erc20_allowance(
             BASE_USDC_ADDRESS, self._safe_address, self._policy.router_address
         )
+        router_stock_allowance = self._rpc.fetch_erc20_allowance(
+            stock_token, self._safe_address, self._policy.router_address
+        )
         nfpm_usdc_allowance = self._rpc.fetch_erc20_allowance(
             BASE_USDC_ADDRESS, self._safe_address, observation.nfpm_address
         )
@@ -3175,6 +3237,7 @@ class LpLifecycleExecutor:
                 mint_context,
                 plan,
                 router_allowance,
+                router_stock_allowance,
                 nfpm_usdc_allowance,
                 nfpm_stock_allowance,
                 deadline,
@@ -4859,7 +4922,10 @@ class LpLifecycleExecutor:
                 amount0_desired_units=plan.amounts.amount0_desired_units,
                 amount1_desired_units=plan.amounts.amount1_desired_units,
                 balancing_swap_required=plan.balancing_swap.required,
+                balancing_swap_direction=plan.balancing_swap.direction,
                 swap_usdc_in_units=plan.balancing_swap.usdc_in_units,
+                swap_stock_in_units=plan.balancing_swap.stock_in_units,
+                swap_expected_usdc_units=plan.balancing_swap.expected_usdc_units,
                 swap_modeled_impact_fraction=plan.balancing_swap.modeled_impact_fraction,
                 caps_enforced=plan.caps_enforced,
             ),

@@ -187,6 +187,14 @@ class MintAmountPlan(BaseModel):
         return self
 
 
+class BalancingSwapDirection(StrEnum):
+    """Identify which side of the Safe inventory a mint must rebalance."""
+
+    NONE = "none"
+    USDC_TO_STOCK = "usdc_to_stock"
+    STOCK_TO_USDC = "stock_to_usdc"
+
+
 class BalancingSwapPlan(BaseModel):
     """Hold the balancing swap the Safe's inventory requires before a mint."""
 
@@ -195,27 +203,66 @@ class BalancingSwapPlan(BaseModel):
 
     # Whether any balancing swap is required at all.
     required: bool
-    # The stock shortfall the swap covers, in raw stock units.
+    # Which side is sold to fund the other side.
+    direction: BalancingSwapDirection
+    # The stock shortfall the buy-side swap covers, in raw stock units.
     stock_shortfall_units: Annotated[int, Field(ge=0)]
-    # The USDC the swap spends, in raw six-decimal units; zero when absent.
+    # The USDC shortfall the sell-side swap covers, in raw six-decimal units.
+    usdc_shortfall_units: Annotated[int, Field(ge=0)] = 0
+    # The USDC the buy-side swap spends, in raw six-decimal units.
     usdc_in_units: Annotated[int, Field(ge=0)]
-    # The spot-quoted stock output, in raw stock units; zero when absent.
+    # The stock the sell-side swap spends, in raw stock units.
+    stock_in_units: Annotated[int, Field(ge=0)] = 0
+    # The spot-quoted stock output from a USDC->stock swap.
     expected_stock_units: Annotated[int, Field(ge=0)]
+    # The spot-quoted USDC output from a stock->USDC swap.
+    expected_usdc_units: Annotated[int, Field(ge=0)] = 0
     # The conservative reserve-based impact bound of the whole swap.
     modeled_impact_fraction: NonNegativeDecimal
     # How many tranches the swap splits into; one below the tranche rule.
     tranche_count: Annotated[int, Field(gt=0)]
-    # The acquisition buffer fraction applied over the raw shortfall.
+    # The buffer fraction applied over the side shortfall.
     buffer_fraction: NonNegativeDecimal
 
     @model_validator(mode="after")
     def require_coherent_swap(self) -> Self:
-        """Reject a present swap without amounts or an absent one with them."""
-        if self.required and (self.usdc_in_units <= 0 or self.expected_stock_units <= 0):
-            raise ValueError("a required balancing swap carries positive amounts")
-        if not self.required and (self.usdc_in_units > 0 or self.stock_shortfall_units > 0):
-            raise ValueError("an absent balancing swap carries no shortfall or USDC")
-        return self
+        """Reject direction/amount combinations that cannot describe one rebalance."""
+        if not self.required:
+            if self.direction is not BalancingSwapDirection.NONE:
+                raise ValueError("an absent balancing swap must use direction none")
+            if any(
+                (
+                    self.stock_shortfall_units,
+                    self.usdc_shortfall_units,
+                    self.usdc_in_units,
+                    self.stock_in_units,
+                    self.expected_stock_units,
+                    self.expected_usdc_units,
+                )
+            ):
+                raise ValueError("an absent balancing swap carries no swap amounts")
+            return self
+        if self.direction is BalancingSwapDirection.USDC_TO_STOCK:
+            if not (
+                self.stock_shortfall_units > 0
+                and self.usdc_in_units > 0
+                and self.expected_stock_units > 0
+            ):
+                raise ValueError("a USDC-to-stock swap carries positive buy-side amounts")
+            if self.usdc_shortfall_units or self.stock_in_units or self.expected_usdc_units:
+                raise ValueError("a USDC-to-stock swap cannot carry sell-side amounts")
+            return self
+        if self.direction is BalancingSwapDirection.STOCK_TO_USDC:
+            if not (
+                self.usdc_shortfall_units > 0
+                and self.stock_in_units > 0
+                and self.expected_usdc_units > 0
+            ):
+                raise ValueError("a stock-to-USDC swap carries positive sell-side amounts")
+            if self.stock_shortfall_units or self.usdc_in_units or self.expected_stock_units:
+                raise ValueError("a stock-to-USDC swap cannot carry buy-side amounts")
+            return self
+        raise ValueError("a required balancing swap needs a concrete direction")
 
 
 class LpPoolObservation(BaseModel):
@@ -826,9 +873,87 @@ def plan_balancing_swap(
             )
         return BalancingSwapPlan(
             required=True,
+            direction=BalancingSwapDirection.USDC_TO_STOCK,
             stock_shortfall_units=stock_shortfall_units,
             usdc_in_units=usdc_in_units,
             expected_stock_units=expected_stock_units,
+            modeled_impact_fraction=+impact,
+            tranche_count=tranche_count,
+            buffer_fraction=buffer_fraction,
+        )
+
+
+def plan_stock_sale_for_usdc(
+    usdc_shortfall_units: int,
+    stock_excess_units: int,
+    price_usdc_per_stock_value: Decimal,
+    stock_decimals: int,
+    usdc_reserve_units: int,
+    buffer_fraction: Decimal,
+    impact_ceiling_fraction: Decimal,
+    tranche_threshold_fraction: Decimal,
+) -> BalancingSwapPlan:
+    """Plan the stock-to-USDC swap covering one mint's quote-side shortfall."""
+    if usdc_shortfall_units <= 0:
+        raise ValueError("usdc_shortfall_units must be positive")
+    if stock_excess_units <= 0:
+        raise LpPlanRefusalError(
+            LpPlanRefusalCode.INSUFFICIENT_USDC_FOR_ENTRY,
+            "the Safe has no stock above the mint's stock side to sell for missing USDC",
+        )
+    if price_usdc_per_stock_value <= 0:
+        raise ValueError("price must be positive")
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        buffered_usdc_units = int(
+            (
+                Decimal(usdc_shortfall_units) * (Decimal(1) + buffer_fraction)
+            ).to_integral_value(rounding=ROUND_CEILING)
+        )
+        buffered_usdc = Decimal(buffered_usdc_units).scaleb(-QUOTE_TOKEN_DECIMALS)
+        stock_in_units = int(
+            (
+                buffered_usdc
+                / price_usdc_per_stock_value
+                * Decimal(10) ** stock_decimals
+            ).to_integral_value(rounding=ROUND_CEILING)
+        )
+        if stock_in_units > stock_excess_units:
+            shortfall = Decimal(usdc_shortfall_units).scaleb(-QUOTE_TOKEN_DECIMALS)
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.INSUFFICIENT_USDC_FOR_ENTRY,
+                f"the Safe is short {shortfall} USDC and its excess stock cannot fund that "
+                "quote-side deficit without consuming the mint's required stock side",
+            )
+        expected_usdc_units = int(
+            (
+                Decimal(stock_in_units).scaleb(-stock_decimals)
+                * price_usdc_per_stock_value
+                * Decimal(10) ** QUOTE_TOKEN_DECIMALS
+            ).to_integral_value(rounding=ROUND_FLOOR)
+        )
+        impact = Decimal(expected_usdc_units) / Decimal(usdc_reserve_units)
+        if impact >= impact_ceiling_fraction:
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.SWAP_IMPACT_ABOVE_CEILING,
+                f"the stock-to-USDC balancing swap's conservative impact bound "
+                f"{impact:.6f} reaches the {impact_ceiling_fraction} ceiling; lower the "
+                "budget below the pool's executable depth",
+            )
+        tranche_count = 1
+        if impact > tranche_threshold_fraction:
+            tranche_count = int(
+                (impact / tranche_threshold_fraction).to_integral_value(rounding=ROUND_CEILING)
+            )
+        return BalancingSwapPlan(
+            required=True,
+            direction=BalancingSwapDirection.STOCK_TO_USDC,
+            stock_shortfall_units=0,
+            usdc_shortfall_units=usdc_shortfall_units,
+            usdc_in_units=0,
+            stock_in_units=stock_in_units,
+            expected_stock_units=0,
+            expected_usdc_units=expected_usdc_units,
             modeled_impact_fraction=+impact,
             tranche_count=tranche_count,
             buffer_fraction=buffer_fraction,
@@ -846,9 +971,13 @@ def _absent_balancing_swap(buffer_fraction: Decimal) -> BalancingSwapPlan:
     """
     return BalancingSwapPlan(
         required=False,
+        direction=BalancingSwapDirection.NONE,
         stock_shortfall_units=0,
+        usdc_shortfall_units=0,
         usdc_in_units=0,
+        stock_in_units=0,
         expected_stock_units=0,
+        expected_usdc_units=0,
         modeled_impact_fraction=Decimal(0),
         tranche_count=1,
         buffer_fraction=buffer_fraction,
@@ -969,6 +1098,7 @@ def plan_mint_entry(
         else amounts.amount0_desired_units
     )
     stock_shortfall = stock_desired - inventory.stock_units
+    usdc_shortfall = usdc_desired - inventory.usdc_units
     if stock_shortfall > 0:
         swap = plan_balancing_swap(
             stock_shortfall,
@@ -980,22 +1110,63 @@ def plan_mint_entry(
             policy.swap_tranche_threshold_fraction,
         )
         caps.append(
-            f"balancing swap impact {swap.modeled_impact_fraction:.6f} below the "
+            f"USDC-to-stock balancing swap impact {swap.modeled_impact_fraction:.6f} below the "
+            f"{policy.swap_impact_ceiling_fraction} ceiling in {swap.tranche_count} tranche(s)"
+        )
+    elif usdc_shortfall > 0:
+        swap = plan_stock_sale_for_usdc(
+            usdc_shortfall,
+            inventory.stock_units - stock_desired,
+            price,
+            observation.stock_decimals,
+            observation.usdc_reserve_units,
+            directive.swap_buffer_fraction,
+            policy.swap_impact_ceiling_fraction,
+            policy.swap_tranche_threshold_fraction,
+        )
+        caps.append(
+            f"stock-to-USDC balancing swap impact {swap.modeled_impact_fraction:.6f} below the "
             f"{policy.swap_impact_ceiling_fraction} ceiling in {swap.tranche_count} tranche(s)"
         )
     else:
         swap = _absent_balancing_swap(directive.swap_buffer_fraction)
-        caps.append("held stock covers the stock side; no balancing swap required")
-    usdc_needed_units = usdc_desired + swap.usdc_in_units
-    if usdc_needed_units > inventory.usdc_units:
+        caps.append("Safe inventory already covers both mint sides; no balancing swap required")
+
+    if swap.direction is BalancingSwapDirection.USDC_TO_STOCK:
+        usdc_needed_units = usdc_desired + swap.usdc_in_units
+        if usdc_needed_units > inventory.usdc_units:
+            held = Decimal(inventory.usdc_units).scaleb(-QUOTE_TOKEN_DECIMALS)
+            needed = Decimal(usdc_needed_units).scaleb(-QUOTE_TOKEN_DECIMALS)
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.INSUFFICIENT_USDC_FOR_ENTRY,
+                f"entering needs {needed} USDC (quote side plus balancing swap) but the Safe "
+                f"holds {held} USDC; fund the Safe or lower the budget",
+            )
+        caps.append("Safe USDC covers the quote side plus the stock acquisition")
+    elif swap.direction is BalancingSwapDirection.STOCK_TO_USDC:
+        stock_needed_units = stock_desired + swap.stock_in_units
+        if stock_needed_units > inventory.stock_units:
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.INSUFFICIENT_USDC_FOR_ENTRY,
+                "the Safe's excess stock cannot fund the quote-side deficit without "
+                "consuming stock required by the mint",
+            )
+        if inventory.usdc_units + swap.expected_usdc_units < usdc_desired:
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.INSUFFICIENT_USDC_FOR_ENTRY,
+                "the stock-to-USDC rebalance does not quote enough USDC to fund the mint",
+            )
+        caps.append("Safe excess stock can fund the quote-side shortfall without a round trip")
+    elif inventory.usdc_units < usdc_desired:
         held = Decimal(inventory.usdc_units).scaleb(-QUOTE_TOKEN_DECIMALS)
-        needed = Decimal(usdc_needed_units).scaleb(-QUOTE_TOKEN_DECIMALS)
+        needed = Decimal(usdc_desired).scaleb(-QUOTE_TOKEN_DECIMALS)
         raise LpPlanRefusalError(
             LpPlanRefusalCode.INSUFFICIENT_USDC_FOR_ENTRY,
-            f"entering needs {needed} USDC (quote side plus balancing swap) but the Safe "
-            f"holds {held} USDC; fund the Safe or lower the budget",
+            f"entering needs {needed} USDC on the quote side but the Safe holds {held} USDC "
+            "and no excess stock is available to rebalance",
         )
-    caps.append("Safe USDC covers the quote side plus the balancing swap")
+    else:
+        caps.append("Safe inventory directly covers both mint sides")
     diagnostics = _mint_diagnostics(
         observation,
         position_range,
@@ -1059,14 +1230,22 @@ def _mint_diagnostics(
         if observation.stock_is_token0
         else amounts.amount0_desired_units
     )
-    swap_line = (
-        f"balancing swap: {swap.usdc_in_units} raw USDC -> ~{swap.expected_stock_units} raw "
-        f"stock ({swap.tranche_count} tranche(s), impact "
-        f"{swap.modeled_impact_fraction:.6f}) covering the {swap.stock_shortfall_units}-unit "
-        "shortfall"
-        if swap.required
-        else "balancing swap: none required; held stock covers the stock side"
-    )
+    if swap.direction is BalancingSwapDirection.USDC_TO_STOCK:
+        swap_line = (
+            f"balancing swap: {swap.usdc_in_units} raw USDC -> "
+            f"~{swap.expected_stock_units} raw stock ({swap.tranche_count} tranche(s), impact "
+            f"{swap.modeled_impact_fraction:.6f}) covering the "
+            f"{swap.stock_shortfall_units}-unit stock shortfall"
+        )
+    elif swap.direction is BalancingSwapDirection.STOCK_TO_USDC:
+        swap_line = (
+            f"balancing swap: {swap.stock_in_units} raw stock -> "
+            f"~{swap.expected_usdc_units} raw USDC ({swap.tranche_count} tranche(s), impact "
+            f"{swap.modeled_impact_fraction:.6f}) covering the "
+            f"{swap.usdc_shortfall_units}-unit USDC shortfall"
+        )
+    else:
+        swap_line = "balancing swap: none required; Safe inventory covers both mint sides"
     return (
         f"{observation.symbol} pool {observation.pool_address} at snapshot block "
         f"{observation.snapshot_block}, price {price} USDC per {observation.symbol}",

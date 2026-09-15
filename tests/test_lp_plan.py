@@ -20,6 +20,7 @@ from aero_bot.lp_plan import (
     MAX_TOTAL_PILOT_EXPOSURE_USDC,
     QUOTE_TOKEN_DECIMALS,
     X96_SCALE,
+    BalancingSwapDirection,
     LpExecutionPolicy,
     LpPlanRefusalCode,
     LpPlanRefusalError,
@@ -618,6 +619,35 @@ def test_plan_mint_entry_skips_the_swap_when_stock_covers_the_side() -> None:
     assert plan.balancing_swap.required is False
     assert plan.balancing_swap.usdc_in_units == 0
     assert any("no balancing swap required" in cap for cap in plan.caps_enforced)
+
+
+def test_live_recenter_inventory_sells_only_excess_stock_for_quote_shortfall() -> None:
+    """The 05:21 canary inventory shape rebalances stock->USDC instead of refusing."""
+    tick = -11985
+    observation = pool_observation(current_tick=tick, sqrt_ratio=sqrt_ratio_at_tick(tick))
+    plan = plan_mint_entry(
+        LpExecutionPolicy(),
+        observation,
+        mint_directive(
+            budget_usdc=Decimal("70.6996952"),
+            half_width_spacings=2,
+        ),
+        safe_inventory(
+            usdc_units=17_672_090,
+            stock_units=21_328_025,
+        ),
+    )
+
+    swap = plan.balancing_swap
+    stock_desired = plan.amounts.amount1_desired_units
+    excess_stock = 21_328_025 - stock_desired
+    assert swap.direction is BalancingSwapDirection.STOCK_TO_USDC
+    assert swap.required is True
+    assert swap.usdc_shortfall_units > 0
+    assert 0 < swap.stock_in_units < excess_stock
+    assert swap.expected_usdc_units >= swap.usdc_shortfall_units
+    assert swap.usdc_in_units == 0
+    assert any("without a round trip" in cap for cap in plan.caps_enforced)
 
 
 def test_plan_amounts_build_valid_mint_calldata() -> None:

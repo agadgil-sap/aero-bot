@@ -276,6 +276,24 @@ class FakeExecutor:
             self._now,
         )
 
+    def dry_run_recenter(
+        self,
+        symbol: str,
+        token_id: int,
+        width_spacings: int | None,
+        budget_usdc: Decimal | None,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> object:
+        """Preflight one replacement without mutating the scripted chain state."""
+        self.calls.append(("recenter_preflight", symbol, token_id, width_spacings, budget_usdc))
+        if self.refuse_next == "recenter_preflight":
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "scripted recenter preflight refusal",
+            )
+        return SimpleNamespace()
+
     def execute_mint(
         self,
         symbol: str,
@@ -757,6 +775,44 @@ class TestLiveCycles:
         ]
         assert "exit_swap" not in [call[0] for call in executor.calls]
         assert book.position is not None
+
+    def test_recenter_preflight_refusal_keeps_the_live_position_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """A replacement that cannot be built refuses before unstake/withdraw."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS))
+        runner, executor, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+        assert executor is not None
+        executor.refuse_next = "recenter_preflight"
+        runner._last_reconciliation = runner._reconcile(tracked_book())
+        outcome = PolicyOutcome(
+            decision=PolicyDecision(
+                action=PolicyActionKind.RECENTER,
+                reason=PolicyReason.DOWNSIDE_RECENTER_ECONOMIC,
+                diagnostics=("fixture economic recenter",),
+                price_range=AlignedPriceRange(
+                    lower_tick=-10,
+                    upper_tick=10,
+                    lower_price=Decimal("99"),
+                    upper_price=Decimal("101"),
+                ),
+                size_usd=Decimal("7"),
+            ),
+            next_state=PolicyState(),
+        )
+
+        actions, halted, book = runner._act(
+            tracked_book(), outcome, b"\x01" * 32, "FIXc"
+        )
+
+        assert [record.action for record in actions] == ["recenter_preflight"]
+        assert actions[0].status == "refused"
+        assert "recenter preflight refused" in halted
+        assert book.position is not None
+        assert reads._statuses[TRACKED_TOKEN_ID].token_owner_address == GAUGE_ADDRESS
+        assert [call[0] for call in executor.calls] == ["recenter_preflight"]
+
 
     def test_stale_low_burn_holds_the_returned_stock(self, tmp_path: Path) -> None:
         """A stale-low burn unstakes and withdraws but never swaps."""

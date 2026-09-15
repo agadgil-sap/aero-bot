@@ -1749,8 +1749,37 @@ class CycleRunner:
                 ):
                     halted = "the recenter decision carried no complete fresh entry"
                     return records, halted, book
-                if self._width_from_range(decision.price_range, tracked_symbol) is None:
+                preflight_width = self._width_from_range(decision.price_range, tracked_symbol)
+                if preflight_width is None:
                     halted = "the recenter decision carried no complete fresh entry"
+                    return records, halted, book
+                try:
+                    executor.dry_run_recenter(
+                        tracked_symbol,
+                        book.position.token_id,
+                        preflight_width,
+                        decision.size_usd,
+                        key_bytes,
+                    )
+                except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+                    code = str(getattr(error, "code", "plan_refused"))
+                    records.append(
+                        CycleActionRecord(
+                            action="recenter_preflight",
+                            status="refused",
+                            refusal_code=code,
+                            diagnostic=str(error),
+                        )
+                    )
+                    halted = f"the recenter preflight refused [{code}]"
+                    return records, halted, book
+                except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
+                    records.append(
+                        CycleActionRecord(
+                            action="recenter_preflight", status="failed", diagnostic=str(error)
+                        )
+                    )
+                    halted = f"the recenter preflight failed: {error}"
                     return records, halted, book
 
             exit_ok = (
