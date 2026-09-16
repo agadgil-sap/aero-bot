@@ -376,6 +376,20 @@ class TestResolveKnownPoolCandidate:
         # The fast path never enumerates the Sugar.
         assert script.enumeration_calls == 0
 
+    def test_caller_can_pin_a_shared_snapshot_block(self) -> None:
+        """Board selection can force every known pool onto one common block."""
+        script = KnownPoolRpcScript()
+        rpc = make_rpc(script)
+        candidate, block = resolve_known_pool_candidate(
+            rpc,
+            make_pin(),
+            make_listing(),
+            aerodrome_contract_evidence(),
+            block_number=FAST_BLOCK_NUMBER - 7,
+        )
+        assert block == FAST_BLOCK_NUMBER - 7
+        assert candidate.pool_address == POOL_ADDRESS
+
     def test_identity_mismatch_refuses(self) -> None:
         """A live identity that diverges from the pin refuses."""
         script = KnownPoolRpcScript(token1="0x" + "cc" * 20)
@@ -508,6 +522,19 @@ class TestDecisionFastPathWiring:
         assert block == FAST_BLOCK_NUMBER
         assert candidate.pool_address == POOL_ADDRESS
         assert candidate.staked0 == LIVE_STAKED0
+
+    def test_complete_pinned_board_resolves_without_enumeration(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A complete pin set verifies the board at one block with zero Sugar pages."""
+        script = KnownPoolRpcScript()
+        sources, _ = self._sources(tmp_path, script, monkeypatch)
+        listings, block = sources.enumerate_pools()
+        assert script.enumeration_calls == 0
+        assert block == FAST_BLOCK_NUMBER
+        assert [(item.symbol, item.pool.pool_address) for item in listings] == [
+            ("FIXc", POOL_ADDRESS)
+        ]
 
     def test_identity_drift_falls_back_to_the_sweep(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

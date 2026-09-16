@@ -37,15 +37,20 @@ from aero_bot.ranging import TICK_PRICE_RATIO
 MATH_PRECISION = 60
 # The locked safety ceiling half width mirrors the ranging solver's ceiling.
 DEFAULT_MAX_RANGE_HALF_WIDTH_FRACTION = Decimal("0.003")
-# The default mint min-amount tolerance. Raised from 0.1 percent to
-# 1 percent by the captain's calibration ruling (2026-09-08):
-# 0.1-percent-of-amount minima on a width-1 (20-tick) range leave a
-# ~0.005-tick price tolerance on the near-bound side, which the measured
-# pool wobble (0.265 ticks per 180 seconds on AAPLc) always exceeds before
-# the capped pipeline's observation-to-execution latency can complete.
-# Mint minima guard position composition, not principal, so 1 percent
-# restores fillability at a bounded composition drift.
+# Swap output floors retain the one-percent tolerance calibrated for the
+# canary. Mint minima no longer use a flat percentage of desired token
+# amounts: narrow concentrated ranges amplify tiny price moves into much
+# larger composition changes, so mint minima are derived from a bounded
+# execution-price envelope instead.
 DEFAULT_MINT_SLIPPAGE_TOLERANCE = Decimal("0.01")
+# A quarter tick covers the measured post-estimate AAPLc movement that caused
+# the 2026-09-15 PSC mint revert (~0.059 tick) with material headroom while
+# remaining far inside one Slipstream tick.
+DEFAULT_MINT_EXECUTION_DRIFT_TICKS = Decimal("0.25")
+# The price envelope may not reduce executable liquidity below this fraction
+# of the anchor mint. If it would, the mint is too composition-sensitive at
+# the current location and planning fails closed instead of weakening minima.
+MIN_MINT_EXECUTION_UTILIZATION_FRACTION = Decimal("0.95")
 # The balancing swap buys the shortfall plus this fraction so the mint's
 # stock pull never exceeds the realized swap output through small adverse
 # moves; the executor re-derives the mint amounts from realized output.
@@ -103,6 +108,8 @@ class LpPlanRefusalCode(StrEnum):
     SWAP_IMPACT_ABOVE_CEILING = "swap_impact_above_ceiling"
     # The Safe's USDC cannot fund both the quote side and the balancing swap.
     INSUFFICIENT_USDC_FOR_ENTRY = "insufficient_usdc_for_entry"
+    # The bounded execution-price envelope would underutilize too much capital.
+    EXECUTION_ENVELOPE_UNDERUTILIZED = "execution_envelope_underutilized"
 
 
 class WidthSource(StrEnum):
@@ -174,8 +181,12 @@ class MintAmountPlan(BaseModel):
     token0_value_usdc: NonNegativeDecimal
     # The token-one side's committed value at the plan price, in USDC.
     token1_value_usdc: NonNegativeDecimal
-    # The tolerance the minima sit below the desired amounts.
+    # Swap-output tolerance retained for the balancing-swap leg.
     slippage_tolerance_fraction: Annotated[Decimal, Field(gt=0, lt=1)]
+    # Symmetric execution-price movement covered by the mint minima, in ticks.
+    execution_price_drift_ticks: Annotated[Decimal, Field(gt=0)]
+    # Worst executable-liquidity share across the price envelope.
+    execution_utilization_fraction: Annotated[Decimal, Field(gt=0, le=1)]
 
     @model_validator(mode="after")
     def require_minima_below_desired(self) -> Self:
@@ -351,9 +362,13 @@ class MintDirective(BaseModel):
     max_range_half_width_fraction: Annotated[Decimal, Field(gt=0)] = (
         DEFAULT_MAX_RANGE_HALF_WIDTH_FRACTION
     )
-    # The tolerance the mint minima sit below the desired amounts.
+    # Swap-output tolerance used by a balancing swap.
     slippage_tolerance_fraction: Annotated[Decimal, Field(gt=0, lt=1)] = (
         DEFAULT_MINT_SLIPPAGE_TOLERANCE
+    )
+    # Price movement the final mint minima must tolerate before inclusion.
+    execution_price_drift_ticks: Annotated[Decimal, Field(gt=0)] = (
+        DEFAULT_MINT_EXECUTION_DRIFT_TICKS
     )
     # The acquisition buffer over the stock shortfall the swap buys.
     swap_buffer_fraction: Annotated[Decimal, Field(ge=0, lt=1)] = DEFAULT_SWAP_BUFFER_FRACTION
@@ -712,6 +727,122 @@ def estimate_in_range_depth_usdc(
     return +(amount0 * token0_scale * token0_price) + +(amount1 * token1_scale * token1_price)
 
 
+def _liquidity_from_desired_amounts(
+    sqrt_ratio: int,
+    tick_lower: int,
+    tick_upper: int,
+    amount0_units: int,
+    amount1_units: int,
+) -> Decimal:
+    """Return the liquidity executable from fixed desired amounts at one price."""
+    if amount0_units <= 0 or amount1_units <= 0:
+        raise ValueError("desired mint amounts must be positive")
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        sqrt_lower = _sqrt_price_at_tick(tick_lower)
+        sqrt_upper = _sqrt_price_at_tick(tick_upper)
+        sqrt_current = Decimal(sqrt_ratio)
+        if not sqrt_lower < sqrt_current < sqrt_upper:
+            raise ValueError("execution price must sit strictly inside the mint range")
+        liquidity0 = (
+            Decimal(amount0_units)
+            * sqrt_current
+            * sqrt_upper
+            / (X96_SCALE * (sqrt_upper - sqrt_current))
+        )
+        liquidity1 = (
+            Decimal(amount1_units)
+            * X96_SCALE
+            / (sqrt_current - sqrt_lower)
+        )
+        return +min(liquidity0, liquidity1)
+
+
+def plan_mint_execution_minima(
+    sqrt_ratio: int,
+    tick_lower: int,
+    tick_upper: int,
+    amount0_desired_units: int,
+    amount1_desired_units: int,
+    execution_price_drift_ticks: Decimal = DEFAULT_MINT_EXECUTION_DRIFT_TICKS,
+    minimum_utilization_fraction: Decimal = MIN_MINT_EXECUTION_UTILIZATION_FRACTION,
+) -> tuple[int, int, Decimal]:
+    """Derive mint minima from a bounded symmetric execution-price envelope.
+
+    The desired token amounts are fixed by the anchor plan. At each price
+    boundary, the NFPM can mint only the liquidity supported by both desired
+    sides; the corresponding actual token pulls are therefore the correct
+    composition minima. This models concentrated-liquidity geometry directly
+    instead of assuming that a one-percent amount haircut equals a one-percent
+    price move.
+    """
+    if execution_price_drift_ticks <= 0:
+        raise ValueError("execution_price_drift_ticks must be positive")
+    if not Decimal(0) < minimum_utilization_fraction <= Decimal(1):
+        raise ValueError("minimum_utilization_fraction must be in (0, 1]")
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        sqrt_current = Decimal(sqrt_ratio)
+        drift_factor = TICK_PRICE_RATIO ** (execution_price_drift_ticks / Decimal(2))
+        lower_execution_sqrt = int(sqrt_current / drift_factor)
+        upper_execution_sqrt = int(sqrt_current * drift_factor)
+        sqrt_lower = _sqrt_price_at_tick(tick_lower)
+        sqrt_upper = _sqrt_price_at_tick(tick_upper)
+        if (
+            Decimal(lower_execution_sqrt) <= sqrt_lower
+            or Decimal(upper_execution_sqrt) >= sqrt_upper
+        ):
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.PRICE_OUTSIDE_RANGE,
+                f"the +/-{execution_price_drift_ticks}-tick execution envelope reaches "
+                "the mint range boundary; wait for a safer range location",
+            )
+        anchor_liquidity = _liquidity_from_desired_amounts(
+            sqrt_ratio,
+            tick_lower,
+            tick_upper,
+            amount0_desired_units,
+            amount1_desired_units,
+        )
+        endpoint_amounts: list[tuple[int, int]] = []
+        worst_utilization = Decimal(1)
+        for execution_sqrt in (lower_execution_sqrt, upper_execution_sqrt):
+            executable_liquidity = _liquidity_from_desired_amounts(
+                execution_sqrt,
+                tick_lower,
+                tick_upper,
+                amount0_desired_units,
+                amount1_desired_units,
+            )
+            utilization = executable_liquidity / anchor_liquidity
+            worst_utilization = min(worst_utilization, utilization)
+            amount0, amount1 = position_amounts_for_liquidity(
+                execution_sqrt,
+                tick_lower,
+                tick_upper,
+                executable_liquidity,
+            )
+            endpoint_amounts.append(
+                (
+                    int(amount0.to_integral_value(rounding=ROUND_FLOOR)),
+                    int(amount1.to_integral_value(rounding=ROUND_FLOOR)),
+                )
+            )
+        if worst_utilization < minimum_utilization_fraction:
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.EXECUTION_ENVELOPE_UNDERUTILIZED,
+                f"the +/-{execution_price_drift_ticks}-tick execution envelope can reduce "
+                f"minted liquidity to {worst_utilization:.6f} of plan, below the "
+                f"{minimum_utilization_fraction} floor; wait for a less sensitive price "
+                "location or widen the range",
+            )
+        # One raw unit below the Decimal floor protects against the final
+        # integer rounding edge without weakening the economic envelope.
+        amount0_min = max(0, min(amount[0] for amount in endpoint_amounts) - 1)
+        amount1_min = max(0, min(amount[1] for amount in endpoint_amounts) - 1)
+        return amount0_min, amount1_min, +worst_utilization
+
+
 def plan_mint_composition(
     sqrt_ratio: int,
     position_range: PositionTickRange,
@@ -720,30 +851,9 @@ def plan_mint_composition(
     stock_decimals: int,
     quote_decimals: int,
     slippage_tolerance_fraction: Decimal,
+    execution_price_drift_ticks: Decimal = DEFAULT_MINT_EXECUTION_DRIFT_TICKS,
 ) -> MintAmountPlan:
-    """Convert one USDC budget into both sides' raw mint amounts.
-
-    The unit liquidity's two sides are valued at the snapshot price, the
-    budget buys liquidity at that unit value, and both desired amounts floor
-    to raw integers so the plan never overstates what the budget funds.
-
-    Args:
-        sqrt_ratio: The pool's positive raw sqrtPriceX96.
-        position_range: The derived range the position spans.
-        budget_usdc: The positive total USDC value both sides commit.
-        stock_is_token0: True when the stock token sorts before USDC.
-        stock_decimals: The stock token's decimal count.
-        quote_decimals: The USDC token's decimal count.
-        slippage_tolerance_fraction: The fraction the minima sit below desired.
-
-    Returns:
-        The mint amount plan with desired amounts, minima, and side values.
-
-    Raises:
-        LpPlanRefusalError: If the current price sits outside the range or the
-            budget is too small to fund both sides after flooring.
-        ValueError: If any argument is malformed.
-    """
+    """Convert one USDC budget into desired amounts and geometric mint minima."""
     if budget_usdc <= 0:
         raise ValueError("budget_usdc must be positive")
     price = price_usdc_per_stock(sqrt_ratio, stock_is_token0, stock_decimals, quote_decimals)
@@ -761,7 +871,6 @@ def plan_mint_composition(
                 LpPlanRefusalCode.PRICE_OUTSIDE_RANGE,
                 f"cannot compose a two-sided position: {error}",
             ) from error
-        # Each side's human scale and USDC price follow from which side is stock.
         token0_scale = (
             Decimal(10) ** -stock_decimals if stock_is_token0 else Decimal(10) ** (-quote_decimals)
         )
@@ -784,12 +893,13 @@ def plan_mint_composition(
                 f"a {budget_usdc} USDC budget floors one side of this range to zero at the "
                 f"price {price} USDC per stock; raise the budget or tighten the range",
             )
-        tolerance = slippage_tolerance_fraction
-        amount0_min = int(
-            (amount0 * (Decimal(1) - tolerance)).to_integral_value(rounding=ROUND_FLOOR)
-        )
-        amount1_min = int(
-            (amount1 * (Decimal(1) - tolerance)).to_integral_value(rounding=ROUND_FLOOR)
+        amount0_min, amount1_min, utilization = plan_mint_execution_minima(
+            sqrt_ratio,
+            position_range.tick_lower,
+            position_range.tick_upper,
+            int(amount0),
+            int(amount1),
+            execution_price_drift_ticks,
         )
         return MintAmountPlan(
             liquidity=liquidity,
@@ -799,9 +909,10 @@ def plan_mint_composition(
             amount1_min_units=amount1_min,
             token0_value_usdc=+(amount0 * token0_scale * token0_price),
             token1_value_usdc=+(amount1 * token1_scale * token1_price),
-            slippage_tolerance_fraction=tolerance,
+            slippage_tolerance_fraction=slippage_tolerance_fraction,
+            execution_price_drift_ticks=execution_price_drift_ticks,
+            execution_utilization_fraction=utilization,
         )
-
 
 def plan_balancing_swap(
     stock_shortfall_units: int,
@@ -1064,6 +1175,7 @@ def plan_mint_entry(
         observation.stock_decimals,
         observation.quote_decimals,
         directive.slippage_tolerance_fraction,
+        directive.execution_price_drift_ticks,
     )
     caps.append("snapshot price strictly inside the derived range")
     depth = estimate_in_range_depth_usdc(
@@ -1255,8 +1367,9 @@ def _mint_diagnostics(
         f"composition: {usdc_units} raw USDC + {stock_units} raw stock, liquidity "
         f"{amounts.liquidity}, sides valued {amounts.token0_value_usdc} + "
         f"{amounts.token1_value_usdc} USDC of the {budget} USDC budget",
-        f"minima {amounts.amount0_min_units}/{amounts.amount1_min_units} raw at tolerance "
-        f"{amounts.slippage_tolerance_fraction}",
+        f"minima {amounts.amount0_min_units}/{amounts.amount1_min_units} raw over +/-"
+        f"{amounts.execution_price_drift_ticks} tick execution drift; worst liquidity "
+        f"utilization {amounts.execution_utilization_fraction:.6f}",
         f"pool in-range depth estimate {depth} USDC; budget is "
         f"{_percentage_of(budget, depth)} of it",
         swap_line,

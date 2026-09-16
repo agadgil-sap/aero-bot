@@ -531,6 +531,8 @@ class HeldInventory(BaseModel):
     stock_quantity: Annotated[Decimal, Field(gt=0)]
     # Held-since anchors the convergence timeout of the hold.
     held_since: datetime
+    # Why inventory is held: stale-low protection, failed entry, or adoption.
+    origin: Literal["stale_low_exit", "failed_entry", "adopted_balance"] = "adopted_balance"
 
     @model_validator(mode="after")
     def require_aware_held_since(self) -> Self:
@@ -612,6 +614,8 @@ class PolicyReason(StrEnum):
     DOWNSIDE_RECENTER_ECONOMIC = "downside_recenter_economic"
     # Entry is eligible because the raw emissions APR threshold is met.
     ENTRY_THRESHOLD_MET = "entry_threshold_met"
+    # A prior mint failed after acquiring stock; retry from that inventory.
+    FAILED_ENTRY_RETRY = "failed_entry_retry"
     # The pool's raw emissions APR is below the entry threshold.
     EMISSIONS_BELOW_ENTRY_THRESHOLD = "emissions_below_entry_threshold"
     # A stop or dilution exit's re-entry cooldown is still running.
@@ -1295,6 +1299,29 @@ class PolicyEngine:
         inventory = state.held_inventory
         if inventory is None:  # pragma: no cover - guarded by the caller
             raise ValueError("inventory branch requires held stock tokens")
+        # Failed-entry inventory is already the intended entry inventory, not
+        # a stale-low safety hold. If the ordinary flat entry gates still pass,
+        # retry the mint directly from these balances before considering a
+        # round-trip sale back to USDC. The original held_since remains the
+        # bounded escape timer if repeated retries cannot qualify or execute.
+        if inventory.origin == "failed_entry" and flat_description is None:
+            flat_state = state.model_copy(update={"held_inventory": None})
+            retry = self._decide_flat(flat_state, observation, flat_description)
+            if retry.decision.action is PolicyActionKind.ENTER:
+                return PolicyOutcome(
+                    decision=retry.decision.model_copy(
+                        update={
+                            "reason": PolicyReason.FAILED_ENTRY_RETRY,
+                            "diagnostics": (
+                                f"Retrying entry from {inventory.stock_quantity} held stock "
+                                "tokens left by a failed mint; existing inventory is reused "
+                                "before any sell-back.",
+                            )
+                            + retry.decision.diagnostics,
+                        }
+                    ),
+                    next_state=retry.next_state,
+                )
         # A fresh reference allows a convergence judgment; without one only the
         # timeout bound or a flat window can release the held tokens.
         reference = observation.reference_price_usdc

@@ -184,6 +184,8 @@ class HeldInventoryRecord(BaseModel):
     stock_quantity: Annotated[Decimal, Field(gt=0)]
     # When the inventory was taken on, timezone-aware.
     held_since: datetime
+    # Why the stock is held, so failed entries can retry before sell-back.
+    origin: Literal["stale_low_exit", "failed_entry", "adopted_balance"] = "adopted_balance"
 
 
 class ReentryCooldown(BaseModel):
@@ -449,6 +451,19 @@ class CycleReportPayload(BaseModel):
 
 class CycleExecutorBoundary(Protocol):
     """Define the audited executor surface one live cycle may drive."""
+
+    def dry_run_switch(
+        self,
+        from_symbol: str,
+        token_id: int,
+        to_symbol: str,
+        width_spacings: int | None,
+        budget_usdc: Decimal,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> object:
+        """Preflight a cross-pool replacement without broadcasting."""
+        ...
 
     def execute_mint(
         self,
@@ -1322,6 +1337,7 @@ class CycleRunner:
                 token_address=book.held_inventory.token_address,
                 stock_quantity=book.held_inventory.stock_quantity,
                 held_since=book.held_inventory.held_since,
+                origin=book.held_inventory.origin,
             )
         day = self._now().astimezone(POLICY_TIMEZONE).date()
         same_day = book.day == day and book.day_start_equity_usd is not None
@@ -1654,7 +1670,21 @@ class CycleRunner:
                     decision_symbol, budget, mint_width, key_bytes, confirm_broadcast=True
                 ),
             ):
-                return records, halted, book
+                held_quantity = self._live_stock_quantity(decision_symbol)
+                failed_book = book
+                if held_quantity > 0:
+                    failed_book = book.model_copy(
+                        update={
+                            "held_inventory": HeldInventoryRecord(
+                                symbol=decision_symbol,
+                                token_address=self._stock_token_address_for(decision_symbol),
+                                stock_quantity=held_quantity,
+                                held_since=self._now(),
+                                origin="failed_entry",
+                            )
+                        }
+                    )
+                return records, halted, failed_book
             token_id = self._decode_mint_token_id(records[-1])
             if token_id is None:
                 halted = "the minted position id could not be decoded from the receipt"
@@ -1688,16 +1718,48 @@ class CycleRunner:
             if book.position is None or tracked_symbol is None:
                 halted = "the selector authorized a switch while flat"
                 return records, halted, book
-            if not self._exit_position(executor, book, key_bytes, run):
-                return records, halted, book
-            switched_book = book.model_copy(update={"position": None, "held_inventory": None})
             size = decision.size_usd
             width = self._width_from_range(decision.price_range, switch.to_symbol)
             if size is None or size <= 0 or width is None:
                 halted = "the switch decision carried no positive size or tick-aligned width"
-                return records, halted, switched_book
+                return records, halted, book
             switch_budget: Decimal = size
             switch_width: int = width
+            # Prove the target can be funded from a conservative projection of
+            # the complete source exit before unstaking the currently earning
+            # LP. A refusal leaves the source NFT untouched and staked.
+            try:
+                executor.dry_run_switch(
+                    tracked_symbol,
+                    book.position.token_id,
+                    switch.to_symbol,
+                    switch_width,
+                    switch_budget,
+                    key_bytes,
+                )
+            except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+                code = str(getattr(error, "code", "plan_refused"))
+                records.append(
+                    CycleActionRecord(
+                        action="switch_preflight",
+                        status="refused",
+                        refusal_code=code,
+                        diagnostic=str(error),
+                    )
+                )
+                halted = f"the switch preflight refused [{code}]"
+                return records, halted, book
+            except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
+                records.append(
+                    CycleActionRecord(
+                        action="switch_preflight", status="failed", diagnostic=str(error)
+                    )
+                )
+                halted = f"the switch preflight failed: {error}"
+                return records, halted, book
+            if not self._exit_position(executor, book, key_bytes, run):
+                return records, halted, book
+            switched_book = book.model_copy(update={"position": None, "held_inventory": None})
             if not run(
                 "mint",
                 lambda: executor.execute_mint(
@@ -1872,6 +1934,7 @@ class CycleRunner:
                             token_address=self._stock_token_address_for(tracked_symbol),
                             stock_quantity=held_quantity,
                             held_since=self._now(),
+                            origin="stale_low_exit",
                         ),
                     }
                 ),

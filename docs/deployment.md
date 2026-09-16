@@ -50,11 +50,11 @@ Discipline, enforced in code: the key file refuses any group/other permission bi
 
 ```bash
 sudo systemctl enable --now aero-bot-dashboard.service
-sudo systemctl enable --now aero-bot-cycle@AAPLc.timer aero-bot-audit-backup.timer
+sudo systemctl enable --now aero-bot-cycle@auto.timer aero-bot-audit-backup.timer
 systemctl list-timers | grep aero-bot
 ```
 
-The cycle timer defaults to hourly (`OnCalendar=hourly`, `Persistent=true`, 180 s jitter); a drop-in changes it (`systemctl edit aero-bot-cycle@AAPLc.timer`). The backup runs daily. Cycles are hardened oneshots: they never overlap, never auto-retry - the next tick reconciles.
+The production selector timer uses `aero-bot-cycle@auto.timer`; pin a pool such as `@AAPLc.timer` only for an explicit operator override. The timer cadence is set by the installed template/drop-ins. The backup runs daily. Cycles are hardened oneshots: they never overlap, never auto-retry - the next tick reconciles.
 
 The range watchtower ships dark and arms separately, on its own explicit decision: set `AERO_BOT_WATCHTOWER_ENABLED=1` in `/etc/aero-bot/cycle.env`, then `sudo systemctl enable --now aero-bot-watchtower@AAPLc.service`.
 See [the watchtower documentation](docs/watchtower.md) for the trip semantics, the fail-safe posture, and the day-two triage.

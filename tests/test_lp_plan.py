@@ -14,10 +14,12 @@ from aero_bot.lp_calldata import (
     build_lp_mint_calldata,
 )
 from aero_bot.lp_plan import (
+    DEFAULT_MINT_EXECUTION_DRIFT_TICKS,
     DEFAULT_MINT_SLIPPAGE_TOLERANCE,
     MATH_PRECISION,
     MAX_POSITION_USDC_PER_POOL,
     MAX_TOTAL_PILOT_EXPOSURE_USDC,
+    MIN_MINT_EXECUTION_UTILIZATION_FRACTION,
     QUOTE_TOKEN_DECIMALS,
     X96_SCALE,
     BalancingSwapDirection,
@@ -33,6 +35,7 @@ from aero_bot.lp_plan import (
     plan_balancing_swap,
     plan_mint_composition,
     plan_mint_entry,
+    plan_mint_execution_minima,
     position_amounts_at_sqrt_ratio,
     position_amounts_for_liquidity,
     position_range_state,
@@ -420,16 +423,38 @@ def test_mint_composition_splits_the_budget_into_both_sides() -> None:
     # carries roughly a third of the budget and the stock side the rest.
     assert Decimal("0.2") < amounts.token0_value_usdc / Decimal(7) < Decimal("0.45")
     assert Decimal("0.55") < amounts.token1_value_usdc / Decimal(7) < Decimal("0.8")
-    # The minima sit exactly one tolerance below the desired amounts; the
-    # 1-percent convention is the captain's approved calibration ruling, and
-    # the plan call above consumes the same default being pinned here.
-    tolerance = Decimal("0.01")
-    assert amounts.amount0_min_units == int(
-        Decimal(amounts.amount0_desired_units) * (1 - tolerance)
+    # Mint minima are geometric: they cover a bounded quarter-tick execution
+    # move while refusing plans whose executable liquidity would fall below
+    # the 95-percent utilization floor.
+    assert amounts.execution_price_drift_ticks == DEFAULT_MINT_EXECUTION_DRIFT_TICKS
+    assert amounts.execution_utilization_fraction >= MIN_MINT_EXECUTION_UTILIZATION_FRACTION
+    assert amounts.amount0_min_units < amounts.amount0_desired_units
+    assert amounts.amount1_min_units < amounts.amount1_desired_units
+
+
+
+def test_execution_envelope_would_have_accepted_the_live_psc_move() -> None:
+    """The 14:31 canary's 0.059-tick move stays inside the new mint envelope."""
+    anchor_sqrt = 43654683706630734830369148781
+    inclusion_sqrt = 43654554653625495173817530859
+    desired0 = 17_235_024
+    desired1 = 13_805_863
+    minimum0, minimum1, utilization = plan_mint_execution_minima(
+        anchor_sqrt, -11950, -11910, desired0, desired1
     )
-    assert amounts.amount1_min_units == int(
-        Decimal(amounts.amount1_desired_units) * (1 - tolerance)
-    )
+    # The old one-percent stock minimum was 13,667,804 and reverted PSC.
+    assert minimum1 < 13_651_320 < 13_667_804
+    assert utilization >= MIN_MINT_EXECUTION_UTILIZATION_FRACTION
+    # The actual inclusion price remains inside the quarter-tick envelope.
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        tick_move = (
+            (Decimal(inclusion_sqrt) / Decimal(anchor_sqrt)).ln()
+            * Decimal(2)
+            / TICK_PRICE_RATIO.ln()
+        )
+    assert abs(tick_move) < DEFAULT_MINT_EXECUTION_DRIFT_TICKS
+    assert minimum0 > 0
 
 
 def test_mint_composition_refuses_a_budget_that_floors_a_side_to_zero() -> None:

@@ -143,6 +143,7 @@ from aero_bot.safe_tx import (
     SafeSignatureValidation,
     SafeTransaction,
     SafeTransactionRpcBackend,
+    SafeTransactionUnavailableError,
     build_exec_transaction_calldata,
     build_safe_transaction,
     sign_safe_tx_hash,
@@ -164,6 +165,10 @@ NFPM_INCREASE_LIQUIDITY_TOPIC0 = (
 )
 # The LP deadline sits eight minutes past its build time, mirroring the swap.
 LP_DEADLINE_SECONDS = 8 * 60
+# A five-percent bounded NFPM allowance buffer lets the final post-approval
+# price rebuild change composition without inserting another approval delay.
+# It never authorizes more than 105 percent of the planned side amount.
+NFPM_APPROVAL_BUFFER_FRACTION = Decimal("0.05")
 # LP entries may require balancing swaps materially larger than the manual
 # one-shot swap executor's 20 USDC standing allowance. Keep this LP-specific
 # so widening LP capacity cannot widen the unrelated manual swap surface.
@@ -264,6 +269,8 @@ class LpExecutionRefusalCode(StrEnum):
     ESTIMATE_REVERTED = "estimate_reverted"
     # A confirmed balancing swap still leaves another fresh swap requirement.
     POST_SWAP_REBALANCE_REQUIRED = "post_swap_rebalance_required"
+    # The final post-approval rebuild would require another approval delay.
+    POST_APPROVAL_REBUILD_REQUIRED = "post_approval_rebuild_required"
     # The relaying EOA cannot afford the floor plus the bounded gas cost.
     RELAYER_ETH_INSUFFICIENT = "relayer_eth_insufficient"
     # The exit swap found no stock balance to convert back to USDC.
@@ -1726,6 +1733,38 @@ class LpLifecycleExecutor:
             self._record_refusal("recenter", ExecutionMode.DRY_RUN, error, symbol)
             raise
 
+    def dry_run_switch(
+        self,
+        from_symbol: str,
+        token_id: int,
+        to_symbol: str,
+        width_spacings: int | None,
+        budget_usdc: Decimal,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> LpMintPlan:
+        """Preflight a cross-pool switch without touching the live position.
+
+        The source LP is projected through a complete decrease/collect and a
+        conservative full stock-to-USDC exit. The target mint is then planned
+        against that projected USDC inventory while allowing only the tracked
+        source NFT to exist. This proves the replacement can be funded before
+        the cycle unstake/withdraws the currently earning position.
+        """
+        try:
+            return self._dry_run_switch(
+                from_symbol,
+                token_id,
+                to_symbol,
+                width_spacings,
+                budget_usdc,
+                key_bytes,
+                ephemeral_key,
+            )
+        except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+            self._record_refusal("switch", ExecutionMode.DRY_RUN, error, to_symbol)
+            raise
+
     def execute_mint(
         self,
         symbol: str,
@@ -1736,12 +1775,13 @@ class LpLifecycleExecutor:
         confirm_broadcast: bool,
         ephemeral_key: bool = False,
     ) -> LpActionExecutionReport:
-        """Build and broadcast one capped mint sequence step by step.
+        """Build and broadcast one capped mint with a late-bound final mint.
 
-        When entry needs a balancing swap, execution is deliberately two-phase.
-        The swap is confirmed first, then the pool and Safe inventory are read
-        again and the NFPM mint is rebuilt from that fresh post-swap state.
-        Pre-swap mint calldata is never broadcast after a pool-changing swap.
+        Any balancing swap confirms first. NFPM approvals then confirm from a
+        fresh post-swap plan. Only after every prerequisite transaction is
+        mined do we reread pool state, inventory, allowances and Safe nonce,
+        rebuild the mint one final time, estimate it, and broadcast it. This
+        removes approval-mining latency from the mint's price observation.
         """
         if not confirm_broadcast:
             error = LpExecutionRefusalError(
@@ -1753,8 +1793,16 @@ class LpLifecycleExecutor:
             self._record_refusal("mint", ExecutionMode.EXECUTE, error, symbol)
             raise error
 
+        def approval_amount(step: _BuiltLpStep) -> int:
+            """Decode the uint256 amount from one ERC20 approve inner call."""
+            data = str(step.transaction.data)
+            return int(data[2 + 8 + 64 : 2 + 8 + 128], 16)
+
+        completed_reports: tuple[LpStepExecutionReport, ...] = ()
+        built_history: list[_BuiltLpStep] = []
+        total_build_ms = Decimal(0)
         try:
-            build, steps = self._build_mint_attempt(
+            initial_build, initial_steps = self._build_mint_attempt(
                 symbol,
                 budget_usdc,
                 width_spacings,
@@ -1762,111 +1810,169 @@ class LpLifecycleExecutor:
                 ephemeral_key,
                 ExecutionMode.EXECUTE,
             )
+            total_build_ms += initial_build.build_duration_ms
+            current_build = initial_build
+            current_steps = initial_steps
 
             swap_index = next(
                 (
                     index
-                    for index, step in enumerate(steps)
+                    for index, step in enumerate(current_steps)
                     if step.report.role == LpExecutionRole.BALANCING_SWAP
                 ),
                 None,
             )
-
-            if swap_index is None:
-                step_reports, halted_reason = self._execute_steps(
-                    "mint", steps, key_bytes
-                )
-            else:
-                # Execute only approvals needed for the swap and the swap itself.
-                prefix_steps = steps[: swap_index + 1]
+            if swap_index is not None:
+                swap_prefix = current_steps[: swap_index + 1]
                 prefix_reports, halted_reason = self._execute_steps(
-                    "mint", prefix_steps, key_bytes
+                    "mint", swap_prefix, key_bytes
                 )
-
+                completed_reports += prefix_reports
+                built_history.extend(swap_prefix)
                 if halted_reason:
                     return LpActionExecutionReport(
                         action="mint",
-                        build=build,
-                        steps=prefix_reports,
+                        build=initial_build,
+                        steps=completed_reports,
                         completed=False,
                         halted_reason=halted_reason,
                     )
-
                 print(
-                    "[mint] balancing swap confirmed; rebuilding the mint from "
-                    "fresh pool and Safe inventory",
+                    "[mint] balancing swap confirmed; rebuilding approvals from fresh "
+                    "pool and Safe inventory",
                     file=sys.stderr,
                     flush=True,
                 )
-
-                # Pool price, Safe balances, allowances and Safe nonce are all
-                # re-read here. This is the execution boundary missing from the
-                # old single-build sequence.
-                try:
-                    fresh_build, fresh_steps = self._build_mint_attempt(
-                        symbol,
-                        budget_usdc,
-                        width_spacings,
-                        key_bytes,
-                        ephemeral_key,
-                        ExecutionMode.EXECUTE,
-                        inventory_only=True,
-                    )
-                except (LpExecutionRefusalError, LpPlanRefusalError) as error:
-                    previous = tuple(getattr(error, "completed_steps", ()))
-                    error.completed_steps = prefix_reports + previous
-                    raise
-
-                # One bounded acquisition is allowed per attempt. If the fresh
-                # state still genuinely needs another balancing swap, stop and
-                # let the next cycle reconcile rather than churn the market.
-                if fresh_build.plan.balancing_swap.required:
+                current_build, current_steps = self._build_mint_attempt(
+                    symbol,
+                    budget_usdc,
+                    width_spacings,
+                    key_bytes,
+                    ephemeral_key,
+                    ExecutionMode.EXECUTE,
+                    inventory_only=True,
+                )
+                total_build_ms += current_build.build_duration_ms
+                if current_build.plan.balancing_swap.required:
                     error = LpExecutionRefusalError(
                         LpExecutionRefusalCode.POST_SWAP_REBALANCE_REQUIRED,
                         "the confirmed balancing swap still leaves a fresh "
-                        "balancing-swap requirement; refusing a second market "
-                        "swap in the same mint attempt so the next cycle can "
-                        "reconcile the acquired inventory from live state",
+                        "balancing-swap requirement; refusing a second market swap in the "
+                        "same mint attempt so the next cycle can reconcile inventory",
                     )
-                    error.completed_steps = prefix_reports
+                    error.completed_steps = completed_reports
                     raise error
 
-                try:
-                    tail_reports, halted_reason = self._execute_steps(
-                        "mint", fresh_steps, key_bytes
-                    )
-                except (LpExecutionRefusalError, LpPlanRefusalError) as error:
-                    previous = tuple(getattr(error, "completed_steps", ()))
-                    error.completed_steps = prefix_reports + previous
-                    raise
-
-                # Keep the fresh plan as the authoritative mint plan, while the
-                # build report retains the actually executed swap-prefix builds.
-                build = fresh_build.model_copy(
-                    update={
-                        "transactions": (
-                            tuple(step.report for step in prefix_steps)
-                            + fresh_build.transactions
-                        ),
-                        "build_duration_ms": (
-                            build.build_duration_ms
-                            + fresh_build.build_duration_ms
-                        ),
-                    }
+            mint_index = next(
+                (
+                    index
+                    for index, step in enumerate(current_steps)
+                    if step.report.role == LpExecutionRole.MINT
+                ),
+                None,
+            )
+            if mint_index is None:
+                raise RuntimeError("the mint build carried no NFPM mint step")
+            prerequisite_steps = current_steps[:mint_index]
+            unexpected = tuple(
+                step.report.role
+                for step in prerequisite_steps
+                if step.report.role
+                not in {
+                    LpExecutionRole.NFPM_USDC_ALLOWANCE,
+                    LpExecutionRole.NFPM_STOCK_ALLOWANCE,
+                }
+            )
+            if unexpected:
+                raise RuntimeError(
+                    "the post-rebalance mint build carried unexpected prerequisite roles "
+                    f"{unexpected}"
                 )
-                step_reports = prefix_reports + tail_reports
 
+            confirmed_usdc_floor = 0
+            confirmed_stock_floor = 0
+            if prerequisite_steps:
+                approval_reports, halted_reason = self._execute_steps(
+                    "mint", prerequisite_steps, key_bytes
+                )
+                completed_reports += approval_reports
+                built_history.extend(prerequisite_steps)
+                if halted_reason:
+                    return LpActionExecutionReport(
+                        action="mint",
+                        build=current_build,
+                        steps=completed_reports,
+                        completed=False,
+                        halted_reason=halted_reason,
+                    )
+                for step in prerequisite_steps:
+                    if step.report.role == LpExecutionRole.NFPM_USDC_ALLOWANCE:
+                        confirmed_usdc_floor = max(
+                            confirmed_usdc_floor, approval_amount(step)
+                        )
+                    elif step.report.role == LpExecutionRole.NFPM_STOCK_ALLOWANCE:
+                        confirmed_stock_floor = max(
+                            confirmed_stock_floor, approval_amount(step)
+                        )
+
+            print(
+                "[mint] prerequisites confirmed; rebuilding the final mint from the "
+                "latest pool price and Safe inventory",
+                file=sys.stderr,
+                flush=True,
+            )
+            final_build, final_steps = self._build_mint_attempt(
+                symbol,
+                current_build.plan.budget_usdc,
+                width_spacings,
+                key_bytes,
+                ephemeral_key,
+                ExecutionMode.EXECUTE,
+                inventory_only=True,
+                confirmed_nfpm_usdc_allowance_floor=confirmed_usdc_floor,
+                confirmed_nfpm_stock_allowance_floor=confirmed_stock_floor,
+                buffer_nfpm_approvals=False,
+            )
+            total_build_ms += final_build.build_duration_ms
+            if final_build.plan.balancing_swap.required:
+                error = LpExecutionRefusalError(
+                    LpExecutionRefusalCode.POST_SWAP_REBALANCE_REQUIRED,
+                    "the final post-approval price read requires another market rebalance; "
+                    "preserving inventory for the next cycle instead of churning twice",
+                )
+                error.completed_steps = completed_reports
+                raise error
+            if tuple(step.report.role for step in final_steps) != (LpExecutionRole.MINT,):
+                error = LpExecutionRefusalError(
+                    LpExecutionRefusalCode.POST_APPROVAL_REBUILD_REQUIRED,
+                    "the final post-approval rebuild requires another approval before mint; "
+                    "refusing another delay and preserving inventory for the next cycle",
+                )
+                error.completed_steps = completed_reports
+                raise error
+
+            mint_reports, halted_reason = self._execute_steps("mint", final_steps, key_bytes)
+            completed_reports += mint_reports
+            built_history.extend(final_steps)
+            authoritative_build = final_build.model_copy(
+                update={
+                    "transactions": tuple(step.report for step in built_history),
+                    "build_duration_ms": total_build_ms,
+                }
+            )
+            return LpActionExecutionReport(
+                action="mint",
+                build=authoritative_build,
+                steps=completed_reports,
+                completed=halted_reason == "",
+                halted_reason=halted_reason,
+            )
         except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+            previous = tuple(getattr(error, "completed_steps", ()))
+            if completed_reports and not previous:
+                error.completed_steps = completed_reports
             self._record_refusal("mint", ExecutionMode.EXECUTE, error, symbol)
             raise
-
-        return LpActionExecutionReport(
-            action="mint",
-            build=build,
-            steps=step_reports,
-            completed=halted_reason == "",
-            halted_reason=halted_reason,
-        )
 
     def execute_stake(
         self,
@@ -2183,6 +2289,9 @@ class LpLifecycleExecutor:
         mode: ExecutionMode = ExecutionMode.DRY_RUN,
         *,
         inventory_only: bool = False,
+        confirmed_nfpm_usdc_allowance_floor: int = 0,
+        confirmed_nfpm_stock_allowance_floor: int = 0,
+        buffer_nfpm_approvals: bool = True,
     ) -> tuple[LpMintDryRunReport, tuple[_BuiltLpStep, ...]]:
         """Build, sign, validate, and estimate the complete mint sequence."""
         build_started = self._timer()
@@ -2234,11 +2343,17 @@ class LpLifecycleExecutor:
         router_stock_allowance = self._rpc.fetch_erc20_allowance(
             stock_token, self._safe_address, self._policy.router_address
         )
-        nfpm_usdc_allowance = self._rpc.fetch_erc20_allowance(
-            BASE_USDC_ADDRESS, self._safe_address, observation.nfpm_address
+        nfpm_usdc_allowance = max(
+            self._rpc.fetch_erc20_allowance(
+                BASE_USDC_ADDRESS, self._safe_address, observation.nfpm_address
+            ),
+            confirmed_nfpm_usdc_allowance_floor,
         )
-        nfpm_stock_allowance = self._rpc.fetch_erc20_allowance(
-            stock_token, self._safe_address, observation.nfpm_address
+        nfpm_stock_allowance = max(
+            self._rpc.fetch_erc20_allowance(
+                stock_token, self._safe_address, observation.nfpm_address
+            ),
+            confirmed_nfpm_stock_allowance_floor,
         )
         deadline = int(self._now().timestamp()) + LP_DEADLINE_SECONDS
         steps = self._compose_mint_steps(
@@ -2249,6 +2364,7 @@ class LpLifecycleExecutor:
             nfpm_usdc_allowance,
             nfpm_stock_allowance,
             deadline,
+            buffer_nfpm_approvals=buffer_nfpm_approvals,
         )
         built_steps = self._build_steps(steps, live_nonce, key_bytes, "mint", mode)
         report = LpMintDryRunReport(
@@ -2276,6 +2392,8 @@ class LpLifecycleExecutor:
         nfpm_usdc_allowance_units: int,
         nfpm_stock_allowance_units: int,
         deadline: int,
+        *,
+        buffer_nfpm_approvals: bool = True,
     ) -> list[_LpStepSpec]:
         """Compose the mint sequence's inner calls in execution order.
 
@@ -2287,6 +2405,8 @@ class LpLifecycleExecutor:
             nfpm_usdc_allowance_units: The live USDC allowance to the NFPM.
             nfpm_stock_allowance_units: The live stock allowance to the NFPM.
             deadline: The unix deadline every swap and mint carries.
+            buffer_nfpm_approvals: Whether prerequisite approvals carry the
+                bounded composition-drift buffer before the final rebuild.
 
         Returns:
             The composed steps in execution order; skipped approvals are
@@ -2396,26 +2516,46 @@ class LpLifecycleExecutor:
                 )
             else:
                 raise ValueError("required balancing swap has no executable direction")
-        if nfpm_usdc_allowance_units < usdc_desired:
+        allowance_multiplier = (
+            Decimal(1) + NFPM_APPROVAL_BUFFER_FRACTION
+            if buffer_nfpm_approvals
+            else Decimal(1)
+        )
+        usdc_approval_target = int(
+            (Decimal(usdc_desired) * allowance_multiplier).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
+        stock_approval_target = int(
+            (Decimal(stock_desired) * allowance_multiplier).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
+        if nfpm_usdc_allowance_units < usdc_approval_target:
             steps.append(
                 _LpStepSpec(
                     role=LpExecutionRole.NFPM_USDC_ALLOWANCE,
                     to_address=BASE_USDC_ADDRESS,
-                    inner_calldata=build_approval_calldata(observation.nfpm_address, usdc_desired),
+                    inner_calldata=build_approval_calldata(
+                        observation.nfpm_address, usdc_approval_target
+                    ),
                     description=(
-                        f"approve exactly {usdc_desired} raw USDC to the NFPM for the mint pull"
+                        f"approve {usdc_approval_target} raw USDC to the NFPM for the mint "
+                        "pull, including the bounded final-rebuild buffer"
                     ),
                 )
             )
-        if nfpm_stock_allowance_units < stock_desired:
+        if nfpm_stock_allowance_units < stock_approval_target:
             steps.append(
                 _LpStepSpec(
                     role=LpExecutionRole.NFPM_STOCK_ALLOWANCE,
                     to_address=stock_token,
-                    inner_calldata=build_approval_calldata(observation.nfpm_address, stock_desired),
+                    inner_calldata=build_approval_calldata(
+                        observation.nfpm_address, stock_approval_target
+                    ),
                     description=(
-                        f"approve exactly {stock_desired} raw {context.listing.symbol} to the "
-                        "NFPM for the mint pull"
+                        f"approve {stock_approval_target} raw {context.listing.symbol} to the "
+                        "NFPM for the mint pull, including the bounded final-rebuild buffer"
                     ),
                 )
             )
@@ -3036,6 +3176,131 @@ class LpLifecycleExecutor:
             ),
         )
         return report, built_steps
+
+    def _dry_run_switch(
+        self,
+        from_symbol: str,
+        token_id: int,
+        to_symbol: str,
+        width_spacings: int | None,
+        budget_usdc: Decimal,
+        key_bytes: bytes,
+        ephemeral_key: bool,
+    ) -> LpMintPlan:
+        """Project a full source exit and prove the target mint can be funded."""
+        if from_symbol.strip().lower() == to_symbol.strip().lower():
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.SYMBOL_NOT_IN_REGISTRY,
+                "a pool switch must target a different B20 symbol",
+            )
+        if width_spacings is None:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.DERIVED_WIDTH_UNAVAILABLE,
+                "the switch target carried no explicit tick-aligned width",
+            )
+        if budget_usdc <= 0:
+            raise ValueError(f"the switch target budget must be positive, not {budget_usdc}")
+
+        source = self._resolve_position(from_symbol, token_id)
+        source_observation = source.observation
+        held_source = self._enumerate_held_positions(source_observation)
+        live_others = [
+            held.token_id
+            for held in held_source
+            if held.live and held.token_id != token_id
+        ]
+        if live_others:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS,
+                "the Safe holds live position NFT(s) "
+                f"{', '.join(str(value) for value in live_others)} besides the tracked switch "
+                "source; refusing to project a second pool",
+            )
+        if source.staked:
+            accrued = self._read_gauge_reward_word(
+                source_observation.gauge_address,
+                build_gauge_earned_read_calldata(self._safe_address, token_id),
+                "earned(address,uint256)",
+            )
+            self._require_penalty_clear(
+                self._read_penalty_window(source_observation, token_id), accrued
+            )
+
+        amount0, amount1 = self._exit_amounts(source_observation, source.position)
+        projected_usdc, projected_source_stock = self._projected_inventory(
+            source_observation, source.position, amount0, amount1
+        )
+        with localcontext() as context:
+            context.prec = 50
+            expected_source_sale_usdc = int(
+                (
+                    Decimal(projected_source_stock)
+                    .scaleb(-source_observation.stock_decimals)
+                    * source_observation.price_usdc_per_stock
+                    * Decimal(10) ** source_observation.quote_decimals
+                ).to_integral_value(ROUND_FLOOR)
+            )
+        conservative_source_sale = int(
+            (
+                Decimal(expected_source_sale_usdc)
+                * (Decimal(1) - DEFAULT_MINT_SLIPPAGE_TOLERANCE)
+            ).to_integral_value(ROUND_FLOOR)
+        )
+        projected_target_usdc = projected_usdc + max(0, conservative_source_sale)
+
+        target_listing, target_observation, target_caps = self._observe_pool(to_symbol)
+        target_held = self._enumerate_held_positions(target_observation)
+        same_nfpm = (
+            target_observation.nfpm_address.lower()
+            == source_observation.nfpm_address.lower()
+        )
+        target_live_others = [
+            held.token_id
+            for held in target_held
+            if held.live and not (same_nfpm and held.token_id == token_id)
+        ]
+        if target_live_others:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS,
+                f"the target NFPM carries live position NFT(s) "
+                f"{', '.join(str(value) for value in target_live_others)} beyond the tracked "
+                "switch source; refusing before the source LP is touched",
+            )
+        target_stock = (
+            target_observation.token0_address
+            if target_observation.stock_is_token0
+            else target_observation.token1_address
+        )
+        target_stock_units = self._rpc.fetch_token_balance(target_stock, self._safe_address)
+        inventory = SafeInventory(
+            usdc_units=projected_target_usdc,
+            stock_units=target_stock_units,
+        )
+        directive = MintDirective(
+            budget_usdc=budget_usdc,
+            half_width_spacings=width_spacings,
+            width_source=WidthSource.EXPLICIT_OVERRIDE,
+        )
+        plan = plan_mint_entry(
+            self._plan_policy, target_observation, directive, inventory
+        )
+        if plan.balancing_swap.required and plan.balancing_swap.tranche_count > 1:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.MULTI_TRANCHE_SWAP_UNSUPPORTED,
+                f"the switch target {target_listing.symbol} needs "
+                f"{plan.balancing_swap.tranche_count} balancing tranches; the live surface "
+                "supports one, so the source LP stays untouched",
+            )
+        caps = list(source.caps)
+        caps.extend(target_caps)
+        caps.extend(plan.caps_enforced)
+        caps.append(
+            f"switch source projected to at least {projected_target_usdc} raw USDC after a "
+            f"{DEFAULT_MINT_SLIPPAGE_TOLERANCE} source-stock exit tolerance"
+        )
+        self._preflight(caps)
+        self._record_mint_plan(ExecutionMode.DRY_RUN, plan)
+        return plan
 
     def _dry_run_recenter(
         self,
@@ -4602,10 +4867,27 @@ class LpLifecycleExecutor:
             )
         else:
             outcome = "failed"
-            diagnostic = (
-                "the delivery transaction reverted on-chain; the Safe nonce was "
-                "consumed and the inner call did not execute"
-            )
+            try:
+                live_safe_nonce = self._safe_rpc.fetch_live_nonce()
+            except SafeTransactionUnavailableError as error:
+                diagnostic = (
+                    "the delivery transaction reverted on-chain atomically and the inner call "
+                    f"did not execute; the Safe nonce could not be reread ({error})"
+                )
+            else:
+                if live_safe_nonce == step.report.nonce:
+                    diagnostic = (
+                        "the delivery transaction reverted atomically on-chain and the inner "
+                        f"call did not execute; Safe nonce remains {live_safe_nonce}"
+                    )
+                else:
+                    diagnostic = (
+                        "the delivery transaction reverted atomically on-chain and the inner "
+                        f"call did not execute; live Safe nonce is {live_safe_nonce} versus "
+                        f"attempted nonce {step.report.nonce}, so any nonce advance must be "
+                        "reconciled independently rather than attributed to this reverted "
+                        "delivery"
+                    )
             print(
                 f"[{action}/{role.value}] FAILED {transaction_hash}: {diagnostic}",
                 file=sys.stderr,

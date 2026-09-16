@@ -197,4 +197,4 @@ ls -1 "${REPO_ROOT}/deploy/systemd/" | sed 's/^/  /'
 log "next steps, in order - see docs/deployment.md:"
 log "  1. seal the real values into ${CONFIG_DIR}/cycle.env and backup.env"
 log "  2. run the smoke checklist (docs/deployment.md)"
-log "  3. arm the timers: systemctl enable --now aero-bot-cycle@AAPLc.timer aero-bot-audit-backup.timer"
+log "  3. arm one cycle timer: aero-bot-cycle@auto.timer for dynamic B20 selection, or @AAPLc.timer to pin Apple; also arm aero-bot-audit-backup.timer"

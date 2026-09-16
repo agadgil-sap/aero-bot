@@ -46,6 +46,7 @@ from aero_bot.lp_calldata import (
 from aero_bot.lp_executor import (
     DEFAULT_LP_ROUTER_ALLOWANCE_USDC,
     ERC721_TOKEN_OF_OWNER_BY_INDEX_SELECTOR,
+    NFPM_APPROVAL_BUFFER_FRACTION,
     NFPM_INCREASE_LIQUIDITY_TOPIC0,
     LpExecutionRefusalCode,
     LpExecutionRefusalError,
@@ -1005,8 +1006,20 @@ def test_dry_run_mint_encodes_every_inner_call_from_the_plan() -> None:
         LpExecutionRole.ROUTER_ALLOWANCE: build_approval_calldata(
             AERODROME_ROUTER_ADDRESS, int(DEFAULT_LP_ROUTER_ALLOWANCE_USDC * 10**6)
         ),
-        LpExecutionRole.NFPM_USDC_ALLOWANCE: build_approval_calldata(NFPM_ADDRESS, usdc_desired),
-        LpExecutionRole.NFPM_STOCK_ALLOWANCE: build_approval_calldata(NFPM_ADDRESS, stock_desired),
+        LpExecutionRole.NFPM_USDC_ALLOWANCE: build_approval_calldata(
+            NFPM_ADDRESS,
+            int(
+                (Decimal(usdc_desired) * (Decimal(1) + NFPM_APPROVAL_BUFFER_FRACTION))
+                .to_integral_value(rounding="ROUND_CEILING")
+            ),
+        ),
+        LpExecutionRole.NFPM_STOCK_ALLOWANCE: build_approval_calldata(
+            NFPM_ADDRESS,
+            int(
+                (Decimal(stock_desired) * (Decimal(1) + NFPM_APPROVAL_BUFFER_FRACTION))
+                .to_integral_value(rounding="ROUND_CEILING")
+            ),
+        ),
         LpExecutionRole.MINT: build_lp_mint_calldata(
             LpMintParams(
                 token0_address=BASE_USDC_ADDRESS,
@@ -3231,7 +3244,7 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
             post_swap_stock_balance_units=10**12,
         ),
         safe_script=SafeRpcScript(
-            nonce_reads=[4, 6], signature_verdicts=[True] * 20
+            nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20
         ),
     )
 
@@ -3272,10 +3285,16 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
         AuditEventType.LP_EXECUTE_CONFIRMED,
         AuditEventType.LP_EXECUTE_SENT,
         AuditEventType.LP_EXECUTE_CONFIRMED,
-        # Phase 2: fresh post-swap replan/build, then approvals + mint.
+        # Phase 2: fresh post-swap replan/build, then execute the approvals only.
         AuditEventType.LP_MINT_PLANNED,
         *([AuditEventType.LP_TRANSACTION_BUILT] * 3),
-        *([AuditEventType.LP_EXECUTE_SENT, AuditEventType.LP_EXECUTE_CONFIRMED] * 3),
+        *([AuditEventType.LP_EXECUTE_SENT, AuditEventType.LP_EXECUTE_CONFIRMED] * 2),
+        # Phase 3: after approvals confirm, rebuild the final mint from the
+        # newest pool/balance state and broadcast it immediately.
+        AuditEventType.LP_MINT_PLANNED,
+        AuditEventType.LP_TRANSACTION_BUILT,
+        AuditEventType.LP_EXECUTE_SENT,
+        AuditEventType.LP_EXECUTE_CONFIRMED,
     ]
     planned = json.loads(records[0].payload_json)
     assert planned["mode"] == "execute"
@@ -3302,7 +3321,7 @@ def test_execute_mint_can_rebalance_excess_stock_into_usdc_then_mint(tmp_path: P
             post_swap_usdc_balance_units=10_000_000,
             post_swap_stock_balance_units=90_000_000,
         ),
-        safe_script=SafeRpcScript(nonce_reads=[4, 6], signature_verdicts=[True] * 20),
+        safe_script=SafeRpcScript(nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20),
     )
 
     report = executor.execute_mint(
@@ -3334,7 +3353,7 @@ def test_execute_mint_resizes_to_fresh_inventory_after_swap(tmp_path: Path) -> N
             allow_broadcasts=True,
             post_swap_stock_balance_units=3_492_000,
         ),
-        safe_script=SafeRpcScript(nonce_reads=[4, 6], signature_verdicts=[True] * 20),
+        safe_script=SafeRpcScript(nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20),
     )
 
     report = executor.execute_mint(
@@ -3368,7 +3387,7 @@ def make_execute_stake_executor(
     executor, _, _ = make_lp_executor(
         audit_path=audit_path,
         rpc_script=script,
-        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+        safe_script=SafeRpcScript(nonce_reads=[4, 4], signature_verdicts=[True] * 4),
         **executor_kwargs,  # type: ignore[arg-type]
     )
     return executor, script
@@ -3452,7 +3471,8 @@ def test_execute_reports_a_failed_delivery_and_halts(tmp_path: Path) -> None:
     assert report.completed is False
     assert report.steps[0].status == "failed"
     assert len(report.steps) == 1
-    assert "reverted on-chain" in report.steps[0].diagnostic
+    assert "reverted atomically on-chain" in report.steps[0].diagnostic
+    assert "Safe nonce remains" in report.steps[0].diagnostic
     assert len(rpc_script.broadcasts) == 1
     records = AuditStore(audit_path).read_records(100)
     assert records[4].event_type is AuditEventType.LP_EXECUTE_FAILED
@@ -3663,7 +3683,7 @@ def test_cli_execute_mint_broadcasts_and_exits_zero(
             post_swap_stock_balance_units=10**12,
         ),
         safe_script=SafeRpcScript(
-            nonce_reads=[4, 6], signature_verdicts=[True] * 20
+            nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20
         ),
     )
     with (
@@ -3708,7 +3728,7 @@ def test_cli_execute_with_a_failed_delivery_exits_one(
             allow_broadcasts=True,
             receipt_status=0,
         ),
-        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+        safe_script=SafeRpcScript(nonce_reads=[4, 4], signature_verdicts=[True] * 4),
     )
     with (
         patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),

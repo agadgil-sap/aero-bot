@@ -294,6 +294,27 @@ class FakeExecutor:
             )
         return SimpleNamespace()
 
+    def dry_run_switch(
+        self,
+        from_symbol: str,
+        token_id: int,
+        to_symbol: str,
+        width_spacings: int | None,
+        budget_usdc: Decimal,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> object:
+        """Preflight one cross-pool replacement without mutating chain state."""
+        self.calls.append(
+            ("switch_preflight", from_symbol, token_id, to_symbol, width_spacings, budget_usdc)
+        )
+        if self.refuse_next == "switch_preflight":
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "scripted switch preflight refusal",
+            )
+        return SimpleNamespace()
+
     def execute_mint(
         self,
         symbol: str,
@@ -1321,13 +1342,14 @@ class TestSelectorCycles:
         assert report.decision_action == "pool_switch"
         assert report.decision_reason == "pool_switch_triggered"
         assert [call[0] for call in executor.calls] == [
+            "switch_preflight",
             "unstake",
             "withdraw",
             "exit_swap",
             "mint",
             "stake",
         ]
-        assert executor.calls[3][1] == "BBBc"
+        assert executor.calls[4][1] == "BBBc"
         book = state_store.load()
         assert book.position is not None
         assert book.position.symbol == "BBBc"
@@ -1364,11 +1386,37 @@ class TestSelectorCycles:
             key_bytes=b"\x01" * 32,
             reference_prices_by_symbol=SELECTOR_REFERENCES,
         )
-        assert [call[0] for call in executor.calls] == ["unstake"]
+        assert [call[0] for call in executor.calls] == ["switch_preflight", "unstake"]
         assert "refused" in report.halted_reason
         book = state_store.load()
         assert book.position is not None
         assert book.position.symbol == "AAAc"
+
+    def test_switch_preflight_refusal_keeps_the_source_position_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """A target-plan refusal never unstake/withdraws the earning source LP."""
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=tracked_book(symbol="AAAc"),
+            reads=_tracked_reads(staked=True),
+        )
+        assert executor is not None
+        executor.refuse_next = "switch_preflight"
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert [call[0] for call in executor.calls] == ["switch_preflight"]
+        assert len(report.actions) == 1
+        assert report.actions[0].action == "switch_preflight"
+        assert report.actions[0].status == "refused"
+        assert "switch preflight refused" in report.halted_reason
+        book = state_store.load()
+        assert book.position is not None
+        assert book.position.symbol == "AAAc"
+        assert book.position.token_id == TRACKED_TOKEN_ID
 
     def test_per_pool_cooldown_blocks_only_its_own_pool(self, tmp_path: Path) -> None:
         """A BBBc cooldown skips BBBc and lets the cycle enter AAAc."""
