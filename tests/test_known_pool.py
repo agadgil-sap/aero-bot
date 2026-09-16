@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from aero_bot.executor import ExecutorRpcBackend
+from aero_bot.executor import ExecutionUnavailableError, ExecutorRpcBackend
 from aero_bot.known_pool import (
     KNOWN_POOL_SOURCE,
     grid_cell_lower_tick,
@@ -535,6 +535,57 @@ class TestDecisionFastPathWiring:
         assert [(item.symbol, item.pool.pool_address) for item in listings] == [
             ("FIXc", POOL_ADDRESS)
         ]
+
+    def test_verified_board_survives_pin_metadata_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A decimals RPC failure may skip a cache write but cannot discard the verified board."""
+        import aero_bot.strategy as strategy_module
+        from aero_bot.strategy import LiveStrategySources
+
+        sweep_candidate = make_candidate()
+        sweep = PoolDiscoveryResult(
+            venue=VenueId.AERODROME,
+            status=PoolDiscoveryStatus.VERIFIED,
+            source="lp-sugar:fixture@block:123",
+            observed_at=BASE_NOW,
+            snapshot_block=123,
+            pools=(sweep_candidate,),
+            diagnostics=("fixture sweep",),
+        )
+
+        class FakeExecutionSources:
+            def load_registry(self) -> B20RegistryResult:
+                return make_registry()
+
+            def discover_pools(self) -> PoolDiscoveryResult:
+                return sweep
+
+            def read_token_decimals(self, token_address: str) -> int:
+                raise ExecutionUnavailableError("metadata rate limited")
+
+        monkeypatch.setattr(
+            strategy_module, "LiveExecutionSources", lambda **_: FakeExecutionSources()
+        )
+        store = LpPoolPinStore(tmp_path / "lp_pool_pins.json")
+        progress: list[str] = []
+        sources = LiveStrategySources(
+            rpc_url="https://example.invalid",
+            sugar_address="0x27fc745390d1f4baf8d184fbd97748340f786634",
+            transport=KnownPoolRpcScript().transport(),
+            pool_pin_store=store,
+            progress=progress.append,
+            sleep=lambda _seconds: None,
+            timer=lambda: 0.0,
+        )
+
+        listings, block = sources.enumerate_pools()
+        assert block == 123
+        assert [(item.symbol, item.pool.pool_address) for item in listings] == [
+            ("FIXc", POOL_ADDRESS)
+        ]
+        assert store.load() == {}
+        assert any("pool-pin cache skipped for FIXc" in line for line in progress)
 
     def test_identity_drift_falls_back_to_the_sweep(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

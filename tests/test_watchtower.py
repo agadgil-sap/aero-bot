@@ -243,6 +243,31 @@ class FakeCloseExecutor:
             action=action, build=None, steps=(step,), completed=True, halted_reason=""
         )
 
+    def dry_run_recenter(
+        self,
+        symbol: str,
+        token_id: int,
+        width_spacings: int | None,
+        budget_usdc: Decimal | None,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> object:
+        """The watchtower never recenters; refuse if asked."""
+        raise AssertionError("the watchtower must never recenter")
+
+    def dry_run_switch(
+        self,
+        from_symbol: str,
+        token_id: int,
+        to_symbol: str,
+        width_spacings: int | None,
+        budget_usdc: Decimal,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> object:
+        """The watchtower never switches pools; refuse if asked."""
+        raise AssertionError("the watchtower must never switch pools")
+
     def execute_unstake(
         self,
         symbol: str,

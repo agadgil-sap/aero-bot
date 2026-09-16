@@ -52,6 +52,7 @@ from aero_bot.lp_executor import (
     LpExecutionRefusalError,
     LpExecutionRole,
     LpLifecycleExecutor,
+    LpMintDryRunReport,
     LpSafeExecutionPolicy,
     main,
 )
@@ -944,6 +945,7 @@ def decode_inner(calldata: str) -> bytes:
 # Mint dry-run composition
 # ---------------------------------------------------------------------------
 
+
 def test_lp_router_allowance_is_200_without_widening_manual_swap() -> None:
     """LP entry capacity is 200 USDC while the manual swap allowance stays 20."""
     assert Decimal("20") == DEFAULT_APPROVAL_STANDING_CAP_USDC
@@ -951,7 +953,6 @@ def test_lp_router_allowance_is_200_without_widening_manual_swap() -> None:
     assert LpSafeExecutionPolicy().router_allowance_standing_cap_usdc == Decimal("200")
     with pytest.raises(ValueError):
         LpSafeExecutionPolicy(router_allowance_standing_cap_usdc=Decimal("200.01"))
-
 
 
 def test_dry_run_mint_composes_the_full_entry_sequence() -> None:
@@ -1009,15 +1010,17 @@ def test_dry_run_mint_encodes_every_inner_call_from_the_plan() -> None:
         LpExecutionRole.NFPM_USDC_ALLOWANCE: build_approval_calldata(
             NFPM_ADDRESS,
             int(
-                (Decimal(usdc_desired) * (Decimal(1) + NFPM_APPROVAL_BUFFER_FRACTION))
-                .to_integral_value(rounding="ROUND_CEILING")
+                (
+                    Decimal(usdc_desired) * (Decimal(1) + NFPM_APPROVAL_BUFFER_FRACTION)
+                ).to_integral_value(rounding="ROUND_CEILING")
             ),
         ),
         LpExecutionRole.NFPM_STOCK_ALLOWANCE: build_approval_calldata(
             NFPM_ADDRESS,
             int(
-                (Decimal(stock_desired) * (Decimal(1) + NFPM_APPROVAL_BUFFER_FRACTION))
-                .to_integral_value(rounding="ROUND_CEILING")
+                (
+                    Decimal(stock_desired) * (Decimal(1) + NFPM_APPROVAL_BUFFER_FRACTION)
+                ).to_integral_value(rounding="ROUND_CEILING")
             ),
         ),
         LpExecutionRole.MINT: build_lp_mint_calldata(
@@ -3243,9 +3246,7 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
             allow_broadcasts=True,
             post_swap_stock_balance_units=10**12,
         ),
-        safe_script=SafeRpcScript(
-            nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20
-        ),
+        safe_script=SafeRpcScript(nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20),
     )
 
     report = executor.execute_mint(
@@ -3308,8 +3309,6 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
     assert AuditStore(audit_path).verify_chain().status.value == "verified"
 
 
-
-
 def test_execute_mint_can_rebalance_excess_stock_into_usdc_then_mint(tmp_path: Path) -> None:
     """The live two-phase mint confirms a stock sale, rereads balances, then mints."""
     executor, rpc_script, _ = make_lp_executor(
@@ -3341,6 +3340,7 @@ def test_execute_mint_can_rebalance_excess_stock_into_usdc_then_mint(tmp_path: P
         LpExecutionRole.MINT,
     ]
     assert len(rpc_script.broadcasts) == 5
+    assert isinstance(report.build, LpMintDryRunReport)
     assert report.build.plan.balancing_swap.required is False
     assert report.build.plan.budget_usdc == MINT_BUDGET_USDC
 
@@ -3368,8 +3368,10 @@ def test_execute_mint_resizes_to_fresh_inventory_after_swap(tmp_path: Path) -> N
     roles = [step.role for step in report.steps]
     assert roles.count(LpExecutionRole.BALANCING_SWAP) == 1
     assert roles[-1] is LpExecutionRole.MINT
+    assert isinstance(report.build, LpMintDryRunReport)
     assert report.build.plan.balancing_swap.required is False
     assert report.build.plan.budget_usdc < MINT_BUDGET_USDC
+
 
 def make_execute_stake_executor(
     audit_path: Path | None = None,
@@ -3526,7 +3528,6 @@ def test_execute_rotates_receipt_polling_across_backends() -> None:
     assert all(step.status == "confirmed" for step in report.steps)
 
 
-
 def test_execute_survives_a_forbidden_primary_receipt_endpoint() -> None:
     """A transient 403 on the primary receipt endpoint falls through to a healthy secondary."""
     primary = LpRpcScript(
@@ -3568,9 +3569,7 @@ def test_execute_recovers_when_broadcast_ack_is_lost_but_secondary_confirms(
         receipt_script=secondary,
     )
 
-    report = executor.execute_stake(
-        "FIXc", 77, bytes(Account.create().key), confirm_broadcast=True
-    )
+    report = executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
 
     assert report.completed is True
     assert all(step.status == "confirmed" for step in report.steps)
@@ -3682,9 +3681,7 @@ def test_cli_execute_mint_broadcasts_and_exits_zero(
             allow_broadcasts=True,
             post_swap_stock_balance_units=10**12,
         ),
-        safe_script=SafeRpcScript(
-            nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20
-        ),
+        safe_script=SafeRpcScript(nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20),
     )
     with (
         patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),

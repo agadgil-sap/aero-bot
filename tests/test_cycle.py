@@ -1,5 +1,6 @@
 """Pin the scheduled decision cycle's reconcile-decide-act behavior."""
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 from pathlib import Path
@@ -512,7 +513,7 @@ def make_runner(
     audit_seed: bool = False,
     now: datetime = QUIET_INSTANT,
     symbol: str | None = "FIXc",
-    sleep: object | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, AuditStore, CycleStateStore]:
     """Assemble one cycle runner over fully scripted boundaries."""
     store_path = tmp_path / "cycle_state.json"
@@ -572,7 +573,7 @@ def make_runner(
         audit_sink=audit,
         state_store=state_store,
         now=lambda: now,
-        **({"sleep": sleep} if sleep is not None else {}),
+        sleep=sleep if sleep is not None else (lambda _seconds: None),
     )
     return runner, fake_executor, audit, state_store
 
@@ -783,9 +784,7 @@ class TestLiveCycles:
             next_state=PolicyState(),
         )
 
-        actions, halted, book = runner._act(
-            tracked_book(), outcome, b"\x01" * 32, "FIXc"
-        )
+        actions, halted, book = runner._act(tracked_book(), outcome, b"\x01" * 32, "FIXc")
 
         assert halted == ""
         assert [record.action for record in actions] == [
@@ -823,9 +822,7 @@ class TestLiveCycles:
             next_state=PolicyState(),
         )
 
-        actions, halted, book = runner._act(
-            tracked_book(), outcome, b"\x01" * 32, "FIXc"
-        )
+        actions, halted, book = runner._act(tracked_book(), outcome, b"\x01" * 32, "FIXc")
 
         assert [record.action for record in actions] == ["recenter_preflight"]
         assert actions[0].status == "refused"
@@ -833,7 +830,6 @@ class TestLiveCycles:
         assert book.position is not None
         assert reads._statuses[TRACKED_TOKEN_ID].token_owner_address == GAUGE_ADDRESS
         assert [call[0] for call in executor.calls] == ["recenter_preflight"]
-
 
     def test_stale_low_burn_holds_the_returned_stock(self, tmp_path: Path) -> None:
         """A stale-low burn unstakes and withdraws but never swaps."""
@@ -906,9 +902,7 @@ class TestPostActionVisibility:
                 return self.block_number
 
         balances = LaggingBalances()
-        runner, executor, _, _ = make_runner(
-            tmp_path, balances=balances, sleep=sleeps.append
-        )
+        runner, executor, _, _ = make_runner(tmp_path, balances=balances, sleep=sleeps.append)
         assert executor is not None
         report = runner.run(
             CycleMode.LIVE,
@@ -920,9 +914,7 @@ class TestPostActionVisibility:
         assert report.decision_reconciliation is not None
         assert sleeps == [0.5, 1.0]
 
-    def test_visibility_timeout_marks_final_reconciliation_unverified(
-        self, tmp_path: Path
-    ) -> None:
+    def test_visibility_timeout_marks_final_reconciliation_unverified(self, tmp_path: Path) -> None:
         """A bounded catch-up failure is explicit instead of silently reporting stale state."""
         balances = FakeBalances(block_number=100)
         runner, executor, _, _ = make_runner(
@@ -938,8 +930,7 @@ class TestPostActionVisibility:
         assert report.final_reconciliation_verified is False
         assert "post-action reconciliation is unverified" in report.halted_reason
         assert any(
-            "WARNING: final balances may lag" in line
-            for line in report.reconciliation.diagnostics
+            "WARNING: final balances may lag" in line for line in report.reconciliation.diagnostics
         )
 
 
@@ -1470,6 +1461,28 @@ class TestCycleConfiguration:
             _symbol_from_arguments_and_environment("AAPLc", {CYCLE_SYMBOL_ENV: "FIXc"}) == "AAPLc"
         )
 
+    def test_selector_ignores_a_legacy_single_reference_instead_of_refusing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An AAPL-only sealed quote cannot block Aerodrome-authoritative auto mode."""
+        from aero_bot import cycle as cycle_module
+
+        captured: dict[str, object] = {}
+
+        class FakeRunner:
+            def run(self, mode: CycleMode, **kwargs: object) -> object:
+                captured.update(kwargs)
+                raise RuntimeError("selector reached runner")
+
+        monkeypatch.setenv(CYCLE_REFERENCE_PRICE_ENV, "317.10")
+        monkeypatch.setattr(
+            cycle_module, "build_cycle_runner", lambda *args, **kwargs: FakeRunner()
+        )
+        exit_code = cycle_module.main(["--symbol", "auto", "--dry-run", "--json"])
+        assert exit_code == 1
+        assert captured.get("reference_price_usdc") is None
+        assert captured.get("reference_prices_by_symbol") is None
+
     def test_switch_margin_defaults_and_overrides(self) -> None:
         """The margin defaults to the ruling's thirty percent."""
         assert _switch_margin_from_environment({}) == Decimal("0.30")
@@ -1501,11 +1514,7 @@ def test_token1_stock_in_range_clears_stale_recenter_anchor(tmp_path: Path) -> N
     assert book.position is not None
     stale_anchor = QUIET_INSTANT - timedelta(minutes=30)
     book = book.model_copy(
-        update={
-            "position": book.position.model_copy(
-                update={"out_of_range_since": stale_anchor}
-            )
-        }
+        update={"position": book.position.model_copy(update={"out_of_range_since": stale_anchor})}
     )
 
     reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))

@@ -213,6 +213,7 @@ class LpExecutionRefusalError(RuntimeError):
         """
         super().__init__(message)
         self.code = code
+        self.completed_steps: Any = []
 
 
 class LpExecutionRefusalCode(StrEnum):
@@ -355,7 +356,7 @@ class LpSafeExecutionPolicy(BaseModel):
             raise ValueError(
                 f"router_allowance_standing_cap_usdc {self.router_allowance_standing_cap_usdc}"
                 f" exceeds the documented bound of "
-            f"{LP_ROUTER_ALLOWANCE_CAP_CEILING_USDC} USDC; the "
+                f"{LP_ROUTER_ALLOWANCE_CAP_CEILING_USDC} USDC; the "
                 "allowance is bounded and never infinite"
             )
         return self
@@ -1824,9 +1825,7 @@ class LpLifecycleExecutor:
             )
             if swap_index is not None:
                 swap_prefix = current_steps[: swap_index + 1]
-                prefix_reports, halted_reason = self._execute_steps(
-                    "mint", swap_prefix, key_bytes
-                )
+                prefix_reports, halted_reason = self._execute_steps("mint", swap_prefix, key_bytes)
                 completed_reports += prefix_reports
                 built_history.extend(swap_prefix)
                 if halted_reason:
@@ -1907,13 +1906,9 @@ class LpLifecycleExecutor:
                     )
                 for step in prerequisite_steps:
                     if step.report.role == LpExecutionRole.NFPM_USDC_ALLOWANCE:
-                        confirmed_usdc_floor = max(
-                            confirmed_usdc_floor, approval_amount(step)
-                        )
+                        confirmed_usdc_floor = max(confirmed_usdc_floor, approval_amount(step))
                     elif step.report.role == LpExecutionRole.NFPM_STOCK_ALLOWANCE:
-                        confirmed_stock_floor = max(
-                            confirmed_stock_floor, approval_amount(step)
-                        )
+                        confirmed_stock_floor = max(confirmed_stock_floor, approval_amount(step))
 
             print(
                 "[mint] prerequisites confirmed; rebuilding the final mint from the "
@@ -1970,7 +1965,7 @@ class LpLifecycleExecutor:
         except (LpExecutionRefusalError, LpPlanRefusalError) as error:
             previous = tuple(getattr(error, "completed_steps", ()))
             if completed_reports and not previous:
-                error.completed_steps = completed_reports
+                error.__dict__["completed_steps"] = completed_reports
             self._record_refusal("mint", ExecutionMode.EXECUTE, error, symbol)
             raise
 
@@ -2517,14 +2512,10 @@ class LpLifecycleExecutor:
             else:
                 raise ValueError("required balancing swap has no executable direction")
         allowance_multiplier = (
-            Decimal(1) + NFPM_APPROVAL_BUFFER_FRACTION
-            if buffer_nfpm_approvals
-            else Decimal(1)
+            Decimal(1) + NFPM_APPROVAL_BUFFER_FRACTION if buffer_nfpm_approvals else Decimal(1)
         )
         usdc_approval_target = int(
-            (Decimal(usdc_desired) * allowance_multiplier).to_integral_value(
-                rounding=ROUND_CEILING
-            )
+            (Decimal(usdc_desired) * allowance_multiplier).to_integral_value(rounding=ROUND_CEILING)
         )
         stock_approval_target = int(
             (Decimal(stock_desired) * allowance_multiplier).to_integral_value(
@@ -3205,9 +3196,7 @@ class LpLifecycleExecutor:
         source_observation = source.observation
         held_source = self._enumerate_held_positions(source_observation)
         live_others = [
-            held.token_id
-            for held in held_source
-            if held.live and held.token_id != token_id
+            held.token_id for held in held_source if held.live and held.token_id != token_id
         ]
         if live_others:
             raise LpExecutionRefusalError(
@@ -3234,16 +3223,14 @@ class LpLifecycleExecutor:
             context.prec = 50
             expected_source_sale_usdc = int(
                 (
-                    Decimal(projected_source_stock)
-                    .scaleb(-source_observation.stock_decimals)
+                    Decimal(projected_source_stock).scaleb(-source_observation.stock_decimals)
                     * source_observation.price_usdc_per_stock
                     * Decimal(10) ** source_observation.quote_decimals
                 ).to_integral_value(ROUND_FLOOR)
             )
         conservative_source_sale = int(
             (
-                Decimal(expected_source_sale_usdc)
-                * (Decimal(1) - DEFAULT_MINT_SLIPPAGE_TOLERANCE)
+                Decimal(expected_source_sale_usdc) * (Decimal(1) - DEFAULT_MINT_SLIPPAGE_TOLERANCE)
             ).to_integral_value(ROUND_FLOOR)
         )
         projected_target_usdc = projected_usdc + max(0, conservative_source_sale)
@@ -3251,8 +3238,7 @@ class LpLifecycleExecutor:
         target_listing, target_observation, target_caps = self._observe_pool(to_symbol)
         target_held = self._enumerate_held_positions(target_observation)
         same_nfpm = (
-            target_observation.nfpm_address.lower()
-            == source_observation.nfpm_address.lower()
+            target_observation.nfpm_address.lower() == source_observation.nfpm_address.lower()
         )
         target_live_others = [
             held.token_id
@@ -3281,9 +3267,7 @@ class LpLifecycleExecutor:
             half_width_spacings=width_spacings,
             width_source=WidthSource.EXPLICIT_OVERRIDE,
         )
-        plan = plan_mint_entry(
-            self._plan_policy, target_observation, directive, inventory
-        )
+        plan = plan_mint_entry(self._plan_policy, target_observation, directive, inventory)
         if plan.balancing_swap.required and plan.balancing_swap.tranche_count > 1:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.MULTI_TRANCHE_SWAP_UNSUPPORTED,

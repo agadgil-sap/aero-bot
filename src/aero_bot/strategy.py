@@ -327,15 +327,24 @@ class LiveStrategySources:
         if pool is None:
             raise ValueError(f"symbol {symbol!r} has no discovered B20/USDC pool")
         if self._pool_pin_store is not None:
-            persist_decision_pool_pin(
-                self._pool_pin_store,
-                listing,
-                pool,
-                self._execution_sources.read_token_decimals(listing.address),
-                result.snapshot_block,
-                datetime.now(UTC),
-                result.source,
-            )
+            try:
+                stock_decimals = self._execution_sources.read_token_decimals(listing.address)
+            except ExecutionUnavailableError as error:
+                if self._progress is not None:
+                    self._progress(
+                        f"pool-pin cache skipped for {listing.symbol}: token metadata unavailable: "
+                        f"{error}"
+                    )
+            else:
+                persist_decision_pool_pin(
+                    self._pool_pin_store,
+                    listing,
+                    pool,
+                    stock_decimals,
+                    result.snapshot_block,
+                    datetime.now(UTC),
+                    result.source,
+                )
         return pool, result.snapshot_block
 
     def enumerate_pools(self) -> tuple[tuple[BoardListing, ...], int]:
@@ -425,15 +434,24 @@ class LiveStrategySources:
             # stale or hand-edited cache entries that caused the fast path to
             # fall back, instead of trapping future cycles in full discovery.
             if self._pool_pin_store is not None:
-                persist_decision_pool_pin(
-                    self._pool_pin_store,
-                    listing,
-                    pool,
-                    self._execution_sources.read_token_decimals(stock_token),
-                    result.snapshot_block,
-                    datetime.now(UTC),
-                    result.source,
-                )
+                try:
+                    stock_decimals = self._execution_sources.read_token_decimals(stock_token)
+                except ExecutionUnavailableError as error:
+                    if self._progress is not None:
+                        self._progress(
+                            f"pool-pin cache skipped for {symbol}: token metadata unavailable: "
+                            f"{error}"
+                        )
+                else:
+                    persist_decision_pool_pin(
+                        self._pool_pin_store,
+                        listing,
+                        pool,
+                        stock_decimals,
+                        result.snapshot_block,
+                        datetime.now(UTC),
+                        result.source,
+                    )
             listings.append(BoardListing(symbol=symbol, pool=pool))
         listings.sort(key=lambda listing: listing.symbol)
         return tuple(listings), result.snapshot_block

@@ -452,6 +452,18 @@ class CycleReportPayload(BaseModel):
 class CycleExecutorBoundary(Protocol):
     """Define the audited executor surface one live cycle may drive."""
 
+    def dry_run_recenter(
+        self,
+        symbol: str,
+        token_id: int,
+        width_spacings: int | None,
+        budget_usdc: Decimal | None,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> object:
+        """Preflight one same-pool recenter without broadcasting."""
+        ...
+
     def dry_run_switch(
         self,
         from_symbol: str,
@@ -637,11 +649,13 @@ def _action_hashes_fees_and_block(
     """Collect one action's delivery hashes, total fees, and latest confirmed block."""
     hashes = tuple(step.transaction_hash for step in report.steps)
     fees = sum(step.fee_wei or 0 for step in report.steps)
-    blocks = tuple(
-        int(step.block_number)
-        for step in report.steps
-        if step.status == "confirmed" and getattr(step, "block_number", None) is not None
-    )
+    blocks: list[int] = []
+    for step in report.steps:
+        if step.status != "confirmed":
+            continue
+        block_number = getattr(step, "block_number", None)
+        if isinstance(block_number, int):
+            blocks.append(block_number)
     return hashes, fees, max(blocks) if blocks else None
 
 
@@ -1302,9 +1316,8 @@ class CycleRunner:
             stock_address = self._stock_token_address_for(book.position.symbol)
             pool = self._pool_for_symbol(book.position.symbol)
             stock_decimals = self._sources.token_decimals(stock_address)
-            stock_is_token0 = (
-                normalize_evm_address(pool.token0_address)
-                == normalize_evm_address(stock_address)
+            stock_is_token0 = normalize_evm_address(pool.token0_address) == normalize_evm_address(
+                stock_address
             )
             first_edge_price = _price_at_tick(
                 status.position.tick_lower,
@@ -1421,10 +1434,7 @@ class CycleRunner:
         )
         # Include the tracked LP mark in portfolio equity.
         tracked_status = self._last_reconciliation.tracked_status
-        if (
-            tracked_status is not None
-            and tracked_status.position_value_usdc is not None
-        ):
+        if tracked_status is not None and tracked_status.position_value_usdc is not None:
             lp_value = tracked_status.position_value_usdc
             observation = observation.model_copy(
                 update={"equity_usd": observation.equity_usd + lp_value}
@@ -2513,14 +2523,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     single_reference: Decimal | None = None
     reference_map: dict[str, Decimal] = {}
     if isinstance(configured_reference, Decimal):
-        if symbol is None:
-            print(
-                f"selector mode needs per-symbol reference quotes in {CYCLE_REFERENCE_PRICE_ENV} "
-                "or --reference-price (SYMBOL=PRICE pairs)",
-                file=sys.stderr,
-            )
-            return EXIT_FAILURE
-        single_reference = configured_reference
+        # A legacy single-symbol quote belongs to pinned mode. Selector mode is
+        # Aerodrome-authoritative and references are diagnostic-only, so an
+        # AAPL-only sealed quote must not block cross-board operation or be
+        # misapplied to every B20 pool. Per-symbol maps remain available when
+        # the operator wants complete external diagnostics.
+        if symbol is not None:
+            single_reference = configured_reference
     elif configured_reference is not None:
         reference_map = configured_reference
     safe_address = os.environ.get(SAFE_ADDRESS_ENV, DEFAULT_CANARY_SAFE_ADDRESS)

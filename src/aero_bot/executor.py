@@ -47,7 +47,6 @@ from aero_bot.config import Settings
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
 from aero_bot.history import (
     SWAP_EVENT_TOPIC0,
-    EventHistoryRpcBackend,
     decode_swap_log,
     price_usdc_per_stock,
 )
@@ -629,6 +628,16 @@ class LiveExecutionSources:
         self._transport = transport
         self._sleep = sleep
         self._progress = progress
+        # Token metadata uses the same hardened endpoint rotation as execution.
+        # A late primary-RPC 403/429 must not waste an otherwise verified Sugar
+        # sweep merely because one decimals() read landed on a rate limit.
+        self._metadata_rpc = ExecutorRpcBackend(
+            rpc_url=rpc_url,
+            fallback_rpc_urls=fallback_rpc_urls,
+            transport=transport,
+            sleep=sleep,
+            progress=progress,
+        )
         # Token decimals are pure metadata, so one read per token is cached.
         self._decimals_cache: dict[str, int] = {}
         # One Sugar sweep per run: the first discovery is pinned (its pages
@@ -688,19 +697,14 @@ class LiveExecutionSources:
             The token's decimal count.
 
         Raises:
-            HistoryUnavailableError: If the read cannot complete or is
-                malformed.
+            ExecutionUnavailableError: If every configured RPC endpoint fails
+                or the decimals() response is malformed.
         """
         normalized = normalize_evm_address(token_address)
         cached = self._decimals_cache.get(normalized)
         if cached is not None:
             return cached
-        backend = EventHistoryRpcBackend(
-            rpc_url=self._rpc_url,
-            transport=self._transport,
-            sleep=self._sleep,
-        )
-        decimals = backend.read_erc20_decimals(normalized)
+        decimals = self._metadata_rpc.fetch_token_decimals(normalized)
         self._decimals_cache[normalized] = decimals
         return decimals
 
