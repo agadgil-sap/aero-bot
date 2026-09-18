@@ -712,7 +712,7 @@ def estimate_in_range_depth_usdc(
         MIN_HALF_WIDTH_SPACINGS,
         WidthSource.EXPLICIT_OVERRIDE,
     )
-    amount0, amount1 = position_amounts_for_liquidity(
+    amount0, amount1 = position_amounts_at_sqrt_ratio(
         sqrt_ratio, band.tick_lower, band.tick_upper, Decimal(pool_active_liquidity)
     )
     price = price_usdc_per_stock(sqrt_ratio, stock_is_token0, stock_decimals, quote_decimals)

@@ -526,6 +526,30 @@ def test_depth_estimate_values_one_spacing_of_active_liquidity() -> None:
     assert depth > Decimal(1000)
 
 
+def test_depth_estimate_tolerates_a_snapshot_at_the_band_boundary() -> None:
+    """Depth valuation remains defined when raw sqrt price lands on the derived edge."""
+    observation = pool_observation()
+    band = derive_position_range(
+        observation.current_tick,
+        observation.tick_spacing,
+        1,
+        WidthSource.EXPLICIT_OVERRIDE,
+    )
+    boundary_sqrt = sqrt_ratio_at_tick(band.tick_upper) + 1
+
+    depth = estimate_in_range_depth_usdc(
+        boundary_sqrt,
+        observation.tick_spacing,
+        observation.current_tick,
+        observation.pool_active_liquidity,
+        observation.stock_is_token0,
+        observation.stock_decimals,
+        observation.quote_decimals,
+    )
+
+    assert depth > Decimal(0)
+
+
 def test_balancing_swap_covers_the_shortfall_with_buffer_and_bound() -> None:
     """The swap ceils its USDC input over the buffered shortfall."""
     observation = pool_observation()
