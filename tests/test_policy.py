@@ -1350,6 +1350,29 @@ class TestDislocationMonitor:
         assert held.decision.action is PolicyActionKind.HOLD
         assert held.decision.reason is PolicyReason.HOLDING_INVENTORY_AWAITING_CONVERGENCE
 
+    def test_failed_entry_retry_stops_at_the_inventory_timeout(self) -> None:
+        """A failed mint cannot retry forever after the five-minute escape bound."""
+        engine = PolicyEngine()
+        state = PolicyState(
+            held_inventory=HeldInventory(
+                pool_address=POOL_ADDRESS,
+                token_address=TOKEN_ADDRESS,
+                stock_quantity=Decimal("0.15"),
+                held_since=BASE_OBSERVED_AT,
+                origin="failed_entry",
+            )
+        )
+        at_timeout = engine.decide(
+            state,
+            base_observation(
+                observed_at=BASE_OBSERVED_AT + timedelta(minutes=5),
+                reference_enforcement_enabled=False,
+            ),
+        )
+        assert at_timeout.decision.action is PolicyActionKind.SELL_INVENTORY
+        assert at_timeout.decision.reason is PolicyReason.INVENTORY_CONVERGENCE_TIMEOUT
+        assert at_timeout.next_state.held_inventory is None
+
     def test_convergence_timeout_sells_at_market_as_the_safety_bound(self) -> None:
         """Tokens still held five minutes after the burn sell at market."""
         engine, state = entered_session()

@@ -1299,12 +1299,15 @@ class PolicyEngine:
         inventory = state.held_inventory
         if inventory is None:  # pragma: no cover - guarded by the caller
             raise ValueError("inventory branch requires held stock tokens")
+        timed_out = (
+            observation.observed_at - inventory.held_since >= self._parameters.convergence_timeout
+        )
         # Failed-entry inventory is already the intended entry inventory, not
         # a stale-low safety hold. If the ordinary flat entry gates still pass,
         # retry the mint directly from these balances before considering a
-        # round-trip sale back to USDC. The original held_since remains the
-        # bounded escape timer if repeated retries cannot qualify or execute.
-        if inventory.origin == "failed_entry" and flat_description is None:
+        # round-trip sale back to USDC. The original held_since is a hard escape
+        # timer: once it expires, sell inventory rather than retrying forever.
+        if inventory.origin == "failed_entry" and flat_description is None and not timed_out:
             flat_state = state.model_copy(update={"held_inventory": None})
             retry = self._decide_flat(flat_state, observation, flat_description)
             if retry.decision.action is PolicyActionKind.ENTER:
@@ -1331,9 +1334,6 @@ class PolicyEngine:
             and not self._reference_stale(observation)
             and observation.amm_price_usdc
             >= reference * (Decimal(1) - self._parameters.dislocation_threshold_fraction)
-        )
-        timed_out = (
-            observation.observed_at - inventory.held_since >= self._parameters.convergence_timeout
         )
         if flat_description is not None:
             reason = PolicyReason.INVENTORY_FLAT_WINDOW_SELL
