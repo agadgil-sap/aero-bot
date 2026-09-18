@@ -1274,6 +1274,7 @@ class TestSelectorCycles:
         assert report.decision_reason == "entry_threshold_met"
         assert report.symbol == "BBBc"
         assert any("diagnostic-only" in note for note in report.input_notes)
+        assert any("10% headroom" in note for note in report.input_notes)
         assert any("board [" in note for note in report.input_notes)
 
     def test_selector_counts_tracked_lp_in_daily_loss_equity(self, tmp_path: Path) -> None:
@@ -1411,6 +1412,46 @@ class TestSelectorCycles:
         book = state_store.load()
         assert book.position is not None
         assert book.position.symbol == "AAAc"
+
+    def test_failed_switch_mint_preserves_target_inventory_for_retry(self, tmp_path: Path) -> None:
+        """A partial target mint keeps acquired stock tagged for direct retry."""
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=tracked_book(symbol="AAAc"),
+            reads=_tracked_reads(staked=True),
+        )
+        assert executor is not None
+
+        def refusing_mint(
+            symbol: str,
+            budget_usdc: Decimal,
+            width_spacings: int | None,
+            key_bytes: bytes,
+            *,
+            confirm_broadcast: bool,
+            ephemeral_key: bool = False,
+        ) -> LpActionExecutionReport:
+            executor.calls.append(("mint", symbol, budget_usdc, width_spacings))
+            runner._balances.stock_units = 3_000_000
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "scripted post-swap mint refusal",
+            )
+
+        executor.execute_mint = refusing_mint  # type: ignore[method-assign]
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+
+        assert "mint action refused" in report.halted_reason
+        book = state_store.load()
+        assert book.position is None
+        assert book.held_inventory is not None
+        assert book.held_inventory.symbol == "BBBc"
+        assert book.held_inventory.stock_quantity == Decimal("0.03")
+        assert book.held_inventory.origin == "failed_entry"
 
     def test_switch_preflight_refusal_keeps_the_source_position_untouched(
         self, tmp_path: Path

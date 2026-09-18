@@ -115,6 +115,11 @@ CYCLE_SYMBOL_ENV = "AERO_BOT_CYCLE_SYMBOL"
 # Environment variable carrying the cross-board switch margin as a fraction
 # (default 0.30, the captain's 2026-09-09 trial ruling).
 CYCLE_SWITCH_MARGIN_ENV = "AERO_BOT_CYCLE_SWITCH_MARGIN_FRACTION"
+# Dynamic selector sizing keeps ten percent of the observed in-range depth cap
+# unused. The target pool can move between preflight, source exit, balancing
+# swap, and the final mint rebuild; this headroom keeps a still-safe switch
+# from failing solely because live depth moved a few percent during execution.
+SELECTOR_DEPTH_HEADROOM_FRACTION = Decimal("0.90")
 # After a confirmed live action, the primary read endpoint must catch up to
 # the action's inclusion block before final reconciliation. This prevents a
 # load-balanced or briefly lagging RPC from reporting the pre-action balance
@@ -1504,15 +1509,26 @@ class CycleRunner:
             self._safe_address,
         )
         # Apply the same pool-authoritative doctrine to every selector option.
+        # Selector sizing also reserves ten percent of the observed depth cap
+        # so a few-percent live-depth move during a multi-step switch cannot
+        # strand inventory between source exit and target mint.
         options = tuple(
             option.model_copy(
                 update={
                     "observation": option.observation.model_copy(
-                        update={"reference_enforcement_enabled": False}
+                        update={
+                            "reference_enforcement_enabled": False,
+                            "pool_depth_usd": (
+                                option.observation.pool_depth_usd * SELECTOR_DEPTH_HEADROOM_FRACTION
+                            ),
+                        }
                     )
                 }
             )
             for option in options
+        )
+        notes = notes + (
+            "selector sizing reserves 10% headroom below each observed pool-depth cap",
         )
         # Selector observations start from loose Safe balances. When an LP is
         # already tracked, add its live marked value to every board option
@@ -1795,6 +1811,19 @@ class CycleRunner:
                     switch.to_symbol, switch_budget, switch_width, key_bytes, confirm_broadcast=True
                 ),
             ):
+                held_quantity = self._live_stock_quantity(switch.to_symbol)
+                if held_quantity > 0:
+                    switched_book = switched_book.model_copy(
+                        update={
+                            "held_inventory": HeldInventoryRecord(
+                                symbol=switch.to_symbol,
+                                token_address=self._stock_token_address_for(switch.to_symbol),
+                                stock_quantity=held_quantity,
+                                held_since=self._now(),
+                                origin="failed_entry",
+                            )
+                        }
+                    )
                 return records, halted, switched_book
             token_id = self._decode_mint_token_id(records[-1])
             if token_id is None:
