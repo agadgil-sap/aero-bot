@@ -1276,6 +1276,35 @@ class TestSelectorCycles:
         assert any("diagnostic-only" in note for note in report.input_notes)
         assert any("board [" in note for note in report.input_notes)
 
+    def test_selector_counts_tracked_lp_in_daily_loss_equity(self, tmp_path: Path) -> None:
+        """Deployed LP capital cannot masquerade as a selector-mode daily loss."""
+        policy_day = QUIET_INSTANT.astimezone(
+            __import__("zoneinfo").ZoneInfo("America/New_York")
+        ).date()
+        book = tracked_book(symbol="AAAc").model_copy(
+            update={
+                "day": policy_day,
+                "day_start_equity_usd": Decimal("18"),
+                "halted_day": None,
+            }
+        )
+        sources = SelectorCycleSources().with_listings(selector_listings(1))
+        runner, _, state_store = selector_runner(
+            tmp_path,
+            book=book,
+            reads=_tracked_reads(),
+            sources=sources,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN)
+
+        assert "daily_loss_halt_active" not in " ".join(report.input_notes)
+        assert any(
+            "selector equity includes tracked LP marked value 8 USDC" in note
+            for note in report.input_notes
+        )
+        assert state_store.load().halted_day is None
+
     def test_selector_enters_the_best_qualifying_pool(self, tmp_path: Path) -> None:
         """The live cycle mints and stakes the higher-APR pool only."""
         runner, executor, state_store = selector_runner(tmp_path)

@@ -1514,6 +1514,25 @@ class CycleRunner:
             )
             for option in options
         )
+        # Selector observations start from loose Safe balances. When an LP is
+        # already tracked, add its live marked value to every board option
+        # before policy evaluation so the daily-loss guard sees total managed
+        # portfolio equity rather than falsely treating deployed LP capital as
+        # a drawdown.
+        tracked_status = self._last_reconciliation.tracked_status
+        if tracked_status is not None and tracked_status.position_value_usdc is not None:
+            lp_value = tracked_status.position_value_usdc
+            options = tuple(
+                option.model_copy(
+                    update={
+                        "observation": option.observation.model_copy(
+                            update={"equity_usd": option.observation.equity_usd + lp_value}
+                        )
+                    }
+                )
+                for option in options
+            )
+            notes = notes + (f"selector equity includes tracked LP marked value {lp_value} USDC",)
         notes = notes + (
             "external references are diagnostic-only; selector actions use each "
             "resolved Aerodrome pool's on-chain price and state",
