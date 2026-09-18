@@ -100,15 +100,26 @@ def qualified_board() -> tuple[PoolBoardOption, ...]:
     )
 
 
-def held_state(pool_address: str, token_address: str) -> PolicyState:
-    """Build one state holding a freshly entered position in one pool."""
+def held_state(
+    pool_address: str,
+    token_address: str,
+    *,
+    age: timedelta = timedelta(minutes=20),
+) -> PolicyState:
+    """Build one state holding a position old enough for ordinary switch tests."""
     engine = PolicyEngine()
     entry = engine.decide(
         PolicyState(),
         board_option("AAAc", pool_address, token_address).observation,
     )
     assert entry.decision.action is PolicyActionKind.ENTER
-    return entry.next_state
+    position = entry.next_state.position
+    assert position is not None
+    return entry.next_state.model_copy(
+        update={
+            "position": position.model_copy(update={"entered_at": BASE_TIME - age})
+        }
+    )
 
 
 class TestBoardQualification:
@@ -213,6 +224,22 @@ class TestSwitchDiscipline:
             board_option("CCCc", CCC_POOL, CCC_TOKEN, emissions_apr=Decimal("1.2")),
         )
         return PolicyEngine(), held_state(AAA_POOL, AAA_TOKEN), options
+
+    def test_fresh_position_blocks_voluntary_switch_for_fifteen_minutes(self) -> None:
+        """A newly entered pool cannot churn before one persistence window."""
+        engine = PolicyEngine()
+        state = held_state(AAA_POOL, AAA_TOKEN, age=timedelta(minutes=5))
+        options = (
+            board_option("AAAc", AAA_POOL, AAA_TOKEN, emissions_apr=Decimal("2.0")),
+            board_option("BBBc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("9.0")),
+        )
+
+        selection = select_board(engine, state, options, {})
+
+        assert selection.outcome.decision.action is PolicyActionKind.HOLD
+        assert selection.switch is None
+        assert selection.selected_symbol == "AAAc"
+        assert "voluntary switch hold period active" in selection.summary
 
     def test_no_switch_below_the_margin(self) -> None:
         """A candidate inside the thirty percent margin never churns."""

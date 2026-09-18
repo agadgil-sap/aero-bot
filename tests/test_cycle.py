@@ -46,6 +46,7 @@ from aero_bot.lp_executor import (
     LpExecutionRefusalCode,
     LpExecutionRefusalError,
     LpExecutionRole,
+    LpPenaltyWindow,
     LpPositionStatusReport,
     LpSafePositionsSnapshot,
 )
@@ -454,19 +455,34 @@ def tracked_status(
     owner: str = SAFE_ADDRESS,
     value: Decimal = Decimal("8"),
     pnl: Decimal | None = Decimal("1"),
+    penalty_remaining_seconds: int | None = None,
 ) -> LpPositionStatusReport:
     """Build one minimal tracked-position status via unchecked construction."""
     view = SimpleNamespace(tick_lower=FIXTURE_RANGE_LOWER, tick_upper=FIXTURE_RANGE_UPPER)
-    return LpPositionStatusReport.model_construct(
-        symbol="FIXc",
-        pool_address=POOL_ADDRESS,
-        token_owner_address=owner,
-        gauge_address=GAUGE_ADDRESS,
-        position=view,
-        position_value_usdc=value,
-        unrealized_pnl_usdc=pnl,
-        pnl_diagnostic="" if pnl is not None else "no entry cost",
+    penalty = (
+        None
+        if penalty_remaining_seconds is None
+        else LpPenaltyWindow(
+            penalty_rate_bps=10_000,
+            min_stake_seconds=300,
+            deposit_timestamp=1_000,
+            window_clears_at_timestamp=1_000 + penalty_remaining_seconds,
+            remaining_seconds=penalty_remaining_seconds,
+        )
     )
+    values: dict[str, object] = {
+        "symbol": "FIXc",
+        "pool_address": POOL_ADDRESS,
+        "token_owner_address": owner,
+        "gauge_address": GAUGE_ADDRESS,
+        "position": view,
+        "position_value_usdc": value,
+        "unrealized_pnl_usdc": pnl,
+        "pnl_diagnostic": "" if pnl is not None else "no entry cost",
+    }
+    if penalty is not None:
+        values["penalty"] = penalty
+    return LpPositionStatusReport.model_construct(**values)
 
 
 def mint_receipt(token_id: int) -> dict[str, object]:
@@ -488,15 +504,16 @@ def tracked_book(
     owner: str = SAFE_ADDRESS,
     committed: Decimal = Decimal("7"),
     symbol: str = "FIXc",
+    entered_at: datetime = QUIET_INSTANT - timedelta(minutes=20),
 ) -> CycleStateBook:
-    """Build one book tracking the fixture position."""
+    """Build one book tracking a position mature enough for ordinary lifecycle tests."""
     return CycleStateBook(
         position=TrackedPosition(
             symbol=symbol,
             token_id=TRACKED_TOKEN_ID,
             pool_address=POOL_ADDRESS,
             committed_usd=committed,
-            entered_at=QUIET_INSTANT,
+            entered_at=entered_at,
         ),
         updated_at=QUIET_INSTANT,
     )
@@ -1377,6 +1394,31 @@ class TestSelectorCycles:
         # Exactly one position is funded after the switch.
         assert book.position.token_id == TRACKED_TOKEN_ID
 
+    def test_selector_defers_switch_inside_minimum_stake_penalty_window(
+        self, tmp_path: Path
+    ) -> None:
+        """A fresh staked position cannot churn into another pool before its penalty clears."""
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=tracked_book(symbol="AAAc"),
+            reads=_tracked_reads(staked=True, penalty_remaining_seconds=200),
+        )
+        assert executor is not None
+
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+
+        assert report.decision_action == "hold"
+        assert report.symbol == "AAAc"
+        assert executor.calls == []
+        assert any("minimum-stake penalty window clears" in note for note in report.input_notes)
+        book = state_store.load()
+        assert book.position is not None
+        assert book.position.symbol == "AAAc"
+
     def test_a_failed_switch_exit_halts_before_any_entry(self, tmp_path: Path) -> None:
         """A refused exit stops the switch with no second position minted."""
         runner, executor, state_store = selector_runner(
@@ -1504,12 +1546,17 @@ class TestSelectorCycles:
         assert state_store.load().position is not None
 
 
-def _tracked_reads(*, staked: bool = False) -> FakeReads:
+def _tracked_reads(
+    *, staked: bool = False, penalty_remaining_seconds: int | None = None
+) -> FakeReads:
     """Serve one live in-range tracked position for the switch fixtures."""
     reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
     reads.set_status(
         TRACKED_TOKEN_ID,
-        tracked_status(owner=GAUGE_ADDRESS if staked else SAFE_ADDRESS),
+        tracked_status(
+            owner=GAUGE_ADDRESS if staked else SAFE_ADDRESS,
+            penalty_remaining_seconds=penalty_remaining_seconds,
+        ),
     )
     return reads
 
