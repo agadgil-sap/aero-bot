@@ -504,7 +504,7 @@ def tracked_book(
     owner: str = SAFE_ADDRESS,
     committed: Decimal = Decimal("7"),
     symbol: str = "FIXc",
-    entered_at: datetime = QUIET_INSTANT - timedelta(minutes=20),
+    entered_at: datetime = QUIET_INSTANT - timedelta(minutes=70),
 ) -> CycleStateBook:
     """Build one book tracking a position mature enough for ordinary lifecycle tests."""
     return CycleStateBook(

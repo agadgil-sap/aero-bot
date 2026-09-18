@@ -50,7 +50,7 @@ DEFAULT_SWITCH_MARGIN_FRACTION = Decimal("0.30")
 # A newly entered pool must earn for one full policy persistence window before
 # a purely economic cross-pool switch may displace it. Safety exits and
 # same-pool maintenance still take precedence immediately.
-DEFAULT_SWITCH_MIN_HOLD = timedelta(minutes=15)
+DEFAULT_SWITCH_MIN_HOLD = timedelta(hours=1)
 
 
 class PoolBoardOption(BaseModel):

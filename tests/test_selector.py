@@ -104,7 +104,7 @@ def held_state(
     pool_address: str,
     token_address: str,
     *,
-    age: timedelta = timedelta(minutes=20),
+    age: timedelta = timedelta(minutes=70),
 ) -> PolicyState:
     """Build one state holding a position old enough for ordinary switch tests."""
     engine = PolicyEngine()
@@ -225,8 +225,8 @@ class TestSwitchDiscipline:
         )
         return PolicyEngine(), held_state(AAA_POOL, AAA_TOKEN), options
 
-    def test_fresh_position_blocks_voluntary_switch_for_fifteen_minutes(self) -> None:
-        """A newly entered pool cannot churn before one persistence window."""
+    def test_fresh_position_blocks_voluntary_switch_for_one_hour(self) -> None:
+        """A newly entered pool cannot churn during the one-hour switch hold."""
         engine = PolicyEngine()
         state = held_state(AAA_POOL, AAA_TOKEN, age=timedelta(minutes=5))
         options = (
