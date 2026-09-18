@@ -1554,13 +1554,37 @@ class CycleRunner:
             "resolved Aerodrome pool's on-chain price and state",
         )
         engine = PolicyEngine(LOCKED_POLICY_PARAMETERS, load_event_calendar())
+        policy_state = self._policy_state(book, self._last_reconciliation)
         selection = select_board(
             engine,
-            self._policy_state(book, self._last_reconciliation),
+            policy_state,
             options,
             self._cooldown_map(book),
             self._switch_margin_fraction,
         )
+        penalty = getattr(tracked_status, "penalty", None)
+        if (
+            selection.switch is not None
+            and penalty is not None
+            and penalty.remaining_seconds > 0
+            and book.position is not None
+        ):
+            held_option = next(
+                option for option in options if option.symbol == book.position.symbol
+            )
+            held_outcome = engine.decide(policy_state, held_option.observation)
+            selection = BoardSelection(
+                outcome=held_outcome,
+                evaluations=selection.evaluations,
+                selected_symbol=book.position.symbol,
+                switch=None,
+                summary=(
+                    f"holding {book.position.symbol}: cross-pool switch deferred for "
+                    f"{penalty.remaining_seconds}s until the active minimum-stake penalty "
+                    "window clears; "
+                    + selection.summary
+                ),
+            )
         decision_option = self._option_for_selection(selection, options)
         window = evaluate_event_window(self._now(), decision_option.token_address, engine.calendar)
         switch = selection.switch
