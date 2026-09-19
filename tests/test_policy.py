@@ -758,6 +758,64 @@ class TestPositionLifecycle:
         assert new_position.price_range.lower_price < above_price
         assert new_position.price_range.upper_price > above_price
 
+    def test_upside_recenter_shrinks_to_the_current_depth_cap(self) -> None:
+        """A shallower pool recenters smaller instead of repeatedly refusing the old size."""
+        engine, state = entered_session()
+        position = entered_position_for(state)
+        assert position.committed_usd == Decimal("160")
+        above_price = position.price_range.upper_price * Decimal("1.01")
+        waiting = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+                pool_depth_usd=Decimal("6000"),
+            ),
+        )
+        recentred = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 21, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+                pool_depth_usd=Decimal("6000"),
+            ),
+        )
+
+        assert recentred.decision.action is PolicyActionKind.RECENTER
+        assert recentred.decision.size_usd == Decimal("60")
+        assert recentred.decision.swap_plan is not None
+        assert recentred.decision.swap_plan.total_usd == Decimal("30")
+        assert recentred.next_state.position is not None
+        assert recentred.next_state.position.committed_usd == Decimal("60")
+        assert any("Recenter size reduced" in line for line in recentred.decision.diagnostics)
+
+    def test_upside_recenter_holds_when_depth_cap_is_zero(self) -> None:
+        """Zero current depth never burns an earning position without a replacement size."""
+        engine, state = entered_session()
+        position = entered_position_for(state)
+        above_price = position.price_range.upper_price * Decimal("1.01")
+        waiting = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+            ),
+        )
+        held = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 21, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+                pool_depth_usd=Decimal("0"),
+            ),
+        )
+
+        assert held.decision.action is PolicyActionKind.HOLD
+        assert held.decision.reason is PolicyReason.OPEN_ABOVE_RANGE_WAITING
+        assert held.next_state.position is not None
+        assert held.next_state.position.committed_usd == Decimal("160")
+        assert "no positive safe replacement" in held.decision.diagnostics[0]
+
     def test_returning_in_range_resets_the_recenter_wait(self) -> None:
         """A price returning inside the range clears the wait anchor."""
         engine, state = entered_session()

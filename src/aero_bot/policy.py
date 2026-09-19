@@ -975,6 +975,31 @@ class PolicyEngine:
             return "Registry-pause signal requires the policy to be flat in USDC."
         return None
 
+    def _recenter_size(
+        self,
+        position: PolicyPosition,
+        observation: PolicyObservation,
+    ) -> tuple[Decimal, tuple[str, ...]]:
+        """Cap maintenance size to the current pool-depth hard gate.
+
+        A position can become too large for the current depth cap after entry as
+        liquidity leaves the pool. Recenter is a fresh mint, so it must obey the
+        same current-depth constraint instead of blindly recycling the historical
+        committed amount. Selector mode already applies its ten-percent depth
+        headroom to observation.pool_depth_usd before this policy runs.
+
+        Returns:
+            The safe replacement-mint size and any resizing diagnostic.
+        """
+        depth_cap = observation.pool_depth_usd * self._parameters.max_position_depth_fraction
+        size_usd = min(position.committed_usd, depth_cap)
+        if size_usd < position.committed_usd:
+            return size_usd, (
+                f"Recenter size reduced from {position.committed_usd} to {size_usd} USDC "
+                f"because the current depth cap is {depth_cap} USDC.",
+            )
+        return size_usd, ()
+
     def _decide_with_position(
         self,
         state: PolicyState,
@@ -1074,11 +1099,24 @@ class PolicyEngine:
             )
             waited = observation.observed_at - wait_anchor
             if waited >= self._parameters.recenter_wait:
+                recenter_size, resize_diagnostics = self._recenter_size(position, observation)
+                if recenter_size <= 0:
+                    waiting_position = position.model_copy(
+                        update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
+                    )
+                    return self._hold(
+                        state.model_copy(update={"position": waiting_position}),
+                        PolicyReason.OPEN_ABOVE_RANGE_WAITING,
+                        (
+                            "The current pool-depth cap leaves no positive safe replacement "
+                            "mint size; holding the existing position until depth recovers.",
+                        ),
+                    )
                 # The gas sense-check gate defers non-urgent recenters.
                 deferred, defer_diagnostics = self._gas_gate_blocks(
                     observation,
                     self._parameters.recenter_batch_gas_units,
-                    position.committed_usd,
+                    recenter_size,
                 )
                 if deferred:
                     # The anchor persists so the elapsed wait stays elapsed and
@@ -1094,7 +1132,7 @@ class PolicyEngine:
                 # The recenter width is re-derived from the target net daily
                 # yield at the current observables, then the range is rebuilt
                 # around the current pool price.
-                width_solution = self._solve_range_width(observation, position.committed_usd)
+                width_solution = self._solve_range_width(observation, recenter_size)
                 new_range = self.build_aligned_range(
                     observation.amm_price_usdc, width_solution.half_width_fraction
                 )
@@ -1105,11 +1143,12 @@ class PolicyEngine:
                 # re-mint buys roughly half of it back into stock.
                 swap_plan = self._swap_plan(
                     SwapDirection.BUY_STOCK,
-                    position.committed_usd / Decimal(2),
+                    recenter_size / Decimal(2),
                     observation.pool_depth_usd,
                 )
                 diagnostics = (
-                    (
+                    resize_diagnostics
+                    + (
                         f"Upside out-of-range wait of {waited} elapsed the locked "
                         f"recenter wait {self._parameters.recenter_wait}.",
                         f"New range {new_range.lower_price}..{new_range.upper_price} "
@@ -1126,6 +1165,7 @@ class PolicyEngine:
                 next_position = position.model_copy(
                     update={
                         "price_range": new_range,
+                        "committed_usd": recenter_size,
                         "entered_at": observation.observed_at,
                         "out_of_range_since": None,
                         "out_of_range_side": None,
@@ -1138,7 +1178,7 @@ class PolicyEngine:
                         reason=PolicyReason.RECENTER_WAIT_ELAPSED,
                         diagnostics=diagnostics,
                         price_range=new_range,
-                        size_usd=position.committed_usd,
+                        size_usd=recenter_size,
                         swap_plan=swap_plan,
                         estimated_gas_units=gas_units,
                         estimated_gas_cost_usd=gas_cost_usd,
@@ -1196,10 +1236,20 @@ class PolicyEngine:
                 return self._hold(
                     waiting_state, PolicyReason.OPEN_BELOW_EDGE_HOLDING, diagnostics
                 )
+            recenter_size, resize_diagnostics = self._recenter_size(position, observation)
+            if recenter_size <= 0:
+                return self._hold(
+                    waiting_state,
+                    PolicyReason.OPEN_BELOW_EDGE_HOLDING,
+                    (
+                        "The current pool-depth cap leaves no positive safe replacement "
+                        "mint size; holding the existing position until depth recovers.",
+                    ),
+                )
             deferred, defer_diagnostics = self._gas_gate_blocks(
                 observation,
                 self._parameters.recenter_batch_gas_units,
-                position.committed_usd,
+                recenter_size,
             )
             if deferred:
                 return self._hold(
@@ -1210,14 +1260,14 @@ class PolicyEngine:
             # needed to rebalance instead of round-tripping the whole position.
             swap_plan = self._swap_plan(
                 SwapDirection.SELL_STOCK,
-                position.committed_usd / Decimal(2),
+                recenter_size / Decimal(2),
                 observation.pool_depth_usd,
             )
             gas_units, gas_cost_usd = self._batch_gas(
                 observation, self._parameters.recenter_batch_gas_units
             )
             economic, economics_diagnostics = self._downside_recenter_economics(
-                observation, position.committed_usd, swap_plan, gas_cost_usd
+                observation, recenter_size, swap_plan, gas_cost_usd
             )
             if not economic:
                 return self._hold(
@@ -1225,20 +1275,22 @@ class PolicyEngine:
                     PolicyReason.DOWNSIDE_RECENTER_UNECONOMIC,
                     economics_diagnostics,
                 )
-            width_solution = self._solve_range_width(observation, position.committed_usd)
+            width_solution = self._solve_range_width(observation, recenter_size)
             new_range = self.build_aligned_range(
                 observation.amm_price_usdc, width_solution.half_width_fraction
             )
             next_position = position.model_copy(
                 update={
                     "price_range": new_range,
+                    "committed_usd": recenter_size,
                     "entered_at": observation.observed_at,
                     "out_of_range_since": None,
                     "out_of_range_side": None,
                 }
             )
             diagnostics = (
-                (
+                resize_diagnostics
+                + (
                     f"Downside out-of-range wait {waited} and displacement "
                     f"{distance_fraction} passed the locked recenter gates.",
                     f"New range {new_range.lower_price}..{new_range.upper_price} "
@@ -1254,7 +1306,7 @@ class PolicyEngine:
                     reason=PolicyReason.DOWNSIDE_RECENTER_ECONOMIC,
                     diagnostics=diagnostics,
                     price_range=new_range,
-                    size_usd=position.committed_usd,
+                    size_usd=recenter_size,
                     swap_plan=swap_plan,
                     estimated_gas_units=gas_units,
                     estimated_gas_cost_usd=gas_cost_usd,
