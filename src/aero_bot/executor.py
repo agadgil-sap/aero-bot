@@ -178,7 +178,12 @@ class ExecutionUnavailableError(RuntimeError):
 
 
 class ExecutorRpcRevertError(ExecutionUnavailableError):
-    """Signal that an RPC call reverted inside a contract."""
+    """Signal that an RPC call reverted inside a contract, preserving public revert bytes."""
+
+    def __init__(self, message: str, revert_data: str = "") -> None:
+        """Keep the human RPC message plus any 0x-prefixed EVM revert payload."""
+        super().__init__(message)
+        self.revert_data = revert_data
 
 
 class BroadcastTimeoutError(ExecutionUnavailableError):
@@ -1012,6 +1017,30 @@ class ExecutorRpcBackend:
             ),
         )
 
+    def eth_call_from_at(
+        self,
+        from_address: str,
+        to_address: str,
+        calldata: str,
+        block_tag: str,
+        value_wei: int = 0,
+    ) -> str:
+        """Replay one inner call from an explicit sender at a pinned block.
+
+        The call is diagnostic-only and never signs or broadcasts. It lets a
+        failed Safe delivery replay its exact inner call directly from the Safe
+        so the underlying contract revert can be observed instead of only the
+        Safe wrapper's outer failure.
+        """
+        call: dict[str, str] = {
+            "from": normalize_evm_address(from_address),
+            "to": normalize_evm_address(to_address),
+            "data": calldata,
+        }
+        if value_wei:
+            call["value"] = hex(value_wei)
+        return cast("str", self._rpc_call("eth_call", [call, block_tag]))
+
     def fetch_block_number(self) -> int:
         """Read the endpoint's latest block number.
 
@@ -1348,6 +1377,19 @@ class ExecutorRpcBackend:
         except ValueError as error:
             raise ExecutionUnavailableError(f"{source} returned a malformed quantity") from error
 
+    @staticmethod
+    def _extract_revert_data(value: object) -> str:
+        """Return the first bounded 0x-prefixed revert payload in an RPC error value."""
+        if isinstance(value, str) and value.startswith("0x"):
+            return value
+        if isinstance(value, dict):
+            for key in ("data", "result", "return", "output"):
+                if key in value:
+                    found = ExecutorRpcBackend._extract_revert_data(value[key])
+                    if found:
+                        return found
+        return ""
+
     def _rpc_call(self, method: str, params: list[object]) -> object:
         """Perform one JSON-RPC request with retry and backoff.
 
@@ -1415,7 +1457,11 @@ class ExecutorRpcBackend:
                 error_code = error_body.get("code")
                 error_message = str(error_body.get("message", ""))
                 if error_code == EXECUTION_REVERT_ERROR_CODE or "revert" in error_message.lower():
-                    raise ExecutorRpcRevertError(f"RPC call reverted: {error_message}")
+                    revert_data = self._extract_revert_data(error_body.get("data"))
+                    raise ExecutorRpcRevertError(
+                        f"RPC call reverted: {error_message}",
+                        revert_data=revert_data,
+                    )
                 if error_code == RATE_LIMIT_ERROR_CODE or "rate limit" in error_message.lower():
                     failure = f"RPC error {error_code}: {error_message}"
                     continue

@@ -54,6 +54,7 @@ from aero_bot.lp_executor import (
     LpLifecycleExecutor,
     LpMintDryRunReport,
     LpSafeExecutionPolicy,
+    decode_evm_revert_data,
     main,
 )
 from aero_bot.lp_pins import LpPoolPin, LpPoolPinStore
@@ -145,6 +146,18 @@ AERO_POOL_ADDRESS = "0x" + "ee" * 20
 def word_hex(value: int) -> str:
     """Encode one integer as the 0x-prefixed 32-byte word JSON-RPC returns."""
     return "0x" + value.to_bytes(32, "big").hex()
+
+
+def error_string_data(message: str) -> str:
+    """Encode one Solidity Error(string) revert payload."""
+    raw = message.encode()
+    padded = raw + b"\x00" * ((32 - len(raw) % 32) % 32)
+    return (
+        "0x08c379a0"
+        + (32).to_bytes(32, "big").hex()
+        + len(raw).to_bytes(32, "big").hex()
+        + padded.hex()
+    )
 
 
 def signed_word(value: int) -> bytes:
@@ -361,6 +374,8 @@ class LpRpcScript:
         receipt_status: int = 1,
         receipt_present: bool = True,
         receipt_http_status: int = 200,
+        replay_revert_message: str = "execution reverted",
+        replay_revert_data: str = "0x",
         estimate_reverts_after: int | None = None,
         estimate_revert_message: str = "execution reverted: PSC",
         estimate_gs026_lag_calls: int = 0,
@@ -438,6 +453,8 @@ class LpRpcScript:
                 every poll empty so the bounded wait can time out.
             receipt_http_status: HTTP status served only for receipt reads;
                 non-200 values simulate one unhealthy receipt endpoint.
+            replay_revert_message: Error message returned by diagnostic inner-call replay.
+            replay_revert_data: Raw 0x-prefixed revert bytes returned by that replay.
             estimate_reverts_after: Make every estimateGas call past this
                 count revert with estimate_revert_message, counting both the
                 build-time and execute-time estimates.
@@ -506,6 +523,8 @@ class LpRpcScript:
         self.receipt_status = receipt_status
         self.receipt_present = receipt_present
         self.receipt_http_status = receipt_http_status
+        self.replay_revert_message = replay_revert_message
+        self.replay_revert_data = replay_revert_data
         self.estimate_reverts_after = estimate_reverts_after
         self.estimate_revert_message = estimate_revert_message
         self.estimate_gs026_lag_remaining = estimate_gs026_lag_calls
@@ -544,6 +563,24 @@ class LpRpcScript:
         elif method == "eth_blockNumber":
             result = hex(self.fast_block_number)
         elif method == "eth_call":
+            call = params[0]
+            if (
+                isinstance(call, dict)
+                and "from" in call
+                and self.receipt_status == 0
+            ):
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "error": {
+                            "code": 3,
+                            "message": self.replay_revert_message,
+                            "data": self.replay_revert_data,
+                        },
+                    },
+                )
             result = self._eth_call(str(params[0]["to"]).lower(), str(params[0]["data"]))
         elif method == "eth_estimateGas":
             calldata = str(params[0]["data"])
@@ -3461,11 +3498,42 @@ def test_execute_refuses_a_signature_rejected_at_execute_time(tmp_path: Path) ->
     assert len(script.broadcasts) == 1
 
 
+def test_decode_evm_revert_data_decodes_error_string_and_panic() -> None:
+    """Standard Solidity revert payloads become compact human diagnostics."""
+    message = b"fixture inner failure"
+    padded = message.ljust((len(message) + 31) // 32 * 32, b"\x00")
+    error_data = (
+        "0x08c379a0"
+        + (32).to_bytes(32, "big").hex()
+        + len(message).to_bytes(32, "big").hex()
+        + padded.hex()
+    )
+    panic_data = "0x4e487b71" + (0x11).to_bytes(32, "big").hex()
+
+    assert decode_evm_revert_data(error_data) == "Solidity Error('fixture inner failure')"
+    assert decode_evm_revert_data(panic_data) == (
+        "Solidity Panic(0x11: arithmetic overflow or underflow)"
+    )
+
+
 def test_execute_reports_a_failed_delivery_and_halts(tmp_path: Path) -> None:
-    """An on-chain revert marks the step failed and stops the sequence."""
+    """An on-chain revert records the underlying inner-call replay evidence."""
     audit_path = tmp_path / "audit.sqlite3"
+    message = b"fixture inner failure"
+    padded = message.ljust((len(message) + 31) // 32 * 32, b"\x00")
+    replay_data = (
+        "0x08c379a0"
+        + (32).to_bytes(32, "big").hex()
+        + len(message).to_bytes(32, "big").hex()
+        + padded.hex()
+    )
     executor, rpc_script = make_execute_stake_executor(
-        audit_path=audit_path, script_kwargs={"receipt_status": 0}
+        audit_path=audit_path,
+        script_kwargs={
+            "receipt_status": 0,
+            "replay_revert_message": "execution reverted",
+            "replay_revert_data": replay_data,
+        },
     )
 
     report = executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
@@ -3475,11 +3543,14 @@ def test_execute_reports_a_failed_delivery_and_halts(tmp_path: Path) -> None:
     assert len(report.steps) == 1
     assert "reverted atomically on-chain" in report.steps[0].diagnostic
     assert "Safe nonce remains" in report.steps[0].diagnostic
+    assert "inner-call replay at receipt and parent block agrees" in report.steps[0].diagnostic
+    assert "fixture inner failure" in report.steps[0].diagnostic
     assert len(rpc_script.broadcasts) == 1
     records = AuditStore(audit_path).read_records(100)
     assert records[4].event_type is AuditEventType.LP_EXECUTE_FAILED
     failed = json.loads(records[4].payload_json)
     assert failed["outcome"] == "failed"
+    assert "fixture inner failure" in failed["diagnostic"]
 
 
 def test_execute_reports_an_unconfirmed_delivery_as_a_warning(tmp_path: Path) -> None:

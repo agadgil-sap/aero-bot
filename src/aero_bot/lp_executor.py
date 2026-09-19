@@ -198,6 +198,55 @@ TIMING_PRECISION = Decimal("0.001")
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_REFUSED = 2
+# Standard Solidity revert selectors.
+ERROR_STRING_SELECTOR = "08c379a0"
+PANIC_SELECTOR = "4e487b71"
+PANIC_DESCRIPTIONS: dict[int, str] = {
+    0x01: "assertion failed",
+    0x11: "arithmetic overflow or underflow",
+    0x12: "division or modulo by zero",
+    0x21: "invalid enum conversion",
+    0x22: "invalid storage byte array encoding",
+    0x31: "pop on empty array",
+    0x32: "array index out of bounds",
+    0x41: "memory allocation overflow",
+    0x51: "call to uninitialized internal function",
+}
+
+
+def decode_evm_revert_data(revert_data: str) -> str:
+    """Decode standard Solidity revert bytes without requiring a contract ABI."""
+    if not revert_data or revert_data == "0x":
+        return "empty revert data"
+    if not revert_data.startswith("0x"):
+        return "malformed revert data"
+    try:
+        raw = bytes.fromhex(revert_data[2:])
+    except ValueError:
+        return "malformed revert data"
+    if len(raw) < 4:
+        return f"short revert data 0x{raw.hex()}"
+    selector = raw[:4].hex()
+    payload = raw[4:]
+    if selector == ERROR_STRING_SELECTOR and len(payload) >= 64:
+        try:
+            offset = int.from_bytes(payload[:32], "big")
+            if offset + 32 > len(payload):
+                raise ValueError("string offset outside payload")
+            length = int.from_bytes(payload[offset : offset + 32], "big")
+            start = offset + 32
+            end = start + length
+            if end > len(payload):
+                raise ValueError("string extends past payload")
+            message = payload[start:end].decode("utf-8", errors="replace")
+        except (ValueError, OverflowError):
+            return "Solidity Error(string) with malformed payload"
+        return f"Solidity Error({message!r})"
+    if selector == PANIC_SELECTOR and len(payload) >= 32:
+        code = int.from_bytes(payload[:32], "big")
+        description = PANIC_DESCRIPTIONS.get(code, "unknown panic")
+        return f"Solidity Panic(0x{code:x}: {description})"
+    return f"custom error selector 0x{selector} ({len(payload)} payload bytes)"
 
 
 class LpExecutionRefusalError(RuntimeError):
@@ -4872,6 +4921,7 @@ class LpLifecycleExecutor:
                         "reconciled independently rather than attributed to this reverted "
                         "delivery"
                     )
+            diagnostic += "; " + self._diagnose_failed_inner_call(step, block_number)
             print(
                 f"[{action}/{role.value}] FAILED {transaction_hash}: {diagnostic}",
                 file=sys.stderr,
@@ -4910,6 +4960,47 @@ class LpLifecycleExecutor:
             delivery_ms=delivery_ms,
             send_ms=send_ms,
             diagnostic=diagnostic,
+        )
+
+    def _diagnose_failed_inner_call(self, step: _BuiltLpStep, block_number: int) -> str:
+        """Replay a reverted Safe inner call read-only and summarize its revert evidence.
+
+        The outer Safe execution intentionally collapses failed zero-gas-price
+        inner calls to GS013. Replaying the exact inner target/data directly
+        from the Safe at the receipt block and its parent can expose the
+        underlying Solidity error without signing or broadcasting anything.
+        """
+        observations: list[tuple[str, str]] = []
+        for label, number in (
+            ("receipt block", block_number),
+            ("parent block", max(block_number - 1, 0)),
+        ):
+            try:
+                self._rpc.eth_call_from_at(
+                    self._safe_address,
+                    step.transaction.to_address,
+                    step.transaction.data,
+                    hex(number),
+                    step.transaction.value_wei,
+                )
+            except ExecutorRpcRevertError as error:
+                detail = (
+                    decode_evm_revert_data(error.revert_data)
+                    if error.revert_data
+                    else str(error)
+                )
+                observations.append((label, detail[:500]))
+            except ExecutionUnavailableError as error:
+                observations.append((label, f"diagnostic replay unavailable: {error}"[:500]))
+            else:
+                observations.append((label, "inner replay succeeded"))
+        first = observations[0][1]
+        second = observations[1][1]
+        if first == second:
+            return f"inner-call replay at receipt and parent block agrees: {first}"
+        return (
+            f"inner-call replay is state-sensitive: {observations[0][0]} -> {first}; "
+            f"{observations[1][0]} -> {second}"
         )
 
     def _await_receipt_multi(self, transaction_hash: str) -> dict[str, object] | None:
