@@ -423,7 +423,7 @@ def test_mint_composition_splits_the_budget_into_both_sides() -> None:
     # carries roughly a third of the budget and the stock side the rest.
     assert Decimal("0.2") < amounts.token0_value_usdc / Decimal(7) < Decimal("0.45")
     assert Decimal("0.55") < amounts.token1_value_usdc / Decimal(7) < Decimal("0.8")
-    # Mint minima are geometric: they cover a bounded quarter-tick execution
+    # Mint minima are geometric: they cover a bounded 0.35-tick execution
     # move while refusing plans whose executable liquidity would fall below
     # the 95-percent utilization floor.
     assert amounts.execution_price_drift_ticks == DEFAULT_MINT_EXECUTION_DRIFT_TICKS
@@ -445,7 +445,7 @@ def test_execution_envelope_would_have_accepted_the_live_psc_move() -> None:
     # The old one-percent stock minimum was 13,667,804 and reverted PSC.
     assert minimum1 < 13_651_320 < 13_667_804
     assert utilization >= MIN_MINT_EXECUTION_UTILIZATION_FRACTION
-    # The actual inclusion price remains inside the quarter-tick envelope.
+    # The actual inclusion price remains inside the calibrated execution envelope.
     with localcontext() as decimal_context:
         decimal_context.prec = MATH_PRECISION
         tick_move = (
@@ -455,6 +455,46 @@ def test_execution_envelope_would_have_accepted_the_live_psc_move() -> None:
         )
     assert abs(tick_move) < DEFAULT_MINT_EXECUTION_DRIFT_TICKS
     assert minimum0 > 0
+
+
+def test_calibrated_envelope_covers_the_live_mstr_recenter_psc_move() -> None:
+    """The 04:54 MSTRc failure's 0.312-tick move fits the 0.35-tick envelope."""
+    anchor_sqrt = 63702423830535303671726084235
+    inclusion_sqrt = 63701428588523091055902992096
+    desired0 = 22_015_761
+    desired1 = 31_658_587
+    # Reconstructing the execution-block composition from the desired amounts
+    # shows the stock side could actually pull only this many raw units.
+    execution_amount1 = 30_530_400
+
+    old_minimum0, old_minimum1, _ = plan_mint_execution_minima(
+        anchor_sqrt,
+        -4390,
+        -4350,
+        desired0,
+        desired1,
+        Decimal("0.25"),
+    )
+    minimum0, minimum1, utilization = plan_mint_execution_minima(
+        anchor_sqrt,
+        -4390,
+        -4350,
+        desired0,
+        desired1,
+    )
+
+    assert old_minimum1 > execution_amount1
+    assert minimum1 <= execution_amount1
+    assert minimum0 < old_minimum0
+    assert utilization >= MIN_MINT_EXECUTION_UTILIZATION_FRACTION
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        tick_move = (
+            (Decimal(inclusion_sqrt) / Decimal(anchor_sqrt)).ln()
+            * Decimal(2)
+            / TICK_PRICE_RATIO.ln()
+        )
+    assert Decimal("0.30") < abs(tick_move) < DEFAULT_MINT_EXECUTION_DRIFT_TICKS
 
 
 def test_mint_composition_refuses_a_budget_that_floors_a_side_to_zero() -> None:

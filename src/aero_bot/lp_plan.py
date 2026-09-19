@@ -43,10 +43,11 @@ DEFAULT_MAX_RANGE_HALF_WIDTH_FRACTION = Decimal("0.003")
 # larger composition changes, so mint minima are derived from a bounded
 # execution-price envelope instead.
 DEFAULT_MINT_SLIPPAGE_TOLERANCE = Decimal("0.01")
-# A quarter tick covers the measured post-estimate AAPLc movement that caused
-# the 2026-09-15 PSC mint revert (~0.059 tick) with material headroom while
-# remaining far inside one Slipstream tick.
-DEFAULT_MINT_EXECUTION_DRIFT_TICKS = Decimal("0.25")
+# A 0.35-tick envelope covers both measured post-estimate PSC failures: the
+# original AAPLc move (~0.059 tick) and the 2026-09-19 MSTRc final-mint move
+# (~0.312 tick), while the 95-percent utilization floor still permits the
+# narrowest supported one-spacing fixture range.
+DEFAULT_MINT_EXECUTION_DRIFT_TICKS = Decimal("0.35")
 # The price envelope may not reduce executable liquidity below this fraction
 # of the anchor mint. If it would, the mint is too composition-sensitive at
 # the current location and planning fails closed instead of weakening minima.
