@@ -3500,14 +3500,7 @@ def test_execute_refuses_a_signature_rejected_at_execute_time(tmp_path: Path) ->
 
 def test_decode_evm_revert_data_decodes_error_string_and_panic() -> None:
     """Standard Solidity revert payloads become compact human diagnostics."""
-    message = b"fixture inner failure"
-    padded = message.ljust((len(message) + 31) // 32 * 32, b"\x00")
-    error_data = (
-        "0x08c379a0"
-        + (32).to_bytes(32, "big").hex()
-        + len(message).to_bytes(32, "big").hex()
-        + padded.hex()
-    )
+    error_data = error_string_data("fixture inner failure")
     panic_data = "0x4e487b71" + (0x11).to_bytes(32, "big").hex()
 
     assert decode_evm_revert_data(error_data) == "Solidity Error('fixture inner failure')"
@@ -3519,14 +3512,7 @@ def test_decode_evm_revert_data_decodes_error_string_and_panic() -> None:
 def test_execute_reports_a_failed_delivery_and_halts(tmp_path: Path) -> None:
     """An on-chain revert records the underlying inner-call replay evidence."""
     audit_path = tmp_path / "audit.sqlite3"
-    message = b"fixture inner failure"
-    padded = message.ljust((len(message) + 31) // 32 * 32, b"\x00")
-    replay_data = (
-        "0x08c379a0"
-        + (32).to_bytes(32, "big").hex()
-        + len(message).to_bytes(32, "big").hex()
-        + padded.hex()
-    )
+    replay_data = error_string_data("fixture inner failure")
     executor, rpc_script = make_execute_stake_executor(
         audit_path=audit_path,
         script_kwargs={
