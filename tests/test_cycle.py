@@ -482,7 +482,7 @@ def tracked_status(
     }
     if penalty is not None:
         values["penalty"] = penalty
-    return LpPositionStatusReport.model_construct(**values)
+    return LpPositionStatusReport.model_construct(**values)  # type: ignore[arg-type]
 
 
 def mint_receipt(token_id: int) -> dict[str, object]:
@@ -812,6 +812,87 @@ class TestLiveCycles:
         ]
         assert "exit_swap" not in [call[0] for call in executor.calls]
         assert book.position is not None
+
+    def test_failed_recenter_mint_preserves_inventory_for_same_symbol_retry(
+        self, tmp_path: Path
+    ) -> None:
+        """A burned recenter whose replacement mint fails preserves retry inventory."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS))
+        runner, executor, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+        assert executor is not None
+        cast(FakeBalances, runner._balances).stock_units = 3_000_000
+        executor.refuse_next = "mint"
+        runner._last_reconciliation = runner._reconcile(tracked_book())
+        outcome = PolicyOutcome(
+            decision=PolicyDecision(
+                action=PolicyActionKind.RECENTER,
+                reason=PolicyReason.DOWNSIDE_RECENTER_ECONOMIC,
+                diagnostics=("fixture economic recenter",),
+                price_range=AlignedPriceRange(
+                    lower_tick=-10,
+                    upper_tick=10,
+                    lower_price=Decimal("99"),
+                    upper_price=Decimal("101"),
+                ),
+                size_usd=Decimal("7"),
+            ),
+            next_state=PolicyState(),
+        )
+
+        actions, halted, book = runner._act(
+            tracked_book(), outcome, b"\x01" * 32, "FIXc"
+        )
+
+        assert [record.action for record in actions] == ["unstake", "withdraw", "mint"]
+        assert "mint action refused" in halted
+        assert book.position is None
+        assert book.held_inventory is not None
+        assert book.held_inventory.symbol == "FIXc"
+        assert book.held_inventory.origin == "failed_recenter"
+        assert book.held_inventory.stock_quantity > 0
+
+    def test_failed_recenter_retry_preserves_original_timeout_anchor(
+        self, tmp_path: Path
+    ) -> None:
+        """A second failed retry cannot extend the failed-recenter escape timer."""
+        held_since = QUIET_INSTANT - timedelta(minutes=2)
+        book = CycleStateBook(
+            held_inventory=HeldInventoryRecord(
+                symbol="FIXc",
+                token_address=B20_ADDRESS,
+                stock_quantity=Decimal("0.03"),
+                held_since=held_since,
+                origin="failed_recenter",
+            ),
+            updated_at=QUIET_INSTANT,
+        )
+        runner, executor, _, _ = make_runner(tmp_path, book=book)
+        assert executor is not None
+        cast(FakeBalances, runner._balances).stock_units = 3_000_000
+        executor.refuse_next = "mint"
+        outcome = PolicyOutcome(
+            decision=PolicyDecision(
+                action=PolicyActionKind.ENTER,
+                reason=PolicyReason.FAILED_RECENTER_RETRY,
+                diagnostics=("fixture failed recenter retry",),
+                price_range=AlignedPriceRange(
+                    lower_tick=-10,
+                    upper_tick=10,
+                    lower_price=Decimal("99"),
+                    upper_price=Decimal("101"),
+                ),
+                size_usd=Decimal("7"),
+            ),
+            next_state=PolicyState(),
+        )
+
+        _, halted, retry_book = runner._act(book, outcome, b"\x01" * 32, "FIXc")
+
+        assert "mint action refused" in halted
+        assert retry_book.held_inventory is not None
+        assert retry_book.held_inventory.origin == "failed_recenter"
+        assert retry_book.held_inventory.held_since == held_since
 
     def test_recenter_preflight_refusal_keeps_the_live_position_untouched(
         self, tmp_path: Path
@@ -1474,7 +1555,7 @@ class TestSelectorCycles:
             ephemeral_key: bool = False,
         ) -> LpActionExecutionReport:
             executor.calls.append(("mint", symbol, budget_usdc, width_spacings))
-            runner._balances.stock_units = 3_000_000
+            cast(FakeBalances, runner._balances).stock_units = 3_000_000
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
                 "scripted post-swap mint refusal",

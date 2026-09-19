@@ -190,7 +190,9 @@ class HeldInventoryRecord(BaseModel):
     # When the inventory was taken on, timezone-aware.
     held_since: datetime
     # Why the stock is held, so failed entries can retry before sell-back.
-    origin: Literal["stale_low_exit", "failed_entry", "adopted_balance"] = "adopted_balance"
+    origin: Literal["stale_low_exit", "failed_entry", "failed_recenter", "adopted_balance"] = (
+        "adopted_balance"
+    )
 
 
 class ReentryCooldown(BaseModel):
@@ -1742,14 +1744,29 @@ class CycleRunner:
                 held_quantity = self._live_stock_quantity(decision_symbol)
                 failed_book = book
                 if held_quantity > 0:
+                    existing_retry = (
+                        book.held_inventory
+                        if book.held_inventory is not None
+                        and book.held_inventory.symbol == decision_symbol
+                        and book.held_inventory.origin in ("failed_entry", "failed_recenter")
+                        else None
+                    )
                     failed_book = book.model_copy(
                         update={
                             "held_inventory": HeldInventoryRecord(
                                 symbol=decision_symbol,
                                 token_address=self._stock_token_address_for(decision_symbol),
                                 stock_quantity=held_quantity,
-                                held_since=self._now(),
-                                origin="failed_entry",
+                                held_since=(
+                                    existing_retry.held_since
+                                    if existing_retry is not None
+                                    else self._now()
+                                ),
+                                origin=(
+                                    existing_retry.origin
+                                    if existing_retry is not None
+                                    else "failed_entry"
+                                ),
                             )
                         }
                     )
@@ -1955,11 +1972,21 @@ class CycleRunner:
                         confirm_broadcast=True,
                     ),
                 ):
-                    return (
-                        records,
-                        halted,
-                        book.model_copy(update={"position": None, "held_inventory": None}),
-                    )
+                    held_quantity = self._live_stock_quantity(tracked_symbol)
+                    failed_book = book.model_copy(update={"position": None, "held_inventory": None})
+                    if held_quantity > 0:
+                        failed_book = failed_book.model_copy(
+                            update={
+                                "held_inventory": HeldInventoryRecord(
+                                    symbol=tracked_symbol,
+                                    token_address=self._stock_token_address_for(tracked_symbol),
+                                    stock_quantity=held_quantity,
+                                    held_since=self._now(),
+                                    origin="failed_recenter",
+                                )
+                            }
+                        )
+                    return records, halted, failed_book
                 token_id = self._decode_mint_token_id(records[-1])
                 if token_id is None:
                     halted = "the recentered position id could not be decoded"

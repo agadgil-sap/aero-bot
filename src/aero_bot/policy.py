@@ -532,7 +532,9 @@ class HeldInventory(BaseModel):
     # Held-since anchors the convergence timeout of the hold.
     held_since: datetime
     # Why inventory is held: stale-low protection, failed entry, or adoption.
-    origin: Literal["stale_low_exit", "failed_entry", "adopted_balance"] = "adopted_balance"
+    origin: Literal["stale_low_exit", "failed_entry", "failed_recenter", "adopted_balance"] = (
+        "adopted_balance"
+    )
 
     @model_validator(mode="after")
     def require_aware_held_since(self) -> Self:
@@ -616,6 +618,9 @@ class PolicyReason(StrEnum):
     ENTRY_THRESHOLD_MET = "entry_threshold_met"
     # A prior mint failed after acquiring stock; retry from that inventory.
     FAILED_ENTRY_RETRY = "failed_entry_retry"
+    # A recenter burned the old LP but its replacement mint failed; retry the
+    # same-symbol mint from the preserved withdrawn inventory.
+    FAILED_RECENTER_RETRY = "failed_recenter_retry"
     # The pool's raw emissions APR is below the entry threshold.
     EMISSIONS_BELOW_ENTRY_THRESHOLD = "emissions_below_entry_threshold"
     # A stop or dilution exit's re-entry cooldown is still running.
@@ -1302,22 +1307,34 @@ class PolicyEngine:
         timed_out = (
             observation.observed_at - inventory.held_since >= self._parameters.convergence_timeout
         )
-        # Failed-entry inventory is already the intended entry inventory, not
-        # a stale-low safety hold. If the ordinary flat entry gates still pass,
-        # retry the mint directly from these balances before considering a
-        # round-trip sale back to USDC. The original held_since is a hard escape
-        # timer: once it expires, sell inventory rather than retrying forever.
-        if inventory.origin == "failed_entry" and flat_description is None and not timed_out:
+        # Failed-entry and failed-recenter inventory is already intended LP
+        # inventory, not a stale-low safety hold. If the ordinary flat entry
+        # gates still pass, retry the same-symbol mint directly from these
+        # balances before considering a round-trip sale back to USDC. The
+        # original held_since is a hard escape timer: once it expires, sell
+        # inventory rather than retrying forever.
+        retry_origin = inventory.origin in ("failed_entry", "failed_recenter")
+        if retry_origin and flat_description is None and not timed_out:
             flat_state = state.model_copy(update={"held_inventory": None})
             retry = self._decide_flat(flat_state, observation, flat_description)
             if retry.decision.action is PolicyActionKind.ENTER:
+                retry_reason = (
+                    PolicyReason.FAILED_RECENTER_RETRY
+                    if inventory.origin == "failed_recenter"
+                    else PolicyReason.FAILED_ENTRY_RETRY
+                )
+                retry_label = (
+                    "failed recenter replacement mint"
+                    if inventory.origin == "failed_recenter"
+                    else "failed mint"
+                )
                 return PolicyOutcome(
                     decision=retry.decision.model_copy(
                         update={
-                            "reason": PolicyReason.FAILED_ENTRY_RETRY,
+                            "reason": retry_reason,
                             "diagnostics": (
                                 f"Retrying entry from {inventory.stock_quantity} held stock "
-                                "tokens left by a failed mint; existing inventory is reused "
+                                f"tokens left by a {retry_label}; existing inventory is reused "
                                 "before any sell-back.",
                             )
                             + retry.decision.diagnostics,
