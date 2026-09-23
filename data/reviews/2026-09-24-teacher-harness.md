@@ -94,9 +94,38 @@ The reviewer verified every JSON parse site in the module is shape-guarded (clau
 The reviewer's `fix first` rested on findings 1 and 3 without two facts this session established empirically: the `google-sudoers` posture of the pull's SSH user (finding 1's config writer already holds root) and the codex sandbox's blocked network egress (finding 3's exfil channel).
 With that evidence both convert to accepted residuals with layered bounds; nothing further was changed in turn 2.
 
+## Turn 3 - the launchd deployment fix
+
+Context: after gnhf 25 committed, arming the agents live failed with `Operation not permitted` - an empirical probe proved launchd user agents cannot read the TCC-protected `~/Documents` (the probe script executed from `/tmp` fine and its `cat` of a repo file failed), so the whole execution surface had to move outside TCC scope.
+The fix delta (committed as gnhf 26): `install-mac.sh` maintains a stateless git worktree at `$STATE_DIR/repo` recreated from HEAD each install, copies the wrapper into `$STATE_DIR/bin`, points the plists there with `AERO_BOT_TEACHER_REPO` exported, and bakes a PATH that includes `~/.local/bin` and Homebrew (the first live pass showed launchd's bare PATH leaves both seats `cli_missing` - the honest typed absence doing its job).
+Prompt: `/tmp/teacher-review-turn3.md`; raw answer: `/tmp/teacher-review-turn3-out.md`.
+
+### Finding 5 [major] - reinstall could rip the worktree from a live pass
+
+Claim: `worktree remove --force` runs unconditionally, and a pass holds the venv and lazily imported modules for minutes; reinstalling mid-run breaks it. Also, a custom `AERO_BOT_TEACHER_REPO` would be force-removed even if it is not this installer's worktree.
+
+Assessment: **confirmed, fixed.**
+The installer now refuses to run while any `aero-bot-teacher` process is alive (`pgrep -f`, with a wait-for-it message) and refuses to touch any `$WORKTREE` that exists but is not one of this repo's worktrees (a worktree's `.git` is a file, not a directory).
+Damage bound either way was advisory-only (a crashed pass logs and records nothing; the corpus is outside the worktree), but refusing is strictly better than breaking a live pass.
+Tests: the drain-guard and foreign-path-refusal pins.
+
+### Finding 6 [nit] - XML metacharacters in configured paths could corrupt the plist
+
+Claim: spaces are safe but `&` or `<` in a configured path would produce an invalid plist.
+
+Assessment: **confirmed, fixed.**
+`generate_plist` now escapes `&`, `<`, `>` through a small `xml_escape` applied to the wrapper, log, worktree, and home paths.
+Test: the escape-rule pin.
+
+### Turn 3 verification
+
+- Full gates: ruff format, ruff lint, mypy strict, 1087 tests green.
+- Live: installer rerun clean (worktree refreshed, all three plists `plutil -lint` OK), agents re-bootstrapped, one kickstarted tactical pass appended a complete episode to the real corpus (`~/.local/state/aero-bot/teacher/corpus.jsonl`, both seats `brief`, window `pulled`).
+
 ## Standing decision record
 
 - Turn 1: findings 1, 2, 4 fixed; finding 3 fixed narrowly with the residual accepted and named.
 - Turn 2: findings 2 and 4 confirmed; findings 1 and 3 adjudicated to accepted residuals on box evidence; no new blockers or majors.
+- Turn 3 (launchd delta): findings 5 and 6 fixed.
 - No finding was dismissed without either a fix or a written threat-model rationale.
 

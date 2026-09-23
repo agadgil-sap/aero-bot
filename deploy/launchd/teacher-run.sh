@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Run one aero-bot-teacher stream from a launchd user agent.
 #
-# The script resolves the repository from its own location so the generated
-# plists never hard-code a checkout path beyond this wrapper, prefers the
-# user's uv on PATH, and appends each run's output to the harness state
-# directory so launchd's own logs stay small.
+# The harness repository resolves from AERO_BOT_TEACHER_REPO first (the
+# launchd kit points this at a worktree outside macOS's TCC-protected
+# folders, because launchd agents cannot read ~/Documents), then from this
+# script's own location. The wrapper prefers the user's uv on PATH and
+# appends each run's output to the harness state directory so launchd's own
+# logs stay small.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="${AERO_BOT_TEACHER_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 STREAM="${1:?usage: teacher-run.sh <tactical|daily|news>}"
 STATE_DIR="${AERO_BOT_TEACHER_STATE_DIR:-$HOME/.local/state/aero-bot/teacher}"
 LOG_DIR="$STATE_DIR/logs"

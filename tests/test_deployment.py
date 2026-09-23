@@ -389,7 +389,8 @@ class TestMacTeacherKit:
     def test_the_run_script_resolves_the_repo_and_falls_back_to_uv(self) -> None:
         """The wrapper works from launchd's bare environment."""
         text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
-        assert 'REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"' in text
+        assert 'REPO_ROOT="${AERO_BOT_TEACHER_REPO:-' in text
+        assert 'cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd' in text
         assert "$HOME/.local/bin/uv" in text
         assert 'run aero-bot-teacher "$STREAM"' in text
 
@@ -398,3 +399,52 @@ class TestMacTeacherKit:
         text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
         assert '>>"$LOG_DIR/${STREAM}.log" 2>&1' in text
         assert "AERO_BOT_TEACHER_STATE_DIR" in text
+
+    def test_the_installer_runs_outside_the_tcc_protected_folders(self) -> None:
+        """Everything the agents touch lives outside ~/Documents and friends."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "TCC" in text and "Operation not permitted" in text
+        assert 'WORKTREE="${AERO_BOT_TEACHER_REPO:-$STATE_DIR/repo}"' in text
+        assert 'git -C "$REPO_ROOT" worktree add --detach --quiet "$WORKTREE" HEAD' in text
+
+    def test_the_worktree_is_stateless_and_recreated_from_head(self) -> None:
+        """The worktree carries no state; every install resets it to HEAD."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert 'worktree remove --force "$WORKTREE"' in text
+        assert "worktree prune" in text
+        assert "stateless" in text
+
+    def test_the_agents_run_the_copied_wrapper_over_the_worktree(self) -> None:
+        """The plist points at the state-dir wrapper and exports the worktree."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert 'cp "$WRAPPER_SRC" "$STATE_WRAPPER"' in text
+        assert 'wrapper="$(xml_escape "$STATE_WRAPPER")"' in text
+        assert "<string>${wrapper}</string>" in text
+        assert 'worktree="$(xml_escape "$WORKTREE")"' in text
+        assert "<key>AERO_BOT_TEACHER_REPO</key>" in text
+        assert "<string>${worktree}</string>" in text
+
+    def test_the_agents_carry_a_path_that_finds_the_teacher_clis(self) -> None:
+        """The bare launchd PATH lacks ~/.local/bin and Homebrew; the plist bakes both."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "<string>${path_value}</string>" in text
+        assert "teacher CLIs (claude, codex, uv) live there" in text
+
+    def test_the_installer_never_rips_the_worktree_from_a_live_pass(self) -> None:
+        """Reinstalling mid-run is refused; a live pass keeps its code."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert 'pgrep -f "aero-bot-teacher"' in text
+        assert "wait for it to finish before reinstalling" in text
+
+    def test_the_installer_refuses_paths_it_does_not_manage(self) -> None:
+        """A foreign AERO_BOT_TEACHER_REPO directory is refused, not removed."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert '[[ -e "$WORKTREE" && ! -f "$WORKTREE/.git" ]]' in text
+        assert "not a worktree this installer manages" in text
+
+    def test_the_plist_paths_are_xml_escaped(self) -> None:
+        """Metacharacters in configured paths cannot corrupt the plist."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert 'value="${value//&/&amp;}"' in text
+        assert 'value="${value//</&lt;}"' in text
+        assert 'value="${value//>/&gt;}"' in text

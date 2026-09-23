@@ -88,7 +88,10 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aero-bot.teacher-tac
 launchctl kickstart gui/$(id -u)/com.aero-bot.teacher-tactical
 ```
 
-The agents run `deploy/launchd/teacher-run.sh`, which resolves the repository from its own location, prefers `uv` from PATH with the `~/.local/bin/uv` fallback, and appends each run's output to the state directory's logs.
+macOS constraint the kit works around: launchd user agents cannot read the TCC-protected folders (`~/Documents`, `~/Desktop`, `~/Downloads`), and a checkout living there is unreadable to them - executing a wrapper from such a checkout fails with `Operation not permitted` (verified empirically; only the Terminal's own grant covers interactive runs).
+The installer therefore maintains a stateless git worktree at `~/.local/state/aero-bot/teacher/repo`, recreated from the checkout's HEAD on every install, and copies the wrapper into `~/.local/state/aero-bot/teacher/bin/`; the agents run that copy with `AERO_BOT_TEACHER_REPO` pointing at the worktree, so everything they touch lives outside TCC scope.
+All harness state (corpus, scratch, reports, logs) lives directly under the state directory, never inside the worktree, so reinstalling never loses an episode.
+The wrapper prefers `uv` from PATH with the `~/.local/bin/uv` fallback and appends each run's output to the state directory's logs.
 
 ## Manual runs
 
