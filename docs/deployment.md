@@ -90,3 +90,15 @@ Build artifacts (`.venv`, `__pycache__`, `*.pyc`, caches) and the per-install `D
 Remote-only `<file>.pre-<tag>-<timestamp>` files are the rollback snapshots the 2026-09-20 on-box hotfix sessions left in `/opt/aero-bot` - they are reported as known extras, not divergence, and should be removed during the next deploy (`sudo find /opt/aero-bot -name '*.pre-*'` lists them).
 The SSH transport and remote path default to the production box (`gcloud compute ssh aero-bot --zone us-west1-b`, `/opt/aero-bot`) and override through `AERO_BOT_SSH` / `AERO_BOT_REMOTE_APP`.
 - **The relayer gas tank:** the alert floor (default 0.0005 ETH) warns before the executor's own 0.0002-ETH floor refuses broadcasts.
+
+## The Mac-side teacher kit
+
+The teacher harness (see [the teacher documentation](teacher.md)) runs on the operator's Mac, not this box: its launchd agents pull one read-only window over `gcloud compute ssh` and ask the advisory seats, so the box itself needs nothing new - the pull only reads the audit database and cycle book through the existing `sudo` path.
+Generate the three user agents from the Mac checkout:
+
+```
+bash deploy/launchd/install-mac.sh
+```
+
+The installer writes `com.aero-bot.teacher-{tactical,daily,news}.plist` into `~/Library/LaunchAgents` and never loads them; arming each stream is the operator's own `launchctl bootstrap` line (printed by the installer, documented in the teacher guide).
+The `gcloud` credential the pull rides is the operator's own login on the Mac.

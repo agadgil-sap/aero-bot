@@ -117,6 +117,12 @@ The `aero-bot-advisor` command is the intelligence layer's advisory surface: it 
 It is fail-closed (every failure is a typed absence, never a guess), advisory-only (it sends nothing, signs nothing, and never writes the cycle book), and dark until the sealed plane values arm it.
 See [the advisor documentation](docs/advisor.md) for the sealed environment, the absence catalog, the systemd wiring, and the bake-off harness.
 
+## Teacher harness command
+
+The `aero-bot-teacher` command is the intelligence layer's Mac-side dual-seat advisory surface: it pulls one read-only window from the production box over `gcloud` and asks two premium seats - the Claude Code CLI's configured model and Codex pinned to GPT 6 Luna at high reasoning, both through the operator's coding-plan logins - one bounded question per stream (tactical, daily, news).
+Every answer validates against the same strict brief schema the student advisor uses, every absence is typed, and the only effect is one episode appended to the local corpus - the teaching material for hindsight scoring and student upgrades.
+See [the teacher documentation](docs/teacher.md) for the three streams, the read-only pull, the seat invocations, the launchd kit, and the manual runs.
+
 ## Wallet-free transaction planning
 
 The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.

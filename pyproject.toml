@@ -62,6 +62,10 @@ aero-bot-watchtower = "aero_bot.watchtower:main"
 # audited factual picture and requests one bounded brief; advisory only,
 # fail-closed, and dark until the sealed plane values arm it.
 aero-bot-advisor = "aero_bot.advisor:main"
+# The teacher command runs the Mac-side advisory seats over a read-only
+# window pulled from the production box; schema-validated briefs land in the
+# local corpus, one episode per pass, advisory only.
+aero-bot-teacher = "aero_bot.teacher:main"
 
 [tool.hatch.build.targets.wheel]
 # The wheel contains only the application package under the src layout.

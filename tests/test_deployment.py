@@ -327,3 +327,74 @@ class TestDeploymentDoc:
         text = DEPLOYMENT_DOC.read_text(encoding="utf-8")
         assert "Seal the secrets" in text
         assert "captain present" in text
+
+
+MAC_INSTALL_SCRIPT = Path("deploy/launchd/install-mac.sh")
+MAC_RUN_SCRIPT = Path("deploy/launchd/teacher-run.sh")
+
+
+class TestMacTeacherKit:
+    """The macOS launchd kit mirrors the Ubuntu posture: generate, never arm."""
+
+    def test_the_installer_parses_as_strict_bash(self) -> None:
+        """Bash's own parser accepts the installer under strict settings."""
+        completed = subprocess.run(  # noqa: S603 - a syntax check of our own script
+            ["/bin/bash", "-n", str(MAC_INSTALL_SCRIPT)],
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    def test_the_run_script_parses_as_strict_bash(self) -> None:
+        """Bash's own parser accepts the wrapper under strict settings."""
+        completed = subprocess.run(  # noqa: S603 - a syntax check of our own script
+            ["/bin/bash", "-n", str(MAC_RUN_SCRIPT)],
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    def test_the_installer_never_loads_an_agent(self) -> None:
+        """Arming stays the operator's explicit act; only hints are printed."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "NEVER loads" in text
+        assert "launchctl bootstrap" in text
+        assert "launchctl kickstart" in text
+        executable = [
+            line.strip()
+            for line in text.splitlines()
+            if "launchctl" in line and not line.lstrip().startswith(("#", "echo"))
+        ]
+        assert executable == []
+
+    def test_the_installer_generates_all_three_streams(self) -> None:
+        """Tactical, daily, and news each get their own job definition."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        for label in ("teacher-tactical", "teacher-daily", "teacher-news"):
+            assert f"com.aero-bot.{label}" in text, label
+
+    def test_the_cadences_are_thirty_minutes_daily_and_morning_news(self) -> None:
+        """Tactical runs each half hour; daily and news ride calendar times."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "<integer>1800</integer>" in text
+        assert "<key>Hour</key>\n        <integer>9</integer>" in text
+        assert "<key>Hour</key>\n        <integer>7</integer>" in text
+
+    def test_the_jobs_run_as_background_priority(self) -> None:
+        """Advisory passes never compete with interactive work."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "<string>Background</string>" in text
+        assert "<integer>10</integer>" in text
+
+    def test_the_run_script_resolves_the_repo_and_falls_back_to_uv(self) -> None:
+        """The wrapper works from launchd's bare environment."""
+        text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
+        assert 'REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"' in text
+        assert "$HOME/.local/bin/uv" in text
+        assert 'run aero-bot-teacher "$STREAM"' in text
+
+    def test_the_run_script_streams_into_the_state_logs(self) -> None:
+        """Each run appends to the stream's log inside the state directory."""
+        text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
+        assert '>>"$LOG_DIR/${STREAM}.log" 2>&1' in text
+        assert "AERO_BOT_TEACHER_STATE_DIR" in text
