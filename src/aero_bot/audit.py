@@ -130,6 +130,8 @@ class AuditEventType(StrEnum):
     SYSTEM_STATE = "system_state"
     # One scheduled cycle's complete reconcile-decide-act summary.
     CYCLE_REPORTED = "cycle_reported"
+    # One shadow-advisor pass: the accepted brief or its typed absence.
+    ADVISOR_REPORTED = "advisor_reported"
 
 
 class AuditVerificationStatus(StrEnum):

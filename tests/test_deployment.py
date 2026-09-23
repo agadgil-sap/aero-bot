@@ -51,6 +51,7 @@ class TestInstallScript:
         assert 'chown root:"${SERVICE_USER}" "${CONFIG_DIR}/cycle.env"' in text
         assert 'chmod 0640 "${CONFIG_DIR}/cycle.env"' in text
         assert 'chmod 0640 "${CONFIG_DIR}/daily-report.env"' in text
+        assert 'chmod 0640 "${CONFIG_DIR}/advisor.env"' in text
         assert 'chmod 0640 "${CONFIG_DIR}/backup.env"' in text
 
     def test_the_config_dir_is_service_group_traversable(self) -> None:
@@ -76,7 +77,16 @@ class TestInstallScript:
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
         assert '[[ ! -f "${CONFIG_DIR}/cycle.env" ]]' in text
         assert '[[ ! -f "${CONFIG_DIR}/daily-report.env" ]]' in text
+        assert '[[ ! -f "${CONFIG_DIR}/advisor.env" ]]' in text
         assert '[[ ! -f "${CONFIG_DIR}/backup.env" ]]' in text
+
+    def test_advisor_env_template_stays_dark_until_sealed(self) -> None:
+        """The advisor template ships commented plane values and thinking knobs."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "#AERO_BOT_ADVISOR_URL=" in text
+        assert "#AERO_BOT_ADVISOR_MODEL=" in text
+        assert "#AERO_BOT_ADVISOR_TIMEOUT_SECONDS=120" in text
+        assert "#AERO_BOT_ADVISOR_DISABLE_THINKING=0" in text
 
     def test_the_venv_builds_locked_and_dev_free(self) -> None:
         """The venv comes from the lockfile without dev extras."""
@@ -210,6 +220,8 @@ class TestDashboardUnit:
         """The installer copies exactly the kit's units."""
         units = sorted(path.name for path in Path("deploy/systemd").iterdir())
         assert units == [
+            "aero-bot-advisor.service",
+            "aero-bot-advisor.timer",
             "aero-bot-audit-backup.service",
             "aero-bot-audit-backup.timer",
             "aero-bot-cycle@.service",
@@ -252,6 +264,37 @@ class TestDailyReportUnit:
         assert "OnCalendar=*-*-* 09:00:00 Australia/Melbourne" in timer
         assert "Persistent=true" in timer
         assert "Unit=aero-bot-daily-report.service" in timer
+
+
+class TestAdvisorUnit:
+    """The shadow advisor is a dark, bounded, advisory-only oneshot."""
+
+    def test_the_advisor_runs_one_bounded_pass_under_the_sealed_overlay(self) -> None:
+        """One advisor invocation over both env files, gated on the overlay."""
+        service = Path("deploy/systemd/aero-bot-advisor.service").read_text(encoding="utf-8")
+        assert "Type=oneshot" in service
+        assert "EnvironmentFile=/etc/aero-bot/cycle.env" in service
+        assert "EnvironmentFile=/etc/aero-bot/advisor.env" in service
+        assert "ConditionPathExists=/etc/aero-bot/advisor.env" in service
+        assert "ExecStart=/opt/aero-bot/.venv/bin/aero-bot-advisor --max-runs 1" in service
+        assert "TimeoutStartSec=300" in service
+        assert "Restart=no" in service
+
+    def test_the_advisor_is_hardened_like_every_oneshot(self) -> None:
+        """The advisor carries the kit's standard hardening posture."""
+        service = Path("deploy/systemd/aero-bot-advisor.service").read_text(encoding="utf-8")
+        assert "NoNewPrivileges=true" in service
+        assert "ProtectSystem=strict" in service
+        assert "ProtectHome=true" in service
+        assert "ReadWritePaths=/var/lib/aero-bot" in service
+        assert "StateDirectoryMode=0700" in service
+
+    def test_the_timer_fires_one_pass_every_thirty_minutes(self) -> None:
+        """A bounded advisory cadence catches up after downtime."""
+        timer = Path("deploy/systemd/aero-bot-advisor.timer").read_text(encoding="utf-8")
+        assert "OnCalendar=*-*-* *:00/30" in timer
+        assert "Persistent=true" in timer
+        assert "Unit=aero-bot-advisor.service" in timer
 
 
 class TestDeploymentDoc:

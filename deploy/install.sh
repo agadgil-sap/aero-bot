@@ -177,6 +177,26 @@ EOF
     chown root:"${SERVICE_USER}" "${CONFIG_DIR}/daily-report.env"
     chmod 0640 "${CONFIG_DIR}/daily-report.env"
 fi
+if [[ ! -f "${CONFIG_DIR}/advisor.env" ]]; then
+    cat >"${CONFIG_DIR}/advisor.env" <<'EOF'
+# Aero Bot shadow-advisor environment - seal real values here (mode 0640).
+# The advisor unit overlays this onto cycle.env: the private inference
+# plane's URL and model live here (see docs/advisor.md). The command is
+# dark until both values are uncommented, and it stays advisory-only no
+# matter what this file carries.
+#AERO_BOT_ADVISOR_URL=http://100.106.111.37:11434
+#AERO_BOT_ADVISOR_MODEL=qwen3.6:35b-a3b
+# A cold reasoning-model pass thinks for tens of seconds (observed 55 s on
+# the 35B-A3B plane); the 15 s default cuts those off, so seal 120.
+#AERO_BOT_ADVISOR_TIMEOUT_SECONDS=120
+# Reasoning models: the budget must cover thinking plus the JSON answer
+# (default 4096); set 1 to ask thinking models not to think at all.
+#AERO_BOT_ADVISOR_MAX_TOKENS=4096
+#AERO_BOT_ADVISOR_DISABLE_THINKING=0
+EOF
+    chown root:"${SERVICE_USER}" "${CONFIG_DIR}/advisor.env"
+    chmod 0640 "${CONFIG_DIR}/advisor.env"
+fi
 if [[ ! -f "${CONFIG_DIR}/backup.env" ]]; then
     cat >"${CONFIG_DIR}/backup.env" <<'EOF'
 # Aero Bot audit-backup environment - seal real values here (mode 0600).
@@ -219,6 +239,6 @@ log "install complete"
 log "units installed (NOT enabled - Phase 2 arms them after secrets and funding):"
 ls -1 "${REPO_ROOT}/deploy/systemd/" | sed 's/^/  /'
 log "next steps, in order - see docs/deployment.md:"
-log "  1. seal the real values into ${CONFIG_DIR}/cycle.env, daily-report.env, and backup.env"
+log "  1. seal the real values into ${CONFIG_DIR}/cycle.env, daily-report.env, advisor.env, and backup.env"
 log "  2. run the smoke checklist (docs/deployment.md)"
 log "  3. arm one cycle timer: aero-bot-cycle@auto.timer for dynamic B20 selection, or @AAPLc.timer to pin Apple; also arm aero-bot-audit-backup.timer"

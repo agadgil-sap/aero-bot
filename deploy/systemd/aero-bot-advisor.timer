@@ -1,0 +1,15 @@
+[Unit]
+Description=Run one Aero Bot shadow advisor pass
+Documentation=file:/opt/aero-bot/docs/advisor.md
+
+[Timer]
+# One bounded advisory pass every thirty minutes; drop-ins override
+# OnCalendar for a different cadence (systemctl edit aero-bot-advisor.timer).
+OnCalendar=*-*-* *:00/30
+# A missed start (host asleep or down) runs one catch-up pass on wake.
+Persistent=true
+AccuracySec=1m
+Unit=aero-bot-advisor.service
+
+[Install]
+WantedBy=timers.target

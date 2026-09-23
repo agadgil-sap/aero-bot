@@ -1,0 +1,123 @@
+{
+  "regime": [
+    {
+      "name": "steady_session",
+      "description": "A quiet Saturday drift inside one percent.",
+      "window": [
+        {"minutes": 0, "price": "100.00"},
+        {"minutes": 30, "price": "100.15"},
+        {"minutes": 60, "price": "99.90"},
+        {"minutes": 90, "price": "100.25"},
+        {"minutes": 120, "price": "100.40"}
+      ]
+    },
+    {
+      "name": "upside_breakout",
+      "description": "A sustained leg up through four percent.",
+      "window": [
+        {"minutes": 0, "price": "100.00"},
+        {"minutes": 30, "price": "101.20"},
+        {"minutes": 60, "price": "102.60"},
+        {"minutes": 90, "price": "103.50"},
+        {"minutes": 120, "price": "104.20"}
+      ]
+    },
+    {
+      "name": "choppy_range",
+      "description": "A flat close hiding a three-plus percent intraweek swing.",
+      "window": [
+        {"minutes": 0, "price": "100.00"},
+        {"minutes": 30, "price": "101.80"},
+        {"minutes": 60, "price": "99.60"},
+        {"minutes": 90, "price": "103.20"},
+        {"minutes": 120, "price": "99.80"}
+      ]
+    }
+  ],
+  "board": [
+    {
+      "name": "wide_board",
+      "description": "Four qualified pools across an APR ladder plus one below the floor.",
+      "pools": [
+        {"symbol": "SNDKc", "qualified": true, "emissions_apr": "2.71", "note": "held, out of range above"},
+        {"symbol": "MSTRc", "qualified": true, "emissions_apr": "1.90", "note": "flat"},
+        {"symbol": "SPCXc", "qualified": true, "emissions_apr": "1.20", "note": "flat"},
+        {"symbol": "TSLAc", "qualified": true, "emissions_apr": "0.75", "note": "cooldown until tomorrow"},
+        {"symbol": "LMTc", "qualified": false, "emissions_apr": "0.10", "note": "below the APR floor"}
+      ]
+    },
+    {
+      "name": "close_call",
+      "description": "Two pools inside the switch margin and one weak tail.",
+      "pools": [
+        {"symbol": "AAPLc", "qualified": true, "emissions_apr": "1.30", "note": "held, in range"},
+        {"symbol": "NVDAc", "qualified": true, "emissions_apr": "1.25", "note": "flat"},
+        {"symbol": "MSFTc", "qualified": true, "emissions_apr": "0.40", "note": "flat"},
+        {"symbol": "ORCLc", "qualified": false, "emissions_apr": "0.05", "note": "stale oracle"}
+      ]
+    }
+  ],
+  "width": [
+    {
+      "name": "tight_solve",
+      "description": "The rehearsal-shaped default fixture; the tightest candidate meets the target.",
+      "observations": {
+        "pool_price_usdc": "100",
+        "emissions_apr": "200",
+        "gauge_liquidity_raw": 80000000000000,
+        "staked_tvl_usd": "100000",
+        "active_liquidity_raw": 80000000000000,
+        "pool_depth_usd": "20000",
+        "fee_window_seconds": 86400,
+        "fee_window_notional_usd": "1000000",
+        "pool_fee_ppm": 500,
+        "realized_daily_volatility": "0.005",
+        "stock_decimals": 6,
+        "quote_decimals": 6,
+        "position_size_usd": "40",
+        "gas_price_gwei": "0.006"
+      }
+    },
+    {
+      "name": "thin_emissions",
+      "description": "One-tenth the emissions on the same grid; the target is now unreachable.",
+      "observations": {
+        "pool_price_usdc": "100",
+        "emissions_apr": "20",
+        "gauge_liquidity_raw": 80000000000000,
+        "staked_tvl_usd": "100000",
+        "active_liquidity_raw": 80000000000000,
+        "pool_depth_usd": "20000",
+        "fee_window_seconds": 86400,
+        "fee_window_notional_usd": "1000000",
+        "pool_fee_ppm": 500,
+        "realized_daily_volatility": "0.005",
+        "stock_decimals": 6,
+        "quote_decimals": 6,
+        "position_size_usd": "40",
+        "gas_price_gwei": "0.006"
+      }
+    },
+    {
+      "name": "wide_grid",
+      "description": "A coarse tick grid whose tightest candidate is already too wide; the answer must read the spacing.",
+      "observations": {
+        "pool_price_usdc": "100",
+        "emissions_apr": "200",
+        "gauge_liquidity_raw": 80000000000000,
+        "staked_tvl_usd": "100000",
+        "active_liquidity_raw": 80000000000000,
+        "pool_depth_usd": "20000",
+        "fee_window_seconds": 86400,
+        "fee_window_notional_usd": "1000000",
+        "pool_fee_ppm": 500,
+        "realized_daily_volatility": "0.005",
+        "stock_decimals": 6,
+        "quote_decimals": 6,
+        "position_size_usd": "40",
+        "gas_price_gwei": "0.006",
+        "tick_spacing": 200
+      }
+    }
+  ]
+}

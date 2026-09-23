@@ -1,0 +1,34 @@
+[Unit]
+Description=Aero Bot shadow advisor pass
+Documentation=file:/opt/aero-bot/docs/advisor.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/aero-bot/advisor.env
+
+[Service]
+Type=oneshot
+User=aero-bot
+Group=aero-bot
+# The advisor rides the cycle's sealed surface: cycle.env carries the audit
+# store and book paths, advisor.env overlays the inference plane's URL and
+# model (and optionally the thinking knobs). Nothing secret is ever stored
+# here; the surface is dark until the overlay file exists.
+EnvironmentFile=/etc/aero-bot/cycle.env
+EnvironmentFile=/etc/aero-bot/advisor.env
+Environment=HOME=/var/lib/aero-bot
+WorkingDirectory=/var/lib/aero-bot
+StateDirectory=aero-bot
+StateDirectoryMode=0700
+Environment=UMASK=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aero-bot
+# One pass composes local history and waits on one bounded model call; the
+# ceiling covers a slow first-load plane without hanging the timer.
+TimeoutStartSec=300
+ExecStart=/opt/aero-bot/.venv/bin/aero-bot-advisor --max-runs 1
+# A failed pass retries on the next timer tick; an absent advisor is dark,
+# not failed, and exits zero on its own.
+Restart=no

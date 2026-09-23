@@ -111,6 +111,12 @@ Each cycle can email its summary and alerts through a sealed-credential SMTP or 
 The `aero-bot-watchtower` command is the always-on range watcher: one cheap tick poll every few seconds against the tracked position's range bounds, and the audited defensive close the moment a verified trip leaves the earning range - never gated by market windows or the reference quote, fail-safe on unreadable state, dark until the sealed enable flag arms it.
 See [the watchtower documentation](docs/watchtower.md) for the trip semantics, the latch and cooldown, the configuration, and the arming path.
 
+## Shadow advisor command
+
+The `aero-bot-advisor` command is the intelligence layer's advisory surface: it composes the audited factual picture - the tracked position, day economics, fee evidence, decision cadence - and asks one language model on the operator's private inference plane for a bounded brief and anomaly flags.
+It is fail-closed (every failure is a typed absence, never a guess), advisory-only (it sends nothing, signs nothing, and never writes the cycle book), and dark until the sealed plane values arm it.
+See [the advisor documentation](docs/advisor.md) for the sealed environment, the absence catalog, the systemd wiring, and the bake-off harness.
+
 ## Wallet-free transaction planning
 
 The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.

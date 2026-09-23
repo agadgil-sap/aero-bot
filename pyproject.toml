@@ -58,6 +58,10 @@ aero-bot-audit-backup = "aero_bot.audit_backup:main"
 # poll every few seconds and the audited defensive close on a verified
 # range trip; dark until the sealed enable flag arms it.
 aero-bot-watchtower = "aero_bot.watchtower:main"
+# The advisor command runs the shadow intelligence pass: it composes the
+# audited factual picture and requests one bounded brief; advisory only,
+# fail-closed, and dark until the sealed plane values arm it.
+aero-bot-advisor = "aero_bot.advisor:main"
 
 [tool.hatch.build.targets.wheel]
 # The wheel contains only the application package under the src layout.
