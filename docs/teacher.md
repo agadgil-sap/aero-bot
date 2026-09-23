@@ -59,7 +59,7 @@ Every way an answer can be missing is a stable typed reason recorded in the corp
 ## The corpus
 
 Episodes append as JSONL lines under `~/.local/state/aero-bot/teacher/corpus.jsonl` (one per pass, schema tag `teacher_episode/1`), each carrying the stream, the window outcome, the composed facts, the student's latest audited answer, and every seat's outcome tagged by seat and model.
-The corpus is the teaching material: hindsight scoring (the next surface) replays episodes against what actually followed, and the student's upgrades train on it.
+The corpus is the teaching material: hindsight scoring (the next section) replays episodes against what actually followed, and the student's upgrades train on it.
 Malformed lines are skipped on load, never fatal.
 A per-stream `reports/<stream>_last.json` is atomically rewritten beside it for quick inspection.
 
@@ -80,7 +80,7 @@ Every field fails closed: an invalid file exits one naming the path, never the c
 
 ## Deployment on the Mac
 
-`deploy/launchd/install-mac.sh` generates the three user agents into `~/Library/LaunchAgents` - `com.aero-bot.teacher-tactical` (StartInterval 1800), `com.aero-bot.teacher-daily` (09:30, after the box's 09:00 Melbourne morning report), and `com.aero-bot.teacher-news` (07:10) - and never loads any of them, mirroring the Ubuntu kit's posture.
+`deploy/launchd/install-mac.sh` generates the four user agents into `~/Library/LaunchAgents` - `com.aero-bot.teacher-tactical` (StartInterval 1800), `com.aero-bot.teacher-daily` (09:30, after the box's 09:00 Melbourne morning report), `com.aero-bot.teacher-news` (07:10), and `com.aero-bot.teacher-hindsight` (09:50, after the daily stream drains) - and never loads any of them, mirroring the Ubuntu kit's posture.
 Arming a stream is the operator's explicit act:
 
 ```
@@ -93,11 +93,33 @@ The installer therefore maintains a stateless git worktree at `~/.local/state/ae
 All harness state (corpus, scratch, reports, logs) lives directly under the state directory, never inside the worktree, so reinstalling never loses an episode.
 The wrapper prefers `uv` from PATH with the `~/.local/bin/uv` fallback and appends each run's output to the state directory's logs.
 
+## The hindsight scorer
+
+The `aero-bot-hindsight` command is the intelligence layer's third surface: it closes the loop by replaying the corpus against itself.
+Every pulled episode snapshots the window facts at its timestamp, so the realized outcome of an earlier read is simply what later episodes observed - the scorer needs no live reads and no model calls; it replays deterministic facts against deterministic facts.
+
+```
+uv run aero-bot-hindsight [--corpus-dir PATH] [--horizon-hours H] [--json]
+```
+
+Three desks are scored - the `claude` seat, the `codex` seat, and the student whose audited brief rides each episode - on two axes:
+
+- **Availability**: how many episodes that actually offered the desk a question were answered with a brief, with every typed absence counted by its stable reason.
+A `dark` seat and an unreachable window are unasked, never absent.
+- **Anomaly calibration**: over the window-grounded streams (tactical and daily; news judges the outside world, which has no deterministic follow-up truth here), each answered brief is scored against the stated truth rule - did any later grounded episode within the horizon (24 hours by default) observe a negative day P&L or a higher halted-cycle count.
+A bad outcome scores the moment it is observed; a quiet verdict waits until the horizon has fully elapsed, and a brief stays pending until then - never guessed.
+Absences are never scored at all.
+The four counts (flagged-bad, flagged-quiet, unflagged-bad, unflagged-quiet) plus the pending count are the whole judgment - no model grades another model, and every number is recomputable by hand.
+
+The report is one schema-validated object (`hindsight_report/1`, carrying its own horizon and truth rule) atomically rewritten to `reports/hindsight_last.json` beside the corpus, with the latest equity, day P&L, and bounded sample series for scoreboard context.
+The daily launchd agent `com.aero-bot.teacher-hindsight` (09:50, after the 09:30 daily stream's bounded timeout has drained) makes it the daily report; the command exits zero on an honest empty corpus and one only when the report cannot be written.
+
 ## Manual runs
 
 ```
 uv run aero-bot-teacher tactical
 AERO_BOT_TEACHER_CORPUS_DIR=/tmp/teacher-probe uv run aero-bot-teacher daily --seat codex
+uv run aero-bot-hindsight --horizon-hours 48
 ```
 
 A manual pass is identical to a scheduled one: one pull, one question per enabled seat, one corpus line.

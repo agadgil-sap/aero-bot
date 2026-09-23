@@ -122,10 +122,57 @@ Test: the escape-rule pin.
 - Full gates: ruff format, ruff lint, mypy strict, 1087 tests green.
 - Live: installer rerun clean (worktree refreshed, all three plists `plutil -lint` OK), agents re-bootstrapped, one kickstarted tactical pass appended a complete episode to the real corpus (`~/.local/state/aero-bot/teacher/corpus.jsonl`, both seats `brief`, window `pulled`).
 
+## Turn 4 - the hindsight scorer review
+
+Subject: the intelligence layer's third surface - `src/aero_bot/hindsight.py` (the `aero-bot-hindsight` command replaying the teacher corpus against itself: per-desk availability and anomaly calibration over deterministic later facts, the `hindsight_report/1` daily report), plus the fourth launchd agent, the wrapper's hindsight branch, and the docs/tests pins.
+Prompt: `/tmp/teacher-review-turn4.md`; raw answer: `/tmp/teacher-review-turn4-out.md`.
+Reviewer verdict: **fix first** (two majors, two moderates).
+
+### Finding 7 [major] - quiet verdicts scored before the horizon had filled
+
+Claim: one quiet follow-up made the verdict False even when the report ran before `created_at + horizon`, converting an unfinished read into a final quiet calibration.
+
+Assessment: **confirmed, fixed.**
+The quiet branch now requires `now >= created_at + horizon`; a bad outcome still scores the moment it is observed (the horizon cannot hide what already happened).
+The truth rule string, the docs, and the test base moved with it, and the 09:50 daily cadence aligns: each day's report scores exactly the episodes whose 24-hour horizon completed.
+The live rerun over the real corpus proves the effect - every read honestly pending, because the corpus is younger than a day.
+Tests: the open-horizon pending pin and the bad-scores-immediately pin.
+
+### Finding 8 [major] - follow-up search assumed append order equals timestamp order
+
+Claim: episodes carry `created_at` at pass start but append at pass end, so overlapping passes can append out of timestamp order and a later-timestamp episode earlier in the file is missed as evidence.
+
+Assessment: **confirmed, fixed.**
+The timeline is now the grounded episodes sorted by `created_at` (the scoreboard's latest moved to the same order); file order is no longer chronology.
+Test: the out-of-order append pin.
+
+### Finding 9 [moderate] - non-finite economics could silently become truth
+
+Claim: `float("NaN")` and infinities parse; NaN makes a window look quiet (NaN comparisons are False) and -inf fabricates a bad outcome.
+
+Assessment: **confirmed, fixed.**
+`_parse_usdc` now requires `math.isfinite`; a non-finite reading is an absence exactly like a malformed one.
+Test: the nan/-inf pin.
+
+### Finding 10 [moderate] - corpus read failures escaped the CLI
+
+Claim: `load_episodes` ran outside the try block, so an unreadable file or invalid UTF-8 raised a traceback instead of the honest typed failure.
+
+Assessment: **confirmed, fixed.**
+The load joined the guarded block with its own `UnicodeDecodeError` branch and exit-one message ("the corpus could not be read").
+Test: the invalid-UTF-8 corpus pin.
+Residual accepted and named: the reviewer noted a repeated identical episode object passed directly to `score_corpus` could alias in the id()-keyed verdict map - the corpus loader can never produce that (each line is a distinct object), so it is an API-misuse edge outside any real path.
+
+### Turn 4 verification
+
+- Full gates: ruff format, ruff lint, mypy strict, 1134 tests green (45 in `tests/test_hindsight.py`).
+- Live: the scorer ran over the real corpus before and after the fixes; the post-fix report honestly holds every read pending (the corpus is younger than the 24-hour horizon), while availability still counts the real `cli_missing` launchd-PATH episode as an asked absence per teacher seat.
+
 ## Standing decision record
 
 - Turn 1: findings 1, 2, 4 fixed; finding 3 fixed narrowly with the residual accepted and named.
 - Turn 2: findings 2 and 4 confirmed; findings 1 and 3 adjudicated to accepted residuals on box evidence; no new blockers or majors.
 - Turn 3 (launchd delta): findings 5 and 6 fixed.
+- Turn 4 (hindsight delta): findings 7, 8, 9, 10 fixed; one named residual (id() aliasing under direct-API misuse).
 - No finding was dismissed without either a fix or a written threat-model rationale.
 

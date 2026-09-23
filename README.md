@@ -123,6 +123,12 @@ The `aero-bot-teacher` command is the intelligence layer's Mac-side dual-seat ad
 Every answer validates against the same strict brief schema the student advisor uses, every absence is typed, and the only effect is one episode appended to the local corpus - the teaching material for hindsight scoring and student upgrades.
 See [the teacher documentation](docs/teacher.md) for the three streams, the read-only pull, the seat invocations, the launchd kit, and the manual runs.
 
+## Hindsight scoring command
+
+The `aero-bot-hindsight` command closes the loop: it replays the teacher corpus offline against itself, scoring every desk (both teacher seats and the student) on availability and anomaly calibration against deterministic later facts - a negative day P&L or a higher halted-cycle count observed within the horizon - and rewrites one schema-validated report beside the corpus.
+Pending is honest (no later facts, no score), no model grades another model, and the daily launchd agent makes the report the teaching loop's daily scoreboard.
+See [the teacher documentation](docs/teacher.md) for the truth rule, the desk scores, and the daily agent.
+
 ## Wallet-free transaction planning
 
 The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.

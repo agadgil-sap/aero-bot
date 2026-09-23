@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run one aero-bot-teacher stream from a launchd user agent.
+# Run one aero-bot-teacher stream, or the daily hindsight scoring pass,
+# from a launchd user agent.
 #
 # The harness repository resolves from AERO_BOT_TEACHER_REPO first (the
 # launchd kit points this at a worktree outside macOS's TCC-protected
@@ -10,7 +11,7 @@
 set -euo pipefail
 
 REPO_ROOT="${AERO_BOT_TEACHER_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-STREAM="${1:?usage: teacher-run.sh <tactical|daily|news>}"
+STREAM="${1:?usage: teacher-run.sh <tactical|daily|news|hindsight>}"
 STATE_DIR="${AERO_BOT_TEACHER_STATE_DIR:-$HOME/.local/state/aero-bot/teacher}"
 LOG_DIR="$STATE_DIR/logs"
 
@@ -27,4 +28,8 @@ if [[ -z "$UV_BIN" ]]; then
 fi
 
 cd "$REPO_ROOT"
+if [[ "$STREAM" == "hindsight" ]]; then
+    # The scorer replays the corpus offline; it is not a teacher stream.
+    exec "$UV_BIN" run aero-bot-hindsight >>"$LOG_DIR/${STREAM}.log" 2>&1
+fi
 exec "$UV_BIN" run aero-bot-teacher "$STREAM" >>"$LOG_DIR/${STREAM}.log" 2>&1

@@ -367,10 +367,10 @@ class TestMacTeacherKit:
         ]
         assert executable == []
 
-    def test_the_installer_generates_all_three_streams(self) -> None:
-        """Tactical, daily, and news each get their own job definition."""
+    def test_the_installer_generates_all_four_jobs(self) -> None:
+        """Tactical, daily, news, and hindsight each get their own job."""
         text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
-        for label in ("teacher-tactical", "teacher-daily", "teacher-news"):
+        for label in ("teacher-tactical", "teacher-daily", "teacher-news", "teacher-hindsight"):
             assert f"com.aero-bot.{label}" in text, label
 
     def test_the_cadences_are_thirty_minutes_daily_and_morning_news(self) -> None:
@@ -379,6 +379,12 @@ class TestMacTeacherKit:
         assert "<integer>1800</integer>" in text
         assert "<key>Hour</key>\n        <integer>9</integer>" in text
         assert "<key>Hour</key>\n        <integer>7</integer>" in text
+
+    def test_the_hindsight_scorer_runs_after_the_daily_stream_drains(self) -> None:
+        """The daily report scores at 09:50, past the daily stream's ceiling."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "<key>Minute</key>\n        <integer>50</integer>" in text
+        assert text.index("<integer>30</integer>") < text.index("<integer>50</integer>")
 
     def test_the_jobs_run_as_background_priority(self) -> None:
         """Advisory passes never compete with interactive work."""
@@ -393,6 +399,13 @@ class TestMacTeacherKit:
         assert 'cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd' in text
         assert "$HOME/.local/bin/uv" in text
         assert 'run aero-bot-teacher "$STREAM"' in text
+
+    def test_the_run_script_serves_the_hindsight_scorer(self) -> None:
+        """The hindsight argument runs the scorer, not a teacher stream."""
+        text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
+        assert "<tactical|daily|news|hindsight>" in text
+        assert '"$STREAM" == "hindsight"' in text
+        assert 'run aero-bot-hindsight >>"$LOG_DIR/${STREAM}.log"' in text
 
     def test_the_run_script_streams_into_the_state_logs(self) -> None:
         """Each run appends to the stream's log inside the state directory."""
@@ -433,7 +446,7 @@ class TestMacTeacherKit:
     def test_the_installer_never_rips_the_worktree_from_a_live_pass(self) -> None:
         """Reinstalling mid-run is refused; a live pass keeps its code."""
         text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
-        assert 'pgrep -f "aero-bot-teacher"' in text
+        assert 'pgrep -f "aero-bot-(teacher|hindsight)"' in text
         assert "wait for it to finish before reinstalling" in text
 
     def test_the_installer_refuses_paths_it_does_not_manage(self) -> None:

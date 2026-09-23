@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Generate the aero-bot teacher harness launchd user agents on macOS.
 #
-# Mirrors the Ubuntu kit's posture: this installer writes the three job
-# definitions into ~/Library/LaunchAgents and NEVER loads any of them.
+# Mirrors the Ubuntu kit's posture: this installer writes the four job
+# definitions (three teacher streams plus the daily hindsight scorer) into
+# ~/Library/LaunchAgents and NEVER loads any of them.
 # Arming a stream is the operator's explicit Phase 2 act (the launchctl
 # bootstrap lines it prints); the harness itself is advisory-only and owns
 # no trading authority of any kind.
@@ -38,7 +39,7 @@ mkdir -p "$LAUNCH_AGENTS_DIR" "$STATE_DIR/logs" "$STATE_BIN"
 
 # Never rip the worktree out from under a live pass: a run holds the venv
 # and lazily imported modules for minutes, so reinstalling mid-run breaks it.
-if pgrep -f "aero-bot-teacher" >/dev/null 2>&1; then
+if pgrep -f "aero-bot-(teacher|hindsight)" >/dev/null 2>&1; then
     echo "install-mac.sh: a teacher pass is running; wait for it to finish before reinstalling." >&2
     exit 1
 fi
@@ -71,10 +72,11 @@ xml_escape() {
 }
 
 # One job per stream: tactical every thirty minutes, daily review after the
-# box's 09:00 Melbourne morning report, news before the trading day starts.
-# All three stay unloaded until the operator bootstraps them. The baked PATH
-# carries ~/.local/bin and Homebrew because launchd's bare PATH has neither,
-# and the teacher CLIs (claude, codex, uv) live there.
+# box's 09:00 Melbourne morning report, news before the trading day starts,
+# and the hindsight scorer after the daily stream's bounded timeout has
+# drained. All four stay unloaded until the operator bootstraps them. The
+# baked PATH carries ~/.local/bin and Homebrew because launchd's bare PATH
+# has neither, and the teacher CLIs (claude, codex, uv) live there.
 generate_plist() {
     local label="$1"
     local stream="$2"
@@ -137,9 +139,18 @@ NEWS_BLOCK='    <key>StartCalendarInterval</key>
         <integer>10</integer>
     </dict>'
 
+HINDSIGHT_BLOCK='    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>50</integer>
+    </dict>'
+
 generate_plist "com.aero-bot.teacher-tactical" "tactical" "$INTERVAL_BLOCK"
 generate_plist "com.aero-bot.teacher-daily" "daily" "$DAILY_BLOCK"
 generate_plist "com.aero-bot.teacher-news" "news" "$NEWS_BLOCK"
+generate_plist "com.aero-bot.teacher-hindsight" "hindsight" "$HINDSIGHT_BLOCK"
 
 echo "Refreshed the teacher worktree at $WORKTREE (detached at HEAD, stateless)."
 echo "Generated teacher launchd agents (none loaded):"

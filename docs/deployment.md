@@ -94,12 +94,12 @@ The SSH transport and remote path default to the production box (`gcloud compute
 ## The Mac-side teacher kit
 
 The teacher harness (see [the teacher documentation](teacher.md)) runs on the operator's Mac, not this box: its launchd agents pull one read-only window over `gcloud compute ssh` and ask the advisory seats, so the box itself needs nothing new - the pull only reads the audit database and cycle book through the existing `sudo` path.
-Generate the three user agents from the Mac checkout:
+Generate the four user agents from the Mac checkout:
 
 ```
 bash deploy/launchd/install-mac.sh
 ```
 
-The installer writes `com.aero-bot.teacher-{tactical,daily,news}.plist` into `~/Library/LaunchAgents` and never loads them; arming each stream is the operator's own `launchctl bootstrap` line (printed by the installer, documented in the teacher guide).
+The installer writes `com.aero-bot.teacher-{tactical,daily,news,hindsight}.plist` into `~/Library/LaunchAgents` and never loads them; arming each job is the operator's own `launchctl bootstrap` line (printed by the installer, documented in the teacher guide).
 Because launchd user agents cannot read macOS's TCC-protected folders, the installer also maintains a stateless worktree at `~/.local/state/aero-bot/teacher/repo` (recreated from the checkout's HEAD on every install) and points the agents at it - see the teacher guide for the full story.
 The `gcloud` credential the pull rides is the operator's own login on the Mac.
