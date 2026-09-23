@@ -8,7 +8,7 @@ backend is the only authoritative pool inventory for the application.
 """
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Annotated, cast
 
@@ -335,6 +335,7 @@ class LpSugarRpcBackend:
         self,
         rpc_url: str = DEFAULT_BASE_RPC_URL,
         sugar_address: str = LP_SUGAR_ADDRESS,
+        fallback_rpc_urls: Sequence[str] = (),
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         page_size: int = DEFAULT_PAGE_SIZE,
         max_attempts: int = MAX_REQUEST_ATTEMPTS,
@@ -347,8 +348,9 @@ class LpSugarRpcBackend:
         """Configure bounded read-only enumeration behavior.
 
         Args:
-            rpc_url: Base JSON-RPC endpoint used exclusively for eth_call reads.
+            rpc_url: Primary Base JSON-RPC endpoint for eth_call reads.
             sugar_address: LP Sugar contract address supplying the enumeration.
+            fallback_rpc_urls: Ordered alternate endpoints used after transient failures.
             timeout_seconds: Complete per-request timeout in seconds.
             page_size: Pools requested per all() page, at most the contract cap.
             max_attempts: Attempts per request before failing closed.
@@ -376,6 +378,7 @@ class LpSugarRpcBackend:
         # Address normalization rejects malformed configuration before any request.
         self._sugar_address = normalize_evm_address(sugar_address)
         self._rpc_url = rpc_url
+        self._rpc_urls = tuple(dict.fromkeys((rpc_url, *fallback_rpc_urls)))
         self._timeout_seconds = timeout_seconds
         self._page_size = page_size
         self._max_attempts = max_attempts
@@ -524,11 +527,12 @@ class LpSugarRpcBackend:
                     )
                 self._sleep(backoff)
             try:
-                response = client.post(self._rpc_url, json=payload)
+                endpoint = self._rpc_urls[attempt % len(self._rpc_urls)]
+                response = client.post(endpoint, json=payload)
             except httpx.TransportError as error:
                 failure = f"transport error: {error}"
                 continue
-            if response.status_code == 429 or response.status_code >= 500:
+            if response.status_code in {403, 408, 425, 429} or response.status_code >= 500:
                 failure = f"HTTP status {response.status_code}"
                 continue
             response_size = len(response.content)

@@ -537,6 +537,88 @@ class TestPositionLifecycle:
         assert outcome.decision.reason is PolicyReason.OPEN_BELOW_EDGE_HOLDING
         assert outcome.next_state.position is not None
 
+    def test_downside_recenter_waits_for_distance_then_uses_economics(self) -> None:
+        """A sustained material downside breach recenters when churn pays back quickly."""
+        engine, state = entered_session()
+        lower = entered_position_for(state).price_range.lower_price
+        below_price = lower * Decimal("0.998")
+        first = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        assert first.decision.action is PolicyActionKind.HOLD
+        assert first.decision.reason is PolicyReason.OPEN_BELOW_EDGE_HOLDING
+        assert first.next_state.position is not None
+        assert first.next_state.position.out_of_range_side == "below"
+
+        recentred = engine.decide(
+            first.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 17, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        assert recentred.decision.action is PolicyActionKind.RECENTER
+        assert recentred.decision.reason is PolicyReason.DOWNSIDE_RECENTER_ECONOMIC
+        assert recentred.decision.swap_plan is not None
+        assert recentred.decision.swap_plan.direction is SwapDirection.SELL_STOCK
+        assert recentred.next_state.position is not None
+        assert recentred.next_state.position.out_of_range_since is None
+        assert recentred.next_state.position.out_of_range_side is None
+        assert any("payback is" in line for line in recentred.decision.diagnostics)
+
+    def test_downside_recenter_does_not_chase_a_tiny_edge_breach(self) -> None:
+        """Even after the wait, a sub-threshold breach holds rather than churns."""
+        engine, state = entered_session()
+        lower = entered_position_for(state).price_range.lower_price
+        below_price = lower * Decimal("0.9995")
+        first = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        held = engine.decide(
+            first.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 30, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        assert held.decision.action is PolicyActionKind.HOLD
+        assert held.decision.reason is PolicyReason.OPEN_BELOW_EDGE_HOLDING
+        assert any("minimum" in line for line in held.decision.diagnostics)
+
+    def test_downside_recenter_holds_when_modeled_payback_is_too_slow(self) -> None:
+        """The downside path exposes an explicit economic hold instead of blind recentering."""
+        parameters = PolicyParameters(downside_recenter_max_payback_days=Decimal("0.001"))
+        engine = PolicyEngine(parameters=parameters)
+        entered = engine.decide(PolicyState(), base_observation())
+        assert entered.decision.action is PolicyActionKind.ENTER
+        position = entered_position_for(entered.next_state)
+        below_price = position.price_range.lower_price * Decimal("0.998")
+        first = engine.decide(
+            entered.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        held = engine.decide(
+            first.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 17, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        assert held.decision.action is PolicyActionKind.HOLD
+        assert held.decision.reason is PolicyReason.DOWNSIDE_RECENTER_UNECONOMIC
+        assert any("payback is" in line for line in held.decision.diagnostics)
+
     def test_downside_stop_exits_and_sets_reentry_cooldown(self) -> None:
         """A price at the stop level burns and swaps back to USDC, then cools down."""
         engine, state = entered_session()
@@ -675,6 +757,35 @@ class TestPositionLifecycle:
         assert new_position.entered_at == datetime(2026, 8, 19, 11, 21, tzinfo=NEW_YORK)
         assert new_position.price_range.lower_price < above_price
         assert new_position.price_range.upper_price > above_price
+
+    def test_recenter_reserves_post_exit_depth_headroom(self) -> None:
+        """A replacement mint sizes below the live cap before source liquidity is removed."""
+        engine, state = entered_session()
+        upper = entered_position_for(state).price_range.upper_price
+        above_price = upper * Decimal("1.01")
+        waiting = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+                pool_depth_usd=Decimal("10000"),
+            ),
+        )
+        recentred = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 21, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+                pool_depth_usd=Decimal("10000"),
+            ),
+        )
+
+        assert recentred.decision.action is PolicyActionKind.RECENTER
+        assert recentred.decision.size_usd == Decimal("70")
+        assert any(
+            "current depth cap is 70.0000 USDC" in line
+            for line in recentred.decision.diagnostics
+        )
 
     def test_returning_in_range_resets_the_recenter_wait(self) -> None:
         """A price returning inside the range clears the wait anchor."""
@@ -1244,6 +1355,52 @@ class TestDislocationMonitor:
             base_observation(observed_at=datetime(2026, 8, 19, 11, 4, tzinfo=NEW_YORK)),
         )
         assert reentered.decision.action is PolicyActionKind.ENTER
+
+    def test_disabled_reference_enforcement_cannot_trigger_inventory_convergence(self) -> None:
+        """Diagnostic-only references cannot authorize an inventory sale."""
+        engine, state = entered_session()
+        burned = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("199.6"),
+                reference_price_usdc=Decimal("200"),
+            ),
+        )
+        held = engine.decide(
+            burned.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 3, tzinfo=NEW_YORK),
+                amm_price_usdc=Decimal("205"),
+                reference_price_usdc=Decimal("200"),
+                reference_enforcement_enabled=False,
+            ),
+        )
+        assert held.decision.action is PolicyActionKind.HOLD
+        assert held.decision.reason is PolicyReason.HOLDING_INVENTORY_AWAITING_CONVERGENCE
+
+    def test_failed_entry_retry_stops_at_the_inventory_timeout(self) -> None:
+        """A failed mint cannot retry forever after the five-minute escape bound."""
+        engine = PolicyEngine()
+        state = PolicyState(
+            held_inventory=HeldInventory(
+                pool_address=POOL_ADDRESS,
+                token_address=TOKEN_ADDRESS,
+                stock_quantity=Decimal("0.15"),
+                held_since=BASE_OBSERVED_AT,
+                origin="failed_entry",
+            )
+        )
+        at_timeout = engine.decide(
+            state,
+            base_observation(
+                observed_at=BASE_OBSERVED_AT + timedelta(minutes=5),
+                reference_enforcement_enabled=False,
+            ),
+        )
+        assert at_timeout.decision.action is PolicyActionKind.SELL_INVENTORY
+        assert at_timeout.decision.reason is PolicyReason.INVENTORY_CONVERGENCE_TIMEOUT
+        assert at_timeout.next_state.held_inventory is None
 
     def test_convergence_timeout_sells_at_market_as_the_safety_bound(self) -> None:
         """Tokens still held five minutes after the burn sell at market."""

@@ -101,14 +101,22 @@ def qualified_board() -> tuple[PoolBoardOption, ...]:
 
 
 def held_state(pool_address: str, token_address: str) -> PolicyState:
-    """Build one state holding a freshly entered position in one pool."""
+    """Build one state whose funded position has cleared the switch hold period."""
     engine = PolicyEngine()
     entry = engine.decide(
         PolicyState(),
         board_option("AAAc", pool_address, token_address).observation,
     )
     assert entry.decision.action is PolicyActionKind.ENTER
-    return entry.next_state
+    position = entry.next_state.position
+    assert position is not None
+    return entry.next_state.model_copy(
+        update={
+            "position": position.model_copy(
+                update={"entered_at": BASE_TIME - timedelta(hours=2)}
+            )
+        }
+    )
 
 
 class TestBoardQualification:
@@ -213,6 +221,25 @@ class TestSwitchDiscipline:
             board_option("CCCc", CCC_POOL, CCC_TOKEN, emissions_apr=Decimal("1.2")),
         )
         return PolicyEngine(), held_state(AAA_POOL, AAA_TOKEN), options
+
+    def test_fresh_position_observes_the_one_hour_switch_hold(self) -> None:
+        """A new position cannot churn solely for a better APR during its first hour."""
+        engine = PolicyEngine()
+        entry = engine.decide(
+            PolicyState(),
+            board_option("AAAc", AAA_POOL, AAA_TOKEN).observation,
+        )
+        assert entry.next_state.position is not None
+        options = (
+            board_option("AAAc", AAA_POOL, AAA_TOKEN, emissions_apr=Decimal("2.0")),
+            board_option("BBBc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("3.1")),
+        )
+
+        selection = select_board(engine, entry.next_state, options, {})
+
+        assert selection.outcome.decision.action is PolicyActionKind.HOLD
+        assert selection.switch is None
+        assert "voluntary switch hold period active" in selection.summary
 
     def test_no_switch_below_the_margin(self) -> None:
         """A candidate inside the thirty percent margin never churns."""

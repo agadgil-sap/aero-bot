@@ -692,6 +692,27 @@ def test_rpc_backend_retries_rate_limit_responses_then_succeeds() -> None:
     assert sleeps == [0.5]
 
 
+def test_rpc_backend_rotates_to_fallback_after_transient_primary_failure() -> None:
+    """A transient primary 403 rotates the same request to the next configured endpoint."""
+    hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(str(request.url.host))
+        if request.url.host == "primary.example":
+            return httpx.Response(403, text="temporarily forbidden")
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "0x7"})
+
+    backend = ExecutorRpcBackend(
+        rpc_url="https://primary.example",
+        fallback_rpc_urls=("https://secondary.example",),
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+    )
+
+    assert backend.fetch_gas_price() == 7
+    assert hosts == ["primary.example", "secondary.example"]
+
+
 def test_rpc_backend_raises_revert_errors_immediately() -> None:
     """A contract revert surfaces as the typed revert error, not a retry."""
 
@@ -1729,6 +1750,32 @@ def test_rpc_backend_eth_call_defaults_to_latest() -> None:
     )
 
     assert backend.eth_call(SAFE_ADDRESS, "0xabcdef01") == word_hex(1)
+
+
+def test_live_sources_token_decimals_rotate_to_fallback_and_cache() -> None:
+    """Token metadata survives a primary 429 and is cached after fallback success."""
+    hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(str(request.url.host))
+        if request.url.host == "primary.example":
+            return httpx.Response(429, text="slow down")
+        call = json.loads(request.content)
+        assert call["method"] == "eth_call"
+        return httpx.Response(
+            200, json={"jsonrpc": "2.0", "id": 1, "result": word_hex(STOCK_DECIMALS)}
+        )
+
+    sources = LiveExecutionSources(
+        rpc_url="https://primary.example",
+        fallback_rpc_urls=("https://secondary.example",),
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+    )
+
+    assert sources.read_token_decimals(B20_ADDRESS) == STOCK_DECIMALS
+    assert sources.read_token_decimals(B20_ADDRESS) == STOCK_DECIMALS
+    assert hosts == ["primary.example", "secondary.example"]
 
 
 def test_live_sources_pin_one_discovery_sweep_per_run() -> None:

@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 from enum import StrEnum
 from importlib.resources import files
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, model_validator
@@ -332,8 +332,15 @@ class PolicyParameters(BaseModel):
     max_range_half_width_fraction: Decimal = Decimal("0.003")
     # Range boundaries are aligned to the pool tick grid of spacing ten.
     tick_spacing: Annotated[int, Field(ge=1)] = 10
-    # Upside out-of-range recenters only after a fifteen-minute wait.
+    # Any non-urgent out-of-range recenter waits fifteen minutes before the
+    # economics are evaluated.
     recenter_wait: timedelta = timedelta(minutes=15)
+    # A downside recenter is ignored for tiny edge breaches; the pool must be
+    # at least 0.10 percent below the lower edge before we pay churn costs.
+    downside_recenter_min_distance_fraction: Decimal = Decimal("0.001")
+    # A downside recenter must earn back modeled gas plus price impact within
+    # one day of the current gross emissions-plus-fee yield.
+    downside_recenter_max_payback_days: Decimal = Decimal("1")
     # The downside stop triggers 0.5 percent below the lower range edge.
     stop_buffer_fraction: Decimal = Decimal("0.005")
     # Re-entry is blocked for fifteen minutes after a stop or dilution exit.
@@ -454,6 +461,10 @@ class PolicyObservation(BaseModel):
     reference_price_usdc: Annotated[Decimal, Field(gt=0)] | None = None
     # Reference age is seconds since that quote; absence means no live quote.
     reference_age_seconds: Annotated[int, Field(ge=0)] | None = None
+    # External references are advisory unless an explicit caller enables
+    # reference enforcement. Scheduled production cycles deliberately disable
+    # it: the resolved Aerodrome pool is authoritative for trading actions.
+    reference_enforcement_enabled: bool = True
     # A stale oracle observation is a condition-driven flat event per policy.
     oracle_stale: bool = False
     # A paused B20 registry is a condition-driven flat event per policy.
@@ -490,8 +501,11 @@ class PolicyPosition(BaseModel):
     committed_usd: Annotated[Decimal, Field(gt=0)]
     # Entry time anchors the wait and cooldown timeline of this position.
     entered_at: datetime
-    # The upside out-of-range wait anchor is set once price exits above range.
+    # The out-of-range wait anchor persists across observations.
     out_of_range_since: datetime | None = None
+    # Which side owns the wait anchor. None preserves backward compatibility
+    # with state written before side-aware downside recenters existed.
+    out_of_range_side: Literal["above", "below"] | None = None
 
     @model_validator(mode="after")
     def require_aware_entry_time(self) -> Self:
@@ -517,6 +531,10 @@ class HeldInventory(BaseModel):
     stock_quantity: Annotated[Decimal, Field(gt=0)]
     # Held-since anchors the convergence timeout of the hold.
     held_since: datetime
+    # Why inventory is held: stale-low protection, failed entry, or adoption.
+    origin: Literal["stale_low_exit", "failed_entry", "failed_recenter", "adopted_balance"] = (
+        "adopted_balance"
+    )
 
     @model_validator(mode="after")
     def require_aware_held_since(self) -> Self:
@@ -587,11 +605,22 @@ class PolicyReason(StrEnum):
     OPEN_IN_RANGE = "open_in_range"
     # Price exited above the range and the time-based recenter wait is running.
     OPEN_ABOVE_RANGE_WAITING = "open_above_range_waiting"
-    # Price sits below the range edge but above the stop level, so the
-    # position holds and may recover into the range.
+    # Price sits below the range edge but has not yet met both the wait,
+    # distance, and economic recenter gates.
     OPEN_BELOW_EDGE_HOLDING = "open_below_edge_holding"
+    # The downside grace/distance gates elapsed but modeled recenter churn
+    # cannot earn itself back inside the locked payback horizon.
+    DOWNSIDE_RECENTER_UNECONOMIC = "downside_recenter_uneconomic"
+    # The downside grace/distance gates elapsed and modeled recenter churn is
+    # economic inside the locked payback horizon.
+    DOWNSIDE_RECENTER_ECONOMIC = "downside_recenter_economic"
     # Entry is eligible because the raw emissions APR threshold is met.
     ENTRY_THRESHOLD_MET = "entry_threshold_met"
+    # A prior mint failed after acquiring stock; retry from that inventory.
+    FAILED_ENTRY_RETRY = "failed_entry_retry"
+    # A recenter burned the old LP but its replacement mint failed; retry the
+    # same-symbol mint from the preserved withdrawn inventory.
+    FAILED_RECENTER_RETRY = "failed_recenter_retry"
     # The pool's raw emissions APR is below the entry threshold.
     EMISSIONS_BELOW_ENTRY_THRESHOLD = "emissions_below_entry_threshold"
     # A stop or dilution exit's re-entry cooldown is still running.
@@ -946,6 +975,40 @@ class PolicyEngine:
             return "Registry-pause signal requires the policy to be flat in USDC."
         return None
 
+    def _recenter_size(
+        self,
+        position: PolicyPosition,
+        observation: PolicyObservation,
+    ) -> tuple[Decimal, tuple[str, ...]]:
+        """Cap maintenance size to the current pool-depth hard gate.
+
+        A position can become too large for the current depth cap after entry as
+        liquidity leaves the pool. Recenter is a fresh mint, so it must obey the
+        same current-depth constraint instead of blindly recycling the historical
+        committed amount. Selector mode already applies its ten-percent depth
+        headroom to observation.pool_depth_usd before this policy runs.
+
+        Returns:
+            The safe replacement-mint size and any resizing diagnostic.
+        """
+        # Recenter removes our own concentrated liquidity before the replacement
+        # mint lands.  Reserve additional headroom so the replacement budget is
+        # safe against that self-induced depth drop plus small intervening moves.
+        # Selector observations already carry their independent 10% headroom.
+        post_exit_depth_headroom = Decimal("0.70")
+        depth_cap = (
+            observation.pool_depth_usd
+            * self._parameters.max_position_depth_fraction
+            * post_exit_depth_headroom
+        )
+        size_usd = min(position.committed_usd, depth_cap)
+        if size_usd < position.committed_usd:
+            return size_usd, (
+                f"Recenter size reduced from {position.committed_usd} to {size_usd} USDC "
+                f"because the current depth cap is {depth_cap} USDC.",
+            )
+        return size_usd, ()
+
     def _decide_with_position(
         self,
         state: PolicyState,
@@ -1037,20 +1100,38 @@ class PolicyEngine:
             )
         # Upside out-of-range starts a time-based wait before any recenter.
         if observation.amm_price_usdc >= position.price_range.upper_price:
-            wait_anchor = position.out_of_range_since or observation.observed_at
+            wait_anchor = (
+                position.out_of_range_since
+                if position.out_of_range_since is not None
+                and position.out_of_range_side in {None, "above"}
+                else observation.observed_at
+            )
             waited = observation.observed_at - wait_anchor
             if waited >= self._parameters.recenter_wait:
+                recenter_size, resize_diagnostics = self._recenter_size(position, observation)
+                if recenter_size <= 0:
+                    waiting_position = position.model_copy(
+                        update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
+                    )
+                    return self._hold(
+                        state.model_copy(update={"position": waiting_position}),
+                        PolicyReason.OPEN_ABOVE_RANGE_WAITING,
+                        (
+                            "The current pool-depth cap leaves no positive safe replacement "
+                            "mint size; holding the existing position until depth recovers.",
+                        ),
+                    )
                 # The gas sense-check gate defers non-urgent recenters.
                 deferred, defer_diagnostics = self._gas_gate_blocks(
                     observation,
                     self._parameters.recenter_batch_gas_units,
-                    position.committed_usd,
+                    recenter_size,
                 )
                 if deferred:
                     # The anchor persists so the elapsed wait stays elapsed and
                     # the recenter retries on a cheaper observation.
                     waiting_position = position.model_copy(
-                        update={"out_of_range_since": wait_anchor}
+                        update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
                     )
                     return self._hold(
                         state.model_copy(update={"position": waiting_position}),
@@ -1060,7 +1141,7 @@ class PolicyEngine:
                 # The recenter width is re-derived from the target net daily
                 # yield at the current observables, then the range is rebuilt
                 # around the current pool price.
-                width_solution = self._solve_range_width(observation, position.committed_usd)
+                width_solution = self._solve_range_width(observation, recenter_size)
                 new_range = self.build_aligned_range(
                     observation.amm_price_usdc, width_solution.half_width_fraction
                 )
@@ -1071,11 +1152,12 @@ class PolicyEngine:
                 # re-mint buys roughly half of it back into stock.
                 swap_plan = self._swap_plan(
                     SwapDirection.BUY_STOCK,
-                    position.committed_usd / Decimal(2),
+                    recenter_size / Decimal(2),
                     observation.pool_depth_usd,
                 )
                 diagnostics = (
-                    (
+                    resize_diagnostics
+                    + (
                         f"Upside out-of-range wait of {waited} elapsed the locked "
                         f"recenter wait {self._parameters.recenter_wait}.",
                         f"New range {new_range.lower_price}..{new_range.upper_price} "
@@ -1092,8 +1174,10 @@ class PolicyEngine:
                 next_position = position.model_copy(
                     update={
                         "price_range": new_range,
+                        "committed_usd": recenter_size,
                         "entered_at": observation.observed_at,
                         "out_of_range_since": None,
+                        "out_of_range_side": None,
                     }
                 )
                 next_state = state.model_copy(update={"position": next_position})
@@ -1103,6 +1187,7 @@ class PolicyEngine:
                         reason=PolicyReason.RECENTER_WAIT_ELAPSED,
                         diagnostics=diagnostics,
                         price_range=new_range,
+                        size_usd=recenter_size,
                         swap_plan=swap_plan,
                         estimated_gas_units=gas_units,
                         estimated_gas_cost_usd=gas_cost_usd,
@@ -1116,7 +1201,9 @@ class PolicyEngine:
                 f"edge {position.price_range.upper_price}; waited {waited} of the "
                 f"locked recenter wait {self._parameters.recenter_wait}.",
             )
-            next_position = position.model_copy(update={"out_of_range_since": wait_anchor})
+            next_position = position.model_copy(
+                update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
+            )
             next_state = state.model_copy(update={"position": next_position})
             return PolicyOutcome(
                 decision=PolicyDecision(
@@ -1126,35 +1213,136 @@ class PolicyEngine:
                 ),
                 next_state=next_state,
             )
-        # Returning inside the range clears any prior upside wait anchor.
+        if observation.amm_price_usdc < position.price_range.lower_price:
+            # Downside out-of-range is neither an indefinite recovery hold nor
+            # an automatic chase. A grace period and minimum displacement must
+            # pass, then the modeled churn must earn itself back quickly enough.
+            wait_anchor = (
+                position.out_of_range_since
+                if position.out_of_range_since is not None
+                and position.out_of_range_side in {None, "below"}
+                else observation.observed_at
+            )
+            waited = observation.observed_at - wait_anchor
+            distance_fraction = (
+                position.price_range.lower_price - observation.amm_price_usdc
+            ) / position.price_range.lower_price
+            waiting_position = position.model_copy(
+                update={"out_of_range_since": wait_anchor, "out_of_range_side": "below"}
+            )
+            waiting_state = state.model_copy(update={"position": waiting_position})
+            if (
+                waited < self._parameters.recenter_wait
+                or distance_fraction < self._parameters.downside_recenter_min_distance_fraction
+            ):
+                diagnostics = (
+                    f"Pool price {observation.amm_price_usdc} is below the lower range "
+                    f"edge {position.price_range.lower_price} but above the stop level "
+                    f"{stop_level}; waited {waited} of {self._parameters.recenter_wait} "
+                    f"and is {distance_fraction} below the edge versus the locked "
+                    f"{self._parameters.downside_recenter_min_distance_fraction} minimum.",
+                )
+                return self._hold(
+                    waiting_state, PolicyReason.OPEN_BELOW_EDGE_HOLDING, diagnostics
+                )
+            recenter_size, resize_diagnostics = self._recenter_size(position, observation)
+            if recenter_size <= 0:
+                return self._hold(
+                    waiting_state,
+                    PolicyReason.OPEN_BELOW_EDGE_HOLDING,
+                    (
+                        "The current pool-depth cap leaves no positive safe replacement "
+                        "mint size; holding the existing position until depth recovers.",
+                    ),
+                )
+            deferred, defer_diagnostics = self._gas_gate_blocks(
+                observation,
+                self._parameters.recenter_batch_gas_units,
+                recenter_size,
+            )
+            if deferred:
+                return self._hold(
+                    waiting_state, PolicyReason.GAS_GATE_DEFERRED, defer_diagnostics
+                )
+            # A downside out-of-range position is stock-heavy. Preserving the
+            # withdrawn inventory lets the mint planner sell only the amount
+            # needed to rebalance instead of round-tripping the whole position.
+            swap_plan = self._swap_plan(
+                SwapDirection.SELL_STOCK,
+                recenter_size / Decimal(2),
+                observation.pool_depth_usd,
+            )
+            gas_units, gas_cost_usd = self._batch_gas(
+                observation, self._parameters.recenter_batch_gas_units
+            )
+            economic, economics_diagnostics = self._downside_recenter_economics(
+                observation, recenter_size, swap_plan, gas_cost_usd
+            )
+            if not economic:
+                return self._hold(
+                    waiting_state,
+                    PolicyReason.DOWNSIDE_RECENTER_UNECONOMIC,
+                    economics_diagnostics,
+                )
+            width_solution = self._solve_range_width(observation, recenter_size)
+            new_range = self.build_aligned_range(
+                observation.amm_price_usdc, width_solution.half_width_fraction
+            )
+            next_position = position.model_copy(
+                update={
+                    "price_range": new_range,
+                    "committed_usd": recenter_size,
+                    "entered_at": observation.observed_at,
+                    "out_of_range_since": None,
+                    "out_of_range_side": None,
+                }
+            )
+            diagnostics = (
+                resize_diagnostics
+                + (
+                    f"Downside out-of-range wait {waited} and displacement "
+                    f"{distance_fraction} passed the locked recenter gates.",
+                    f"New range {new_range.lower_price}..{new_range.upper_price} "
+                    f"USDC per stock around pool price {observation.amm_price_usdc}.",
+                )
+                + economics_diagnostics
+                + width_solution.diagnostics
+                + self._gas_diagnostics(gas_units, gas_cost_usd)
+            )
+            return PolicyOutcome(
+                decision=PolicyDecision(
+                    action=PolicyActionKind.RECENTER,
+                    reason=PolicyReason.DOWNSIDE_RECENTER_ECONOMIC,
+                    diagnostics=diagnostics,
+                    price_range=new_range,
+                    size_usd=recenter_size,
+                    swap_plan=swap_plan,
+                    estimated_gas_units=gas_units,
+                    estimated_gas_cost_usd=gas_cost_usd,
+                    width_solution=width_solution,
+                ),
+                next_state=state.model_copy(update={"position": next_position}),
+            )
+        # Returning inside the range clears either side's prior wait anchor.
         updated_position = (
             position
-            if position.out_of_range_since is None
-            else position.model_copy(update={"out_of_range_since": None})
+            if position.out_of_range_since is None and position.out_of_range_side is None
+            else position.model_copy(
+                update={"out_of_range_since": None, "out_of_range_side": None}
+            )
         )
-        next_state = state.model_copy(update={"position": updated_position})
-        if observation.amm_price_usdc < position.price_range.lower_price:
-            # Below the edge but above the stop level, the position holds.
-            diagnostics = (
-                f"Pool price {observation.amm_price_usdc} is below the lower range "
-                f"edge {position.price_range.lower_price} but above the stop level "
-                f"{stop_level}; holding for recovery.",
-            )
-            reason = PolicyReason.OPEN_BELOW_EDGE_HOLDING
-        else:
-            diagnostics = (
-                f"Pool price {observation.amm_price_usdc} is inside the range "
-                f"{position.price_range.lower_price}..{position.price_range.upper_price}; "
-                f"no rule requires action.",
-            )
-            reason = PolicyReason.OPEN_IN_RANGE
+        diagnostics = (
+            f"Pool price {observation.amm_price_usdc} is inside the range "
+            f"{position.price_range.lower_price}..{position.price_range.upper_price}; "
+            f"no rule requires action.",
+        )
         return PolicyOutcome(
             decision=PolicyDecision(
                 action=PolicyActionKind.HOLD,
-                reason=reason,
+                reason=PolicyReason.OPEN_IN_RANGE,
                 diagnostics=diagnostics,
             ),
-            next_state=next_state,
+            next_state=state.model_copy(update={"position": updated_position}),
         )
 
     def _decide_holding_inventory(
@@ -1177,17 +1365,53 @@ class PolicyEngine:
         inventory = state.held_inventory
         if inventory is None:  # pragma: no cover - guarded by the caller
             raise ValueError("inventory branch requires held stock tokens")
+        timed_out = (
+            observation.observed_at - inventory.held_since >= self._parameters.convergence_timeout
+        )
+        # Failed-entry and failed-recenter inventory is already intended LP
+        # inventory, not a stale-low safety hold. If the ordinary flat entry
+        # gates still pass, retry the same-symbol mint directly from these
+        # balances before considering a round-trip sale back to USDC. The
+        # original held_since is a hard escape timer: once it expires, sell
+        # inventory rather than retrying forever.
+        retry_origin = inventory.origin in ("failed_entry", "failed_recenter")
+        if retry_origin and flat_description is None and not timed_out:
+            flat_state = state.model_copy(update={"held_inventory": None})
+            retry = self._decide_flat(flat_state, observation, flat_description)
+            if retry.decision.action is PolicyActionKind.ENTER:
+                retry_reason = (
+                    PolicyReason.FAILED_RECENTER_RETRY
+                    if inventory.origin == "failed_recenter"
+                    else PolicyReason.FAILED_ENTRY_RETRY
+                )
+                retry_label = (
+                    "failed recenter replacement mint"
+                    if inventory.origin == "failed_recenter"
+                    else "failed mint"
+                )
+                return PolicyOutcome(
+                    decision=retry.decision.model_copy(
+                        update={
+                            "reason": retry_reason,
+                            "diagnostics": (
+                                f"Retrying entry from {inventory.stock_quantity} held stock "
+                                f"tokens left by a {retry_label}; existing inventory is reused "
+                                "before any sell-back.",
+                            )
+                            + retry.decision.diagnostics,
+                        }
+                    ),
+                    next_state=retry.next_state,
+                )
         # A fresh reference allows a convergence judgment; without one only the
         # timeout bound or a flat window can release the held tokens.
         reference = observation.reference_price_usdc
         converged = (
-            reference is not None
+            observation.reference_enforcement_enabled
+            and reference is not None
             and not self._reference_stale(observation)
             and observation.amm_price_usdc
             >= reference * (Decimal(1) - self._parameters.dislocation_threshold_fraction)
-        )
-        timed_out = (
-            observation.observed_at - inventory.held_since >= self._parameters.convergence_timeout
         )
         if flat_description is not None:
             reason = PolicyReason.INVENTORY_FLAT_WINDOW_SELL
@@ -1262,6 +1486,8 @@ class PolicyEngine:
         Raises:
             ValueError: If the state carries no open position.
         """
+        if not observation.reference_enforcement_enabled:
+            return None
         reference = observation.reference_price_usdc
         if reference is None or self._reference_stale(observation):
             return None
@@ -1541,6 +1767,53 @@ class PolicyEngine:
                 max_modeled_impact_fraction=max(tranche_impacts),
             )
 
+    def _downside_recenter_economics(
+        self,
+        observation: PolicyObservation,
+        position_value_usd: Decimal,
+        swap_plan: SwapPlan,
+        gas_cost_usd: Decimal | None,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Require downside recenter churn to repay from expected gross yield quickly."""
+        if gas_cost_usd is None:
+            return False, (
+                "Downside recenter economics are unavailable because gas cost is unknown.",
+            )
+        impact = swap_plan.max_modeled_impact_fraction
+        if impact is None:
+            return False, (
+                "Downside recenter impact is unmodeled at the observed pool depth; holding.",
+            )
+        if impact > self._parameters.swap_impact_ceiling_fraction:
+            return False, (
+                f"Downside recenter worst modeled tranche impact {impact} exceeds the "
+                f"{self._parameters.swap_impact_ceiling_fraction} ceiling; holding.",
+            )
+        impact_cost = sum(
+            (
+                tranche.usd_size * (tranche.modeled_impact_fraction or Decimal(0))
+                for tranche in swap_plan.tranches
+            ),
+            Decimal(0),
+        )
+        expected_daily_gross_yield = (
+            position_value_usd * (observation.emissions_apr + observation.fee_apr) / DAYS_PER_YEAR
+        )
+        if expected_daily_gross_yield <= 0:
+            return False, (
+                "Downside recenter has no positive expected daily gross yield to repay churn.",
+            )
+        modeled_cost = gas_cost_usd + impact_cost
+        payback_days = modeled_cost / expected_daily_gross_yield
+        diagnostics = (
+            f"Downside recenter modeled churn is {modeled_cost} USDC "
+            f"({gas_cost_usd} gas + {impact_cost} modeled price impact) against "
+            f"{expected_daily_gross_yield} USDC expected daily gross yield; "
+            f"payback is {payback_days} days versus the locked "
+            f"{self._parameters.downside_recenter_max_payback_days}-day maximum.",
+        )
+        return payback_days <= self._parameters.downside_recenter_max_payback_days, diagnostics
+
     def _batch_gas(
         self,
         observation: PolicyObservation,
@@ -1652,6 +1925,8 @@ class PolicyEngine:
             True when the reference is missing or older than the open-position
             bound.
         """
+        if not observation.reference_enforcement_enabled:
+            return False
         if observation.reference_price_usdc is None or observation.reference_age_seconds is None:
             return True
         return observation.reference_age_seconds > (
@@ -1804,6 +2079,10 @@ class PolicyEngine:
         Returns:
             True when the reference quote is missing or older than the bound.
         """
+        # Scheduled production cycles use the resolved Aerodrome pool as the
+        # trading authority; an external quote is then diagnostic only.
+        if not observation.reference_enforcement_enabled:
+            return False
         # A missing quote or age is treated as unavailable, never as fresh.
         if observation.reference_price_usdc is None or observation.reference_age_seconds is None:
             return True

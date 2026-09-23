@@ -113,10 +113,17 @@ class AuditEventType(StrEnum):
     # LP execute sent captures one broadcast submission of an LP Safe
     # transaction from the execute path, appended before any receipt wait.
     LP_EXECUTE_SENT = "lp_execute_sent"
+    # LP execute broadcast unknown captures a signed delivery whose deterministic
+    # transaction hash is known but whose submission response was unavailable.
+    LP_EXECUTE_BROADCAST_UNKNOWN = "lp_execute_broadcast_unknown"
     # LP execute confirmed captures one included LP delivery with status one.
     LP_EXECUTE_CONFIRMED = "lp_execute_confirmed"
     # LP execute failed captures one included LP delivery that reverted.
     LP_EXECUTE_FAILED = "lp_execute_failed"
+    # Historical compatibility only: earlier Arc experiments may have appended
+    # this event to the immutable audit chain. Base-only runtime does not emit
+    # it, but retaining the reviewed category lets the chain remain verifiable.
+    CCTP_DELIVERY_PREPARED = "cctp_delivery_prepared"
     # One exit swap converting the Safe's stock inventory back to USDC.
     LP_EXIT_SWAP_PLANNED = "lp_exit_swap_planned"
     # System state captures startup, migration, and diagnostic events without secrets.

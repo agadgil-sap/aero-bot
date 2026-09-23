@@ -148,6 +148,8 @@ def resolve_known_pool_candidate(
     pin: LpPoolPin,
     listing: B20AssetListing,
     contracts: AerodromeContractEvidence,
+    *,
+    block_number: int | None = None,
 ) -> tuple[PoolCandidate, int]:
     """Resolve one pinned pool into a decision candidate from live reads.
 
@@ -162,6 +164,10 @@ def resolve_known_pool_candidate(
         pin: The persisted Sugar-verified identity for the pool.
         listing: The registry listing the symbol resolved to.
         contracts: The official Aerodrome contract evidence catalog.
+        block_number: Optional shared snapshot block. When absent, the fast
+            path fetches one fresh block itself. Board selection passes one
+            block to every pinned pool so all candidates are comparable at
+            the same chain height.
 
     Returns:
         The verified candidate and the block pinning every read.
@@ -170,8 +176,10 @@ def resolve_known_pool_candidate(
         ValueError: If any pinned identity fact no longer matches the live
             pool, any acceptance boundary fails, or any view is unreadable.
     """
-    block_number = rpc.fetch_block_number()
-    block_tag = hex(block_number)
+    snapshot_block = rpc.fetch_block_number() if block_number is None else block_number
+    if snapshot_block < 0:
+        raise ValueError("block_number must not be negative")
+    block_tag = hex(snapshot_block)
 
     def read(contract_address: str, calldata: str) -> str:
         return rpc.eth_call_at(contract_address, calldata, block_tag)
@@ -304,7 +312,7 @@ def resolve_known_pool_candidate(
         pool_active_liquidity=pool_active_liquidity,
         nfpm_address=EvmAddress(nfpm),
     )
-    return candidate, block_number
+    return candidate, snapshot_block
 
 
 def persist_decision_pool_pin(

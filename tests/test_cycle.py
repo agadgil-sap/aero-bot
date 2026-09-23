@@ -1,5 +1,6 @@
 """Pin the scheduled decision cycle's reconcile-decide-act behavior."""
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 from pathlib import Path
@@ -11,6 +12,8 @@ from pydantic import BaseModel
 from test_lp_executor import (
     B20_ADDRESS,
     GAUGE_ADDRESS,
+    LP_RANGE_LOWER,
+    LP_RANGE_UPPER,
     LP_SQRT_RATIO,
     NFPM_ADDRESS,
     POOL_ADDRESS,
@@ -47,6 +50,7 @@ from aero_bot.lp_executor import (
     LpSafePositionsSnapshot,
 )
 from aero_bot.policy import (
+    AlignedPriceRange,
     PolicyActionKind,
     PolicyDecision,
     PolicyOutcome,
@@ -66,8 +70,8 @@ RELAYER_ADDRESS = "0x0c49cc4d53423ccd6be2bcf115a25f418649c5c9"
 # A mint delivery hash the fake receipt store resolves.
 MINT_TX_HASH = "0x" + "ab" * 32
 # A stand-in gauge/staked custody shape.
-FIXTURE_RANGE_LOWER = -11630
-FIXTURE_RANGE_UPPER = -11610
+FIXTURE_RANGE_LOWER = LP_RANGE_LOWER
+FIXTURE_RANGE_UPPER = LP_RANGE_UPPER
 # The entry size and width the locked engine derives at a ten-USDC
 # equity: the 80-percent equity cap (the captain's 2026-09-09 sizing
 # ruling) and the ceiling-rounded spacing width.
@@ -191,11 +195,13 @@ class FakeBalances:
         usdc_units: int = 10_000_000,
         stock_units: int = 0,
         relayer_eth_wei: int = 10**15,
+        block_number: int = 99_999_999,
     ) -> None:
         """Configure every served balance."""
         self.usdc_units = usdc_units
         self.stock_units = stock_units
         self.relayer_eth_wei = relayer_eth_wei
+        self.block_number = block_number
         self.receipts: dict[str, dict[str, object]] = {}
 
     def fetch_token_balance(self, token_address: str, owner_address: str) -> int:
@@ -211,6 +217,10 @@ class FakeBalances:
     def fetch_transaction_receipt(self, transaction_hash: str) -> dict[str, object] | None:
         """Serve one scripted receipt when present."""
         return self.receipts.get(transaction_hash)
+
+    def fetch_block_number(self) -> int:
+        """Serve the primary RPC block used by the post-action visibility gate."""
+        return self.block_number
 
 
 class FakeExecutor:
@@ -232,7 +242,9 @@ class FakeExecutor:
         self.calls: list[tuple[object, ...]] = []
         self.refuse_next: str | None = None
         self.mint_receipt_token_id: int | None = TRACKED_TOKEN_ID
+        self.mint_executed_budget: Decimal | None = None
         self.fee_wei_per_step = 90_000
+        self.confirmed_block_number = 51_000_000
 
     def _complete(self, action: str, hashes: tuple[str, ...]) -> LpActionExecutionReport:
         """Build one completed execution report over scripted steps."""
@@ -240,7 +252,10 @@ class FakeExecutor:
             cast(
                 object,
                 SimpleNamespace(
-                    transaction_hash=h, fee_wei=self.fee_wei_per_step, status="confirmed"
+                    transaction_hash=h,
+                    fee_wei=self.fee_wei_per_step,
+                    status="confirmed",
+                    block_number=self.confirmed_block_number,
                 ),
             )
             for h in hashes
@@ -261,6 +276,45 @@ class FakeExecutor:
             ),
             self._now,
         )
+
+    def dry_run_recenter(
+        self,
+        symbol: str,
+        token_id: int,
+        width_spacings: int | None,
+        budget_usdc: Decimal | None,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> object:
+        """Preflight one replacement without mutating the scripted chain state."""
+        self.calls.append(("recenter_preflight", symbol, token_id, width_spacings, budget_usdc))
+        if self.refuse_next == "recenter_preflight":
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "scripted recenter preflight refusal",
+            )
+        return SimpleNamespace()
+
+    def dry_run_switch(
+        self,
+        from_symbol: str,
+        token_id: int,
+        to_symbol: str,
+        width_spacings: int | None,
+        budget_usdc: Decimal,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> object:
+        """Preflight one cross-pool replacement without mutating chain state."""
+        self.calls.append(
+            ("switch_preflight", from_symbol, token_id, to_symbol, width_spacings, budget_usdc)
+        )
+        if self.refuse_next == "switch_preflight":
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "scripted switch preflight refusal",
+            )
+        return SimpleNamespace()
 
     def execute_mint(
         self,
@@ -289,7 +343,16 @@ class FakeExecutor:
             self._now,
         )
         self._reads.set_inventory(inventory_with(TRACKED_TOKEN_ID))
-        return self._complete("mint", (MINT_TX_HASH,))
+        report = self._complete("mint", (MINT_TX_HASH,))
+        if self.mint_executed_budget is not None:
+            report = report.model_copy(
+                update={
+                    "build": SimpleNamespace(
+                        plan=SimpleNamespace(budget_usdc=self.mint_executed_budget)
+                    )
+                }
+            )
+        return report
 
     def execute_stake(
         self,
@@ -425,6 +488,7 @@ def tracked_book(
     owner: str = SAFE_ADDRESS,
     committed: Decimal = Decimal("7"),
     symbol: str = "FIXc",
+    entered_at: datetime = QUIET_INSTANT,
 ) -> CycleStateBook:
     """Build one book tracking the fixture position."""
     return CycleStateBook(
@@ -433,7 +497,7 @@ def tracked_book(
             token_id=TRACKED_TOKEN_ID,
             pool_address=POOL_ADDRESS,
             committed_usd=committed,
-            entered_at=QUIET_INSTANT,
+            entered_at=entered_at,
         ),
         updated_at=QUIET_INSTANT,
     )
@@ -450,6 +514,7 @@ def make_runner(
     audit_seed: bool = False,
     now: datetime = QUIET_INSTANT,
     symbol: str | None = "FIXc",
+    sleep: Callable[[float], None] | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, AuditStore, CycleStateStore]:
     """Assemble one cycle runner over fully scripted boundaries."""
     store_path = tmp_path / "cycle_state.json"
@@ -509,6 +574,7 @@ def make_runner(
         audit_sink=audit,
         state_store=state_store,
         now=lambda: now,
+        sleep=sleep if sleep is not None else (lambda _seconds: None),
     )
     return runner, fake_executor, audit, state_store
 
@@ -564,12 +630,13 @@ class TestMintReceiptDecoding:
 class TestDryRunCycles:
     """Dry runs reconcile and decide without any key or build."""
 
-    def test_flat_cycle_without_a_reference_holds_fail_closed(self, tmp_path: Path) -> None:
-        """The reference-stale hold is the honest verdict, audited once."""
+    def test_flat_cycle_without_a_reference_uses_pool_authority(self, tmp_path: Path) -> None:
+        """Scheduled cycles use the resolved Aerodrome pool without an external quote."""
         runner, _, audit, state_store = make_runner(tmp_path)
         report = runner.run(CycleMode.DRY_RUN)
-        assert report.decision_action == "hold"
-        assert report.decision_reason == "reference_stale"
+        assert report.decision_action == "enter"
+        assert report.decision_reason == "entry_threshold_met"
+        assert any("diagnostic-only" in note for note in report.input_notes)
         assert report.actions == ()
         assert report.halted_reason == ""
         book = state_store.load()
@@ -622,6 +689,21 @@ class TestLiveCycles:
         assert book.position is not None
         assert book.position.token_id == TRACKED_TOKEN_ID
         assert book.position.committed_usd == EXPECTED_ENTER_SIZE
+
+    def test_enter_records_the_actual_resized_mint_budget(self, tmp_path: Path) -> None:
+        """A post-swap resized mint persists its actual deployed cost basis."""
+        runner, executor, _, state_store = make_runner(tmp_path)
+        assert executor is not None
+        executor.mint_executed_budget = Decimal("63.25")
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_price_usdc=Decimal("100"),
+        )
+        assert [action.status for action in report.actions] == ["completed", "completed"]
+        book = state_store.load()
+        assert book.position is not None
+        assert book.position.committed_usd == Decimal("63.25")
 
     def test_a_refused_mint_halts_the_cycle_before_any_stake(self, tmp_path: Path) -> None:
         """A refused mint records the catalog code and stops the cycle."""
@@ -678,6 +760,78 @@ class TestLiveCycles:
         assert all(record.status == "completed" for record in actions)
         assert book.position is None and book.held_inventory is None
 
+    def test_recenter_preserves_withdrawn_inventory_instead_of_round_tripping_usdc(
+        self, tmp_path: Path
+    ) -> None:
+        """A recenter unstakes/withdraws then lets mint rebalance without a full exit swap."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS))
+        runner, executor, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+        assert executor is not None
+        runner._last_reconciliation = runner._reconcile(tracked_book())
+        outcome = PolicyOutcome(
+            decision=PolicyDecision(
+                action=PolicyActionKind.RECENTER,
+                reason=PolicyReason.DOWNSIDE_RECENTER_ECONOMIC,
+                diagnostics=("fixture economic recenter",),
+                price_range=AlignedPriceRange(
+                    lower_tick=-10,
+                    upper_tick=10,
+                    lower_price=Decimal("99"),
+                    upper_price=Decimal("101"),
+                ),
+                size_usd=Decimal("7"),
+            ),
+            next_state=PolicyState(),
+        )
+
+        actions, halted, book = runner._act(tracked_book(), outcome, b"\x01" * 32, "FIXc")
+
+        assert halted == ""
+        assert [record.action for record in actions] == [
+            "unstake",
+            "withdraw",
+            "mint",
+            "stake",
+        ]
+        assert "exit_swap" not in [call[0] for call in executor.calls]
+        assert book.position is not None
+
+    def test_recenter_preflight_refusal_keeps_the_live_position_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """A replacement that cannot be built refuses before unstake/withdraw."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS))
+        runner, executor, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+        assert executor is not None
+        executor.refuse_next = "recenter_preflight"
+        runner._last_reconciliation = runner._reconcile(tracked_book())
+        outcome = PolicyOutcome(
+            decision=PolicyDecision(
+                action=PolicyActionKind.RECENTER,
+                reason=PolicyReason.DOWNSIDE_RECENTER_ECONOMIC,
+                diagnostics=("fixture economic recenter",),
+                price_range=AlignedPriceRange(
+                    lower_tick=-10,
+                    upper_tick=10,
+                    lower_price=Decimal("99"),
+                    upper_price=Decimal("101"),
+                ),
+                size_usd=Decimal("7"),
+            ),
+            next_state=PolicyState(),
+        )
+
+        actions, halted, book = runner._act(tracked_book(), outcome, b"\x01" * 32, "FIXc")
+
+        assert [record.action for record in actions] == ["recenter_preflight"]
+        assert actions[0].status == "refused"
+        assert "recenter preflight refused" in halted
+        assert book.position is not None
+        assert reads._statuses[TRACKED_TOKEN_ID].token_owner_address == GAUGE_ADDRESS
+        assert [call[0] for call in executor.calls] == ["recenter_preflight"]
+
     def test_stale_low_burn_holds_the_returned_stock(self, tmp_path: Path) -> None:
         """A stale-low burn unstakes and withdraws but never swaps."""
         reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
@@ -730,8 +884,92 @@ class TestLiveCycles:
         assert new_book.held_inventory is None
 
 
+class TestPostActionVisibility:
+    """Final reconciliation waits for the primary RPC to observe confirmed actions."""
+
+    def test_live_cycle_waits_for_confirmed_block_before_final_reconcile(
+        self, tmp_path: Path
+    ) -> None:
+        """A live action waits until the primary RPC reaches its confirmed block."""
+        sleeps: list[float] = []
+
+        class LaggingBalances(FakeBalances):
+            def __init__(self) -> None:
+                super().__init__(block_number=100)
+                self.blocks = iter((100, 120, 51_000_000))
+
+            def fetch_block_number(self) -> int:
+                self.block_number = next(self.blocks)
+                return self.block_number
+
+        balances = LaggingBalances()
+        runner, executor, _, _ = make_runner(tmp_path, balances=balances, sleep=sleeps.append)
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_price_usdc=Decimal("100"),
+        )
+
+        assert report.final_reconciliation_verified is True
+        assert report.decision_reconciliation is not None
+        assert sleeps == [0.5, 1.0]
+
+    def test_visibility_timeout_marks_final_reconciliation_unverified(self, tmp_path: Path) -> None:
+        """A bounded catch-up failure is explicit instead of silently reporting stale state."""
+        balances = FakeBalances(block_number=100)
+        runner, executor, _, _ = make_runner(
+            tmp_path, balances=balances, sleep=lambda _seconds: None
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_price_usdc=Decimal("100"),
+        )
+
+        assert report.final_reconciliation_verified is False
+        assert "post-action reconciliation is unverified" in report.halted_reason
+        assert any(
+            "WARNING: final balances may lag" in line for line in report.reconciliation.diagnostics
+        )
+
+
 class TestReconciliation:
     """The reconcile-first discipline and its out-of-band refusals."""
+
+    def test_above_range_wait_survives_across_scheduled_cycles(self, tmp_path: Path) -> None:
+        """The fifteen-minute recenter clock never restarts on each cycle."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        # Explicitly put the token1-stock NFT below the fixture's
+        # USDC/stock price so this test exercises the upside wait path.
+        above_range = tracked_status().model_copy(
+            update={"position": SimpleNamespace(tick_lower=-10, tick_upper=10)}
+        )
+        reads.set_status(TRACKED_TOKEN_ID, above_range)
+        runner, _, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        first = runner.run(
+            CycleMode.DRY_RUN,
+            reference_price_usdc=FIXTURE_AMM_PRICE,
+        )
+        assert first.decision_reason == "open_above_range_waiting"
+
+        position = state_store.load().position
+        assert position is not None
+        assert position.out_of_range_since == QUIET_INSTANT
+
+        runner._now = lambda: QUIET_INSTANT + timedelta(minutes=5)
+        second = runner.run(
+            CycleMode.DRY_RUN,
+            reference_price_usdc=FIXTURE_AMM_PRICE,
+        )
+        assert second.decision_reason == "open_above_range_waiting"
+        assert any("0:05:00" in line for line in second.decision_diagnostics)
+
+        position = state_store.load().position
+        assert position is not None
+        assert position.out_of_range_since == QUIET_INSTANT
 
     def test_tracked_position_reports_custody_value_and_pnl(self, tmp_path: Path) -> None:
         """An open tracked position carries its P&L into the report."""
@@ -742,6 +980,48 @@ class TestReconciliation:
         assert report.reconciliation.tracked_staked is False
         assert report.pnl_vs_entry_usdc == Decimal("1")
         assert report.decision_action == "hold"
+
+    def test_live_hold_recovers_an_unstaked_tracked_position(self, tmp_path: Path) -> None:
+        """A partial prior cycle is healed by restaking the valid Safe-held NFT."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=SAFE_ADDRESS))
+        runner, executor, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+        assert executor is not None
+
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_price_usdc=FIXTURE_AMM_PRICE,
+        )
+
+        assert report.decision_action == "hold"
+        assert [call[0] for call in executor.calls] == ["stake"]
+        assert len(report.actions) == 1
+        assert report.actions[0].action == "stake_recovery"
+        assert report.actions[0].status == "completed"
+        assert report.reconciliation.tracked_staked is True
+        assert report.halted_reason == ""
+
+    def test_external_reference_cannot_force_scheduled_position_exit(self, tmp_path: Path) -> None:
+        """A divergent external quote is advisory and cannot order an Aerodrome exit."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status())
+        runner, _, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+        report = runner.run(
+            CycleMode.DRY_RUN,
+            reference_price_usdc=Decimal("1"),
+            reference_age_seconds=999999,
+        )
+        assert report.reconciliation.tracked_token_id == TRACKED_TOKEN_ID
+        assert report.decision_action == "hold"
+        assert report.decision_reason in {
+            "open_in_range",
+            "open_above_range_waiting",
+            "open_below_edge_holding",
+        }
+        assert "dislocation" not in report.decision_reason
+        assert "reference_stale" not in report.decision_reason
+        assert any("diagnostic-only" in note for note in report.input_notes)
 
     def test_a_crashed_entry_is_adopted_from_audit_evidence(self, tmp_path: Path) -> None:
         """One live untracked position proven by the audit chain adopts."""
@@ -790,6 +1070,24 @@ class TestReconciliation:
         assert book.held_inventory is not None
         assert book.held_inventory.stock_quantity == Decimal("0.021")
 
+    def test_rebuild_persists_post_action_unrecorded_stock(self, tmp_path: Path) -> None:
+        """Post-action reconciliation persists stock acquired before a failed mint."""
+        runner, _, _, _ = make_runner(tmp_path)
+        reconciliation = runner._reconcile(CycleStateBook()).model_copy(
+            update={
+                "held_stock_quantity": Decimal("0.14296689"),
+                "held_symbol": "FIXc",
+                "safe_stock_units": 14_296_689,
+            }
+        )
+        rebuilt = runner._rebuild_book(
+            CycleStateBook(), reconciliation, PolicyState(), "FIXc", PolicyActionKind.RECENTER
+        )
+        assert rebuilt.position is None
+        assert rebuilt.held_inventory is not None
+        assert rebuilt.held_inventory.symbol == "FIXc"
+        assert rebuilt.held_inventory.stock_quantity == Decimal("0.14296689")
+
 
 class TestReferenceEnvironment:
     """The optional injected reference quote from the environment."""
@@ -810,12 +1108,13 @@ class TestReferenceEnvironment:
 class TestSystemdUnits:
     """The deployment contract the timer and service units pin."""
 
-    def test_the_timer_defaults_hourly_with_persistence_and_jitter(self) -> None:
-        """One cycle per hour, catching up after downtime, never overlapping."""
+    def test_the_timer_defaults_five_minutes_with_persistence_and_jitter(self) -> None:
+        """Five-minute policy cycles honor fifteen-minute persistence rules."""
         timer = Path("deploy/systemd/aero-bot-cycle@.timer").read_text(encoding="utf-8")
-        assert "OnCalendar=hourly" in timer
+        assert "OnCalendar=*:0/5" in timer
         assert "Persistent=true" in timer
-        assert "RandomizedDelaySec=180" in timer
+        assert "AccuracySec=15s" in timer
+        assert "RandomizedDelaySec=15" in timer
         assert "Unit=aero-bot-cycle@%i.service" in timer
 
     def test_the_service_is_a_hardened_oneshot(self) -> None:
@@ -987,18 +1286,47 @@ def selector_runner(
 class TestSelectorCycles:
     """Cross-board selection cycles: entry, hysteresis, and one position."""
 
-    def test_flat_selector_cycle_holds_when_no_pool_qualifies(self, tmp_path: Path) -> None:
-        """Without references every pool blocks and the board holds honestly."""
+    def test_flat_selector_cycle_uses_pool_authority_without_references(
+        self, tmp_path: Path
+    ) -> None:
+        """External references are not required for Aerodrome pool selection."""
         runner, _, _ = selector_runner(tmp_path)
         report = runner.run(CycleMode.DRY_RUN)
-        assert report.decision_action == "hold"
-        assert report.decision_reason == "no_qualifying_pool"
-        assert "AAAc reference_stale" in report.decision_diagnostics[0]
-        assert "BBBc reference_stale" in report.decision_diagnostics[0]
-        assert any("board [" in note for note in report.input_notes)
-        # The no-qualify report names the closest-call pool (the highest
-        # emissions APR), mirroring the decide surface's fallback.
+        assert report.decision_action == "enter"
+        assert report.decision_reason == "entry_threshold_met"
         assert report.symbol == "BBBc"
+        assert any("diagnostic-only" in note for note in report.input_notes)
+        assert any("10% headroom" in note for note in report.input_notes)
+        assert any("board [" in note for note in report.input_notes)
+
+    def test_selector_counts_tracked_lp_in_daily_loss_equity(self, tmp_path: Path) -> None:
+        """Deployed LP capital cannot masquerade as a selector-mode daily loss."""
+        policy_day = QUIET_INSTANT.astimezone(
+            __import__("zoneinfo").ZoneInfo("America/New_York")
+        ).date()
+        book = tracked_book(symbol="AAAc").model_copy(
+            update={
+                "day": policy_day,
+                "day_start_equity_usd": Decimal("18"),
+                "halted_day": None,
+            }
+        )
+        sources = SelectorCycleSources().with_listings(selector_listings(1))
+        runner, _, state_store = selector_runner(
+            tmp_path,
+            book=book,
+            reads=_tracked_reads(),
+            sources=sources,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN)
+
+        assert "daily_loss_halt_active" not in " ".join(report.input_notes)
+        assert any(
+            "selector equity includes tracked LP marked value 8 USDC" in note
+            for note in report.input_notes
+        )
+        assert state_store.load().halted_day is None
 
     def test_selector_enters_the_best_qualifying_pool(self, tmp_path: Path) -> None:
         """The live cycle mints and stakes the higher-APR pool only."""
@@ -1024,8 +1352,10 @@ class TestSelectorCycles:
         sources = SelectorCycleSources().with_listings(selector_listings(1))
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(symbol="AAAc"),
-            reads=_tracked_reads(),
+            book=tracked_book(
+                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
+            ),
+            reads=_tracked_reads(staked=True),
             sources=sources,
         )
         assert executor is not None
@@ -1045,7 +1375,9 @@ class TestSelectorCycles:
         # BBBc at double AAAc's APR clears the default thirty percent margin.
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(symbol="AAAc"),
+            book=tracked_book(
+                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
+            ),
             reads=_tracked_reads(staked=True),
         )
         assert executor is not None
@@ -1057,13 +1389,14 @@ class TestSelectorCycles:
         assert report.decision_action == "pool_switch"
         assert report.decision_reason == "pool_switch_triggered"
         assert [call[0] for call in executor.calls] == [
+            "switch_preflight",
             "unstake",
             "withdraw",
             "exit_swap",
             "mint",
             "stake",
         ]
-        assert executor.calls[3][1] == "BBBc"
+        assert executor.calls[4][1] == "BBBc"
         book = state_store.load()
         assert book.position is not None
         assert book.position.symbol == "BBBc"
@@ -1074,7 +1407,9 @@ class TestSelectorCycles:
         """A refused exit stops the switch with no second position minted."""
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(symbol="AAAc"),
+            book=tracked_book(
+                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
+            ),
             reads=_tracked_reads(staked=True),
         )
         assert executor is not None
@@ -1100,11 +1435,81 @@ class TestSelectorCycles:
             key_bytes=b"\x01" * 32,
             reference_prices_by_symbol=SELECTOR_REFERENCES,
         )
-        assert [call[0] for call in executor.calls] == ["unstake"]
+        assert [call[0] for call in executor.calls] == ["switch_preflight", "unstake"]
         assert "refused" in report.halted_reason
         book = state_store.load()
         assert book.position is not None
         assert book.position.symbol == "AAAc"
+
+    def test_failed_switch_mint_preserves_target_inventory_for_retry(self, tmp_path: Path) -> None:
+        """A partial target mint keeps acquired stock tagged for direct retry."""
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=tracked_book(
+                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
+            ),
+            reads=_tracked_reads(staked=True),
+        )
+        assert executor is not None
+
+        def refusing_mint(
+            symbol: str,
+            budget_usdc: Decimal,
+            width_spacings: int | None,
+            key_bytes: bytes,
+            *,
+            confirm_broadcast: bool,
+            ephemeral_key: bool = False,
+        ) -> LpActionExecutionReport:
+            executor.calls.append(("mint", symbol, budget_usdc, width_spacings))
+            runner._balances.stock_units = 3_000_000
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "scripted post-swap mint refusal",
+            )
+
+        executor.execute_mint = refusing_mint  # type: ignore[method-assign]
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+
+        assert "mint action refused" in report.halted_reason
+        book = state_store.load()
+        assert book.position is None
+        assert book.held_inventory is not None
+        assert book.held_inventory.symbol == "BBBc"
+        assert book.held_inventory.stock_quantity == Decimal("0.03")
+        assert book.held_inventory.origin == "failed_entry"
+
+    def test_switch_preflight_refusal_keeps_the_source_position_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """A target-plan refusal never unstake/withdraws the earning source LP."""
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=tracked_book(
+                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
+            ),
+            reads=_tracked_reads(staked=True),
+        )
+        assert executor is not None
+        executor.refuse_next = "switch_preflight"
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert [call[0] for call in executor.calls] == ["switch_preflight"]
+        assert len(report.actions) == 1
+        assert report.actions[0].action == "switch_preflight"
+        assert report.actions[0].status == "refused"
+        assert "switch preflight refused" in report.halted_reason
+        book = state_store.load()
+        assert book.position is not None
+        assert book.position.symbol == "AAAc"
+        assert book.position.token_id == TRACKED_TOKEN_ID
 
     def test_per_pool_cooldown_blocks_only_its_own_pool(self, tmp_path: Path) -> None:
         """A BBBc cooldown skips BBBc and lets the cycle enter AAAc."""
@@ -1158,6 +1563,28 @@ class TestCycleConfiguration:
             _symbol_from_arguments_and_environment("AAPLc", {CYCLE_SYMBOL_ENV: "FIXc"}) == "AAPLc"
         )
 
+    def test_selector_ignores_a_legacy_single_reference_instead_of_refusing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An AAPL-only sealed quote cannot block Aerodrome-authoritative auto mode."""
+        from aero_bot import cycle as cycle_module
+
+        captured: dict[str, object] = {}
+
+        class FakeRunner:
+            def run(self, mode: CycleMode, **kwargs: object) -> object:
+                captured.update(kwargs)
+                raise RuntimeError("selector reached runner")
+
+        monkeypatch.setenv(CYCLE_REFERENCE_PRICE_ENV, "317.10")
+        monkeypatch.setattr(
+            cycle_module, "build_cycle_runner", lambda *args, **kwargs: FakeRunner()
+        )
+        exit_code = cycle_module.main(["--symbol", "auto", "--dry-run", "--json"])
+        assert exit_code == 1
+        assert captured.get("reference_price_usdc") is None
+        assert captured.get("reference_prices_by_symbol") is None
+
     def test_switch_margin_defaults_and_overrides(self) -> None:
         """The margin defaults to the ruling's thirty percent."""
         assert _switch_margin_from_environment({}) == Decimal("0.30")
@@ -1181,3 +1608,41 @@ class TestCycleConfiguration:
             _reference_price_from_environment({CYCLE_REFERENCE_PRICE_ENV: "AAPLc="})
         with pytest.raises(ValueError, match="more than once"):
             _reference_price_from_environment({CYCLE_REFERENCE_PRICE_ENV: "A=1,A=2"})
+
+
+def test_token1_stock_in_range_clears_stale_recenter_anchor(tmp_path: Path) -> None:
+    """An in-range token1-stock NFT cannot recenter from a stale wait anchor."""
+    book = tracked_book()
+    assert book.position is not None
+    stale_anchor = QUIET_INSTANT - timedelta(minutes=30)
+    book = book.model_copy(
+        update={"position": book.position.model_copy(update={"out_of_range_since": stale_anchor})}
+    )
+
+    reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+    reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS))
+
+    runner, _, _, state_store = make_runner(
+        tmp_path,
+        book=book,
+        reads=reads,
+    )
+
+    reconciliation = runner._reconcile(book)
+    state = runner._policy_state(book, reconciliation)
+
+    assert state.position is not None
+    assert state.position.price_range.lower_price < FIXTURE_AMM_PRICE
+    assert state.position.price_range.upper_price > FIXTURE_AMM_PRICE
+
+    report = runner.run(
+        CycleMode.DRY_RUN,
+        reference_price_usdc=FIXTURE_AMM_PRICE,
+    )
+
+    assert report.decision_action == "hold"
+    assert report.decision_reason != "recenter_wait_elapsed"
+
+    saved = state_store.load()
+    assert saved.position is not None
+    assert saved.position.out_of_range_since is None

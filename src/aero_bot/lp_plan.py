@@ -37,15 +37,21 @@ from aero_bot.ranging import TICK_PRICE_RATIO
 MATH_PRECISION = 60
 # The locked safety ceiling half width mirrors the ranging solver's ceiling.
 DEFAULT_MAX_RANGE_HALF_WIDTH_FRACTION = Decimal("0.003")
-# The default mint min-amount tolerance. Raised from 0.1 percent to
-# 1 percent by the captain's calibration ruling (2026-09-08):
-# 0.1-percent-of-amount minima on a width-1 (20-tick) range leave a
-# ~0.005-tick price tolerance on the near-bound side, which the measured
-# pool wobble (0.265 ticks per 180 seconds on AAPLc) always exceeds before
-# the capped pipeline's observation-to-execution latency can complete.
-# Mint minima guard position composition, not principal, so 1 percent
-# restores fillability at a bounded composition drift.
+# Swap output floors retain the one-percent tolerance calibrated for the
+# canary. Mint minima no longer use a flat percentage of desired token
+# amounts: narrow concentrated ranges amplify tiny price moves into much
+# larger composition changes, so mint minima are derived from a bounded
+# execution-price envelope instead.
 DEFAULT_MINT_SLIPPAGE_TOLERANCE = Decimal("0.01")
+# A 0.35-tick envelope covers both measured post-estimate PSC failures: the
+# original AAPLc move (~0.059 tick) and the 2026-09-19 MSTRc final-mint move
+# (~0.312 tick), while the 95-percent utilization floor still permits the
+# narrowest supported one-spacing fixture range.
+DEFAULT_MINT_EXECUTION_DRIFT_TICKS = Decimal("0.35")
+# The price envelope may not reduce executable liquidity below this fraction
+# of the anchor mint. If it would, the mint is too composition-sensitive at
+# the current location and planning fails closed instead of weakening minima.
+MIN_MINT_EXECUTION_UTILIZATION_FRACTION = Decimal("0.95")
 # The balancing swap buys the shortfall plus this fraction so the mint's
 # stock pull never exceeds the realized swap output through small adverse
 # moves; the executor re-derives the mint amounts from realized output.
@@ -103,6 +109,8 @@ class LpPlanRefusalCode(StrEnum):
     SWAP_IMPACT_ABOVE_CEILING = "swap_impact_above_ceiling"
     # The Safe's USDC cannot fund both the quote side and the balancing swap.
     INSUFFICIENT_USDC_FOR_ENTRY = "insufficient_usdc_for_entry"
+    # The bounded execution-price envelope would underutilize too much capital.
+    EXECUTION_ENVELOPE_UNDERUTILIZED = "execution_envelope_underutilized"
 
 
 class WidthSource(StrEnum):
@@ -174,8 +182,12 @@ class MintAmountPlan(BaseModel):
     token0_value_usdc: NonNegativeDecimal
     # The token-one side's committed value at the plan price, in USDC.
     token1_value_usdc: NonNegativeDecimal
-    # The tolerance the minima sit below the desired amounts.
+    # Swap-output tolerance retained for the balancing-swap leg.
     slippage_tolerance_fraction: Annotated[Decimal, Field(gt=0, lt=1)]
+    # Symmetric execution-price movement covered by the mint minima, in ticks.
+    execution_price_drift_ticks: Annotated[Decimal, Field(gt=0)]
+    # Worst executable-liquidity share across the price envelope.
+    execution_utilization_fraction: Annotated[Decimal, Field(gt=0, le=1)]
 
     @model_validator(mode="after")
     def require_minima_below_desired(self) -> Self:
@@ -187,6 +199,14 @@ class MintAmountPlan(BaseModel):
         return self
 
 
+class BalancingSwapDirection(StrEnum):
+    """Identify which side of the Safe inventory a mint must rebalance."""
+
+    NONE = "none"
+    USDC_TO_STOCK = "usdc_to_stock"
+    STOCK_TO_USDC = "stock_to_usdc"
+
+
 class BalancingSwapPlan(BaseModel):
     """Hold the balancing swap the Safe's inventory requires before a mint."""
 
@@ -195,27 +215,66 @@ class BalancingSwapPlan(BaseModel):
 
     # Whether any balancing swap is required at all.
     required: bool
-    # The stock shortfall the swap covers, in raw stock units.
+    # Which side is sold to fund the other side.
+    direction: BalancingSwapDirection
+    # The stock shortfall the buy-side swap covers, in raw stock units.
     stock_shortfall_units: Annotated[int, Field(ge=0)]
-    # The USDC the swap spends, in raw six-decimal units; zero when absent.
+    # The USDC shortfall the sell-side swap covers, in raw six-decimal units.
+    usdc_shortfall_units: Annotated[int, Field(ge=0)] = 0
+    # The USDC the buy-side swap spends, in raw six-decimal units.
     usdc_in_units: Annotated[int, Field(ge=0)]
-    # The spot-quoted stock output, in raw stock units; zero when absent.
+    # The stock the sell-side swap spends, in raw stock units.
+    stock_in_units: Annotated[int, Field(ge=0)] = 0
+    # The spot-quoted stock output from a USDC->stock swap.
     expected_stock_units: Annotated[int, Field(ge=0)]
+    # The spot-quoted USDC output from a stock->USDC swap.
+    expected_usdc_units: Annotated[int, Field(ge=0)] = 0
     # The conservative reserve-based impact bound of the whole swap.
     modeled_impact_fraction: NonNegativeDecimal
     # How many tranches the swap splits into; one below the tranche rule.
     tranche_count: Annotated[int, Field(gt=0)]
-    # The acquisition buffer fraction applied over the raw shortfall.
+    # The buffer fraction applied over the side shortfall.
     buffer_fraction: NonNegativeDecimal
 
     @model_validator(mode="after")
     def require_coherent_swap(self) -> Self:
-        """Reject a present swap without amounts or an absent one with them."""
-        if self.required and (self.usdc_in_units <= 0 or self.expected_stock_units <= 0):
-            raise ValueError("a required balancing swap carries positive amounts")
-        if not self.required and (self.usdc_in_units > 0 or self.stock_shortfall_units > 0):
-            raise ValueError("an absent balancing swap carries no shortfall or USDC")
-        return self
+        """Reject direction/amount combinations that cannot describe one rebalance."""
+        if not self.required:
+            if self.direction is not BalancingSwapDirection.NONE:
+                raise ValueError("an absent balancing swap must use direction none")
+            if any(
+                (
+                    self.stock_shortfall_units,
+                    self.usdc_shortfall_units,
+                    self.usdc_in_units,
+                    self.stock_in_units,
+                    self.expected_stock_units,
+                    self.expected_usdc_units,
+                )
+            ):
+                raise ValueError("an absent balancing swap carries no swap amounts")
+            return self
+        if self.direction is BalancingSwapDirection.USDC_TO_STOCK:
+            if not (
+                self.stock_shortfall_units > 0
+                and self.usdc_in_units > 0
+                and self.expected_stock_units > 0
+            ):
+                raise ValueError("a USDC-to-stock swap carries positive buy-side amounts")
+            if self.usdc_shortfall_units or self.stock_in_units or self.expected_usdc_units:
+                raise ValueError("a USDC-to-stock swap cannot carry sell-side amounts")
+            return self
+        if self.direction is BalancingSwapDirection.STOCK_TO_USDC:
+            if not (
+                self.usdc_shortfall_units > 0
+                and self.stock_in_units > 0
+                and self.expected_usdc_units > 0
+            ):
+                raise ValueError("a stock-to-USDC swap carries positive sell-side amounts")
+            if self.stock_shortfall_units or self.usdc_in_units or self.expected_stock_units:
+                raise ValueError("a stock-to-USDC swap cannot carry buy-side amounts")
+            return self
+        raise ValueError("a required balancing swap needs a concrete direction")
 
 
 class LpPoolObservation(BaseModel):
@@ -304,9 +363,13 @@ class MintDirective(BaseModel):
     max_range_half_width_fraction: Annotated[Decimal, Field(gt=0)] = (
         DEFAULT_MAX_RANGE_HALF_WIDTH_FRACTION
     )
-    # The tolerance the mint minima sit below the desired amounts.
+    # Swap-output tolerance used by a balancing swap.
     slippage_tolerance_fraction: Annotated[Decimal, Field(gt=0, lt=1)] = (
         DEFAULT_MINT_SLIPPAGE_TOLERANCE
+    )
+    # Price movement the final mint minima must tolerate before inclusion.
+    execution_price_drift_ticks: Annotated[Decimal, Field(gt=0)] = (
+        DEFAULT_MINT_EXECUTION_DRIFT_TICKS
     )
     # The acquisition buffer over the stock shortfall the swap buys.
     swap_buffer_fraction: Annotated[Decimal, Field(ge=0, lt=1)] = DEFAULT_SWAP_BUFFER_FRACTION
@@ -650,7 +713,7 @@ def estimate_in_range_depth_usdc(
         MIN_HALF_WIDTH_SPACINGS,
         WidthSource.EXPLICIT_OVERRIDE,
     )
-    amount0, amount1 = position_amounts_for_liquidity(
+    amount0, amount1 = position_amounts_at_sqrt_ratio(
         sqrt_ratio, band.tick_lower, band.tick_upper, Decimal(pool_active_liquidity)
     )
     price = price_usdc_per_stock(sqrt_ratio, stock_is_token0, stock_decimals, quote_decimals)
@@ -665,6 +728,122 @@ def estimate_in_range_depth_usdc(
     return +(amount0 * token0_scale * token0_price) + +(amount1 * token1_scale * token1_price)
 
 
+def _liquidity_from_desired_amounts(
+    sqrt_ratio: int,
+    tick_lower: int,
+    tick_upper: int,
+    amount0_units: int,
+    amount1_units: int,
+) -> Decimal:
+    """Return the liquidity executable from fixed desired amounts at one price."""
+    if amount0_units <= 0 or amount1_units <= 0:
+        raise ValueError("desired mint amounts must be positive")
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        sqrt_lower = _sqrt_price_at_tick(tick_lower)
+        sqrt_upper = _sqrt_price_at_tick(tick_upper)
+        sqrt_current = Decimal(sqrt_ratio)
+        if not sqrt_lower < sqrt_current < sqrt_upper:
+            raise ValueError("execution price must sit strictly inside the mint range")
+        liquidity0 = (
+            Decimal(amount0_units)
+            * sqrt_current
+            * sqrt_upper
+            / (X96_SCALE * (sqrt_upper - sqrt_current))
+        )
+        liquidity1 = (
+            Decimal(amount1_units)
+            * X96_SCALE
+            / (sqrt_current - sqrt_lower)
+        )
+        return +min(liquidity0, liquidity1)
+
+
+def plan_mint_execution_minima(
+    sqrt_ratio: int,
+    tick_lower: int,
+    tick_upper: int,
+    amount0_desired_units: int,
+    amount1_desired_units: int,
+    execution_price_drift_ticks: Decimal = DEFAULT_MINT_EXECUTION_DRIFT_TICKS,
+    minimum_utilization_fraction: Decimal = MIN_MINT_EXECUTION_UTILIZATION_FRACTION,
+) -> tuple[int, int, Decimal]:
+    """Derive mint minima from a bounded symmetric execution-price envelope.
+
+    The desired token amounts are fixed by the anchor plan. At each price
+    boundary, the NFPM can mint only the liquidity supported by both desired
+    sides; the corresponding actual token pulls are therefore the correct
+    composition minima. This models concentrated-liquidity geometry directly
+    instead of assuming that a one-percent amount haircut equals a one-percent
+    price move.
+    """
+    if execution_price_drift_ticks <= 0:
+        raise ValueError("execution_price_drift_ticks must be positive")
+    if not Decimal(0) < minimum_utilization_fraction <= Decimal(1):
+        raise ValueError("minimum_utilization_fraction must be in (0, 1]")
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        sqrt_current = Decimal(sqrt_ratio)
+        drift_factor = TICK_PRICE_RATIO ** (execution_price_drift_ticks / Decimal(2))
+        lower_execution_sqrt = int(sqrt_current / drift_factor)
+        upper_execution_sqrt = int(sqrt_current * drift_factor)
+        sqrt_lower = _sqrt_price_at_tick(tick_lower)
+        sqrt_upper = _sqrt_price_at_tick(tick_upper)
+        if (
+            Decimal(lower_execution_sqrt) <= sqrt_lower
+            or Decimal(upper_execution_sqrt) >= sqrt_upper
+        ):
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.PRICE_OUTSIDE_RANGE,
+                f"the +/-{execution_price_drift_ticks}-tick execution envelope reaches "
+                "the mint range boundary; wait for a safer range location",
+            )
+        anchor_liquidity = _liquidity_from_desired_amounts(
+            sqrt_ratio,
+            tick_lower,
+            tick_upper,
+            amount0_desired_units,
+            amount1_desired_units,
+        )
+        endpoint_amounts: list[tuple[int, int]] = []
+        worst_utilization = Decimal(1)
+        for execution_sqrt in (lower_execution_sqrt, upper_execution_sqrt):
+            executable_liquidity = _liquidity_from_desired_amounts(
+                execution_sqrt,
+                tick_lower,
+                tick_upper,
+                amount0_desired_units,
+                amount1_desired_units,
+            )
+            utilization = executable_liquidity / anchor_liquidity
+            worst_utilization = min(worst_utilization, utilization)
+            amount0, amount1 = position_amounts_for_liquidity(
+                execution_sqrt,
+                tick_lower,
+                tick_upper,
+                executable_liquidity,
+            )
+            endpoint_amounts.append(
+                (
+                    int(amount0.to_integral_value(rounding=ROUND_FLOOR)),
+                    int(amount1.to_integral_value(rounding=ROUND_FLOOR)),
+                )
+            )
+        if worst_utilization < minimum_utilization_fraction:
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.EXECUTION_ENVELOPE_UNDERUTILIZED,
+                f"the +/-{execution_price_drift_ticks}-tick execution envelope can reduce "
+                f"minted liquidity to {worst_utilization:.6f} of plan, below the "
+                f"{minimum_utilization_fraction} floor; wait for a less sensitive price "
+                "location or widen the range",
+            )
+        # One raw unit below the Decimal floor protects against the final
+        # integer rounding edge without weakening the economic envelope.
+        amount0_min = max(0, min(amount[0] for amount in endpoint_amounts) - 1)
+        amount1_min = max(0, min(amount[1] for amount in endpoint_amounts) - 1)
+        return amount0_min, amount1_min, +worst_utilization
+
+
 def plan_mint_composition(
     sqrt_ratio: int,
     position_range: PositionTickRange,
@@ -673,30 +852,9 @@ def plan_mint_composition(
     stock_decimals: int,
     quote_decimals: int,
     slippage_tolerance_fraction: Decimal,
+    execution_price_drift_ticks: Decimal = DEFAULT_MINT_EXECUTION_DRIFT_TICKS,
 ) -> MintAmountPlan:
-    """Convert one USDC budget into both sides' raw mint amounts.
-
-    The unit liquidity's two sides are valued at the snapshot price, the
-    budget buys liquidity at that unit value, and both desired amounts floor
-    to raw integers so the plan never overstates what the budget funds.
-
-    Args:
-        sqrt_ratio: The pool's positive raw sqrtPriceX96.
-        position_range: The derived range the position spans.
-        budget_usdc: The positive total USDC value both sides commit.
-        stock_is_token0: True when the stock token sorts before USDC.
-        stock_decimals: The stock token's decimal count.
-        quote_decimals: The USDC token's decimal count.
-        slippage_tolerance_fraction: The fraction the minima sit below desired.
-
-    Returns:
-        The mint amount plan with desired amounts, minima, and side values.
-
-    Raises:
-        LpPlanRefusalError: If the current price sits outside the range or the
-            budget is too small to fund both sides after flooring.
-        ValueError: If any argument is malformed.
-    """
+    """Convert one USDC budget into desired amounts and geometric mint minima."""
     if budget_usdc <= 0:
         raise ValueError("budget_usdc must be positive")
     price = price_usdc_per_stock(sqrt_ratio, stock_is_token0, stock_decimals, quote_decimals)
@@ -714,7 +872,6 @@ def plan_mint_composition(
                 LpPlanRefusalCode.PRICE_OUTSIDE_RANGE,
                 f"cannot compose a two-sided position: {error}",
             ) from error
-        # Each side's human scale and USDC price follow from which side is stock.
         token0_scale = (
             Decimal(10) ** -stock_decimals if stock_is_token0 else Decimal(10) ** (-quote_decimals)
         )
@@ -737,12 +894,13 @@ def plan_mint_composition(
                 f"a {budget_usdc} USDC budget floors one side of this range to zero at the "
                 f"price {price} USDC per stock; raise the budget or tighten the range",
             )
-        tolerance = slippage_tolerance_fraction
-        amount0_min = int(
-            (amount0 * (Decimal(1) - tolerance)).to_integral_value(rounding=ROUND_FLOOR)
-        )
-        amount1_min = int(
-            (amount1 * (Decimal(1) - tolerance)).to_integral_value(rounding=ROUND_FLOOR)
+        amount0_min, amount1_min, utilization = plan_mint_execution_minima(
+            sqrt_ratio,
+            position_range.tick_lower,
+            position_range.tick_upper,
+            int(amount0),
+            int(amount1),
+            execution_price_drift_ticks,
         )
         return MintAmountPlan(
             liquidity=liquidity,
@@ -752,9 +910,10 @@ def plan_mint_composition(
             amount1_min_units=amount1_min,
             token0_value_usdc=+(amount0 * token0_scale * token0_price),
             token1_value_usdc=+(amount1 * token1_scale * token1_price),
-            slippage_tolerance_fraction=tolerance,
+            slippage_tolerance_fraction=slippage_tolerance_fraction,
+            execution_price_drift_ticks=execution_price_drift_ticks,
+            execution_utilization_fraction=utilization,
         )
-
 
 def plan_balancing_swap(
     stock_shortfall_units: int,
@@ -826,9 +985,87 @@ def plan_balancing_swap(
             )
         return BalancingSwapPlan(
             required=True,
+            direction=BalancingSwapDirection.USDC_TO_STOCK,
             stock_shortfall_units=stock_shortfall_units,
             usdc_in_units=usdc_in_units,
             expected_stock_units=expected_stock_units,
+            modeled_impact_fraction=+impact,
+            tranche_count=tranche_count,
+            buffer_fraction=buffer_fraction,
+        )
+
+
+def plan_stock_sale_for_usdc(
+    usdc_shortfall_units: int,
+    stock_excess_units: int,
+    price_usdc_per_stock_value: Decimal,
+    stock_decimals: int,
+    usdc_reserve_units: int,
+    buffer_fraction: Decimal,
+    impact_ceiling_fraction: Decimal,
+    tranche_threshold_fraction: Decimal,
+) -> BalancingSwapPlan:
+    """Plan the stock-to-USDC swap covering one mint's quote-side shortfall."""
+    if usdc_shortfall_units <= 0:
+        raise ValueError("usdc_shortfall_units must be positive")
+    if stock_excess_units <= 0:
+        raise LpPlanRefusalError(
+            LpPlanRefusalCode.INSUFFICIENT_USDC_FOR_ENTRY,
+            "the Safe has no stock above the mint's stock side to sell for missing USDC",
+        )
+    if price_usdc_per_stock_value <= 0:
+        raise ValueError("price must be positive")
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        buffered_usdc_units = int(
+            (
+                Decimal(usdc_shortfall_units) * (Decimal(1) + buffer_fraction)
+            ).to_integral_value(rounding=ROUND_CEILING)
+        )
+        buffered_usdc = Decimal(buffered_usdc_units).scaleb(-QUOTE_TOKEN_DECIMALS)
+        stock_in_units = int(
+            (
+                buffered_usdc
+                / price_usdc_per_stock_value
+                * Decimal(10) ** stock_decimals
+            ).to_integral_value(rounding=ROUND_CEILING)
+        )
+        if stock_in_units > stock_excess_units:
+            shortfall = Decimal(usdc_shortfall_units).scaleb(-QUOTE_TOKEN_DECIMALS)
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.INSUFFICIENT_USDC_FOR_ENTRY,
+                f"the Safe is short {shortfall} USDC and its excess stock cannot fund that "
+                "quote-side deficit without consuming the mint's required stock side",
+            )
+        expected_usdc_units = int(
+            (
+                Decimal(stock_in_units).scaleb(-stock_decimals)
+                * price_usdc_per_stock_value
+                * Decimal(10) ** QUOTE_TOKEN_DECIMALS
+            ).to_integral_value(rounding=ROUND_FLOOR)
+        )
+        impact = Decimal(expected_usdc_units) / Decimal(usdc_reserve_units)
+        if impact >= impact_ceiling_fraction:
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.SWAP_IMPACT_ABOVE_CEILING,
+                f"the stock-to-USDC balancing swap's conservative impact bound "
+                f"{impact:.6f} reaches the {impact_ceiling_fraction} ceiling; lower the "
+                "budget below the pool's executable depth",
+            )
+        tranche_count = 1
+        if impact > tranche_threshold_fraction:
+            tranche_count = int(
+                (impact / tranche_threshold_fraction).to_integral_value(rounding=ROUND_CEILING)
+            )
+        return BalancingSwapPlan(
+            required=True,
+            direction=BalancingSwapDirection.STOCK_TO_USDC,
+            stock_shortfall_units=0,
+            usdc_shortfall_units=usdc_shortfall_units,
+            usdc_in_units=0,
+            stock_in_units=stock_in_units,
+            expected_stock_units=0,
+            expected_usdc_units=expected_usdc_units,
             modeled_impact_fraction=+impact,
             tranche_count=tranche_count,
             buffer_fraction=buffer_fraction,
@@ -846,9 +1083,13 @@ def _absent_balancing_swap(buffer_fraction: Decimal) -> BalancingSwapPlan:
     """
     return BalancingSwapPlan(
         required=False,
+        direction=BalancingSwapDirection.NONE,
         stock_shortfall_units=0,
+        usdc_shortfall_units=0,
         usdc_in_units=0,
+        stock_in_units=0,
         expected_stock_units=0,
+        expected_usdc_units=0,
         modeled_impact_fraction=Decimal(0),
         tranche_count=1,
         buffer_fraction=buffer_fraction,
@@ -935,6 +1176,7 @@ def plan_mint_entry(
         observation.stock_decimals,
         observation.quote_decimals,
         directive.slippage_tolerance_fraction,
+        directive.execution_price_drift_ticks,
     )
     caps.append("snapshot price strictly inside the derived range")
     depth = estimate_in_range_depth_usdc(
@@ -969,6 +1211,7 @@ def plan_mint_entry(
         else amounts.amount0_desired_units
     )
     stock_shortfall = stock_desired - inventory.stock_units
+    usdc_shortfall = usdc_desired - inventory.usdc_units
     if stock_shortfall > 0:
         swap = plan_balancing_swap(
             stock_shortfall,
@@ -980,22 +1223,63 @@ def plan_mint_entry(
             policy.swap_tranche_threshold_fraction,
         )
         caps.append(
-            f"balancing swap impact {swap.modeled_impact_fraction:.6f} below the "
+            f"USDC-to-stock balancing swap impact {swap.modeled_impact_fraction:.6f} below the "
+            f"{policy.swap_impact_ceiling_fraction} ceiling in {swap.tranche_count} tranche(s)"
+        )
+    elif usdc_shortfall > 0:
+        swap = plan_stock_sale_for_usdc(
+            usdc_shortfall,
+            inventory.stock_units - stock_desired,
+            price,
+            observation.stock_decimals,
+            observation.usdc_reserve_units,
+            directive.swap_buffer_fraction,
+            policy.swap_impact_ceiling_fraction,
+            policy.swap_tranche_threshold_fraction,
+        )
+        caps.append(
+            f"stock-to-USDC balancing swap impact {swap.modeled_impact_fraction:.6f} below the "
             f"{policy.swap_impact_ceiling_fraction} ceiling in {swap.tranche_count} tranche(s)"
         )
     else:
         swap = _absent_balancing_swap(directive.swap_buffer_fraction)
-        caps.append("held stock covers the stock side; no balancing swap required")
-    usdc_needed_units = usdc_desired + swap.usdc_in_units
-    if usdc_needed_units > inventory.usdc_units:
+        caps.append("Safe inventory already covers both mint sides; no balancing swap required")
+
+    if swap.direction is BalancingSwapDirection.USDC_TO_STOCK:
+        usdc_needed_units = usdc_desired + swap.usdc_in_units
+        if usdc_needed_units > inventory.usdc_units:
+            held = Decimal(inventory.usdc_units).scaleb(-QUOTE_TOKEN_DECIMALS)
+            needed = Decimal(usdc_needed_units).scaleb(-QUOTE_TOKEN_DECIMALS)
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.INSUFFICIENT_USDC_FOR_ENTRY,
+                f"entering needs {needed} USDC (quote side plus balancing swap) but the Safe "
+                f"holds {held} USDC; fund the Safe or lower the budget",
+            )
+        caps.append("Safe USDC covers the quote side plus the stock acquisition")
+    elif swap.direction is BalancingSwapDirection.STOCK_TO_USDC:
+        stock_needed_units = stock_desired + swap.stock_in_units
+        if stock_needed_units > inventory.stock_units:
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.INSUFFICIENT_USDC_FOR_ENTRY,
+                "the Safe's excess stock cannot fund the quote-side deficit without "
+                "consuming stock required by the mint",
+            )
+        if inventory.usdc_units + swap.expected_usdc_units < usdc_desired:
+            raise LpPlanRefusalError(
+                LpPlanRefusalCode.INSUFFICIENT_USDC_FOR_ENTRY,
+                "the stock-to-USDC rebalance does not quote enough USDC to fund the mint",
+            )
+        caps.append("Safe excess stock can fund the quote-side shortfall without a round trip")
+    elif inventory.usdc_units < usdc_desired:
         held = Decimal(inventory.usdc_units).scaleb(-QUOTE_TOKEN_DECIMALS)
-        needed = Decimal(usdc_needed_units).scaleb(-QUOTE_TOKEN_DECIMALS)
+        needed = Decimal(usdc_desired).scaleb(-QUOTE_TOKEN_DECIMALS)
         raise LpPlanRefusalError(
             LpPlanRefusalCode.INSUFFICIENT_USDC_FOR_ENTRY,
-            f"entering needs {needed} USDC (quote side plus balancing swap) but the Safe "
-            f"holds {held} USDC; fund the Safe or lower the budget",
+            f"entering needs {needed} USDC on the quote side but the Safe holds {held} USDC "
+            "and no excess stock is available to rebalance",
         )
-    caps.append("Safe USDC covers the quote side plus the balancing swap")
+    else:
+        caps.append("Safe inventory directly covers both mint sides")
     diagnostics = _mint_diagnostics(
         observation,
         position_range,
@@ -1059,14 +1343,22 @@ def _mint_diagnostics(
         if observation.stock_is_token0
         else amounts.amount0_desired_units
     )
-    swap_line = (
-        f"balancing swap: {swap.usdc_in_units} raw USDC -> ~{swap.expected_stock_units} raw "
-        f"stock ({swap.tranche_count} tranche(s), impact "
-        f"{swap.modeled_impact_fraction:.6f}) covering the {swap.stock_shortfall_units}-unit "
-        "shortfall"
-        if swap.required
-        else "balancing swap: none required; held stock covers the stock side"
-    )
+    if swap.direction is BalancingSwapDirection.USDC_TO_STOCK:
+        swap_line = (
+            f"balancing swap: {swap.usdc_in_units} raw USDC -> "
+            f"~{swap.expected_stock_units} raw stock ({swap.tranche_count} tranche(s), impact "
+            f"{swap.modeled_impact_fraction:.6f}) covering the "
+            f"{swap.stock_shortfall_units}-unit stock shortfall"
+        )
+    elif swap.direction is BalancingSwapDirection.STOCK_TO_USDC:
+        swap_line = (
+            f"balancing swap: {swap.stock_in_units} raw stock -> "
+            f"~{swap.expected_usdc_units} raw USDC ({swap.tranche_count} tranche(s), impact "
+            f"{swap.modeled_impact_fraction:.6f}) covering the "
+            f"{swap.usdc_shortfall_units}-unit USDC shortfall"
+        )
+    else:
+        swap_line = "balancing swap: none required; Safe inventory covers both mint sides"
     return (
         f"{observation.symbol} pool {observation.pool_address} at snapshot block "
         f"{observation.snapshot_block}, price {price} USDC per {observation.symbol}",
@@ -1076,8 +1368,9 @@ def _mint_diagnostics(
         f"composition: {usdc_units} raw USDC + {stock_units} raw stock, liquidity "
         f"{amounts.liquidity}, sides valued {amounts.token0_value_usdc} + "
         f"{amounts.token1_value_usdc} USDC of the {budget} USDC budget",
-        f"minima {amounts.amount0_min_units}/{amounts.amount1_min_units} raw at tolerance "
-        f"{amounts.slippage_tolerance_fraction}",
+        f"minima {amounts.amount0_min_units}/{amounts.amount1_min_units} raw over +/-"
+        f"{amounts.execution_price_drift_ticks} tick execution drift; worst liquidity "
+        f"utilization {amounts.execution_utilization_fraction:.6f}",
         f"pool in-range depth estimate {depth} USDC; budget is "
         f"{_percentage_of(budget, depth)} of it",
         swap_line,

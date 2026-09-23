@@ -47,7 +47,6 @@ from aero_bot.config import Settings
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
 from aero_bot.history import (
     SWAP_EVENT_TOPIC0,
-    EventHistoryRpcBackend,
     decode_swap_log,
     price_usdc_per_stock,
 )
@@ -179,7 +178,12 @@ class ExecutionUnavailableError(RuntimeError):
 
 
 class ExecutorRpcRevertError(ExecutionUnavailableError):
-    """Signal that an RPC call reverted inside a contract."""
+    """Signal that an RPC call reverted inside a contract, preserving public revert bytes."""
+
+    def __init__(self, message: str, revert_data: str = "") -> None:
+        """Keep the human RPC message plus any 0x-prefixed EVM revert payload."""
+        super().__init__(message)
+        self.revert_data = revert_data
 
 
 class BroadcastTimeoutError(ExecutionUnavailableError):
@@ -606,6 +610,7 @@ class LiveExecutionSources:
         self,
         rpc_url: str = DEFAULT_BASE_RPC_URL,
         sugar_address: str = LP_SUGAR_ADDRESS,
+        fallback_rpc_urls: Sequence[str] = (),
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         progress: Callable[[str], None] | None = None,
@@ -613,8 +618,9 @@ class LiveExecutionSources:
         """Configure the live discovery, registry, and decimals sources.
 
         Args:
-            rpc_url: Base JSON-RPC endpoint used exclusively for reads.
+            rpc_url: Primary Base JSON-RPC endpoint used for reads.
             sugar_address: LP Sugar contract anchoring pool discovery.
+            fallback_rpc_urls: Ordered alternate endpoints for transient read failures.
             transport: Optional injected HTTP transport for tests.
             sleep: Injected delay function used for retry backoff.
             progress: Optional callback receiving one human-readable line per
@@ -622,10 +628,21 @@ class LiveExecutionSources:
                 so a slow enumeration reports progress instead of silence.
         """
         self._rpc_url = rpc_url
+        self._fallback_rpc_urls = tuple(fallback_rpc_urls)
         self._sugar_address = normalize_evm_address(sugar_address)
         self._transport = transport
         self._sleep = sleep
         self._progress = progress
+        # Token metadata uses the same hardened endpoint rotation as execution.
+        # A late primary-RPC 403/429 must not waste an otherwise verified Sugar
+        # sweep merely because one decimals() read landed on a rate limit.
+        self._metadata_rpc = ExecutorRpcBackend(
+            rpc_url=rpc_url,
+            fallback_rpc_urls=fallback_rpc_urls,
+            transport=transport,
+            sleep=sleep,
+            progress=progress,
+        )
         # Token decimals are pure metadata, so one read per token is cached.
         self._decimals_cache: dict[str, int] = {}
         # One Sugar sweep per run: the first discovery is pinned (its pages
@@ -666,6 +683,7 @@ class LiveExecutionSources:
         backend = LpSugarRpcBackend(
             rpc_url=self._rpc_url,
             sugar_address=self._sugar_address,
+            fallback_rpc_urls=self._fallback_rpc_urls,
             transport=self._transport,
             sleep=self._sleep,
             progress=self._progress,
@@ -684,19 +702,14 @@ class LiveExecutionSources:
             The token's decimal count.
 
         Raises:
-            HistoryUnavailableError: If the read cannot complete or is
-                malformed.
+            ExecutionUnavailableError: If every configured RPC endpoint fails
+                or the decimals() response is malformed.
         """
         normalized = normalize_evm_address(token_address)
         cached = self._decimals_cache.get(normalized)
         if cached is not None:
             return cached
-        backend = EventHistoryRpcBackend(
-            rpc_url=self._rpc_url,
-            transport=self._transport,
-            sleep=self._sleep,
-        )
-        decimals = backend.read_erc20_decimals(normalized)
+        decimals = self._metadata_rpc.fetch_token_decimals(normalized)
         self._decimals_cache[normalized] = decimals
         return decimals
 
@@ -881,6 +894,7 @@ class ExecutorRpcBackend:
     def __init__(
         self,
         rpc_url: str,
+        fallback_rpc_urls: Sequence[str] = (),
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         max_attempts: int = MAX_REQUEST_ATTEMPTS,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
@@ -894,7 +908,9 @@ class ExecutorRpcBackend:
         """Configure bounded RPC behavior shared by reads and broadcasts.
 
         Args:
-            rpc_url: Base JSON-RPC endpoint for reads and broadcasts.
+            rpc_url: Primary Base JSON-RPC endpoint for reads and broadcasts.
+            fallback_rpc_urls: Ordered alternate endpoints used only after a
+                transient transport, rate-limit, forbidden, timeout, or 5xx failure.
             timeout_seconds: Complete per-request timeout in seconds.
             max_attempts: Attempts per request before failing closed.
             max_response_bytes: Maximum accepted size of one response body.
@@ -920,6 +936,7 @@ class ExecutorRpcBackend:
         if receipt_timeout_seconds <= 0:
             raise ValueError("receipt_timeout_seconds must be positive")
         self._rpc_url = rpc_url
+        self._rpc_urls = tuple(dict.fromkeys((rpc_url, *fallback_rpc_urls)))
         self._timeout_seconds = timeout_seconds
         self._max_attempts = max_attempts
         self._max_response_bytes = max_response_bytes
@@ -999,6 +1016,30 @@ class ExecutorRpcBackend:
                 [{"to": normalize_evm_address(to_address), "data": calldata}, block_tag],
             ),
         )
+
+    def eth_call_from_at(
+        self,
+        from_address: str,
+        to_address: str,
+        calldata: str,
+        block_tag: str,
+        value_wei: int = 0,
+    ) -> str:
+        """Replay one inner call from an explicit sender at a pinned block.
+
+        The call is diagnostic-only and never signs or broadcasts. It lets a
+        failed Safe delivery replay its exact inner call directly from the Safe
+        so the underlying contract revert can be observed instead of only the
+        Safe wrapper's outer failure.
+        """
+        call: dict[str, str] = {
+            "from": normalize_evm_address(from_address),
+            "to": normalize_evm_address(to_address),
+            "data": calldata,
+        }
+        if value_wei:
+            call["value"] = hex(value_wei)
+        return cast("str", self._rpc_call("eth_call", [call, block_tag]))
 
     def fetch_block_number(self) -> int:
         """Read the endpoint's latest block number.
@@ -1336,6 +1377,19 @@ class ExecutorRpcBackend:
         except ValueError as error:
             raise ExecutionUnavailableError(f"{source} returned a malformed quantity") from error
 
+    @staticmethod
+    def _extract_revert_data(value: object) -> str:
+        """Return the first bounded 0x-prefixed revert payload in an RPC error value."""
+        if isinstance(value, str) and value.startswith("0x"):
+            return value
+        if isinstance(value, dict):
+            for key in ("data", "result", "return", "output"):
+                if key in value:
+                    found = ExecutorRpcBackend._extract_revert_data(value[key])
+                    if found:
+                        return found
+        return ""
+
     def _rpc_call(self, method: str, params: list[object]) -> object:
         """Perform one JSON-RPC request with retry and backoff.
 
@@ -1373,13 +1427,14 @@ class ExecutorRpcBackend:
                 if wait > 0:
                     self._sleep(wait)
             try:
-                response = client.post(self._rpc_url, json=payload)
+                endpoint = self._rpc_urls[attempt % len(self._rpc_urls)]
+                response = client.post(endpoint, json=payload)
             except httpx.TransportError as error:
                 failure = f"transport error: {error}"
                 continue
             finally:
                 self._next_request_at = self._timer() + REQUEST_PACING_SECONDS
-            if response.status_code == 429 or response.status_code >= 500:
+            if response.status_code in {403, 408, 425, 429} or response.status_code >= 500:
                 failure = f"HTTP status {response.status_code}"
                 continue
             response_size = len(response.content)
@@ -1402,7 +1457,11 @@ class ExecutorRpcBackend:
                 error_code = error_body.get("code")
                 error_message = str(error_body.get("message", ""))
                 if error_code == EXECUTION_REVERT_ERROR_CODE or "revert" in error_message.lower():
-                    raise ExecutorRpcRevertError(f"RPC call reverted: {error_message}")
+                    revert_data = self._extract_revert_data(error_body.get("data"))
+                    raise ExecutorRpcRevertError(
+                        f"RPC call reverted: {error_message}",
+                        revert_data=revert_data,
+                    )
                 if error_code == RATE_LIMIT_ERROR_CODE or "rate limit" in error_message.lower():
                     failure = f"RPC error {error_code}: {error_message}"
                     continue

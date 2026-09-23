@@ -44,18 +44,22 @@ from aero_bot.lp_calldata import (
     build_lp_mint_calldata,
 )
 from aero_bot.lp_executor import (
+    DEFAULT_LP_ROUTER_ALLOWANCE_USDC,
     ERC721_TOKEN_OF_OWNER_BY_INDEX_SELECTOR,
+    NFPM_APPROVAL_BUFFER_FRACTION,
     NFPM_INCREASE_LIQUIDITY_TOPIC0,
     LpExecutionRefusalCode,
     LpExecutionRefusalError,
     LpExecutionRole,
     LpLifecycleExecutor,
+    LpMintDryRunReport,
     LpSafeExecutionPolicy,
     main,
 )
 from aero_bot.lp_pins import LpPoolPin, LpPoolPinStore
 from aero_bot.lp_plan import (
     DEFAULT_MINT_SLIPPAGE_TOLERANCE,
+    BalancingSwapDirection,
     LpExecutionPolicy,
     LpPlanRefusalError,
     position_amounts_at_sqrt_ratio,
@@ -351,12 +355,15 @@ class LpRpcScript:
         burn_gas_estimate: int | None = 60_000,
         get_reward_gas_estimate: int | None = 110_000,
         allow_broadcasts: bool = False,
+        send_http_status: int = 200,
         relayer_eth_wei: int = 10**15,
         relayer_starting_nonce: int = 3,
         receipt_status: int = 1,
         receipt_present: bool = True,
+        receipt_http_status: int = 200,
         estimate_reverts_after: int | None = None,
         estimate_revert_message: str = "execution reverted: PSC",
+        estimate_revert_calls: set[int] | None = None,
         estimate_gs026_lag_calls: int = 0,
         estimate_gs026_lag_from: int = 1,
         fast_block_number: int = 51_000_000,
@@ -369,6 +376,8 @@ class LpRpcScript:
         fast_token1_address: str | None = None,
         fast_views_revert: bool = False,
         aero_price_usdc: Decimal | None = Decimal("0.5"),
+        post_swap_stock_balance_units: int | None = None,
+        post_swap_usdc_balance_units: int | None = None,
     ) -> None:
         """Configure every scripted answer the LP executor's calls receive.
 
@@ -421,15 +430,21 @@ class LpRpcScript:
                 to make that estimate revert.
             allow_broadcasts: Whether eth_sendRawTransaction is served; the
                 default keeps the no-broadcast trap for every dry-run path.
+            send_http_status: HTTP status returned after recording a permitted
+                send attempt, simulating lost/blocked submission acknowledgements.
             relayer_eth_wei: Balance served for the relaying EOA address.
             relayer_starting_nonce: First pending nonce served per send.
             receipt_status: Status word served for included deliveries.
             receipt_present: Whether receipts are served at all; False keeps
                 every poll empty so the bounded wait can time out.
+            receipt_http_status: HTTP status served only for receipt reads;
+                non-200 values simulate one unhealthy receipt endpoint.
             estimate_reverts_after: Make every estimateGas call past this
                 count revert with estimate_revert_message, counting both the
                 build-time and execute-time estimates.
             estimate_revert_message: The revert message for the cap above.
+            estimate_revert_calls: Optional 1-based estimateGas call numbers
+                that revert once with estimate_revert_message.
             estimate_gs026_lag_calls: How many estimateGas calls revert with
                 a GS026 lag marker before resuming the scripted answers.
             estimate_gs026_lag_from: The 1-based estimateGas call the GS026
@@ -450,6 +465,11 @@ class LpRpcScript:
                 unreadable known pool.
             aero_price_usdc: Live USDC/AERO price served to the price read;
                 None makes that read revert so the fail-closed path tests.
+            post_swap_stock_balance_units: Optional stock balance applied after
+                the scripted balancing swap confirms.
+            post_swap_usdc_balance_units: Optional USDC balance applied after
+                the balancing swap confirms, simulating fresh post-swap Safe
+                inventory for the second-phase mint rebuild.
         """
         self.gas_price_wei = gas_price_wei
         self.safe_eth_wei = safe_eth_wei
@@ -482,13 +502,17 @@ class LpRpcScript:
         self.get_reward_gas_estimate = get_reward_gas_estimate
         self.broadcasts: list[str] = []
         self.estimate_requests: list[str] = []
+        self.position_view_reads = 0
         self.allow_broadcasts = allow_broadcasts
+        self.send_http_status = send_http_status
         self.relayer_eth_wei = relayer_eth_wei
         self.relayer_next_nonce = relayer_starting_nonce
         self.receipt_status = receipt_status
         self.receipt_present = receipt_present
+        self.receipt_http_status = receipt_http_status
         self.estimate_reverts_after = estimate_reverts_after
         self.estimate_revert_message = estimate_revert_message
+        self.estimate_revert_calls = set(estimate_revert_calls or set())
         self.estimate_gs026_lag_remaining = estimate_gs026_lag_calls
         self.estimate_gs026_lag_from = estimate_gs026_lag_from
         self.fast_block_number = fast_block_number
@@ -501,6 +525,9 @@ class LpRpcScript:
         self.fast_token1_address = fast_token1_address
         self.fast_views_revert = fast_views_revert
         self.aero_price_usdc = aero_price_usdc
+        self.post_swap_stock_balance_units = post_swap_stock_balance_units
+        self.post_swap_usdc_balance_units = post_swap_usdc_balance_units
+        self.post_swap_balance_applied = False
         self.inclusion_blocks = 51_000_000
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -534,12 +561,29 @@ class LpRpcScript:
                 self.broadcasts.append(str(params[0]))
                 raise AssertionError("the LP executor must never broadcast anything")
             self.broadcasts.append(str(params[0]))
+            if self.send_http_status != 200:
+                return httpx.Response(self.send_http_status, json={})
             result = "0x" + f"{len(self.broadcasts):064x}"
         elif method == "eth_getTransactionReceipt":
+            if self.receipt_http_status != 200:
+                return httpx.Response(self.receipt_http_status, json={})
             if not self.receipt_present:
                 result = None
             else:
                 self.inclusion_blocks += 1
+                if (
+                    (
+                        self.post_swap_stock_balance_units is not None
+                        or self.post_swap_usdc_balance_units is not None
+                    )
+                    and not self.post_swap_balance_applied
+                    and len(self.broadcasts) >= 2
+                ):
+                    if self.post_swap_stock_balance_units is not None:
+                        self.stock_balance_units = self.post_swap_stock_balance_units
+                    if self.post_swap_usdc_balance_units is not None:
+                        self.usdc_balance_units = self.post_swap_usdc_balance_units
+                    self.post_swap_balance_applied = True
                 result = {
                     "status": hex(self.receipt_status),
                     "blockNumber": hex(self.inclusion_blocks),
@@ -611,6 +655,7 @@ class LpRpcScript:
         if data.startswith("0xe985e9c5"):
             return word_hex(1 if self.operator_approved else 0)
         if data.startswith("0x99fbab88"):
+            self.position_view_reads += 1
             if self.position_words is None:
                 raise _ScriptedRevertError("NFPM: unknown token ID")
             return "0x" + b"".join(self.position_words).hex()
@@ -686,6 +731,11 @@ class LpRpcScript:
         ):
             self.estimate_gs026_lag_remaining -= 1
             raise _ScriptedRevertError("GS026")
+        if len(self.estimate_requests) in self.estimate_revert_calls:
+            self.estimate_revert_calls.remove(len(self.estimate_requests))
+            raise _ScriptedRevertError(
+                self.estimate_revert_message.removeprefix("execution reverted: ")
+            )
         if (
             self.estimate_reverts_after is not None
             and len(self.estimate_requests) > self.estimate_reverts_after
@@ -907,6 +957,15 @@ def decode_inner(calldata: str) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+def test_lp_router_allowance_is_200_without_widening_manual_swap() -> None:
+    """LP entry capacity is 200 USDC while the manual swap allowance stays 20."""
+    assert Decimal("20") == DEFAULT_APPROVAL_STANDING_CAP_USDC
+    assert Decimal("200") == DEFAULT_LP_ROUTER_ALLOWANCE_USDC
+    assert LpSafeExecutionPolicy().router_allowance_standing_cap_usdc == Decimal("200")
+    with pytest.raises(ValueError):
+        LpSafeExecutionPolicy(router_allowance_standing_cap_usdc=Decimal("200.01"))
+
+
 def test_dry_run_mint_composes_the_full_entry_sequence() -> None:
     """A cash-poor Safe composes allowance, swap, approvals, and the mint."""
     executor, rpc_script, _ = make_lp_executor()
@@ -957,10 +1016,24 @@ def test_dry_run_mint_encodes_every_inner_call_from_the_plan() -> None:
     )
     expected = {
         LpExecutionRole.ROUTER_ALLOWANCE: build_approval_calldata(
-            AERODROME_ROUTER_ADDRESS, int(DEFAULT_APPROVAL_STANDING_CAP_USDC * 10**6)
+            AERODROME_ROUTER_ADDRESS, int(DEFAULT_LP_ROUTER_ALLOWANCE_USDC * 10**6)
         ),
-        LpExecutionRole.NFPM_USDC_ALLOWANCE: build_approval_calldata(NFPM_ADDRESS, usdc_desired),
-        LpExecutionRole.NFPM_STOCK_ALLOWANCE: build_approval_calldata(NFPM_ADDRESS, stock_desired),
+        LpExecutionRole.NFPM_USDC_ALLOWANCE: build_approval_calldata(
+            NFPM_ADDRESS,
+            int(
+                (
+                    Decimal(usdc_desired) * (Decimal(1) + NFPM_APPROVAL_BUFFER_FRACTION)
+                ).to_integral_value(rounding="ROUND_CEILING")
+            ),
+        ),
+        LpExecutionRole.NFPM_STOCK_ALLOWANCE: build_approval_calldata(
+            NFPM_ADDRESS,
+            int(
+                (
+                    Decimal(stock_desired) * (Decimal(1) + NFPM_APPROVAL_BUFFER_FRACTION)
+                ).to_integral_value(rounding="ROUND_CEILING")
+            ),
+        ),
         LpExecutionRole.MINT: build_lp_mint_calldata(
             LpMintParams(
                 token0_address=BASE_USDC_ADDRESS,
@@ -2184,6 +2257,33 @@ def test_dry_run_recenter_with_an_explicit_budget_swaps_the_shortfall() -> None:
     assert report.plan.balancing_swap.tranche_count == 1
 
 
+def test_dry_run_recenter_can_sell_excess_stock_to_fund_the_quote_side() -> None:
+    """Projected post-exit excess stock funds a quote deficit without a full exit swap."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+            usdc_balance_units=1_000_000,
+            stock_balance_units=100_000_000,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[2], signature_verdicts=[True] * 10),
+    )
+
+    report = executor.dry_run_recenter(
+        "FIXc", 77, MINT_WIDTH_SPACINGS, Decimal("70"), bytes(Account.create().key)
+    )
+
+    swap = report.plan.balancing_swap
+    roles = tuple(transaction.role for transaction in report.transactions)
+    assert swap.direction is BalancingSwapDirection.STOCK_TO_USDC
+    assert swap.stock_in_units > 0
+    assert swap.expected_usdc_units > swap.usdc_shortfall_units
+    assert LpExecutionRole.STOCK_ROUTER_ALLOWANCE in roles
+    assert LpExecutionRole.BALANCING_SWAP in roles
+    assert LpExecutionRole.EXIT_SWAP not in roles
+    assert roles.index(LpExecutionRole.BALANCING_SWAP) < roles.index(LpExecutionRole.MINT)
+
+
 def test_dry_run_recenter_refuses_without_an_explicit_width() -> None:
     """The recenter needs an explicit width until the solver path lands."""
     executor, _, _ = make_lp_executor(
@@ -3153,8 +3253,11 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
     audit_path = tmp_path / "audit.sqlite3"
     executor, rpc_script, _ = make_lp_executor(
         audit_path=audit_path,
-        rpc_script=LpRpcScript(allow_broadcasts=True),
-        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 10),
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            post_swap_stock_balance_units=10**12,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20),
     )
 
     report = executor.execute_mint(
@@ -3187,9 +3290,23 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
 
     records = AuditStore(audit_path).read_records(100)
     assert [record.event_type for record in records] == [
+        # Phase 1: pre-swap plan/build, then execute only through the swap.
         AuditEventType.LP_MINT_PLANNED,
         *([AuditEventType.LP_TRANSACTION_BUILT] * 5),
-        *([AuditEventType.LP_EXECUTE_SENT, AuditEventType.LP_EXECUTE_CONFIRMED] * 5),
+        AuditEventType.LP_EXECUTE_SENT,
+        AuditEventType.LP_EXECUTE_CONFIRMED,
+        AuditEventType.LP_EXECUTE_SENT,
+        AuditEventType.LP_EXECUTE_CONFIRMED,
+        # Phase 2: fresh post-swap replan/build, then execute the approvals only.
+        AuditEventType.LP_MINT_PLANNED,
+        *([AuditEventType.LP_TRANSACTION_BUILT] * 3),
+        *([AuditEventType.LP_EXECUTE_SENT, AuditEventType.LP_EXECUTE_CONFIRMED] * 2),
+        # Phase 3: after approvals confirm, rebuild the final mint from the
+        # newest pool/balance state and broadcast it immediately.
+        AuditEventType.LP_MINT_PLANNED,
+        AuditEventType.LP_TRANSACTION_BUILT,
+        AuditEventType.LP_EXECUTE_SENT,
+        AuditEventType.LP_EXECUTE_CONFIRMED,
     ]
     planned = json.loads(records[0].payload_json)
     assert planned["mode"] == "execute"
@@ -3201,6 +3318,143 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
     assert first_receipt["outcome"] == "confirmed"
     assert first_receipt["gas_used"] == 80_000
     assert AuditStore(audit_path).verify_chain().status.value == "verified"
+
+
+def test_execute_mint_rebuilds_after_execute_time_psc(tmp_path: Path) -> None:
+    """A transient final-mint PSC rebuilds from fresh state instead of stranding inventory."""
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=tmp_path / "audit.sqlite3",
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            post_swap_stock_balance_units=10**12,
+            estimate_revert_calls={14},
+            nfpm_held_positions=2,
+            held_token_ids=[11, 12],
+            position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+        ),
+        safe_script=SafeRpcScript(
+            nonce_reads=[4, 6, 8, 8],
+            signature_verdicts=[True] * 30,
+        ),
+    )
+
+    report = executor.execute_mint(
+        "FIXc",
+        MINT_BUDGET_USDC,
+        MINT_WIDTH_SPACINGS,
+        b"\x01" * 32,
+        confirm_broadcast=True,
+    )
+
+    assert report.completed is True
+    assert report.halted_reason == ""
+    assert [step.role for step in report.steps] == [
+        LpExecutionRole.ROUTER_ALLOWANCE,
+        LpExecutionRole.BALANCING_SWAP,
+        LpExecutionRole.NFPM_USDC_ALLOWANCE,
+        LpExecutionRole.NFPM_STOCK_ALLOWANCE,
+        LpExecutionRole.MINT,
+    ]
+    assert len(rpc_script.broadcasts) == 5
+    assert len(rpc_script.estimate_requests) == 16
+    # The two residual NFTs are fully scanned only on the initial build.
+    # Every post-swap/final rebuild verifies the unchanged NFPM balance count
+    # instead of rereading every empty positions() view.
+    assert rpc_script.position_view_reads == 2
+
+
+def test_execute_mint_bounds_repeated_final_psc_retries(tmp_path: Path) -> None:
+    """Repeated final-mint PSC failures stop after the bounded fresh rebuilds."""
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=tmp_path / "audit.sqlite3",
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            post_swap_stock_balance_units=10**12,
+            estimate_revert_calls={14, 16, 18},
+        ),
+        safe_script=SafeRpcScript(
+            nonce_reads=[4, 6, 8, 8, 8],
+            signature_verdicts=[True] * 40,
+        ),
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.execute_mint(
+            "FIXc",
+            MINT_BUDGET_USDC,
+            MINT_WIDTH_SPACINGS,
+            b"\x01" * 32,
+            confirm_broadcast=True,
+        )
+
+    assert raised.value.code is LpExecutionRefusalCode.ESTIMATE_REVERTED
+    assert "PSC" in str(raised.value)
+    assert len(rpc_script.broadcasts) == 4
+    assert len(rpc_script.estimate_requests) == 18
+
+
+def test_execute_mint_can_rebalance_excess_stock_into_usdc_then_mint(tmp_path: Path) -> None:
+    """The live two-phase mint confirms a stock sale, rereads balances, then mints."""
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=tmp_path / "audit.sqlite3",
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            usdc_balance_units=1_000_000,
+            stock_balance_units=100_000_000,
+            post_swap_usdc_balance_units=10_000_000,
+            post_swap_stock_balance_units=90_000_000,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20),
+    )
+
+    report = executor.execute_mint(
+        "FIXc",
+        MINT_BUDGET_USDC,
+        MINT_WIDTH_SPACINGS,
+        bytes(Account.create().key),
+        confirm_broadcast=True,
+    )
+
+    assert report.completed is True
+    assert [step.role for step in report.steps] == [
+        LpExecutionRole.STOCK_ROUTER_ALLOWANCE,
+        LpExecutionRole.BALANCING_SWAP,
+        LpExecutionRole.NFPM_USDC_ALLOWANCE,
+        LpExecutionRole.NFPM_STOCK_ALLOWANCE,
+        LpExecutionRole.MINT,
+    ]
+    assert len(rpc_script.broadcasts) == 5
+    assert isinstance(report.build, LpMintDryRunReport)
+    assert report.build.plan.balancing_swap.required is False
+    assert report.build.plan.budget_usdc == MINT_BUDGET_USDC
+
+
+def test_execute_mint_resizes_to_fresh_inventory_after_swap(tmp_path: Path) -> None:
+    """A small post-swap stock shortfall shrinks the mint instead of swapping twice."""
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=tmp_path / "audit.sqlite3",
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            post_swap_stock_balance_units=3_492_000,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20),
+    )
+
+    report = executor.execute_mint(
+        "FIXc",
+        MINT_BUDGET_USDC,
+        MINT_WIDTH_SPACINGS,
+        bytes(Account.create().key),
+        confirm_broadcast=True,
+    )
+
+    assert report.completed is True
+    roles = [step.role for step in report.steps]
+    assert roles.count(LpExecutionRole.BALANCING_SWAP) == 1
+    assert roles[-1] is LpExecutionRole.MINT
+    assert isinstance(report.build, LpMintDryRunReport)
+    assert report.build.plan.balancing_swap.required is False
+    assert report.build.plan.budget_usdc < MINT_BUDGET_USDC
 
 
 def make_execute_stake_executor(
@@ -3219,7 +3473,7 @@ def make_execute_stake_executor(
     executor, _, _ = make_lp_executor(
         audit_path=audit_path,
         rpc_script=script,
-        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+        safe_script=SafeRpcScript(nonce_reads=[4, 4], signature_verdicts=[True] * 4),
         **executor_kwargs,  # type: ignore[arg-type]
     )
     return executor, script
@@ -3238,6 +3492,7 @@ def test_execute_halts_at_an_execute_time_estimate_revert(tmp_path: Path) -> Non
     assert raised.value.code is LpExecutionRefusalCode.ESTIMATE_REVERTED
     assert "stopping honestly" in str(raised.value)
     assert "PSC" in str(raised.value)
+    assert "inner-call replay" in str(raised.value)
     # Two build estimates and one execute estimate succeeded; the second
     # execute estimate reverted, so exactly one step broadcast.
     assert len(rpc_script.broadcasts) == 1
@@ -3303,7 +3558,8 @@ def test_execute_reports_a_failed_delivery_and_halts(tmp_path: Path) -> None:
     assert report.completed is False
     assert report.steps[0].status == "failed"
     assert len(report.steps) == 1
-    assert "reverted on-chain" in report.steps[0].diagnostic
+    assert "reverted atomically on-chain" in report.steps[0].diagnostic
+    assert "Safe nonce remains" in report.steps[0].diagnostic
     assert len(rpc_script.broadcasts) == 1
     records = AuditStore(audit_path).read_records(100)
     assert records[4].event_type is AuditEventType.LP_EXECUTE_FAILED
@@ -3355,6 +3611,58 @@ def test_execute_rotates_receipt_polling_across_backends() -> None:
 
     assert report.completed is True
     assert all(step.status == "confirmed" for step in report.steps)
+
+
+def test_execute_survives_a_forbidden_primary_receipt_endpoint() -> None:
+    """A transient 403 on the primary receipt endpoint falls through to a healthy secondary."""
+    primary = LpRpcScript(
+        owner_addresses={77: SAFE_ADDRESS},
+        position_words=make_position_words(),
+        allow_broadcasts=True,
+        receipt_http_status=403,
+    )
+    secondary = LpRpcScript(receipt_present=True)
+    executor, _, _ = make_lp_executor(
+        rpc_script=primary,
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+        receipt_script=secondary,
+    )
+
+    report = executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert report.completed is True
+    assert all(step.status == "confirmed" for step in report.steps)
+
+
+def test_execute_recovers_when_broadcast_ack_is_lost_but_secondary_confirms(
+    tmp_path: Path,
+) -> None:
+    """A lost send acknowledgement keeps the deterministic hash and accepts secondary proof."""
+    audit_path = tmp_path / "audit.sqlite3"
+    primary = LpRpcScript(
+        owner_addresses={77: SAFE_ADDRESS},
+        position_words=make_position_words(),
+        allow_broadcasts=True,
+        send_http_status=403,
+        receipt_http_status=403,
+    )
+    secondary = LpRpcScript(receipt_present=True)
+    executor, _, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=primary,
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+        receipt_script=secondary,
+    )
+
+    report = executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
+
+    assert report.completed is True
+    assert all(step.status == "confirmed" for step in report.steps)
+    records = AuditStore(audit_path).read_records(100)
+    assert any(
+        record.event_type is AuditEventType.LP_EXECUTE_BROADCAST_UNKNOWN for record in records
+    )
+    assert any(record.event_type is AuditEventType.LP_EXECUTE_CONFIRMED for record in records)
 
 
 def test_execute_re_reads_a_lagging_gs026_estimate() -> None:
@@ -3454,8 +3762,11 @@ def test_cli_execute_mint_broadcasts_and_exits_zero(
 ) -> None:
     """A confirmed execute CLI run prints every broadcast hash and exits zero."""
     executor, _, _ = make_lp_executor(
-        rpc_script=LpRpcScript(allow_broadcasts=True),
-        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 10),
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            post_swap_stock_balance_units=10**12,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20),
     )
     with (
         patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
@@ -3499,7 +3810,7 @@ def test_cli_execute_with_a_failed_delivery_exits_one(
             allow_broadcasts=True,
             receipt_status=0,
         ),
-        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+        safe_script=SafeRpcScript(nonce_reads=[4, 4], signature_verdicts=[True] * 4),
     )
     with (
         patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),

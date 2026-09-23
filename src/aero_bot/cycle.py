@@ -37,12 +37,13 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal, localcontext
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Protocol
+from typing import Annotated, Literal, Protocol
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, model_validator
@@ -50,11 +51,13 @@ from pydantic import BaseModel, Field, model_validator
 from aero_bot.audit import AuditEventType, AuditRecord, AuditStore
 from aero_bot.config import Settings
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
+from aero_bot.execution_lock import ExecutionLockUnavailableError, exclusive_execution_lock
 from aero_bot.executor import (
     DEFAULT_CANARY_SAFE_ADDRESS,
     SAFE_ADDRESS_ENV,
     ExecutionUnavailableError,
 )
+from aero_bot.history import price_usdc_per_stock
 from aero_bot.lp_executor import (
     EXIT_FAILURE,
     EXIT_OK,
@@ -112,6 +115,18 @@ CYCLE_SYMBOL_ENV = "AERO_BOT_CYCLE_SYMBOL"
 # Environment variable carrying the cross-board switch margin as a fraction
 # (default 0.30, the captain's 2026-09-09 trial ruling).
 CYCLE_SWITCH_MARGIN_ENV = "AERO_BOT_CYCLE_SWITCH_MARGIN_FRACTION"
+# Dynamic selector sizing keeps ten percent of the observed in-range depth cap
+# unused. The target pool can move between preflight, source exit, balancing
+# swap, and the final mint rebuild; this headroom keeps a still-safe switch
+# from failing solely because live depth moved a few percent during execution.
+SELECTOR_DEPTH_HEADROOM_FRACTION = Decimal("0.90")
+# After a confirmed live action, the primary read endpoint must catch up to
+# the action's inclusion block before final reconciliation. This prevents a
+# load-balanced or briefly lagging RPC from reporting the pre-action balance
+# as if it were the final state.
+POST_ACTION_VISIBILITY_ATTEMPTS = 6
+POST_ACTION_VISIBILITY_BASE_BACKOFF_SECONDS = 0.5
+POST_ACTION_VISIBILITY_MAX_BACKOFF_SECONDS = 4.0
 # The policy day boundary follows the engine's America/New_York convention.
 POLICY_TIMEZONE = ZoneInfo("America/New_York")
 
@@ -153,6 +168,11 @@ class TrackedPosition(BaseModel):
     committed_usd: Annotated[Decimal, Field(gt=0)]
     # When the position was entered, timezone-aware.
     entered_at: datetime
+    # When the position first moved outside either range edge. This must
+    # survive scheduled cycles so the recenter wait cannot restart from zero.
+    out_of_range_since: datetime | None = None
+    # Which side owns the persisted wait anchor.
+    out_of_range_side: Literal["above", "below"] | None = None
 
 
 class HeldInventoryRecord(BaseModel):
@@ -169,6 +189,10 @@ class HeldInventoryRecord(BaseModel):
     stock_quantity: Annotated[Decimal, Field(gt=0)]
     # When the inventory was taken on, timezone-aware.
     held_since: datetime
+    # Why the stock is held, so failed entries can retry before sell-back.
+    origin: Literal["stale_low_exit", "failed_entry", "failed_recenter", "adopted_balance"] = (
+        "adopted_balance"
+    )
 
 
 class ReentryCooldown(BaseModel):
@@ -314,14 +338,20 @@ class CycleActionRecord(BaseModel):
     transaction_hashes: Annotated[tuple[str, ...], Field(min_length=0)] = ()
     # Total delivery fees paid, in wei.
     fee_wei: Annotated[int, Field(ge=0)] = 0
+    # Highest confirmed inclusion block among the action's deliveries. This
+    # lets the cycle prove its final read endpoint has caught up before it
+    # labels post-action balances as final.
+    confirmed_block_number: Annotated[int, Field(ge=0)] | None = None
     # The refusal's catalog code when status is refused, else empty.
     refusal_code: str = ""
+    # Actual mint budget executed after any post-swap inventory resize.
+    executed_budget_usdc: Decimal | None = None
     # Human-readable evidence for the outcome.
     diagnostic: str = ""
 
 
 class CycleReconciliation(BaseModel):
-    """Carry the complete pre-decision on-chain state one cycle acts on."""
+    """Carry one coherent on-chain reconciliation snapshot."""
 
     # Frozen strict fields keep one reconciliation coherent.
     model_config = IMMUTABLE_MODEL_CONFIG
@@ -368,8 +398,14 @@ class CycleReport(BaseModel):
     mode: CycleMode
     # The registry-matched symbol the cycle managed.
     symbol: str
-    # The reconciled on-chain state the decision was made on.
+    # The final reconciled on-chain state after any live action.
     reconciliation: CycleReconciliation
+    # The pre-action snapshot the policy actually decided on. It equals the
+    # final reconciliation for dry runs and no-action cycles.
+    decision_reconciliation: CycleReconciliation | None = None
+    # False only when a live action confirmed but the primary read endpoint
+    # failed to reach its inclusion block within the bounded visibility wait.
+    final_reconciliation_verified: bool = True
     # The engine's chosen action, or hold when the cycle refused out-of-band.
     decision_action: str
     # The engine's stable primary reason, or the out-of-band label.
@@ -422,6 +458,31 @@ class CycleReportPayload(BaseModel):
 
 class CycleExecutorBoundary(Protocol):
     """Define the audited executor surface one live cycle may drive."""
+
+    def dry_run_recenter(
+        self,
+        symbol: str,
+        token_id: int,
+        width_spacings: int | None,
+        budget_usdc: Decimal | None,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> object:
+        """Preflight one same-pool recenter without broadcasting."""
+        ...
+
+    def dry_run_switch(
+        self,
+        from_symbol: str,
+        token_id: int,
+        to_symbol: str,
+        width_spacings: int | None,
+        budget_usdc: Decimal,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> object:
+        """Preflight a cross-pool replacement without broadcasting."""
+        ...
 
     def execute_mint(
         self,
@@ -589,18 +650,53 @@ def _action_completed(report: LpActionExecutionReport) -> bool:
     return report.completed and all(step.status == "confirmed" for step in report.steps)
 
 
-def _action_hashes_and_fees(report: LpActionExecutionReport) -> tuple[tuple[str, ...], int]:
-    """Collect one action's delivery hashes and total fees."""
+def _action_hashes_fees_and_block(
+    report: LpActionExecutionReport,
+) -> tuple[tuple[str, ...], int, int | None]:
+    """Collect one action's delivery hashes, total fees, and latest confirmed block."""
     hashes = tuple(step.transaction_hash for step in report.steps)
     fees = sum(step.fee_wei or 0 for step in report.steps)
+    blocks: list[int] = []
+    for step in report.steps:
+        if step.status != "confirmed":
+            continue
+        block_number = getattr(step, "block_number", None)
+        if isinstance(block_number, int):
+            blocks.append(block_number)
+    return hashes, fees, max(blocks) if blocks else None
+
+
+def _action_hashes_and_fees(report: LpActionExecutionReport) -> tuple[tuple[str, ...], int]:
+    """Backward-compatible action summary used by the monitor-only watchtower."""
+    hashes, fees, _ = _action_hashes_fees_and_block(report)
     return hashes, fees
 
 
-def _price_at_tick(tick: int) -> Decimal:
-    """Return the exact pool price at one tick-grid boundary."""
+def _price_at_tick(
+    tick: int,
+    *,
+    stock_is_token0: bool,
+    stock_decimals: int,
+) -> Decimal:
+    """Return one Slipstream tick boundary in human USDC per stock.
+
+    Args:
+        tick: The pool tick boundary.
+        stock_is_token0: Whether the stock is token0 rather than token1.
+        stock_decimals: Decimal count of the stock token.
+
+    Returns:
+        The boundary price in USDC per whole stock token.
+    """
     with localcontext() as context:
         context.prec = MATH_PRECISION
-        return +(TICK_PRICE_RATIO**tick)
+        sqrt_ratio = int((TICK_PRICE_RATIO**tick).sqrt() * Decimal(1 << 96))
+    return price_usdc_per_stock(
+        sqrt_ratio,
+        stock_is_token0,
+        stock_decimals,
+        6,
+    )
 
 
 def _cooldown_until(book: CycleStateBook, symbol: str) -> datetime | None:
@@ -661,6 +757,7 @@ class CycleRunner:
         audit_sink: AuditStore | None,
         state_store: CycleStateStore,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        sleep: Callable[[float], None] = time.sleep,
         switch_margin_fraction: Decimal = DEFAULT_SWITCH_MARGIN_FRACTION,
     ) -> None:
         """Configure one cycle runner over every injectable boundary.
@@ -680,6 +777,7 @@ class CycleRunner:
             audit_sink: The store receiving the cycle-summary audit record.
             state_store: The self-healing cycle-book store.
             now: Injected clock producing timezone-aware instants.
+            sleep: Injected delay used only for bounded post-action RPC catch-up.
             switch_margin_fraction: The relative APR margin another pool
                 must beat the held pool by before a switch fires.
         """
@@ -694,6 +792,7 @@ class CycleRunner:
         self._audit_sink = audit_sink
         self._state_store = state_store
         self._now = now
+        self._sleep = sleep
         self._switch_margin_fraction = switch_margin_fraction
         self._last_reconciliation: CycleReconciliation | None = None
         # One cycle process enumerates the board at most once; reconcile and
@@ -761,6 +860,8 @@ class CycleRunner:
             raise ValueError("a live cycle requires its signing key and executor")
         book = self._state_store.load()
         reconciliation = self._reconcile(book)
+        decision_reconciliation = reconciliation
+        final_reconciliation_verified = True
         self._last_reconciliation = reconciliation
         # A present quote with an absent age counts as fresh (age zero);
         # only an absent quote leaves the reference unset.
@@ -782,13 +883,63 @@ class CycleRunner:
                 reference_prices_by_symbol or {},
             )
             outcome = decision_report.outcome
-            if mode is CycleMode.LIVE and outcome.decision.action is not PolicyActionKind.HOLD:
+            if (
+                mode is CycleMode.LIVE
+                and outcome.decision.action is PolicyActionKind.HOLD
+                and book.position is not None
+                and not reconciliation.tracked_staked
+            ):
+                if self._executor is None or key_bytes is None:
+                    raise ValueError("a live cycle requires its signing key and executor")
+                actions, halted_reason = self._recover_unstaked_position(book, key_bytes)
+                final_reconciliation_verified = self._await_post_action_visibility(tuple(actions))
+                if not final_reconciliation_verified and not halted_reason:
+                    target = max(
+                        (action.confirmed_block_number or 0 for action in actions), default=0
+                    )
+                    halted_reason = (
+                        "post-action stake recovery is unverified because the primary RPC "
+                        f"did not reach confirmed block {target} within the bounded wait"
+                    )
+            elif mode is CycleMode.LIVE and outcome.decision.action is not PolicyActionKind.HOLD:
                 if self._executor is None or key_bytes is None:
                     raise ValueError("a live cycle requires its signing key and executor")
                 actions, halted_reason, book = self._act(
                     book, outcome, key_bytes, decision_report.symbol, decision_report.switch
                 )
+                final_reconciliation_verified = self._await_post_action_visibility(tuple(actions))
+                if not final_reconciliation_verified and not halted_reason:
+                    target = max(
+                        (action.confirmed_block_number or 0 for action in actions), default=0
+                    )
+                    halted_reason = (
+                        "post-action reconciliation is unverified because the primary RPC "
+                        f"did not reach confirmed block {target} within the bounded wait"
+                    )
             final_reconciliation = self._reconcile(book)
+            stake_recovery_completed = any(
+                action.action == "stake_recovery" and action.status == "completed"
+                for action in actions
+            )
+            if (
+                stake_recovery_completed
+                and not final_reconciliation.tracked_staked
+                and not halted_reason
+            ):
+                halted_reason = (
+                    "stake recovery was confirmed but final reconciliation still sees the "
+                    "tracked NFT unstaked; leaving the cycle fail-closed for the next retry"
+                )
+            if not final_reconciliation_verified:
+                final_reconciliation = final_reconciliation.model_copy(
+                    update={
+                        "diagnostics": final_reconciliation.diagnostics
+                        + (
+                            "WARNING: final balances may lag a confirmed action because the "
+                            "primary RPC did not prove visibility of its inclusion block.",
+                        )
+                    }
+                )
             self._last_reconciliation = final_reconciliation
             if not final_reconciliation.out_of_band:
                 book = self._rebuild_book(
@@ -796,13 +947,21 @@ class CycleRunner:
                     final_reconciliation,
                     decision_report.outcome.next_state,
                     decision_report.symbol,
+                    decision_report.outcome.decision.action,
                 )
             elif not halted_reason:
                 halted_reason = final_reconciliation.out_of_band
             reconciliation = final_reconciliation
         self._state_store.save(book)
         report = self._assemble_report(
-            started_at, mode, reconciliation, decision_report, tuple(actions), halted_reason
+            started_at,
+            mode,
+            reconciliation,
+            decision_reconciliation,
+            final_reconciliation_verified,
+            decision_report,
+            tuple(actions),
+            halted_reason,
         )
         self._record(report)
         return report
@@ -891,6 +1050,11 @@ class CycleRunner:
                     f"{tracked_status.position_value_usdc} USDC against "
                     f"{tracked.committed_usd} committed"
                 )
+                if not tracked_staked:
+                    diagnostics.append(
+                        f"tracked position {tracked.token_id} is unstaked in the Safe; "
+                        "a live HOLD cycle will attempt bounded stake recovery before returning"
+                    )
             untracked_live = tuple(token for token in live_ids if token != tracked.token_id)
             if untracked_live and not out_of_band:
                 out_of_band = (
@@ -986,6 +1150,47 @@ class CycleRunner:
             out_of_band=out_of_band,
             diagnostics=tuple(diagnostics),
         )
+
+    def _await_post_action_visibility(self, actions: tuple[CycleActionRecord, ...]) -> bool:
+        """Wait until the primary RPC reaches every confirmed action's inclusion block.
+
+        The execution layer can confirm a delivery through a secondary receipt
+        endpoint while the primary read endpoint is temporarily behind. Final
+        reconciliation must not label pre-action balances as post-action truth.
+        """
+        target_block = max((action.confirmed_block_number or 0 for action in actions), default=0)
+        if target_block == 0:
+            return True
+        fetch_block_number = getattr(self._balances, "fetch_block_number", None)
+        if fetch_block_number is None:
+            # Test doubles and legacy boundaries without block reads cannot
+            # prove visibility; production ExecutorRpcBackend always can.
+            return False
+        failure = ""
+        for attempt in range(POST_ACTION_VISIBILITY_ATTEMPTS):
+            try:
+                visible_block = int(fetch_block_number())
+            except (ExecutionUnavailableError, ValueError, TypeError) as error:
+                failure = str(error)
+            else:
+                if visible_block >= target_block:
+                    return True
+                failure = f"latest block {visible_block} is behind target {target_block}"
+            if attempt + 1 < POST_ACTION_VISIBILITY_ATTEMPTS:
+                backoff = min(
+                    POST_ACTION_VISIBILITY_BASE_BACKOFF_SECONDS * (2**attempt),
+                    POST_ACTION_VISIBILITY_MAX_BACKOFF_SECONDS,
+                )
+                _cycle_progress(
+                    f"post-action RPC visibility attempt {attempt + 1} of "
+                    f"{POST_ACTION_VISIBILITY_ATTEMPTS} failed ({failure}); "
+                    f"backing off {backoff:.1f}s"
+                )
+                self._sleep(backoff)
+        _cycle_progress(
+            f"post-action RPC visibility remained behind confirmed block {target_block}: {failure}"
+        )
+        return False
 
     def _stock_token_address_for(self, symbol: str) -> str:
         """Resolve one symbol's stock token address from the registry.
@@ -1151,17 +1356,35 @@ class CycleRunner:
         position: PolicyPosition | None = None
         if book.position is not None and reconciliation.tracked_status is not None:
             status = reconciliation.tracked_status
+            stock_address = self._stock_token_address_for(book.position.symbol)
+            pool = self._pool_for_symbol(book.position.symbol)
+            stock_decimals = self._sources.token_decimals(stock_address)
+            stock_is_token0 = normalize_evm_address(pool.token0_address) == normalize_evm_address(
+                stock_address
+            )
+            first_edge_price = _price_at_tick(
+                status.position.tick_lower,
+                stock_is_token0=stock_is_token0,
+                stock_decimals=stock_decimals,
+            )
+            second_edge_price = _price_at_tick(
+                status.position.tick_upper,
+                stock_is_token0=stock_is_token0,
+                stock_decimals=stock_decimals,
+            )
             position = PolicyPosition(
                 pool_address=status.pool_address,
-                token_address=self._stock_token_address_for(book.position.symbol),
+                token_address=stock_address,
                 price_range=AlignedPriceRange(
                     lower_tick=status.position.tick_lower,
                     upper_tick=status.position.tick_upper,
-                    lower_price=_price_at_tick(status.position.tick_lower),
-                    upper_price=_price_at_tick(status.position.tick_upper),
+                    lower_price=min(first_edge_price, second_edge_price),
+                    upper_price=max(first_edge_price, second_edge_price),
                 ),
                 committed_usd=book.position.committed_usd,
                 entered_at=book.position.entered_at,
+                out_of_range_since=book.position.out_of_range_since,
+                out_of_range_side=book.position.out_of_range_side,
             )
         held: HeldInventory | None = None
         if book.held_inventory is not None:
@@ -1170,15 +1393,17 @@ class CycleRunner:
                 token_address=book.held_inventory.token_address,
                 stock_quantity=book.held_inventory.stock_quantity,
                 held_since=book.held_inventory.held_since,
+                origin=book.held_inventory.origin,
             )
         day = self._now().astimezone(POLICY_TIMEZONE).date()
-        day_start = book.day_start_equity_usd if book.day == day else None
+        same_day = book.day == day and book.day_start_equity_usd is not None
+        day_start = book.day_start_equity_usd if same_day else None
         if day_start is None:
             day_start = Decimal(reconciliation.safe_usdc_units).scaleb(-6)
         return PolicyState(
-            day=day,
+            day=day if same_day else None,
             day_start_equity_usd=day_start,
-            halted_day=book.halted_day,
+            halted_day=book.halted_day if same_day else None,
             position=position,
             held_inventory=held,
             reentry_blocked_until=None,
@@ -1242,6 +1467,26 @@ class CycleRunner:
             reference_age_seconds,
             self._safe_address,
         )
+        # Production actions are authoritative to the exact resolved Aerodrome
+        # pool. External equity references remain report-only diagnostics and
+        # can never directly trigger a buy, sell, mint, burn, or defensive exit.
+        observation = observation.model_copy(update={"reference_enforcement_enabled": False})
+        notes = notes + (
+            "external reference is diagnostic-only; scheduled actions use the "
+            "resolved Aerodrome pool's on-chain price and state",
+        )
+        # Include the tracked LP mark in portfolio equity.
+        tracked_status = self._last_reconciliation.tracked_status
+        if tracked_status is not None and tracked_status.position_value_usdc is not None:
+            lp_value = tracked_status.position_value_usdc
+            observation = observation.model_copy(
+                update={"equity_usd": observation.equity_usd + lp_value}
+            )
+            notes = notes + (
+                f"equity includes tracked LP marked value {lp_value} USDC; "
+                f"portfolio equity is {observation.equity_usd} USDC",
+            )
+
         engine = PolicyEngine(LOCKED_POLICY_PARAMETERS, load_event_calendar())
         outcome = engine.decide(state, observation)
         window = evaluate_event_window(
@@ -1301,14 +1546,83 @@ class CycleRunner:
             reference_age_seconds,
             self._safe_address,
         )
+        # Apply the same pool-authoritative doctrine to every selector option.
+        # Selector sizing also reserves ten percent of the observed depth cap
+        # so a few-percent live-depth move during a multi-step switch cannot
+        # strand inventory between source exit and target mint.
+        options = tuple(
+            option.model_copy(
+                update={
+                    "observation": option.observation.model_copy(
+                        update={
+                            "reference_enforcement_enabled": False,
+                            "pool_depth_usd": (
+                                option.observation.pool_depth_usd * SELECTOR_DEPTH_HEADROOM_FRACTION
+                            ),
+                        }
+                    )
+                }
+            )
+            for option in options
+        )
+        notes = notes + (
+            "selector sizing reserves 10% headroom below each observed pool-depth cap",
+        )
+        # Selector observations start from loose Safe balances. When an LP is
+        # already tracked, add its live marked value to every board option
+        # before policy evaluation so the daily-loss guard sees total managed
+        # portfolio equity rather than falsely treating deployed LP capital as
+        # a drawdown.
+        tracked_status = self._last_reconciliation.tracked_status
+        if tracked_status is not None and tracked_status.position_value_usdc is not None:
+            lp_value = tracked_status.position_value_usdc
+            options = tuple(
+                option.model_copy(
+                    update={
+                        "observation": option.observation.model_copy(
+                            update={"equity_usd": option.observation.equity_usd + lp_value}
+                        )
+                    }
+                )
+                for option in options
+            )
+            notes = notes + (f"selector equity includes tracked LP marked value {lp_value} USDC",)
+        notes = notes + (
+            "external references are diagnostic-only; selector actions use each "
+            "resolved Aerodrome pool's on-chain price and state",
+        )
         engine = PolicyEngine(LOCKED_POLICY_PARAMETERS, load_event_calendar())
+        policy_state = self._policy_state(book, self._last_reconciliation)
         selection = select_board(
             engine,
-            self._policy_state(book, self._last_reconciliation),
+            policy_state,
             options,
             self._cooldown_map(book),
             self._switch_margin_fraction,
         )
+        penalty = getattr(tracked_status, "penalty", None)
+        if (
+            selection.switch is not None
+            and penalty is not None
+            and penalty.remaining_seconds > 0
+            and book.position is not None
+        ):
+            held_option = next(
+                option for option in options if option.symbol == book.position.symbol
+            )
+            held_outcome = engine.decide(policy_state, held_option.observation)
+            selection = BoardSelection(
+                outcome=held_outcome,
+                evaluations=selection.evaluations,
+                selected_symbol=book.position.symbol,
+                switch=None,
+                summary=(
+                    f"holding {book.position.symbol}: cross-pool switch deferred for "
+                    f"{penalty.remaining_seconds}s until the active minimum-stake penalty "
+                    "window clears; "
+                    + selection.summary
+                ),
+            )
         decision_option = self._option_for_selection(selection, options)
         window = evaluate_event_window(self._now(), decision_option.token_address, engine.calendar)
         switch = selection.switch
@@ -1369,6 +1683,73 @@ class CycleRunner:
     # Action
     # ------------------------------------------------------------------
 
+    def _recover_unstaked_position(
+        self,
+        book: CycleStateBook,
+        key_bytes: bytes,
+    ) -> tuple[list[CycleActionRecord], str]:
+        """Restake a valid tracked NFT left in the Safe after a partial prior cycle.
+
+        This recovery is intentionally narrow: reconciliation already proved the
+        tracked token is owned by the Safe (not a stranger), the policy verdict is
+        HOLD, and no normal policy action needs the NFT unstaked.  The existing
+        audited stake executor remains the only broadcast surface.
+        """
+        executor = self._executor
+        assert executor is not None  # noqa: S101 - live run validated the boundary
+        tracked = book.position
+        if tracked is None:
+            return [], "stake recovery requested while no position is tracked"
+        try:
+            report = executor.execute_stake(
+                tracked.symbol,
+                tracked.token_id,
+                key_bytes,
+                confirm_broadcast=True,
+            )
+        except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+            code = str(getattr(error, "code", "plan_refused"))
+            completed_steps = tuple(getattr(error, "completed_steps", ()))
+            hashes = tuple(step.transaction_hash for step in completed_steps)
+            fees = sum(step.fee_wei or 0 for step in completed_steps)
+            blocks = tuple(
+                int(step.block_number)
+                for step in completed_steps
+                if step.status == "confirmed" and getattr(step, "block_number", None) is not None
+            )
+            return [
+                CycleActionRecord(
+                    action="stake_recovery",
+                    status="refused",
+                    transaction_hashes=hashes,
+                    fee_wei=fees,
+                    confirmed_block_number=max(blocks) if blocks else None,
+                    refusal_code=code,
+                    diagnostic=str(error),
+                )
+            ], f"the stake recovery action refused [{code}]"
+        except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
+            return [
+                CycleActionRecord(
+                    action="stake_recovery",
+                    status="failed",
+                    diagnostic=str(error),
+                )
+            ], f"the stake recovery action failed: {error}"
+        hashes, fees, confirmed_block = _action_hashes_fees_and_block(report)
+        completed = _action_completed(report)
+        record = CycleActionRecord(
+            action="stake_recovery",
+            status="completed" if completed else "failed",
+            transaction_hashes=hashes,
+            fee_wei=fees,
+            confirmed_block_number=confirmed_block,
+            diagnostic=report.halted_reason,
+        )
+        if not completed:
+            return [record], f"the stake recovery action halted: {report.halted_reason}"
+        return [record], ""
+
     def _act(  # noqa: PLR0915, PLR0912 - one fixed policy mapping, explicit branches
         self,
         book: CycleStateBook,
@@ -1397,10 +1778,22 @@ class CycleRunner:
                 report = call()
             except (LpExecutionRefusalError, LpPlanRefusalError) as error:
                 code = str(getattr(error, "code", "plan_refused"))
+                completed_steps = tuple(getattr(error, "completed_steps", ()))
+                hashes = tuple(step.transaction_hash for step in completed_steps)
+                fees = sum(step.fee_wei or 0 for step in completed_steps)
+                blocks = tuple(
+                    int(step.block_number)
+                    for step in completed_steps
+                    if step.status == "confirmed"
+                    and getattr(step, "block_number", None) is not None
+                )
                 records.append(
                     CycleActionRecord(
                         action=name,
                         status="refused",
+                        transaction_hashes=hashes,
+                        fee_wei=fees,
+                        confirmed_block_number=max(blocks) if blocks else None,
                         refusal_code=code,
                         diagnostic=str(error),
                     )
@@ -1413,13 +1806,19 @@ class CycleRunner:
                 )
                 halted = f"the {name} action failed: {error}"
                 return False
-            hashes, fees = _action_hashes_and_fees(report)
+            hashes, fees, confirmed_block = _action_hashes_fees_and_block(report)
+            mint_plan = getattr(report.build, "plan", None) if name == "mint" else None
+            executed_budget = (
+                getattr(mint_plan, "budget_usdc", None) if mint_plan is not None else None
+            )
             records.append(
                 CycleActionRecord(
                     action=name,
                     status="completed" if _action_completed(report) else "failed",
                     transaction_hashes=hashes,
                     fee_wei=fees,
+                    confirmed_block_number=confirmed_block,
+                    executed_budget_usdc=executed_budget,
                     diagnostic=report.halted_reason,
                 )
             )
@@ -1445,7 +1844,36 @@ class CycleRunner:
                     decision_symbol, budget, mint_width, key_bytes, confirm_broadcast=True
                 ),
             ):
-                return records, halted, book
+                held_quantity = self._live_stock_quantity(decision_symbol)
+                failed_book = book
+                if held_quantity > 0:
+                    existing_retry = (
+                        book.held_inventory
+                        if book.held_inventory is not None
+                        and book.held_inventory.symbol == decision_symbol
+                        and book.held_inventory.origin in ("failed_entry", "failed_recenter")
+                        else None
+                    )
+                    failed_book = book.model_copy(
+                        update={
+                            "held_inventory": HeldInventoryRecord(
+                                symbol=decision_symbol,
+                                token_address=self._stock_token_address_for(decision_symbol),
+                                stock_quantity=held_quantity,
+                                held_since=(
+                                    existing_retry.held_since
+                                    if existing_retry is not None
+                                    else self._now()
+                                ),
+                                origin=(
+                                    existing_retry.origin
+                                    if existing_retry is not None
+                                    else "failed_entry"
+                                ),
+                            )
+                        }
+                    )
+                return records, halted, failed_book
             token_id = self._decode_mint_token_id(records[-1])
             if token_id is None:
                 halted = "the minted position id could not be decoded from the receipt"
@@ -1461,7 +1889,12 @@ class CycleRunner:
             return (
                 records,
                 halted,
-                self._book_with_position(book, decision_symbol, minted_id, budget),
+                self._book_with_position(
+                    book,
+                    decision_symbol,
+                    minted_id,
+                    records[-2].executed_budget_usdc or budget,
+                ),
             )
 
         if action is PolicyActionKind.POOL_SWITCH:
@@ -1474,22 +1907,67 @@ class CycleRunner:
             if book.position is None or tracked_symbol is None:
                 halted = "the selector authorized a switch while flat"
                 return records, halted, book
-            if not self._exit_position(executor, book, key_bytes, run):
-                return records, halted, book
-            switched_book = book.model_copy(update={"position": None, "held_inventory": None})
             size = decision.size_usd
             width = self._width_from_range(decision.price_range, switch.to_symbol)
             if size is None or size <= 0 or width is None:
                 halted = "the switch decision carried no positive size or tick-aligned width"
-                return records, halted, switched_book
+                return records, halted, book
             switch_budget: Decimal = size
             switch_width: int = width
+            # Prove the target can be funded from a conservative projection of
+            # the complete source exit before unstaking the currently earning
+            # LP. A refusal leaves the source NFT untouched and staked.
+            try:
+                executor.dry_run_switch(
+                    tracked_symbol,
+                    book.position.token_id,
+                    switch.to_symbol,
+                    switch_width,
+                    switch_budget,
+                    key_bytes,
+                )
+            except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+                code = str(getattr(error, "code", "plan_refused"))
+                records.append(
+                    CycleActionRecord(
+                        action="switch_preflight",
+                        status="refused",
+                        refusal_code=code,
+                        diagnostic=str(error),
+                    )
+                )
+                halted = f"the switch preflight refused [{code}]"
+                return records, halted, book
+            except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
+                records.append(
+                    CycleActionRecord(
+                        action="switch_preflight", status="failed", diagnostic=str(error)
+                    )
+                )
+                halted = f"the switch preflight failed: {error}"
+                return records, halted, book
+            if not self._exit_position(executor, book, key_bytes, run):
+                return records, halted, book
+            switched_book = book.model_copy(update={"position": None, "held_inventory": None})
             if not run(
                 "mint",
                 lambda: executor.execute_mint(
                     switch.to_symbol, switch_budget, switch_width, key_bytes, confirm_broadcast=True
                 ),
             ):
+                held_quantity = self._live_stock_quantity(switch.to_symbol)
+                if held_quantity > 0:
+                    switched_book = switched_book.model_copy(
+                        update={
+                            "held_inventory": HeldInventoryRecord(
+                                symbol=switch.to_symbol,
+                                token_address=self._stock_token_address_for(switch.to_symbol),
+                                stock_quantity=held_quantity,
+                                held_since=self._now(),
+                                origin="failed_entry",
+                            )
+                        }
+                    )
                 return records, halted, switched_book
             token_id = self._decode_mint_token_id(records[-1])
             if token_id is None:
@@ -1507,7 +1985,10 @@ class CycleRunner:
                 records,
                 halted,
                 self._book_with_position(
-                    switched_book, switch.to_symbol, switched_id, switch_budget
+                    switched_book,
+                    switch.to_symbol,
+                    switched_id,
+                    records[-2].executed_budget_usdc or switch_budget,
                 ),
             )
 
@@ -1522,7 +2003,55 @@ class CycleRunner:
             if book.position is None:
                 halted = f"the engine authorized {action.value} while flat"
                 return records, halted, book
-            if not self._exit_position(executor, book, key_bytes, run):
+            # Preflight the complete replacement before touching the live LP.
+            if action is PolicyActionKind.RECENTER:
+                if (
+                    tracked_symbol is None
+                    or decision.size_usd is None
+                    or decision.size_usd <= 0
+                    or decision.price_range is None
+                ):
+                    halted = "the recenter decision carried no complete fresh entry"
+                    return records, halted, book
+                preflight_width = self._width_from_range(decision.price_range, tracked_symbol)
+                if preflight_width is None:
+                    halted = "the recenter decision carried no complete fresh entry"
+                    return records, halted, book
+                try:
+                    executor.dry_run_recenter(
+                        tracked_symbol,
+                        book.position.token_id,
+                        preflight_width,
+                        decision.size_usd,
+                        key_bytes,
+                    )
+                except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+                    code = str(getattr(error, "code", "plan_refused"))
+                    records.append(
+                        CycleActionRecord(
+                            action="recenter_preflight",
+                            status="refused",
+                            refusal_code=code,
+                            diagnostic=str(error),
+                        )
+                    )
+                    halted = f"the recenter preflight refused [{code}]"
+                    return records, halted, book
+                except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
+                    records.append(
+                        CycleActionRecord(
+                            action="recenter_preflight", status="failed", diagnostic=str(error)
+                        )
+                    )
+                    halted = f"the recenter preflight failed: {error}"
+                    return records, halted, book
+
+            exit_ok = (
+                self._burn_without_swap(executor, book, key_bytes, run)
+                if action is PolicyActionKind.RECENTER
+                else self._exit_position(executor, book, key_bytes, run)
+            )
+            if not exit_ok:
                 return records, halted, book
             if action is PolicyActionKind.RECENTER:
                 size = decision.size_usd
@@ -1546,11 +2075,21 @@ class CycleRunner:
                         confirm_broadcast=True,
                     ),
                 ):
-                    return (
-                        records,
-                        halted,
-                        book.model_copy(update={"position": None, "held_inventory": None}),
-                    )
+                    held_quantity = self._live_stock_quantity(tracked_symbol)
+                    failed_book = book.model_copy(update={"position": None, "held_inventory": None})
+                    if held_quantity > 0:
+                        failed_book = failed_book.model_copy(
+                            update={
+                                "held_inventory": HeldInventoryRecord(
+                                    symbol=tracked_symbol,
+                                    token_address=self._stock_token_address_for(tracked_symbol),
+                                    stock_quantity=held_quantity,
+                                    held_since=self._now(),
+                                    origin="failed_recenter",
+                                )
+                            }
+                        )
+                    return records, halted, failed_book
                 token_id = self._decode_mint_token_id(records[-1])
                 if token_id is None:
                     halted = "the recentered position id could not be decoded"
@@ -1573,7 +2112,12 @@ class CycleRunner:
                 return (
                     records,
                     halted,
-                    self._book_with_position(book, tracked_symbol, token_id, size),
+                    self._book_with_position(
+                        book,
+                        tracked_symbol,
+                        token_id,
+                        records[-2].executed_budget_usdc or size,
+                    ),
                 )
             return (
                 records,
@@ -1602,6 +2146,7 @@ class CycleRunner:
                             token_address=self._stock_token_address_for(tracked_symbol),
                             stock_quantity=held_quantity,
                             held_since=self._now(),
+                            origin="stale_low_exit",
                         ),
                     }
                 ),
@@ -1736,6 +2281,7 @@ class CycleRunner:
         reconciliation: CycleReconciliation,
         next_state: PolicyState,
         decision_symbol: str | None = None,
+        decision_action: PolicyActionKind = PolicyActionKind.HOLD,
     ) -> CycleStateBook:
         """Rebuild the book from post-action chain truth plus engine state."""
         position = book.position
@@ -1745,9 +2291,32 @@ class CycleRunner:
             and reconciliation.tracked_token_id != position.token_id
         ):
             position = position.model_copy(update={"token_id": reconciliation.tracked_token_id})
+        if (
+            position is not None
+            and next_state.position is not None
+            and decision_action is PolicyActionKind.HOLD
+        ):
+            position = position.model_copy(
+                update={
+                    "out_of_range_since": next_state.position.out_of_range_since,
+                    "out_of_range_side": next_state.position.out_of_range_side,
+                }
+            )
         held = book.held_inventory
         if held is not None and reconciliation.held_stock_quantity == 0:
             held = None
+        elif (
+            held is None
+            and reconciliation.held_stock_quantity > 0
+            and reconciliation.held_symbol is not None
+            and reconciliation.tracked_token_id is None
+        ):
+            held = HeldInventoryRecord(
+                symbol=reconciliation.held_symbol,
+                token_address=self._stock_token_address_for(reconciliation.held_symbol),
+                stock_quantity=reconciliation.held_stock_quantity,
+                held_since=self._now(),
+            )
         # The engine's successor state names at most one pool's cooldown -
         # the pool the decision ran over - so only that pool's entry merges.
         cooldown_symbol = decision_symbol or (position.symbol if position is not None else None)
@@ -1777,6 +2346,8 @@ class CycleRunner:
         started_at: datetime,
         mode: CycleMode,
         reconciliation: CycleReconciliation,
+        decision_reconciliation: CycleReconciliation,
+        final_reconciliation_verified: bool,
         decision_report: StrategyDecisionReport | None,
         actions: tuple[CycleActionRecord, ...],
         halted_reason: str,
@@ -1811,6 +2382,8 @@ class CycleRunner:
             mode=mode,
             symbol=report_symbol,
             reconciliation=reconciliation,
+            decision_reconciliation=decision_reconciliation,
+            final_reconciliation_verified=final_reconciliation_verified,
             decision_action=decision_action,
             decision_reason=decision_reason,
             decision_diagnostics=decision_diagnostics,
@@ -1998,7 +2571,11 @@ def build_cycle_runner(
     from aero_bot.safe_tx import SafeTransactionRpcBackend
     from aero_bot.strategy import LiveStrategySources
 
-    rpc = ExecutorRpcBackend(rpc_url=settings.base_rpc_url, progress=_cycle_progress)
+    rpc = ExecutorRpcBackend(
+        rpc_url=settings.base_rpc_url,
+        fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
+        progress=_cycle_progress,
+    )
     audit_store = AuditStore(settings.audit_database_path)
     pin_store = LpPoolPinStore(settings.lp_pool_pins_path)
     # Every long-running phase (the first full Sugar sweep above all) reports
@@ -2008,10 +2585,15 @@ def build_cycle_runner(
     sources = LiveStrategySources(
         rpc_url=settings.base_rpc_url,
         sugar_address=settings.lp_sugar_address,
+        fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
         pool_pin_store=pin_store,
         progress=progress,
     )
-    safe_rpc = SafeTransactionRpcBackend(rpc_url=settings.base_rpc_url, safe_address=safe_address)
+    safe_rpc = SafeTransactionRpcBackend(
+        rpc_url=settings.base_rpc_url,
+        safe_address=safe_address,
+        fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
+    )
     receipt_backends = [rpc] + [
         ExecutorRpcBackend(rpc_url=url)
         for url in EXECUTE_RECEIPT_ENDPOINT_URLS
@@ -2024,6 +2606,7 @@ def build_cycle_runner(
         sources=LiveExecutionSources(
             rpc_url=settings.base_rpc_url,
             sugar_address=settings.lp_sugar_address,
+            fallback_rpc_urls=EXECUTE_RECEIPT_ENDPOINT_URLS,
             progress=progress,
         ),
         rpc=rpc,
@@ -2142,14 +2725,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     single_reference: Decimal | None = None
     reference_map: dict[str, Decimal] = {}
     if isinstance(configured_reference, Decimal):
-        if symbol is None:
-            print(
-                f"selector mode needs per-symbol reference quotes in {CYCLE_REFERENCE_PRICE_ENV} "
-                "or --reference-price (SYMBOL=PRICE pairs)",
-                file=sys.stderr,
-            )
-            return EXIT_FAILURE
-        single_reference = configured_reference
+        # A legacy single-symbol quote belongs to pinned mode. Selector mode is
+        # Aerodrome-authoritative and references are diagnostic-only, so an
+        # AAPL-only sealed quote must not block cross-board operation or be
+        # misapplied to every B20 pool. Per-symbol maps remain available when
+        # the operator wants complete external diagnostics.
+        if symbol is not None:
+            single_reference = configured_reference
     elif configured_reference is not None:
         reference_map = configured_reference
     safe_address = os.environ.get(SAFE_ADDRESS_ENV, DEFAULT_CANARY_SAFE_ADDRESS)
@@ -2188,13 +2770,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"the cycle runner is unavailable: {error}", file=sys.stderr)
         return EXIT_FAILURE
     try:
-        report = runner.run(
-            mode,
-            key_bytes=key_bytes,
-            reference_price_usdc=single_reference,
-            reference_age_seconds=arguments.reference_age_seconds,
-            reference_prices_by_symbol=reference_map or None,
-        )
+        if mode is CycleMode.LIVE:
+            lock_path = settings.audit_database_path.parent / "execution.lock"
+            with exclusive_execution_lock(lock_path):
+                report = runner.run(
+                    mode,
+                    key_bytes=key_bytes,
+                    reference_price_usdc=single_reference,
+                    reference_age_seconds=arguments.reference_age_seconds,
+                    reference_prices_by_symbol=reference_map or None,
+                )
+        else:
+            report = runner.run(
+                mode,
+                key_bytes=key_bytes,
+                reference_price_usdc=single_reference,
+                reference_age_seconds=arguments.reference_age_seconds,
+                reference_prices_by_symbol=reference_map or None,
+            )
+    except ExecutionLockUnavailableError as error:
+        print(f"cycle refused: {error}", file=sys.stderr)
+        return EXIT_REFUSED
     except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
         print(f"cycle failed: {error}", file=sys.stderr)
         return EXIT_FAILURE

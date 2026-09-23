@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from aero_bot.executor import ExecutorRpcBackend
+from aero_bot.executor import ExecutionUnavailableError, ExecutorRpcBackend
 from aero_bot.known_pool import (
     KNOWN_POOL_SOURCE,
     grid_cell_lower_tick,
@@ -376,6 +376,20 @@ class TestResolveKnownPoolCandidate:
         # The fast path never enumerates the Sugar.
         assert script.enumeration_calls == 0
 
+    def test_caller_can_pin_a_shared_snapshot_block(self) -> None:
+        """Board selection can force every known pool onto one common block."""
+        script = KnownPoolRpcScript()
+        rpc = make_rpc(script)
+        candidate, block = resolve_known_pool_candidate(
+            rpc,
+            make_pin(),
+            make_listing(),
+            aerodrome_contract_evidence(),
+            block_number=FAST_BLOCK_NUMBER - 7,
+        )
+        assert block == FAST_BLOCK_NUMBER - 7
+        assert candidate.pool_address == POOL_ADDRESS
+
     def test_identity_mismatch_refuses(self) -> None:
         """A live identity that diverges from the pin refuses."""
         script = KnownPoolRpcScript(token1="0x" + "cc" * 20)
@@ -508,6 +522,70 @@ class TestDecisionFastPathWiring:
         assert block == FAST_BLOCK_NUMBER
         assert candidate.pool_address == POOL_ADDRESS
         assert candidate.staked0 == LIVE_STAKED0
+
+    def test_complete_pinned_board_resolves_without_enumeration(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A complete pin set verifies the board at one block with zero Sugar pages."""
+        script = KnownPoolRpcScript()
+        sources, _ = self._sources(tmp_path, script, monkeypatch)
+        listings, block = sources.enumerate_pools()
+        assert script.enumeration_calls == 0
+        assert block == FAST_BLOCK_NUMBER
+        assert [(item.symbol, item.pool.pool_address) for item in listings] == [
+            ("FIXc", POOL_ADDRESS)
+        ]
+
+    def test_verified_board_survives_pin_metadata_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A decimals RPC failure may skip a cache write but cannot discard the verified board."""
+        import aero_bot.strategy as strategy_module
+        from aero_bot.strategy import LiveStrategySources
+
+        sweep_candidate = make_candidate()
+        sweep = PoolDiscoveryResult(
+            venue=VenueId.AERODROME,
+            status=PoolDiscoveryStatus.VERIFIED,
+            source="lp-sugar:fixture@block:123",
+            observed_at=BASE_NOW,
+            snapshot_block=123,
+            pools=(sweep_candidate,),
+            diagnostics=("fixture sweep",),
+        )
+
+        class FakeExecutionSources:
+            def load_registry(self) -> B20RegistryResult:
+                return make_registry()
+
+            def discover_pools(self) -> PoolDiscoveryResult:
+                return sweep
+
+            def read_token_decimals(self, token_address: str) -> int:
+                raise ExecutionUnavailableError("metadata rate limited")
+
+        monkeypatch.setattr(
+            strategy_module, "LiveExecutionSources", lambda **_: FakeExecutionSources()
+        )
+        store = LpPoolPinStore(tmp_path / "lp_pool_pins.json")
+        progress: list[str] = []
+        sources = LiveStrategySources(
+            rpc_url="https://example.invalid",
+            sugar_address="0x27fc745390d1f4baf8d184fbd97748340f786634",
+            transport=KnownPoolRpcScript().transport(),
+            pool_pin_store=store,
+            progress=progress.append,
+            sleep=lambda _seconds: None,
+            timer=lambda: 0.0,
+        )
+
+        listings, block = sources.enumerate_pools()
+        assert block == 123
+        assert [(item.symbol, item.pool.pool_address) for item in listings] == [
+            ("FIXc", POOL_ADDRESS)
+        ]
+        assert store.load() == {}
+        assert any("pool-pin cache skipped for FIXc" in line for line in progress)
 
     def test_identity_drift_falls_back_to_the_sweep(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

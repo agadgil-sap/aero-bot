@@ -243,6 +243,31 @@ class FakeCloseExecutor:
             action=action, build=None, steps=(step,), completed=True, halted_reason=""
         )
 
+    def dry_run_recenter(
+        self,
+        symbol: str,
+        token_id: int,
+        width_spacings: int | None,
+        budget_usdc: Decimal | None,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> object:
+        """The watchtower never recenters; refuse if asked."""
+        raise AssertionError("the watchtower must never recenter")
+
+    def dry_run_switch(
+        self,
+        from_symbol: str,
+        token_id: int,
+        to_symbol: str,
+        width_spacings: int | None,
+        budget_usdc: Decimal,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> object:
+        """The watchtower never switches pools; refuse if asked."""
+        raise AssertionError("the watchtower must never switch pools")
+
     def execute_unstake(
         self,
         symbol: str,
@@ -365,6 +390,7 @@ class WatchtowerHarness:
         refuse: str | None = None,
         config: WatchtowerConfig = ARMED_CONFIG,
         key_loader: RecordingKeyLoader | None = None,
+        watch_symbol: str = "FIXc",
     ) -> None:
         """Wire every fake and store around one mutable clock."""
         self.clock = MutableClock()
@@ -382,7 +408,7 @@ class WatchtowerHarness:
         self.latch_store = WatchtowerLatchStore(tmp_path / "watchtower_state.json")
         self.audit = AuditStore(tmp_path / "audit.sqlite3")
         self.watchtower = RangeWatchtower(
-            symbol="FIXc",
+            symbol=watch_symbol,
             safe_address=SAFE_ADDRESS,
             relayer_address=None,
             config=config,
@@ -545,6 +571,51 @@ class TestTripSemantics:
         assert outcome.state is WatchtowerPollState.FLAT
         assert harness.executor.calls == []
         assert harness.key_loader.loads == 0
+
+    def test_auto_monitor_follows_the_tracked_positions_symbol(self, tmp_path: Path) -> None:
+        """An auto watchtower follows a selector switch without a service restart."""
+        config = WatchtowerConfig(
+            enabled=True,
+            poll_interval_seconds=5.0,
+            cooldown_seconds=900.0,
+            monitor_only=True,
+        )
+        harness = WatchtowerHarness(
+            tmp_path,
+            tick=ABOVE_TICK,
+            status=status_report(range_state=PositionRangeState.ABOVE_RANGE),
+            config=config,
+            watch_symbol="auto",
+        )
+
+        outcome = harness.poll()
+
+        assert outcome.state is WatchtowerPollState.STOOD_DOWN
+        assert harness.statuses.calls == 0
+        assert harness.executor.calls == []
+        assert harness.key_loader.loads == 0
+        assert len(harness.alerts.notices) == 1
+        assert harness.alerts.notices[0][0].startswith("FIXc range trip observed")
+
+    def test_monitor_only_trip_alerts_but_can_never_trade(self, tmp_path: Path) -> None:
+        """Production monitoring never loads a key or broadcasts."""
+        config = WatchtowerConfig(
+            enabled=True,
+            poll_interval_seconds=5.0,
+            cooldown_seconds=900.0,
+            monitor_only=True,
+        )
+        harness = WatchtowerHarness(tmp_path, tick=ABOVE_TICK, config=config)
+        outcome = harness.poll()
+
+        assert outcome.state is WatchtowerPollState.STOOD_DOWN
+        assert "monitor-only" in outcome.note
+        assert harness.executor.calls == []
+        assert harness.key_loader.loads == 0
+        assert harness.state_store.load().position is not None
+        assert harness.latch_store.load().tripped is True
+        assert len(harness.alerts.notices) == 1
+        assert "no transaction fired" in harness.alerts.notices[0][0]
 
 
 class TestLatchAndCooldown:
@@ -849,7 +920,9 @@ class TestSystemdUnitContract:
         assert "User=aero-bot" in unit
         assert "Group=aero-bot" in unit
         assert "EnvironmentFile=/etc/aero-bot/cycle.env" in unit
-        assert "ExecStart=/opt/aero-bot/.venv/bin/aero-bot-watchtower --symbol %i" in unit
+        assert (
+            "ExecStart=/opt/aero-bot/.venv/bin/aero-bot-watchtower --symbol %i --monitor-only"
+        ) in unit
         assert "Restart=on-failure" in unit
         assert "RestartSec=10" in unit
         assert "NoNewPrivileges=true" in unit

@@ -22,7 +22,7 @@ is ever held inside the unchanged 100 USDC total exposure cap.
 """
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from pydantic import BaseModel
@@ -47,6 +47,10 @@ from aero_bot.policy import (
 # percent forty minutes later) so ordinary APR wobble never churns a funded
 # position, while a genuinely better pool still displaces a stale one.
 DEFAULT_SWITCH_MARGIN_FRACTION = Decimal("0.30")
+# A newly entered pool must earn for one full policy persistence window before
+# a purely economic cross-pool switch may displace it. Safety exits and
+# same-pool maintenance still take precedence immediately.
+DEFAULT_SWITCH_MIN_HOLD = timedelta(hours=1)
 
 
 class PoolBoardOption(BaseModel):
@@ -589,6 +593,19 @@ def select_board(
                 summary=(
                     f"held {option.symbol} verdict {held_action.value} takes precedence; "
                     + _board_summary(evaluations, option.symbol)
+                ),
+            )
+        held_for = option.observation.observed_at - state.position.entered_at
+        if held_for < DEFAULT_SWITCH_MIN_HOLD:
+            remaining = DEFAULT_SWITCH_MIN_HOLD - held_for
+            return BoardSelection(
+                outcome=held_outcome,
+                evaluations=evaluations,
+                selected_symbol=option.symbol,
+                summary=(
+                    f"holding {option.symbol}: voluntary switch hold period active for "
+                    f"{remaining.total_seconds():.0f}s more; "
+                    + _board_summary(evaluations, None)
                 ),
             )
         directive, note = evaluate_switch(

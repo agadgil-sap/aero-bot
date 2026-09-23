@@ -220,6 +220,7 @@ class LiveStrategySources:
         self,
         rpc_url: str,
         sugar_address: str,
+        fallback_rpc_urls: Sequence[str] = (),
         transport: httpx.BaseTransport | None = None,
         pool_pin_store: LpPoolPinStore | None = None,
         progress: Callable[[str], None] | None = None,
@@ -229,8 +230,9 @@ class LiveStrategySources:
         """Configure the discovery and RPC sources.
 
         Args:
-            rpc_url: Base JSON-RPC endpoint for reads.
+            rpc_url: Primary Base JSON-RPC endpoint for reads.
             sugar_address: LP Sugar contract anchoring discovery.
+            fallback_rpc_urls: Ordered alternate endpoints for transient read failures.
             transport: Optional injected HTTP transport for tests.
             pool_pin_store: Optional local store of Sugar-verified pool
                 identities arming the known-pool fast path.
@@ -243,11 +245,13 @@ class LiveStrategySources:
         self._execution_sources = LiveExecutionSources(
             rpc_url=rpc_url,
             sugar_address=sugar_address,
+            fallback_rpc_urls=fallback_rpc_urls,
             transport=transport,
             progress=progress,
         )
         self._rpc = ExecutorRpcBackend(
             rpc_url=rpc_url,
+            fallback_rpc_urls=fallback_rpc_urls,
             transport=transport,
             progress=progress,
             sleep=sleep,
@@ -323,15 +327,24 @@ class LiveStrategySources:
         if pool is None:
             raise ValueError(f"symbol {symbol!r} has no discovered B20/USDC pool")
         if self._pool_pin_store is not None:
-            persist_decision_pool_pin(
-                self._pool_pin_store,
-                listing,
-                pool,
-                self._execution_sources.read_token_decimals(listing.address),
-                result.snapshot_block,
-                datetime.now(UTC),
-                result.source,
-            )
+            try:
+                stock_decimals = self._execution_sources.read_token_decimals(listing.address)
+            except ExecutionUnavailableError as error:
+                if self._progress is not None:
+                    self._progress(
+                        f"pool-pin cache skipped for {listing.symbol}: token metadata unavailable: "
+                        f"{error}"
+                    )
+            else:
+                persist_decision_pool_pin(
+                    self._pool_pin_store,
+                    listing,
+                    pool,
+                    stock_decimals,
+                    result.snapshot_block,
+                    datetime.now(UTC),
+                    result.source,
+                )
         return pool, result.snapshot_block
 
     def enumerate_pools(self) -> tuple[tuple[BoardListing, ...], int]:
@@ -357,6 +370,45 @@ class LiveStrategySources:
         symbol_by_token = {
             address: asset.symbol.strip() for address, asset in listing_by_address.items()
         }
+        # Once one verified Sugar sweep has populated every official B20 pin,
+        # selector cycles re-verify those immutable identities directly at one
+        # shared fresh block instead of enumerating the entire Aerodrome Sugar
+        # universe every five minutes. Any missing/stale/unreadable pin falls
+        # back to the full sweep below, which refreshes the complete cache.
+        if self._pool_pin_store is not None and registry.status is RegistryStatus.VERIFIED:
+            pins = self._pool_pin_store.load()
+            expected = {asset.symbol.strip().lower() for asset in registry.assets}
+            if expected and expected.issubset(pins):
+                try:
+                    shared_block = self._rpc.fetch_block_number()
+                    contracts = aerodrome_contract_evidence()
+                    fast_listings: list[BoardListing] = []
+                    for asset in sorted(registry.assets, key=lambda item: item.symbol):
+                        candidate, candidate_block = resolve_known_pool_candidate(
+                            self._rpc,
+                            pins[asset.symbol.strip().lower()],
+                            asset,
+                            contracts,
+                            block_number=shared_block,
+                        )
+                        if candidate_block != shared_block:
+                            raise ValueError(
+                                f"known-pool board candidate {asset.symbol} drifted from shared "
+                                f"block {shared_block} to {candidate_block}"
+                            )
+                        fast_listings.append(BoardListing(symbol=asset.symbol, pool=candidate))
+                except (ExecutionUnavailableError, ValueError) as error:
+                    if self._progress is not None:
+                        self._progress(
+                            f"known-board fast path fell back to full discovery: {error}"
+                        )
+                else:
+                    if self._progress is not None:
+                        self._progress(
+                            f"known-board fast path verified {len(fast_listings)} B20 pools "
+                            f"at shared block {shared_block}"
+                        )
+                    return tuple(fast_listings), shared_block
         result = self._execution_sources.discover_pools()
         if result.status is not PoolDiscoveryStatus.VERIFIED:
             raise ExecutionUnavailableError(
@@ -365,7 +417,6 @@ class LiveStrategySources:
         if result.snapshot_block is None:
             raise ExecutionUnavailableError("verified discovery carried no snapshot block")
         normalized_usdc = BASE_USDC_ADDRESS.lower()
-        existing_pins = self._pool_pin_store.load() if self._pool_pin_store is not None else {}
         listings: list[BoardListing] = []
         seen_symbols: set[str] = set()
         for pool in result.pools:
@@ -379,18 +430,28 @@ class LiveStrategySources:
             if listing is None or symbol is None or symbol.lower() in seen_symbols:
                 continue
             seen_symbols.add(symbol.lower())
-            # Only missing pins are written: the warm store keeps one pin per
-            # symbol and a board sweep rewrites nothing it already knows.
-            if self._pool_pin_store is not None and symbol.lower() not in existing_pins:
-                persist_decision_pool_pin(
-                    self._pool_pin_store,
-                    listing,
-                    pool,
-                    self._execution_sources.read_token_decimals(stock_token),
-                    result.snapshot_block,
-                    datetime.now(UTC),
-                    result.source,
-                )
+            # A completed board sweep refreshes every verified pin. This heals
+            # stale or hand-edited cache entries that caused the fast path to
+            # fall back, instead of trapping future cycles in full discovery.
+            if self._pool_pin_store is not None:
+                try:
+                    stock_decimals = self._execution_sources.read_token_decimals(stock_token)
+                except ExecutionUnavailableError as error:
+                    if self._progress is not None:
+                        self._progress(
+                            f"pool-pin cache skipped for {symbol}: token metadata unavailable: "
+                            f"{error}"
+                        )
+                else:
+                    persist_decision_pool_pin(
+                        self._pool_pin_store,
+                        listing,
+                        pool,
+                        stock_decimals,
+                        result.snapshot_block,
+                        datetime.now(UTC),
+                        result.source,
+                    )
             listings.append(BoardListing(symbol=symbol, pool=pool))
         listings.sort(key=lambda listing: listing.symbol)
         return tuple(listings), result.snapshot_block
@@ -762,8 +823,9 @@ def assemble_board(
         )
     if not any(listing.symbol in reference_prices for listing in listings):
         notes.append(
-            "no live real-market reference quote is wired yet; every entry blocks "
-            "fail-closed as reference_stale unless per-symbol quotes are injected"
+            "no live real-market reference quote is wired yet; scheduled selector mode "
+            "treats external references as diagnostic-only and uses each resolved "
+            "Aerodrome pool's on-chain state for actions"
         )
     notes.append(
         "fee APR stays zero because a live fee-evidence window needs the "
