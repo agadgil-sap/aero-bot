@@ -1,6 +1,6 @@
 """Pin the scheduled decision cycle's reconcile-decide-act behavior."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 from pathlib import Path
@@ -40,6 +40,12 @@ from aero_bot.cycle import (
     decode_minted_token_id,
 )
 from aero_bot.history import price_usdc_per_stock
+from aero_bot.llm_control import (
+    LlmActionDecision,
+    LlmActionKind,
+    LlmControlConfig,
+    LlmControlMode,
+)
 from aero_bot.lp_executor import (
     NFPM_INCREASE_LIQUIDITY_TOPIC0,
     LpActionExecutionReport,
@@ -96,6 +102,20 @@ class FakePlanPayload(BaseModel):
     """The mint-plan audit shape the real executor writes."""
 
     budget_usdc: str
+
+
+class FakeLlmDecider:
+    """Return one scripted model decision while recording its context."""
+
+    def __init__(self, result: LlmActionDecision) -> None:
+        """Store the scripted decision."""
+        self.result = result
+        self.contexts: list[dict[str, object]] = []
+
+    def decide(self, context: Mapping[str, object]) -> LlmActionDecision:
+        """Record the context and return the scripted decision."""
+        self.contexts.append(dict(context))
+        return self.result
 
 
 class FakeCycleSources:
@@ -515,6 +535,8 @@ def make_runner(
     now: datetime = QUIET_INSTANT,
     symbol: str | None = "FIXc",
     sleep: Callable[[float], None] | None = None,
+    llm_config: LlmControlConfig | None = None,
+    llm_decider: FakeLlmDecider | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, AuditStore, CycleStateStore]:
     """Assemble one cycle runner over fully scripted boundaries."""
     store_path = tmp_path / "cycle_state.json"
@@ -575,8 +597,72 @@ def make_runner(
         state_store=state_store,
         now=lambda: now,
         sleep=sleep if sleep is not None else (lambda _seconds: None),
+        llm_config=llm_config,
+        llm_decider=llm_decider,
     )
     return runner, fake_executor, audit, state_store
+
+
+class TestLlmShadowCycle:
+    """Pin shadow-model evaluation as evidence-only cycle behavior."""
+
+    def test_valid_shadow_decision_is_reported_without_changing_policy(
+        self, tmp_path: Path
+    ) -> None:
+        """A validated shadow action cannot alter the deterministic cycle verdict."""
+        decider = FakeLlmDecider(
+            LlmActionDecision(action=LlmActionKind.HOLD, rationale="wait for a cleaner setup")
+        )
+        runner, _, _, _ = make_runner(
+            tmp_path,
+            llm_config=LlmControlConfig(
+                mode=LlmControlMode.SHADOW,
+                base_url="https://fixture.invalid/v1",
+                api_key="fixture-key",
+                model="fixture-model",
+            ),
+            llm_decider=decider,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        assert report.decision_action == PolicyActionKind.ENTER.value
+        assert report.actions == ()
+        assert any("llm shadow validated action=hold" in note for note in report.input_notes)
+        assert len(decider.contexts) == 1
+        assert decider.contexts[0]["authority"] == "shadow_only"
+
+    def test_invalid_shadow_decision_is_refused_without_affecting_cycle(
+        self, tmp_path: Path
+    ) -> None:
+        """An invented symbol is rejected by the validator and never reaches execution."""
+        decider = FakeLlmDecider(
+            LlmActionDecision(
+                action=LlmActionKind.ENTER,
+                rationale="invented target",
+                symbol="FAKE",
+                budget_usdc=Decimal("8"),
+                width_spacings=4,
+            )
+        )
+        runner, _, _, _ = make_runner(
+            tmp_path,
+            llm_config=LlmControlConfig(
+                mode=LlmControlMode.SHADOW,
+                base_url="https://fixture.invalid/v1",
+                api_key="fixture-key",
+                model="fixture-model",
+            ),
+            llm_decider=decider,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        assert report.decision_action == PolicyActionKind.ENTER.value
+        assert report.actions == ()
+        assert any(
+            "llm shadow refused by deterministic validator" in note for note in report.input_notes
+        )
 
 
 class TestCycleStateStore:

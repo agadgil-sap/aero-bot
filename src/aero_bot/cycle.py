@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Annotated, Literal, Protocol
 from zoneinfo import ZoneInfo
 
+import httpx
 from pydantic import BaseModel, Field, model_validator
 
 from aero_bot.audit import AuditEventType, AuditRecord, AuditStore
@@ -58,6 +59,15 @@ from aero_bot.executor import (
     ExecutionUnavailableError,
 )
 from aero_bot.history import price_usdc_per_stock
+from aero_bot.llm_control import (
+    LlmActionDecision,
+    LlmControlConfig,
+    LlmControlMode,
+    LlmExecutionState,
+    LlmInstructionRefusedError,
+    OpenAICompatibleDecisionClient,
+    validate_llm_action,
+)
 from aero_bot.lp_executor import (
     EXIT_FAILURE,
     EXIT_OK,
@@ -533,6 +543,18 @@ class CycleExecutorBoundary(Protocol):
         """Broadcast the full decrease-and-collect exit of one position."""
         ...
 
+    def execute_collect(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Broadcast a fee/reward collection for one tracked position."""
+        ...
+
     def execute_exit_swap(
         self,
         symbol: str,
@@ -741,6 +763,14 @@ def _book_with_cooldowns(
     return book.model_copy(update={"reentry_cooldowns": kept + fresh})
 
 
+class LlmDecisionBoundary(Protocol):
+    """Define the provider-neutral model decision call used by a cycle."""
+
+    def decide(self, context: Mapping[str, object]) -> LlmActionDecision:
+        """Return exactly one typed model-selected action."""
+        ...
+
+
 class CycleRunner:
     """Run one complete reconcile-decide-act cycle."""
 
@@ -759,6 +789,8 @@ class CycleRunner:
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], None] = time.sleep,
         switch_margin_fraction: Decimal = DEFAULT_SWITCH_MARGIN_FRACTION,
+        llm_config: LlmControlConfig | None = None,
+        llm_decider: LlmDecisionBoundary | None = None,
     ) -> None:
         """Configure one cycle runner over every injectable boundary.
 
@@ -780,6 +812,8 @@ class CycleRunner:
             sleep: Injected delay used only for bounded post-action RPC catch-up.
             switch_margin_fraction: The relative APR margin another pool
                 must beat the held pool by before a switch fires.
+            llm_config: Dark-by-default model-control configuration.
+            llm_decider: Provider-neutral model boundary; required for shadow mode.
         """
         self._symbol = symbol.strip() if symbol is not None else None
         self._safe_address = normalize_evm_address(safe_address)
@@ -794,6 +828,10 @@ class CycleRunner:
         self._now = now
         self._sleep = sleep
         self._switch_margin_fraction = switch_margin_fraction
+        self._llm_config = llm_config or LlmControlConfig()
+        self._llm_decider = llm_decider
+        if self._llm_config.mode is not LlmControlMode.OFF and self._llm_decider is None:
+            raise ValueError("enabled LLM control requires a decision provider")
         self._last_reconciliation: CycleReconciliation | None = None
         # One cycle process enumerates the board at most once; reconcile and
         # decide share the cached listing and its snapshot block.
@@ -882,6 +920,11 @@ class CycleRunner:
                 reference_age_seconds,
                 reference_prices_by_symbol or {},
             )
+            llm_notes = self._evaluate_llm_shadow(book, reconciliation, decision_report)
+            if llm_notes:
+                decision_report = decision_report.model_copy(
+                    update={"input_notes": decision_report.input_notes + llm_notes}
+                )
             outcome = decision_report.outcome
             if (
                 mode is CycleMode.LIVE
@@ -1408,6 +1451,68 @@ class CycleRunner:
             held_inventory=held,
             reentry_blocked_until=None,
         )
+
+    def _evaluate_llm_shadow(
+        self,
+        book: CycleStateBook,
+        reconciliation: CycleReconciliation,
+        decision_report: StrategyDecisionReport,
+    ) -> tuple[str, ...]:
+        """Ask the model for a validated parallel decision without acting on it."""
+        if self._llm_config.mode is LlmControlMode.OFF:
+            return ()
+        decider = self._llm_decider
+        if decider is None:
+            return ("llm shadow unavailable: no decision provider configured",)
+        if self.selector_mode:
+            candidate_symbols = tuple(item.symbol for item in self._board_listings())
+        else:
+            candidate_symbols = (decision_report.symbol,)
+        state = LlmExecutionState(
+            candidate_symbols=candidate_symbols,
+            tracked_symbol=book.position.symbol if book.position is not None else None,
+            tracked_token_id=book.position.token_id if book.position is not None else None,
+            tracked_staked=reconciliation.tracked_staked,
+            held_inventory_symbol=(
+                book.held_inventory.symbol if book.held_inventory is not None else None
+            ),
+            safe_usdc=Decimal(reconciliation.safe_usdc_units).scaleb(-6),
+        )
+        context: dict[str, object] = {
+            "authority": "shadow_only",
+            "candidate_symbols": list(candidate_symbols),
+            "reconciled_state": state.model_dump(mode="json"),
+            "deterministic_policy": decision_report.outcome.decision.model_dump(mode="json"),
+            "market": {
+                "symbol": decision_report.symbol,
+                "pool_address": decision_report.pool_address,
+                "amm_price_usdc": str(decision_report.amm_price_usdc),
+                "emissions_apr": str(decision_report.emissions_apr),
+                "pool_depth_usd": str(decision_report.pool_depth_usd),
+                "equity_usd": str(decision_report.equity_usd),
+                "gas_price_gwei": str(decision_report.gas_price_gwei),
+                "reference_price_usdc": (
+                    str(decision_report.reference_price_usdc)
+                    if decision_report.reference_price_usdc is not None
+                    else None
+                ),
+            },
+            "board": [item.model_dump(mode="json") for item in decision_report.board],
+            "reconciliation_diagnostics": list(reconciliation.diagnostics),
+        }
+        try:
+            model_decision = decider.decide(context)
+            validated = validate_llm_action(
+                model_decision,
+                state,
+                max_action_budget_usdc=self._llm_config.max_action_budget_usdc,
+            )
+        except LlmInstructionRefusedError as error:
+            return (f"llm shadow refused by deterministic validator: {error}",)
+        except (httpx.HTTPError, ValueError, RuntimeError) as error:
+            return (f"llm shadow unavailable: {error}",)
+        chosen = validated.decision
+        return (f"llm shadow validated action={chosen.action.value}; rationale={chosen.rationale}",)
 
     def _cooldown_map(self, book: CycleStateBook) -> dict[str, datetime]:
         """Read the book's per-pool re-entry cooldowns as a mapping.
@@ -2615,6 +2720,10 @@ def build_cycle_runner(
         receipt_backends=receipt_backends,
         pool_pin_store=pin_store,
     )
+    llm_config = LlmControlConfig.from_environment()
+    llm_decider: LlmDecisionBoundary | None = None
+    if llm_config.mode is not LlmControlMode.OFF:
+        llm_decider = OpenAICompatibleDecisionClient(llm_config)
     return CycleRunner(
         symbol=symbol,
         safe_address=safe_address,
@@ -2627,6 +2736,8 @@ def build_cycle_runner(
         audit_sink=audit_store,
         state_store=CycleStateStore.from_environment(settings=settings),
         switch_margin_fraction=switch_margin_fraction,
+        llm_config=llm_config,
+        llm_decider=llm_decider,
     )
 
 
