@@ -6,11 +6,12 @@
 # a stale DEPLOYED_COMMIT stamp can never masquerade as convergence.
 #
 # Excluded from both sides: .venv, __pycache__, *.pyc, .pytest_cache,
-# .mypy_cache (build artifacts), and DEPLOYED_COMMIT (stamped per install,
-# intentionally not part of the tree). Remote-only files matching .pre-*
-# are the known rollback snapshots from the 2026-09-20 on-box hotfix
-# sessions; they are reported, not treated as divergence, and should be
-# removed during the next deploy.
+# .mypy_cache, .ruff_cache (build artifacts), and DEPLOYED_COMMIT (stamped
+# per install, intentionally not part of the tree). Remote-only files whose
+# name carries ".pre-" are the known rollback snapshots from the 2026-09-20
+# on-box hotfix sessions (suffix form: <file>.pre-<tag>-<timestamp>); they
+# are reported, not treated as divergence, and should be removed during the
+# next deploy.
 #
 # Usage from the repository root (any platform; macOS uses shasum -a 256):
 #   bash deploy/converge-check.sh
@@ -53,7 +54,7 @@ git -C "${REPO_ROOT}" archive --format=tar HEAD | tar -x -C "${EXTRACT}"
     cd "${EXTRACT}"
     find . -type f \
         ! -path './.venv/*' ! -path '*__pycache__*' ! -name '*.pyc' \
-        ! -path '*.pytest_cache*' ! -path '*.mypy_cache*' \
+        ! -path '*.pytest_cache*' ! -path '*.mypy_cache*' ! -path '*.ruff_cache*' \
         ! -name DEPLOYED_COMMIT -print0 \
         | LC_ALL=C sort -z | xargs -0 "${HASH[@]}"
 ) >"${WORK}/local.txt"
@@ -61,10 +62,12 @@ log "local side: $(wc -l <"${WORK}/local.txt" | tr -d ' ') files hashed"
 
 # ---------------------------------------------------------------- remote side
 log "hashing the remote tree over SSH (first connect may take a moment)"
-REMOTE_SCRIPT="cd ${REMOTE_APP} && sudo find . -type f \
-! -path './.venv/*' ! -path '*__pycache__*' ! -name '*.pyc' \
-! -path '*.pytest_cache*' ! -path '*.mypy_cache*' \
-! -name DEPLOYED_COMMIT -print0 | LC_ALL=C sort -z | xargs -0 sha256sum"
+# The deployed tree is root-group 0750, so the whole sweep - cd included -
+# runs elevated; the SSH user never needs traverse rights to /opt.
+REMOTE_SCRIPT="sudo sh -c 'cd ${REMOTE_APP} && find . -type f \
+! -path \"./.venv/*\" ! -path \"*__pycache__*\" ! -name \"*.pyc\" \
+! -path \"*.pytest_cache*\" ! -path \"*.mypy_cache*\" ! -path \"*.ruff_cache*\" \
+! -name DEPLOYED_COMMIT -print0 | LC_ALL=C sort -z | xargs -0 sha256sum'"
 # shellcheck disable=SC2086
 if ! ${SSH_CMD} --command="${REMOTE_SCRIPT}" >"${WORK}/remote.txt" 2>"${WORK}/ssh.err"; then
     cat "${WORK}/ssh.err" >&2

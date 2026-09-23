@@ -145,13 +145,14 @@ class TestConvergeCheckScript:
         """Local git-archive and remote find hash identical exclusions."""
         text = CONVERGE_SCRIPT.read_text(encoding="utf-8")
         local_find = text.index("find . -type f")
-        remote_find = text.index("sudo find . -type f")
+        remote_find = text.index("cd ${REMOTE_APP} && find . -type f")
         for exclusion in (
             "'./.venv/*'",
             "'*__pycache__*'",
             "'*.pyc'",
             "'*.pytest_cache*'",
             "'*.mypy_cache*'",
+            "'*.ruff_cache*'",
             "DEPLOYED_COMMIT",
         ):
             assert exclusion in text, exclusion
@@ -164,9 +165,15 @@ class TestConvergeCheckScript:
             "*.pyc",
             ".pytest_cache",
             ".mypy_cache",
+            ".ruff_cache",
             "DEPLOYED_COMMIT",
         ):
             assert token in local_block and token in remote_block, token
+
+    def test_the_remote_sweep_runs_elevated_for_the_0750_tree(self) -> None:
+        """The whole remote pipeline is elevated; the SSH user cannot traverse."""
+        text = CONVERGE_SCRIPT.read_text(encoding="utf-8")
+        assert "sudo sh -c 'cd ${REMOTE_APP}" in text
 
     def test_the_local_side_hashes_the_git_archive_not_the_worktree(self) -> None:
         """Uncommitted working-tree edits can never read as converged."""
