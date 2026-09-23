@@ -604,8 +604,7 @@ def select_board(
                 selected_symbol=option.symbol,
                 summary=(
                     f"holding {option.symbol}: voluntary switch hold period active for "
-                    f"{remaining.total_seconds():.0f}s more; "
-                    + _board_summary(evaluations, None)
+                    f"{remaining.total_seconds():.0f}s more; " + _board_summary(evaluations, None)
                 ),
             )
         directive, note = evaluate_switch(

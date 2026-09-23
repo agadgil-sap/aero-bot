@@ -1242,9 +1242,7 @@ class PolicyEngine:
                     f"and is {distance_fraction} below the edge versus the locked "
                     f"{self._parameters.downside_recenter_min_distance_fraction} minimum.",
                 )
-                return self._hold(
-                    waiting_state, PolicyReason.OPEN_BELOW_EDGE_HOLDING, diagnostics
-                )
+                return self._hold(waiting_state, PolicyReason.OPEN_BELOW_EDGE_HOLDING, diagnostics)
             recenter_size, resize_diagnostics = self._recenter_size(position, observation)
             if recenter_size <= 0:
                 return self._hold(
@@ -1261,9 +1259,7 @@ class PolicyEngine:
                 recenter_size,
             )
             if deferred:
-                return self._hold(
-                    waiting_state, PolicyReason.GAS_GATE_DEFERRED, defer_diagnostics
-                )
+                return self._hold(waiting_state, PolicyReason.GAS_GATE_DEFERRED, defer_diagnostics)
             # A downside out-of-range position is stock-heavy. Preserving the
             # withdrawn inventory lets the mint planner sell only the amount
             # needed to rebalance instead of round-tripping the whole position.
@@ -1327,9 +1323,7 @@ class PolicyEngine:
         updated_position = (
             position
             if position.out_of_range_since is None and position.out_of_range_side is None
-            else position.model_copy(
-                update={"out_of_range_since": None, "out_of_range_side": None}
-            )
+            else position.model_copy(update={"out_of_range_since": None, "out_of_range_side": None})
         )
         diagnostics = (
             f"Pool price {observation.amm_price_usdc} is inside the range "

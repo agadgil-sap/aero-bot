@@ -751,11 +751,7 @@ def _liquidity_from_desired_amounts(
             * sqrt_upper
             / (X96_SCALE * (sqrt_upper - sqrt_current))
         )
-        liquidity1 = (
-            Decimal(amount1_units)
-            * X96_SCALE
-            / (sqrt_current - sqrt_lower)
-        )
+        liquidity1 = Decimal(amount1_units) * X96_SCALE / (sqrt_current - sqrt_lower)
         return +min(liquidity0, liquidity1)
 
 
@@ -915,6 +911,7 @@ def plan_mint_composition(
             execution_utilization_fraction=utilization,
         )
 
+
 def plan_balancing_swap(
     stock_shortfall_units: int,
     price_usdc_per_stock_value: Decimal,
@@ -1018,16 +1015,14 @@ def plan_stock_sale_for_usdc(
     with localcontext() as decimal_context:
         decimal_context.prec = MATH_PRECISION
         buffered_usdc_units = int(
-            (
-                Decimal(usdc_shortfall_units) * (Decimal(1) + buffer_fraction)
-            ).to_integral_value(rounding=ROUND_CEILING)
+            (Decimal(usdc_shortfall_units) * (Decimal(1) + buffer_fraction)).to_integral_value(
+                rounding=ROUND_CEILING
+            )
         )
         buffered_usdc = Decimal(buffered_usdc_units).scaleb(-QUOTE_TOKEN_DECIMALS)
         stock_in_units = int(
             (
-                buffered_usdc
-                / price_usdc_per_stock_value
-                * Decimal(10) ** stock_decimals
+                buffered_usdc / price_usdc_per_stock_value * Decimal(10) ** stock_decimals
             ).to_integral_value(rounding=ROUND_CEILING)
         )
         if stock_in_units > stock_excess_units:

@@ -1619,8 +1619,7 @@ class CycleRunner:
                 summary=(
                     f"holding {book.position.symbol}: cross-pool switch deferred for "
                     f"{penalty.remaining_seconds}s until the active minimum-stake penalty "
-                    "window clears; "
-                    + selection.summary
+                    "window clears; " + selection.summary
                 ),
             )
         decision_option = self._option_for_selection(selection, options)

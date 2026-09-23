@@ -432,7 +432,6 @@ def test_mint_composition_splits_the_budget_into_both_sides() -> None:
     assert amounts.amount1_min_units < amounts.amount1_desired_units
 
 
-
 def test_execution_envelope_would_have_accepted_the_live_psc_move() -> None:
     """The 14:31 canary's 0.059-tick move stays inside the new mint envelope."""
     anchor_sqrt = 43654683706630734830369148781

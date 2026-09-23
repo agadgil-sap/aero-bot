@@ -1352,9 +1352,7 @@ class TestSelectorCycles:
         sources = SelectorCycleSources().with_listings(selector_listings(1))
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(
-                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
-            ),
+            book=tracked_book(symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)),
             reads=_tracked_reads(staked=True),
             sources=sources,
         )
@@ -1375,9 +1373,7 @@ class TestSelectorCycles:
         # BBBc at double AAAc's APR clears the default thirty percent margin.
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(
-                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
-            ),
+            book=tracked_book(symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)),
             reads=_tracked_reads(staked=True),
         )
         assert executor is not None
@@ -1407,9 +1403,7 @@ class TestSelectorCycles:
         """A refused exit stops the switch with no second position minted."""
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(
-                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
-            ),
+            book=tracked_book(symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)),
             reads=_tracked_reads(staked=True),
         )
         assert executor is not None
@@ -1445,9 +1439,7 @@ class TestSelectorCycles:
         """A partial target mint keeps acquired stock tagged for direct retry."""
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(
-                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
-            ),
+            book=tracked_book(symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)),
             reads=_tracked_reads(staked=True),
         )
         assert executor is not None
@@ -1462,7 +1454,7 @@ class TestSelectorCycles:
             ephemeral_key: bool = False,
         ) -> LpActionExecutionReport:
             executor.calls.append(("mint", symbol, budget_usdc, width_spacings))
-            runner._balances.stock_units = 3_000_000
+            cast(FakeBalances, runner._balances).stock_units = 3_000_000
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
                 "scripted post-swap mint refusal",
@@ -1489,9 +1481,7 @@ class TestSelectorCycles:
         """A target-plan refusal never unstake/withdraws the earning source LP."""
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(
-                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
-            ),
+            book=tracked_book(symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)),
             reads=_tracked_reads(staked=True),
         )
         assert executor is not None

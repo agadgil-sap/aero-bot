@@ -112,9 +112,7 @@ def held_state(pool_address: str, token_address: str) -> PolicyState:
     assert position is not None
     return entry.next_state.model_copy(
         update={
-            "position": position.model_copy(
-                update={"entered_at": BASE_TIME - timedelta(hours=2)}
-            )
+            "position": position.model_copy(update={"entered_at": BASE_TIME - timedelta(hours=2)})
         }
     )
 

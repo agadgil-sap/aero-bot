@@ -783,8 +783,7 @@ class TestPositionLifecycle:
         assert recentred.decision.action is PolicyActionKind.RECENTER
         assert recentred.decision.size_usd == Decimal("70")
         assert any(
-            "current depth cap is 70.0000 USDC" in line
-            for line in recentred.decision.diagnostics
+            "current depth cap is 70.0000 USDC" in line for line in recentred.decision.diagnostics
         )
 
     def test_returning_in_range_resets_the_recenter_wait(self) -> None:

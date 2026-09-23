@@ -2030,8 +2030,7 @@ class LpLifecycleExecutor:
                 )
                 if unexpected:
                     raise RuntimeError(
-                        "the final mint rebuild carried unexpected prerequisite roles "
-                        f"{unexpected}"
+                        f"the final mint rebuild carried unexpected prerequisite roles {unexpected}"
                     )
                 if final_prerequisites:
                     approval_reports, halted_reason = self._execute_steps(
@@ -2049,9 +2048,7 @@ class LpLifecycleExecutor:
                         )
                     for step in final_prerequisites:
                         if step.report.role == LpExecutionRole.NFPM_USDC_ALLOWANCE:
-                            confirmed_usdc_floor = max(
-                                confirmed_usdc_floor, approval_amount(step)
-                            )
+                            confirmed_usdc_floor = max(confirmed_usdc_floor, approval_amount(step))
                         elif step.report.role == LpExecutionRole.NFPM_STOCK_ALLOWANCE:
                             confirmed_stock_floor = max(
                                 confirmed_stock_floor, approval_amount(step)
@@ -2069,9 +2066,7 @@ class LpLifecycleExecutor:
                 if tuple(step.report.role for step in mint_steps) != (LpExecutionRole.MINT,):
                     raise RuntimeError("the final mint tail was not exactly one mint step")
                 try:
-                    mint_reports, halted_reason = self._execute_steps(
-                        "mint", mint_steps, key_bytes
-                    )
+                    mint_reports, halted_reason = self._execute_steps("mint", mint_steps, key_bytes)
                 except LpExecutionRefusalError as error:
                     if (
                         error.code is LpExecutionRefusalCode.ESTIMATE_REVERTED
@@ -2104,13 +2099,13 @@ class LpLifecycleExecutor:
                     halted_reason=halted_reason,
                 )
 
-            error = LpExecutionRefusalError(
+            refusal = LpExecutionRefusalError(
                 LpExecutionRefusalCode.POST_APPROVAL_REBUILD_REQUIRED,
                 "the bounded final-mint rebuild loop exhausted before one stable mint "
                 "could estimate and execute; preserving inventory for the next cycle",
             )
-            error.completed_steps = completed_reports
-            raise error
+            refusal.completed_steps = completed_reports
+            raise refusal
         except (LpExecutionRefusalError, LpPlanRefusalError) as error:
             previous = tuple(getattr(error, "completed_steps", ()))
             if completed_reports and not previous:
@@ -5149,9 +5144,7 @@ class LpLifecycleExecutor:
                 )
             except ExecutorRpcRevertError as error:
                 detail = (
-                    decode_evm_revert_data(error.revert_data)
-                    if error.revert_data
-                    else str(error)
+                    decode_evm_revert_data(error.revert_data) if error.revert_data else str(error)
                 )
                 observations.append((label, detail[:500]))
             except Exception as error:  # diagnostics must never mask the primary refusal
@@ -5190,9 +5183,7 @@ class LpLifecycleExecutor:
                 )
             except ExecutorRpcRevertError as error:
                 detail = (
-                    decode_evm_revert_data(error.revert_data)
-                    if error.revert_data
-                    else str(error)
+                    decode_evm_revert_data(error.revert_data) if error.revert_data else str(error)
                 )
                 observations.append((label, detail[:500]))
             except Exception as error:  # diagnostics must never mask the primary refusal
