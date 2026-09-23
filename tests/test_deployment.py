@@ -84,6 +84,13 @@ class TestInstallScript:
         assert "--locked" in text
         assert "--no-dev" in text
 
+    def test_root_installs_from_an_operator_owned_checkout(self) -> None:
+        """The archive step scopes git's dubious-ownership guard away."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        archive_position = text.index("archive --format=tar HEAD")
+        assert 'git -c safe.directory="${REPO_ROOT}"' in text
+        assert text.index('git -c safe.directory="${REPO_ROOT}"') < archive_position
+
     def test_a_rerun_reasserts_service_ownership_of_the_venv(self) -> None:
         """The recursive chown must not cost the service user its venv."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")

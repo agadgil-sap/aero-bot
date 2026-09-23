@@ -67,9 +67,13 @@ fi
 log "installing the application tree into ${APP_DIR}"
 mkdir -p "${APP_DIR}"
 # The full checkout travels so docs and metadata stay on the box; git
-# internals ride along and cost nothing.
+# internals ride along and cost nothing. The archive runs with a scoped
+# safe.directory so root may install from an operator-owned checkout (the
+# normal cloud flow: SSH as your user, sudo the installer) without git's
+# dubious-ownership guard refusing the very first step.
 if [[ -d "${REPO_ROOT}/.git" ]]; then
-    git -C "${REPO_ROOT}" archive --format=tar HEAD | tar -x -C "${APP_DIR}"
+    git -c safe.directory="${REPO_ROOT}" -C "${REPO_ROOT}" \
+        archive --format=tar HEAD | tar -x -C "${APP_DIR}"
 else
     tar -C "${REPO_ROOT}" \
         --exclude=.venv --exclude=__pycache__ --exclude="*.pyc" \
