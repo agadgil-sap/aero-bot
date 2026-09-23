@@ -581,8 +581,8 @@ def assemble_observation(
             "fail-closed as reference_stale unless --reference-price injects one"
         )
     notes.append(
-        "fee APR stays zero because a live fee-evidence window needs the "
-        "price-path machinery the rehearsal reconstructs"
+        "policy decisions keep a conservative zero fee APR; the live claimable "
+        "pool fees and the measured accrual window ride the cycle report as evidence"
     )
     notes.append(
         "oracle staleness is not yet wired live; the oracle-health layer is post-reassessment scope"
@@ -828,8 +828,8 @@ def assemble_board(
             "Aerodrome pool's on-chain state for actions"
         )
     notes.append(
-        "fee APR stays zero because a live fee-evidence window needs the "
-        "price-path machinery the rehearsal reconstructs"
+        "policy decisions keep a conservative zero fee APR; the live claimable "
+        "pool fees and the measured accrual window ride the cycle report as evidence"
     )
     notes.append(
         "oracle staleness is not yet wired live; the oracle-health layer is post-reassessment scope"

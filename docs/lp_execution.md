@@ -307,6 +307,14 @@ Live verification (2026-09-08, formula from this repo's own Sugar reads vs the f
 The unrealized P&L is reported only against an explicitly supplied `--entry-cost`; without one the diagnostic says the entry cost is unknown rather than implying zero.
 Nothing in the status path builds, signs, estimates, or audits a transaction: the single audit event is `lp_status_reported`, and the read-only proof in tests is that the Safe script's preloaded nonce and signature queues are never consumed.
 
+#### Claimable pool fees (the checkpointed lower bound)
+
+The status report also values the NFPM's checkpointed owed fees - the `tokensOwed0/1` columns of the `positions` view - as `fees_owed_usdc`, at the same snapshot price as the composition so the two can never disagree.
+The semantics are a lower bound, stated in the report's diagnostic: Slipstream checkpoints `tokensOwed` only on position modifications (mint, increase, decrease, collect), so between modifications the live claimable accrues uncheckpointed and the reported number understates what a `collect` with `MAX_UINT128` would actually sweep.
+The scheduled cycle threads this reading into its fee-evidence window ([docs/cycle.md](docs/cycle.md), fee evidence); policy decisions keep the conservative zero fee APR regardless.
+The honest path to a full fee APR, in ascending fidelity: (1) the current per-cycle claimable deltas across a day, already measured live and bounded below; (2) a `feeGrowthInside` sampling layer over consecutive cycles, which reconstructs accrued-but-uncheckpointed fees between position modifications; (3) the realized split decoded from collect and burn receipts at exit, the only exact accounting.
+Until one of the higher-fidelity layers lands, the measured window is reported with its lower-bound caveat in every diagnostic, never as a decision input.
+
 ### Audit chain and CLI surface
 
 Every plan, built transaction, and refusal appends to the same append-only hash-chained SQLite store as the swap executor, with these event types: `lp_mint_planned`, `lp_stake_planned`, `lp_unstake_planned`, `lp_exit_planned`, `lp_collect_planned`, `lp_recenter_planned`, `lp_status_reported`, `lp_transaction_built`, `lp_refused`, and - on the execute path - `lp_execute_sent`, `lp_execute_confirmed`, and `lp_execute_failed`.

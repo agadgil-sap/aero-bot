@@ -27,6 +27,9 @@ sudo bash deploy/install.sh
 
 The installer is idempotent and does, in order: Ubuntu check; base packages (git, curl, ufw, unattended-upgrades) with automatic security updates confirmed; uv installed system-wide; the dedicated `aero-bot` system user; the application tree into `/opt/aero-bot` (from the committed tree - run it from a clean checkout); the venv at `/opt/aero-bot/.venv` built with `uv sync --locked` (uv downloads Python 3.12 itself when the image lacks it); the state tree `/var/lib/aero-bot` (mode 0700, service-owned); the sealed environment templates under `/etc/aero-bot` (mode 0600, root-owned, never overwritten on re-run); every systemd unit installed and `daemon-reload`ed; and the firewall - default deny inbound, OpenSSH allowed, then enabled only with the SSH allow already in place so a session can never be locked out.
 
+The installer stamps `/opt/aero-bot/DEPLOYED_COMMIT` itself with the exact commit the archive staged (`git rev-parse HEAD` under the same scoped `safe.directory` override as the archive), so the marker can never go stale the way the once-manually stamped file did - it read `a0993d1` on the production box while `/opt` already ran gnhf 21 bit-identical.
+A tarball-only checkout (no `.git`) says `unversioned tarball tree installed <UTC timestamp>` honestly instead of naming a commit it cannot prove.
+
 The installer does NOT enable any timer: nothing runs until Phase 2 arms it. The sealed cycle template defaults `AERO_BOT_BASE_RPC_URL` to `base.publicnode.com` because the official `mainnet.base.org` throttles the Sugar discovery sweeps into 429 cascades on small hosts (verified live on the e2-micro deploy); a paid endpoint raises the rate limits further.
 
 ## Seal the secrets (captain present)
@@ -80,4 +83,8 @@ See [the watchtower documentation](docs/watchtower.md) for the trip semantics, t
 - **A halted cycle:** the email carries the refusal code - the catalog lives in `docs/lp_execution.md`; out-of-band halts need eyes, everything else self-corrects on the next tick.
 - **Resetting the book** (only after reconciling by hand): stop the timer, inspect `/var/lib/aero-bot/cycle_state.json`, and let the next cycle's reconciliation rebuild truth - the chain, never memory, is the source.
 - **Upgrading:** `cd aero-bot && git fetch && git checkout main && git pull --ff-only && sudo bash deploy/install.sh` - the venv rebuilds, units refresh, sealed files survive.
+- **Proving convergence:** from the laptop checkout, `bash deploy/converge-check.sh` hashes a local `git archive HEAD` extraction against the deployed `/opt/aero-bot` tree over SSH and prints one verdict - byte-identical, converged aside from known snapshots, or diverged with the diff.
+Build artifacts (`.venv`, `__pycache__`, `*.pyc`, caches) and the per-install `DEPLOYED_COMMIT` marker are excluded on both sides; content, not the stamp, is the proof.
+Remote-only `.pre-*-<timestamp>` files are the rollback snapshots the 2026-09-20 on-box hotfix sessions left in `/opt/aero-bot` - they are reported as known extras, not divergence, and should be removed during the next deploy (`sudo find /opt/aero-bot -maxdepth 2 -name '.pre-*'` lists them).
+The SSH transport and remote path default to the production box (`gcloud compute ssh aero-bot --zone us-west1-b`, `/opt/aero-bot`) and override through `AERO_BOT_SSH` / `AERO_BOT_REMOTE_APP`.
 - **The relayer gas tank:** the alert floor (default 0.0005 ETH) warns before the executor's own 0.0002-ETH floor refuses broadcasts.

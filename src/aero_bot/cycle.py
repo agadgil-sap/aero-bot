@@ -207,6 +207,22 @@ class ReentryCooldown(BaseModel):
     blocked_until: datetime
 
 
+class CycleFeeSampleRecord(BaseModel):
+    """Carry one position's latest claimable-fee reading for the window."""
+
+    # Frozen strict fields keep one fee sample coherent.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The position NFT id the sample observed.
+    token_id: Annotated[int, Field(ge=0)]
+    # When the sample was read, timezone-aware.
+    observed_at: datetime
+    # The checkpointed pool fees claimable at the sample, in USDC.
+    claimable_pool_fees_usdc: Annotated[Decimal, Field(ge=0)]
+    # The position's marked USDC value at the sample.
+    position_value_usdc: Annotated[Decimal, Field(ge=0)]
+
+
 class CycleStateBook(BaseModel):
     """Carry every engine-owned fact the next cycle must thread forward."""
 
@@ -217,6 +233,10 @@ class CycleStateBook(BaseModel):
     # Re-entry cooldowns, one per pool: an exit from one pool never blocks
     # another pool's entry (the captain's 2026-09-09 cross-board ruling).
     reentry_cooldowns: tuple[ReentryCooldown, ...] = ()
+    # The latest claimable-fee sample per recent position NFT, the window
+    # the measured fee-accrual evidence reads; bounded to recent ids so a
+    # long-running book cannot grow without limit.
+    fee_samples: tuple[CycleFeeSampleRecord, ...] = ()
     # The America/New_York day the day-start equity anchor belongs to.
     day: date | None = None
     # Day-start equity anchors the five-percent daily loss halt.
@@ -386,6 +406,35 @@ class CycleReconciliation(BaseModel):
     diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
 
 
+class CycleFeeEvidence(BaseModel):
+    """Carry one cycle's live fee evidence for the tracked position.
+
+    Measurement only: nothing here feeds a decision. The policy's expected
+    yield keeps its conservative zero fee APR while this surface proves the
+    claimable-now truth and, once two samples exist, the measured accrual
+    window against the position's marked value.
+    """
+
+    # Frozen strict fields keep one fee-evidence record coherent.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The tracked position NFT the evidence covers, None while flat.
+    token_id: Annotated[int, Field(ge=0)] | None = None
+    # The checkpointed pool fees claimable now, in USDC, None when the
+    # status read carried no valuation.
+    claimable_pool_fees_usdc: Decimal | None = None
+    # The accrued AERO earned on the position when staked, raw units.
+    claimable_aero_units: Annotated[int, Field(ge=0)] | None = None
+    # The measured checkpointed-fee accrual over the sample window, USDC
+    # per day, None until a second sample exists.
+    measured_fee_usdc_per_day: Decimal | None = None
+    # The accrual as an annual fraction of the position's marked value,
+    # None until both a window and a positive mark exist.
+    measured_fee_apr: Decimal | None = None
+    # Why any piece is absent, empty when everything computed.
+    diagnostic: str = ""
+
+
 class CycleReport(BaseModel):
     """Carry one complete cycle's structured evidence and outcome."""
 
@@ -420,6 +469,17 @@ class CycleReport(BaseModel):
     pnl_vs_entry_usdc: Decimal | None = None
     # Why P&L is absent, empty when computed.
     pnl_diagnostic: str = ""
+    # The portfolio equity the engine acted on - Safe USDC, held stock, and
+    # the tracked LP mark - None when the cycle refused out-of-band.
+    equity_usd: Decimal | None = None
+    # The day-start equity anchor in force, priced on the same composition.
+    day_start_equity_usd: Decimal | None = None
+    # The day's P&L against the anchor, None when either input is absent.
+    day_pnl_usdc: Decimal | None = None
+    # Why day economics are absent, empty when computed.
+    day_diagnostic: str = ""
+    # The live fee evidence for the tracked position, measurement only.
+    fee_evidence: CycleFeeEvidence | None = None
     # Total delivery fees paid this cycle, in wei.
     fee_wei: Annotated[int, Field(ge=0)] = 0
     # Empty when the cycle ran to completion; otherwise why it halted.
@@ -448,6 +508,17 @@ class CycleReportPayload(BaseModel):
     position_value_usdc: str | None = None
     # The unrealized P&L vs entry when computable, else None.
     pnl_vs_entry_usdc: str | None = None
+    # The portfolio equity the engine acted on, else None.
+    equity_usdc: str | None = None
+    # The day-start equity anchor in force, else None.
+    day_start_equity_usdc: str | None = None
+    # The day's P&L against the anchor, else None.
+    day_pnl_usdc: str | None = None
+    # The checkpointed pool fees claimable on the tracked position, else None.
+    claimable_pool_fees_usdc: str | None = None
+    # The measured checkpointed-fee accrual as an annual fraction of the
+    # position's marked value, else None.
+    measured_fee_apr: str | None = None
     # Total delivery fees paid, in wei.
     fee_wei: Annotated[int, Field(ge=0)] = 0
     # The number of actions attempted this cycle.
@@ -952,6 +1023,8 @@ class CycleRunner:
             elif not halted_reason:
                 halted_reason = final_reconciliation.out_of_band
             reconciliation = final_reconciliation
+        fee_evidence = self._fee_evidence(book, reconciliation)
+        book = self._book_with_fee_sample(book, reconciliation)
         self._state_store.save(book)
         report = self._assemble_report(
             started_at,
@@ -962,6 +1035,7 @@ class CycleRunner:
             decision_report,
             tuple(actions),
             halted_reason,
+            fee_evidence,
         )
         self._record(report)
         return report
@@ -1399,7 +1473,15 @@ class CycleRunner:
         same_day = book.day == day and book.day_start_equity_usd is not None
         day_start = book.day_start_equity_usd if same_day else None
         if day_start is None:
+            # The engine's day rollover is the authoritative anchor reset -
+            # it prices the fully composed observation including held stock.
+            # This seed only shapes the pre-decision state, so it carries the
+            # same cash-plus-LP composition to keep a deployed position from
+            # ever reading as a drawdown against a cash-only seed.
             day_start = Decimal(reconciliation.safe_usdc_units).scaleb(-6)
+            tracked_status = reconciliation.tracked_status
+            if tracked_status is not None and tracked_status.position_value_usdc is not None:
+                day_start += tracked_status.position_value_usdc
         return PolicyState(
             day=day if same_day else None,
             day_start_equity_usd=day_start,
@@ -2337,6 +2419,108 @@ class CycleRunner:
         )
 
     # ------------------------------------------------------------------
+    # Fee evidence
+    # ------------------------------------------------------------------
+
+    def _fee_evidence(
+        self, book: CycleStateBook, reconciliation: CycleReconciliation
+    ) -> CycleFeeEvidence:
+        """Measure the tracked position's live fee economics; decide nothing.
+
+        The claimable-now reading is checkpointed truth from the audited
+        status read; the accrual window compares it against the book's prior
+        sample for the same token id. Measurement only - the policy keeps
+        its conservative zero fee APR for every decision.
+
+        Args:
+            book: The book carrying the prior sample, if any.
+            reconciliation: The reconciliation whose status read evidence.
+
+        Returns:
+            The complete fee-evidence record with honest absence diagnostics.
+        """
+        status = reconciliation.tracked_status
+        token_id = reconciliation.tracked_token_id
+        if status is None or token_id is None:
+            return CycleFeeEvidence(diagnostic="no tracked position; no fee evidence this cycle")
+        claimable = status.fees_owed_usdc
+        diagnostics: list[str] = []
+        measured_per_day: Decimal | None = None
+        measured_apr: Decimal | None = None
+        prior = next((sample for sample in book.fee_samples if sample.token_id == token_id), None)
+        if claimable is None:
+            diagnostics.append("the status read carried no fee valuation")
+        elif prior is None:
+            diagnostics.append(
+                "first claimable sample recorded; the accrual window opens next cycle"
+            )
+        else:
+            elapsed_seconds = (status.observed_at - prior.observed_at).total_seconds()
+            if elapsed_seconds <= 0:
+                diagnostics.append("no time elapsed since the prior sample; no window")
+            else:
+                measured_per_day = +(
+                    (claimable - prior.claimable_pool_fees_usdc)
+                    * Decimal(86_400)
+                    / Decimal(elapsed_seconds)
+                )
+                if measured_per_day < 0:
+                    diagnostics.append(
+                        "a falling window means a collect or checkpoint refresh landed "
+                        "inside it, not negative accrual"
+                    )
+                if status.position_value_usdc and status.position_value_usdc > 0:
+                    measured_apr = +(measured_per_day * Decimal(365) / status.position_value_usdc)
+                else:
+                    diagnostics.append(
+                        "the position mark is absent so the accrual has no APR denominator"
+                    )
+        diagnostics.append(
+            "checkpointed claimable is a lower bound the pool refreshes on position "
+            "modifications; a flat window means the checkpoint was not refreshed, not "
+            "that no fees accrued"
+        )
+        return CycleFeeEvidence(
+            token_id=token_id,
+            claimable_pool_fees_usdc=claimable,
+            claimable_aero_units=status.accrued_aero_earned_units,
+            measured_fee_usdc_per_day=measured_per_day,
+            measured_fee_apr=measured_apr,
+            diagnostic="; ".join(diagnostics),
+        )
+
+    def _book_with_fee_sample(
+        self, book: CycleStateBook, reconciliation: CycleReconciliation
+    ) -> CycleStateBook:
+        """Fold the cycle's claimable reading into the book's fee window.
+
+        Args:
+            book: The book whose per-token sample map is updated.
+            reconciliation: The reconciliation whose status read the sample.
+
+        Returns:
+            The book carrying the latest sample for the tracked token,
+            bounded to the eight most recent token ids.
+        """
+        status = reconciliation.tracked_status
+        token_id = reconciliation.tracked_token_id
+        if (
+            status is None
+            or token_id is None
+            or status.fees_owed_usdc is None
+            or status.position_value_usdc is None
+        ):
+            return book
+        sample = CycleFeeSampleRecord(
+            token_id=token_id,
+            observed_at=status.observed_at,
+            claimable_pool_fees_usdc=status.fees_owed_usdc,
+            position_value_usdc=status.position_value_usdc,
+        )
+        kept = tuple(item for item in book.fee_samples if item.token_id != token_id)
+        return book.model_copy(update={"fee_samples": (*kept, sample)[-8:]})
+
+    # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
 
@@ -2350,6 +2534,7 @@ class CycleRunner:
         decision_report: StrategyDecisionReport | None,
         actions: tuple[CycleActionRecord, ...],
         halted_reason: str,
+        fee_evidence: CycleFeeEvidence | None = None,
     ) -> CycleReport:
         """Assemble the structured cycle report from its complete evidence."""
         report_symbol = (
@@ -2376,6 +2561,17 @@ class CycleRunner:
         status = reconciliation.tracked_status
         pnl = status.unrealized_pnl_usdc if status is not None else None
         pnl_diagnostic = status.pnl_diagnostic if status is not None else "no tracked position"
+        if decision_report is not None:
+            equity = decision_report.equity_usd
+            anchor = decision_report.outcome.next_state.day_start_equity_usd
+            day_diagnostic = ""
+            if equity is None or anchor is None:
+                day_diagnostic = "the decision carried no complete day economics"
+        else:
+            equity = None
+            anchor = None
+            day_diagnostic = "out-of-band cycle carried no day economics"
+        day_pnl = +(equity - anchor) if equity is not None and anchor is not None else None
         return CycleReport(
             started_at=started_at,
             mode=mode,
@@ -2390,6 +2586,11 @@ class CycleRunner:
             actions=actions,
             pnl_vs_entry_usdc=pnl,
             pnl_diagnostic=pnl_diagnostic if pnl is None else "",
+            equity_usd=equity,
+            day_start_equity_usd=anchor,
+            day_pnl_usdc=day_pnl,
+            day_diagnostic=day_diagnostic if day_pnl is None else "",
+            fee_evidence=fee_evidence,
             fee_wei=sum(action.fee_wei for action in actions),
             halted_reason=halted_reason,
             input_notes=input_notes,
@@ -2426,6 +2627,18 @@ def record_cycle_report(audit_sink: AuditStore, report: CycleReport, created_at:
             position_value_usdc=str(status.position_value_usdc) if status is not None else None,
             pnl_vs_entry_usdc=str(report.pnl_vs_entry_usdc)
             if report.pnl_vs_entry_usdc is not None
+            else None,
+            equity_usdc=str(report.equity_usd) if report.equity_usd is not None else None,
+            day_start_equity_usdc=str(report.day_start_equity_usd)
+            if report.day_start_equity_usd is not None
+            else None,
+            day_pnl_usdc=str(report.day_pnl_usdc) if report.day_pnl_usdc is not None else None,
+            claimable_pool_fees_usdc=str(report.fee_evidence.claimable_pool_fees_usdc)
+            if report.fee_evidence is not None
+            and report.fee_evidence.claimable_pool_fees_usdc is not None
+            else None,
+            measured_fee_apr=str(report.fee_evidence.measured_fee_apr)
+            if report.fee_evidence is not None and report.fee_evidence.measured_fee_apr is not None
             else None,
             fee_wei=report.fee_wei,
             action_count=len(report.actions),

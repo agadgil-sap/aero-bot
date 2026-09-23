@@ -148,8 +148,8 @@ def captain_sample_report() -> CycleReport:
         input_notes=(
             "equity defaulted to the Safe's live 8.921957000000000000000000000 USDC "
             "(8.921957 USDC plus stock valued at the snapshot price)",
-            "fee APR stays zero because a live fee-evidence window needs the "
-            "price-path machinery the rehearsal reconstructs",
+            "policy decisions keep a conservative zero fee APR; the live claimable "
+            "pool fees and the measured accrual window ride the cycle report as evidence",
             "oracle staleness is not yet wired live; the oracle-health layer is "
             "post-reassessment scope",
         ),
@@ -326,8 +326,8 @@ class TestComposeCycleEmail:
             "\n"
             "  - equity defaulted to the Safe's live 8.921957 USDC "
             "(8.921957 USDC plus stock valued at the snapshot price)\n"
-            "  - fee APR stays zero because a live fee-evidence window needs the "
-            "price-path machinery the rehearsal reconstructs\n"
+            "  - policy decisions keep a conservative zero fee APR; the live claimable "
+            "pool fees and the measured accrual window ride the cycle report as evidence\n"
             "  - oracle staleness is not yet wired live; the oracle-health layer is "
             "post-reassessment scope\n"
         )

@@ -2367,6 +2367,16 @@ def test_position_status_reports_a_staked_position_read_only() -> None:
     assert report.token0_value_usdc == +(amount0 * Decimal(10) ** -6)
     assert report.token1_value_usdc == +(amount1 * Decimal(10) ** -STOCK_DECIMALS * price)
     assert report.position_value_usdc == +(report.token0_value_usdc + report.token1_value_usdc)
+    # The claimable-now fee evidence prices both checkpointed owed columns at
+    # the same snapshot price as the composition, and says it is a lower bound.
+    assert report.fees_owed_usdc == +(
+        Decimal(10) * Decimal(10) ** -6 + Decimal(11) * Decimal(10) ** -STOCK_DECIMALS * price
+    )
+    assert any(
+        "checkpointed pool fees 10 + 11 raw units" in line
+        and "a lower bound the pool refreshes on position modifications" in line
+        for line in report.diagnostics
+    )
     assert report.accrued_aero_earned_units == 3 * 10**18
     assert report.accrued_aero_checkpoint_units == 2 * 10**18
     assert report.penalty is not None

@@ -48,6 +48,23 @@ The cycle appends exactly one `cycle_reported` audit record per run beside every
 
 The exit swap (`aero-bot-lp execute exit-swap`) is the canary-proven reverse-direction router swap productized into the LP lifecycle: exact-input of the Safe's entire stock balance, minimum output at the locked one-percent tolerance, and a hard refusal when the quoted output exceeds the 100 USDC per-pool pilot cap - an out-of-band inventory never moves.
 
+## Day economics: the equity anchor and the day P&L
+
+The five-percent daily loss halt anchors on the day-start equity at the America/New_York rollover, and that anchor prices the whole book: Safe USDC, held stock, and the tracked position's marked value - the same composition the engine's observation and the selector's equity gate carry.
+The engine's own day-rollover reset is authoritative: on rollover it re-anchors from the fully composed observation, so a deployed position can never read as a drawdown against a cash-only anchor.
+The production book exposed exactly that trap on 2026-09-23 - an 80.73 anchor beside a roughly 99 book - which is why the cycle's pre-decision seed matches the composition too: whenever the book carries no anchor yet, the seed is cash plus the tracked LP mark, never cash alone.
+The report and the `cycle_reported` audit record both carry `equity_usdc`, `day_start_equity_usdc`, and `day_pnl_usdc`, so the daily number the captain reads is computed where the decision happened, not reconstructed afterward.
+An out-of-band cycle carries no day economics and says so in `day_diagnostic` rather than publishing a number it cannot stand behind.
+
+## Fee evidence (measurement only)
+
+Every cycle measures the tracked position's fee economics without letting them touch a decision: the policy keeps its conservative zero fee APR, exactly as locked.
+The claimable-now reading is checkpointed truth from the audited position-status read - the NFPM's `tokensOwed0/1` valued at the snapshot price - and the cycle threads it into a per-token accrual window persisted in the book (`fee_samples`, bounded to the eight most recent token ids).
+The first sample reports the claimable balance and opens the window; a second sample closes a measured accrual rate and its annualized fraction of the position's marked value, all riding the cycle report (`fee_evidence`) and the audit record (`claimable_pool_fees_usdc`, `measured_fee_apr`).
+The staked AERO emissions ride beside it as `claimable_aero_units`, the live `earned` reading.
+The caveat is in every diagnostic: the checkpointed claimable is a lower bound the pool refreshes only on position modifications, so a flat window means the checkpoint was not refreshed, not that no fees accrued, and a falling window means a collect or checkpoint refresh landed inside it.
+See [the LP execution fee-evidence section](docs/lp_execution.md) for the contract-view derivation and the staged path to a full fee APR.
+
 ## Crash discipline
 
 A crashed cycle reconciles, never double-acts. Every broadcast flows through the executors' per-nonce Safe sequences - each step re-validated, freshly estimated, hash-pinned, and audit-recorded before its delivery - so a crash can only leave a completed prefix mined. On restart:

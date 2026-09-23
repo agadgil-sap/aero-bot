@@ -74,10 +74,17 @@ mkdir -p "${APP_DIR}"
 if [[ -d "${REPO_ROOT}/.git" ]]; then
     git -c safe.directory="${REPO_ROOT}" -C "${REPO_ROOT}" \
         archive --format=tar HEAD | tar -x -C "${APP_DIR}"
+    # The deployment marker names the exact commit the archive staged, written
+    # by the installer itself so it cannot go stale the way the once-manually
+    # stamped file did (it read a0993d1 while /opt already ran gnhf 21).
+    git -c safe.directory="${REPO_ROOT}" -C "${REPO_ROOT}" \
+        rev-parse HEAD >"${APP_DIR}/DEPLOYED_COMMIT"
 else
     tar -C "${REPO_ROOT}" \
         --exclude=.venv --exclude=__pycache__ --exclude="*.pyc" \
         --exclude=.pytest_cache --exclude=.mypy_cache -c . | tar -x -C "${APP_DIR}"
+    printf 'unversioned tarball tree installed %s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${APP_DIR}/DEPLOYED_COMMIT"
 fi
 chown -R "root:${SERVICE_USER}" "${APP_DIR}"
 chmod -R u=rwX,g=rX,o= "${APP_DIR}"

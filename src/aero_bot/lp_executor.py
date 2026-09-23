@@ -1037,6 +1037,10 @@ class LpPositionStatusReport(BaseModel):
     fees_owed0_units: Annotated[int, Field(ge=0)]
     # The checkpointed token-one fees waiting to be collected.
     fees_owed1_units: Annotated[int, Field(ge=0)]
+    # The checkpointed pool fees valued in USDC at the same snapshot price
+    # as the composition, the claimable-now evidence the cycle threads into
+    # its fee-evidence window; None when a legacy construction carried none.
+    fees_owed_usdc: Decimal | None = None
     # The live accrued emissions when staked, else None.
     accrued_aero_earned_units: Annotated[int, Field(ge=0)] | None = None
     # The checkpointed claimable emissions when staked, else None.
@@ -3742,6 +3746,13 @@ class LpLifecycleExecutor:
         token0_value = +(amount0 * token0_scale * token0_price)
         token1_value = +(amount1 * token1_scale * token1_price)
         position_value = +(token0_value + token1_value)
+        # The claimable-now fee evidence rides the same snapshot price as
+        # the composition so the two never disagree; it is a lower bound
+        # because the pool checkpoints owed fees on position modifications.
+        fees_owed_usdc = +(
+            Decimal(position.tokens_owed0_units) * token0_scale * token0_price
+            + Decimal(position.tokens_owed1_units) * token1_scale * token1_price
+        )
         accrued_earned: int | None = None
         accrued_checkpoint: int | None = None
         penalty: LpPenaltyWindow | None = None
@@ -3788,6 +3799,11 @@ class LpLifecycleExecutor:
             f"composition {amount0} + {amount1} raw units worth {position_value} USDC at the "
             f"snapshot price {price} USDC per stock ({range_state.value})"
         )
+        diagnostics.append(
+            f"checkpointed pool fees {position.tokens_owed0_units} + "
+            f"{position.tokens_owed1_units} raw units worth {fees_owed_usdc} USDC claimable "
+            "now; a lower bound the pool refreshes on position modifications"
+        )
         caps = list(context.caps)
         caps.append("read-only observation; nothing was built or signed")
         self._record_status(
@@ -3817,6 +3833,7 @@ class LpLifecycleExecutor:
             position_value_usdc=position_value,
             fees_owed0_units=position.tokens_owed0_units,
             fees_owed1_units=position.tokens_owed1_units,
+            fees_owed_usdc=fees_owed_usdc,
             accrued_aero_earned_units=accrued_earned,
             accrued_aero_checkpoint_units=accrued_checkpoint,
             penalty=penalty,
@@ -6450,6 +6467,11 @@ def _print_position_status(report: LpPositionStatusReport) -> None:
         f"{report.position_value_usdc} USDC"
     )
     print(f"checkpointed fees {report.fees_owed0_units} + {report.fees_owed1_units} raw units")
+    if report.fees_owed_usdc is not None:
+        print(
+            f"claimable pool fees {report.fees_owed_usdc} USDC at the snapshot price "
+            "(lower bound: the pool checkpoints owed on position modifications)"
+        )
     if report.accrued_aero_earned_units is not None:
         print(
             f"accrued AERO: {report.accrued_aero_earned_units} raw live, "

@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 
 INSTALL_SCRIPT = Path("deploy/install.sh")
+CONVERGE_SCRIPT = Path("deploy/converge-check.sh")
 DEPLOYMENT_DOC = Path("docs/deployment.md")
 
 
@@ -91,6 +92,20 @@ class TestInstallScript:
         assert 'git -c safe.directory="${REPO_ROOT}"' in text
         assert text.index('git -c safe.directory="${REPO_ROOT}"') < archive_position
 
+    def test_the_installer_stamps_the_deployed_commit_itself(self) -> None:
+        """The deployment marker names the archived commit and cannot go stale."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        archive_position = text.index("archive --format=tar HEAD")
+        stamp_position = text.index('rev-parse HEAD >"${APP_DIR}/DEPLOYED_COMMIT"')
+        assert archive_position < stamp_position
+        # The rev-parse carries the same scoped ownership override as the archive.
+        assert (
+            'git -c safe.directory="${REPO_ROOT}" -C "${REPO_ROOT}" \\\n'
+            "        rev-parse HEAD" in text
+        )
+        # The tarball fallback branch has no commit to name and says so.
+        assert "unversioned tarball tree installed" in text
+
     def test_a_rerun_reasserts_service_ownership_of_the_venv(self) -> None:
         """The recursive chown must not cost the service user its venv."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
@@ -112,6 +127,64 @@ class TestInstallScript:
         """Automatic security updates stay on."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
         assert 'APT::Periodic::Unattended-Upgrade "1";' in text
+
+
+class TestConvergeCheckScript:
+    """The convergence check's compare-by-content contract."""
+
+    def test_the_script_parses_as_strict_bash(self) -> None:
+        """Bash's own parser accepts the script under strict settings."""
+        completed = subprocess.run(  # noqa: S603 - a syntax check of our own script
+            ["/bin/bash", "-n", str(CONVERGE_SCRIPT)],
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    def test_both_sides_hash_the_same_content_inventory(self) -> None:
+        """Local git-archive and remote find hash identical exclusions."""
+        text = CONVERGE_SCRIPT.read_text(encoding="utf-8")
+        local_find = text.index("find . -type f")
+        remote_find = text.index("sudo find . -type f")
+        for exclusion in (
+            "'./.venv/*'",
+            "'*__pycache__*'",
+            "'*.pyc'",
+            "'*.pytest_cache*'",
+            "'*.mypy_cache*'",
+            "DEPLOYED_COMMIT",
+        ):
+            assert exclusion in text, exclusion
+        # Every exclusion the local side applies appears on the remote side too.
+        local_block = text[local_find:remote_find]
+        remote_block = text[remote_find:]
+        for token in (
+            ".venv",
+            "__pycache__",
+            "*.pyc",
+            ".pytest_cache",
+            ".mypy_cache",
+            "DEPLOYED_COMMIT",
+        ):
+            assert token in local_block and token in remote_block, token
+
+    def test_the_local_side_hashes_the_git_archive_not_the_worktree(self) -> None:
+        """Uncommitted working-tree edits can never read as converged."""
+        text = CONVERGE_SCRIPT.read_text(encoding="utf-8")
+        assert "archive --format=tar HEAD" in text
+        assert text.index('git -C "${REPO_ROOT}" archive') < text.index("find . -type f")
+
+    def test_snapshot_extras_are_reported_not_treated_as_divergence(self) -> None:
+        """Known .pre-* rollback snapshots explain themselves in the verdict."""
+        text = CONVERGE_SCRIPT.read_text(encoding="utf-8")
+        assert "known .pre-* rollback snapshot" in text
+        assert "\\.pre-" in text or ".pre-" in text
+
+    def test_divergence_exits_nonzero_with_the_diff_shown(self) -> None:
+        """A real divergence is a failure, not a warning."""
+        text = CONVERGE_SCRIPT.read_text(encoding="utf-8")
+        assert "VERDICT: DIVERGED" in text
+        assert "exit 1" in text
 
 
 class TestDashboardUnit:

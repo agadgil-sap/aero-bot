@@ -1,5 +1,6 @@
 """Pin the scheduled decision cycle's reconcile-decide-act behavior."""
 
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
@@ -454,6 +455,8 @@ def tracked_status(
     owner: str = SAFE_ADDRESS,
     value: Decimal = Decimal("8"),
     pnl: Decimal | None = Decimal("1"),
+    fees_usdc: Decimal | None = None,
+    observed_at: datetime = QUIET_INSTANT,
 ) -> LpPositionStatusReport:
     """Build one minimal tracked-position status via unchecked construction."""
     view = SimpleNamespace(tick_lower=FIXTURE_RANGE_LOWER, tick_upper=FIXTURE_RANGE_UPPER)
@@ -466,6 +469,8 @@ def tracked_status(
         position_value_usdc=value,
         unrealized_pnl_usdc=pnl,
         pnl_diagnostic="" if pnl is not None else "no entry cost",
+        fees_owed_usdc=fees_usdc,
+        observed_at=observed_at,
     )
 
 
@@ -647,6 +652,131 @@ class TestDryRunCycles:
         )
         records = audit.read_records(10)
         assert [record.event_type for record in records] == [AuditEventType.CYCLE_REPORTED]
+
+    def test_day_rollover_anchor_prices_the_whole_book(self, tmp_path: Path) -> None:
+        """The day-start equity anchor carries the tracked LP mark, not cash alone.
+
+        The production book on 2026-09-23 showed an 80.73 anchor beside a
+        ~99 book and made daily P&L unreadable; the anchor must use the
+        same composition the engine acted on (Safe USDC, held stock, and
+        the tracked position's marked value) so a deployed position never
+        reads as a drawdown against a cash-only anchor.
+        """
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS))
+        runner, _, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        report = runner.run(CycleMode.DRY_RUN)
+
+        policy_day = QUIET_INSTANT.astimezone(
+            __import__("zoneinfo").ZoneInfo("America/New_York")
+        ).date()
+        loaded = state_store.load()
+        assert loaded.day == policy_day
+        assert loaded.day_start_equity_usd == Decimal("18")
+        assert report.equity_usd == Decimal("18")
+        assert report.day_start_equity_usd == Decimal("18")
+        assert report.day_pnl_usdc == Decimal("0")
+        assert report.day_diagnostic == ""
+
+    def test_day_economics_absent_when_the_cycle_refuses_out_of_band(self, tmp_path: Path) -> None:
+        """An out-of-band refusal carries no day economics rather than a lie."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        runner, _, _, _ = make_runner(tmp_path, reads=reads)
+        report = runner.run(CycleMode.DRY_RUN)
+        assert "no audit evidence" in report.reconciliation.out_of_band
+        assert report.decision_reason == "out_of_band"
+        assert report.equity_usd is None
+        assert report.day_start_equity_usd is None
+        assert report.day_pnl_usdc is None
+        assert report.day_diagnostic == "out-of-band cycle carried no day economics"
+
+    def test_cycle_reports_first_claimable_fee_sample_without_a_window(
+        self, tmp_path: Path
+    ) -> None:
+        """The first claimable reading reports evidence and opens the window."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status(owner=GAUGE_ADDRESS, fees_usdc=Decimal("0.25")),
+        )
+        runner, _, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        report = runner.run(CycleMode.DRY_RUN)
+
+        evidence = report.fee_evidence
+        assert evidence is not None
+        assert evidence.token_id == TRACKED_TOKEN_ID
+        assert evidence.claimable_pool_fees_usdc == Decimal("0.25")
+        assert evidence.measured_fee_usdc_per_day is None
+        assert evidence.measured_fee_apr is None
+        assert "first claimable sample recorded" in evidence.diagnostic
+        assert "lower bound" in evidence.diagnostic
+        book = state_store.load()
+        assert [sample.token_id for sample in book.fee_samples] == [TRACKED_TOKEN_ID]
+        assert book.fee_samples[0].claimable_pool_fees_usdc == Decimal("0.25")
+
+    def test_cycle_measures_the_fee_accrual_window_across_samples(self, tmp_path: Path) -> None:
+        """Two samples price the checkpointed accrual rate against the mark."""
+        day_one = QUIET_INSTANT
+        day_two = QUIET_INSTANT + timedelta(hours=24)
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status(owner=GAUGE_ADDRESS, fees_usdc=Decimal("0.25"), observed_at=day_one),
+        )
+        runner, _, _, state_store = make_runner(
+            tmp_path, book=tracked_book(), reads=reads, now=day_one
+        )
+        runner.run(CycleMode.DRY_RUN)
+
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status(
+                owner=GAUGE_ADDRESS,
+                fees_usdc=Decimal("1.25"),
+                observed_at=day_two,
+            ),
+        )
+        second = runner.run(CycleMode.DRY_RUN)
+
+        evidence = second.fee_evidence
+        assert evidence is not None
+        assert evidence.measured_fee_usdc_per_day == Decimal("1")
+        assert evidence.measured_fee_apr == Decimal("365") / Decimal("8")
+        assert "lower bound" in evidence.diagnostic
+        assert [sample.token_id for sample in state_store.load().fee_samples] == [TRACKED_TOKEN_ID]
+
+    def test_cycle_fee_evidence_stays_absent_without_a_tracked_position(
+        self, tmp_path: Path
+    ) -> None:
+        """A flat cycle reports no fee evidence rather than a zero reading."""
+        runner, _, audit, _ = make_runner(tmp_path)
+        report = runner.run(CycleMode.DRY_RUN)
+        assert report.fee_evidence is not None
+        assert report.fee_evidence.token_id is None
+        assert report.fee_evidence.claimable_pool_fees_usdc is None
+        assert "no tracked position" in report.fee_evidence.diagnostic
+        payload = json.loads(audit.read_records(1)[0].payload_json)
+        assert payload["claimable_pool_fees_usdc"] is None
+        assert payload["measured_fee_apr"] is None
+
+    def test_audit_record_carries_the_day_and_fee_economics(self, tmp_path: Path) -> None:
+        """The audited cycle summary persists equity, anchor, P&L, and fees."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status(owner=GAUGE_ADDRESS, fees_usdc=Decimal("0.25")),
+        )
+        runner, _, audit, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        runner.run(CycleMode.DRY_RUN)
+
+        payload = json.loads(audit.read_records(1)[0].payload_json)
+        assert Decimal(payload["equity_usdc"]) == Decimal("18")
+        assert Decimal(payload["day_start_equity_usdc"]) == Decimal("18")
+        assert Decimal(payload["day_pnl_usdc"]) == Decimal("0")
+        assert Decimal(payload["claimable_pool_fees_usdc"]) == Decimal("0.25")
 
     def test_market_window_no_longer_flats_the_cycle_since_the_ruling(self, tmp_path: Path) -> None:
         """A session window inside the cycle no longer gates the verdict.
