@@ -46,7 +46,6 @@ from aero_bot.lp_executor import (
     LpExecutionRefusalCode,
     LpExecutionRefusalError,
     LpExecutionRole,
-    LpPenaltyWindow,
     LpPositionStatusReport,
     LpSafePositionsSnapshot,
 )
@@ -455,34 +454,19 @@ def tracked_status(
     owner: str = SAFE_ADDRESS,
     value: Decimal = Decimal("8"),
     pnl: Decimal | None = Decimal("1"),
-    penalty_remaining_seconds: int | None = None,
 ) -> LpPositionStatusReport:
     """Build one minimal tracked-position status via unchecked construction."""
     view = SimpleNamespace(tick_lower=FIXTURE_RANGE_LOWER, tick_upper=FIXTURE_RANGE_UPPER)
-    penalty = (
-        None
-        if penalty_remaining_seconds is None
-        else LpPenaltyWindow(
-            penalty_rate_bps=10_000,
-            min_stake_seconds=300,
-            deposit_timestamp=1_000,
-            window_clears_at_timestamp=1_000 + penalty_remaining_seconds,
-            remaining_seconds=penalty_remaining_seconds,
-        )
+    return LpPositionStatusReport.model_construct(
+        symbol="FIXc",
+        pool_address=POOL_ADDRESS,
+        token_owner_address=owner,
+        gauge_address=GAUGE_ADDRESS,
+        position=view,
+        position_value_usdc=value,
+        unrealized_pnl_usdc=pnl,
+        pnl_diagnostic="" if pnl is not None else "no entry cost",
     )
-    values: dict[str, object] = {
-        "symbol": "FIXc",
-        "pool_address": POOL_ADDRESS,
-        "token_owner_address": owner,
-        "gauge_address": GAUGE_ADDRESS,
-        "position": view,
-        "position_value_usdc": value,
-        "unrealized_pnl_usdc": pnl,
-        "pnl_diagnostic": "" if pnl is not None else "no entry cost",
-    }
-    if penalty is not None:
-        values["penalty"] = penalty
-    return LpPositionStatusReport.model_construct(**values)  # type: ignore[arg-type]
 
 
 def mint_receipt(token_id: int) -> dict[str, object]:
@@ -504,9 +488,9 @@ def tracked_book(
     owner: str = SAFE_ADDRESS,
     committed: Decimal = Decimal("7"),
     symbol: str = "FIXc",
-    entered_at: datetime = QUIET_INSTANT - timedelta(minutes=70),
+    entered_at: datetime = QUIET_INSTANT,
 ) -> CycleStateBook:
-    """Build one book tracking a position mature enough for ordinary lifecycle tests."""
+    """Build one book tracking the fixture position."""
     return CycleStateBook(
         position=TrackedPosition(
             symbol=symbol,
@@ -813,87 +797,6 @@ class TestLiveCycles:
         assert "exit_swap" not in [call[0] for call in executor.calls]
         assert book.position is not None
 
-    def test_failed_recenter_mint_preserves_inventory_for_same_symbol_retry(
-        self, tmp_path: Path
-    ) -> None:
-        """A burned recenter whose replacement mint fails preserves retry inventory."""
-        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
-        reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS))
-        runner, executor, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
-        assert executor is not None
-        cast(FakeBalances, runner._balances).stock_units = 3_000_000
-        executor.refuse_next = "mint"
-        runner._last_reconciliation = runner._reconcile(tracked_book())
-        outcome = PolicyOutcome(
-            decision=PolicyDecision(
-                action=PolicyActionKind.RECENTER,
-                reason=PolicyReason.DOWNSIDE_RECENTER_ECONOMIC,
-                diagnostics=("fixture economic recenter",),
-                price_range=AlignedPriceRange(
-                    lower_tick=-10,
-                    upper_tick=10,
-                    lower_price=Decimal("99"),
-                    upper_price=Decimal("101"),
-                ),
-                size_usd=Decimal("7"),
-            ),
-            next_state=PolicyState(),
-        )
-
-        actions, halted, book = runner._act(
-            tracked_book(), outcome, b"\x01" * 32, "FIXc"
-        )
-
-        assert [record.action for record in actions] == ["unstake", "withdraw", "mint"]
-        assert "mint action refused" in halted
-        assert book.position is None
-        assert book.held_inventory is not None
-        assert book.held_inventory.symbol == "FIXc"
-        assert book.held_inventory.origin == "failed_recenter"
-        assert book.held_inventory.stock_quantity > 0
-
-    def test_failed_recenter_retry_preserves_original_timeout_anchor(
-        self, tmp_path: Path
-    ) -> None:
-        """A second failed retry cannot extend the failed-recenter escape timer."""
-        held_since = QUIET_INSTANT - timedelta(minutes=2)
-        book = CycleStateBook(
-            held_inventory=HeldInventoryRecord(
-                symbol="FIXc",
-                token_address=B20_ADDRESS,
-                stock_quantity=Decimal("0.03"),
-                held_since=held_since,
-                origin="failed_recenter",
-            ),
-            updated_at=QUIET_INSTANT,
-        )
-        runner, executor, _, _ = make_runner(tmp_path, book=book)
-        assert executor is not None
-        cast(FakeBalances, runner._balances).stock_units = 3_000_000
-        executor.refuse_next = "mint"
-        outcome = PolicyOutcome(
-            decision=PolicyDecision(
-                action=PolicyActionKind.ENTER,
-                reason=PolicyReason.FAILED_RECENTER_RETRY,
-                diagnostics=("fixture failed recenter retry",),
-                price_range=AlignedPriceRange(
-                    lower_tick=-10,
-                    upper_tick=10,
-                    lower_price=Decimal("99"),
-                    upper_price=Decimal("101"),
-                ),
-                size_usd=Decimal("7"),
-            ),
-            next_state=PolicyState(),
-        )
-
-        _, halted, retry_book = runner._act(book, outcome, b"\x01" * 32, "FIXc")
-
-        assert "mint action refused" in halted
-        assert retry_book.held_inventory is not None
-        assert retry_book.held_inventory.origin == "failed_recenter"
-        assert retry_book.held_inventory.held_since == held_since
-
     def test_recenter_preflight_refusal_keeps_the_live_position_untouched(
         self, tmp_path: Path
     ) -> None:
@@ -1077,6 +980,27 @@ class TestReconciliation:
         assert report.reconciliation.tracked_staked is False
         assert report.pnl_vs_entry_usdc == Decimal("1")
         assert report.decision_action == "hold"
+
+    def test_live_hold_recovers_an_unstaked_tracked_position(self, tmp_path: Path) -> None:
+        """A partial prior cycle is healed by restaking the valid Safe-held NFT."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=SAFE_ADDRESS))
+        runner, executor, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+        assert executor is not None
+
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_price_usdc=FIXTURE_AMM_PRICE,
+        )
+
+        assert report.decision_action == "hold"
+        assert [call[0] for call in executor.calls] == ["stake"]
+        assert len(report.actions) == 1
+        assert report.actions[0].action == "stake_recovery"
+        assert report.actions[0].status == "completed"
+        assert report.reconciliation.tracked_staked is True
+        assert report.halted_reason == ""
 
     def test_external_reference_cannot_force_scheduled_position_exit(self, tmp_path: Path) -> None:
         """A divergent external quote is advisory and cannot order an Aerodrome exit."""
@@ -1428,8 +1352,10 @@ class TestSelectorCycles:
         sources = SelectorCycleSources().with_listings(selector_listings(1))
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(symbol="AAAc"),
-            reads=_tracked_reads(),
+            book=tracked_book(
+                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
+            ),
+            reads=_tracked_reads(staked=True),
             sources=sources,
         )
         assert executor is not None
@@ -1449,7 +1375,9 @@ class TestSelectorCycles:
         # BBBc at double AAAc's APR clears the default thirty percent margin.
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(symbol="AAAc"),
+            book=tracked_book(
+                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
+            ),
             reads=_tracked_reads(staked=True),
         )
         assert executor is not None
@@ -1475,36 +1403,13 @@ class TestSelectorCycles:
         # Exactly one position is funded after the switch.
         assert book.position.token_id == TRACKED_TOKEN_ID
 
-    def test_selector_defers_switch_inside_minimum_stake_penalty_window(
-        self, tmp_path: Path
-    ) -> None:
-        """A fresh staked position cannot churn into another pool before its penalty clears."""
-        runner, executor, state_store = selector_runner(
-            tmp_path,
-            book=tracked_book(symbol="AAAc"),
-            reads=_tracked_reads(staked=True, penalty_remaining_seconds=200),
-        )
-        assert executor is not None
-
-        report = runner.run(
-            CycleMode.LIVE,
-            key_bytes=b"\x01" * 32,
-            reference_prices_by_symbol=SELECTOR_REFERENCES,
-        )
-
-        assert report.decision_action == "hold"
-        assert report.symbol == "AAAc"
-        assert executor.calls == []
-        assert any("minimum-stake penalty window clears" in note for note in report.input_notes)
-        book = state_store.load()
-        assert book.position is not None
-        assert book.position.symbol == "AAAc"
-
     def test_a_failed_switch_exit_halts_before_any_entry(self, tmp_path: Path) -> None:
         """A refused exit stops the switch with no second position minted."""
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(symbol="AAAc"),
+            book=tracked_book(
+                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
+            ),
             reads=_tracked_reads(staked=True),
         )
         assert executor is not None
@@ -1540,7 +1445,9 @@ class TestSelectorCycles:
         """A partial target mint keeps acquired stock tagged for direct retry."""
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(symbol="AAAc"),
+            book=tracked_book(
+                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
+            ),
             reads=_tracked_reads(staked=True),
         )
         assert executor is not None
@@ -1555,7 +1462,7 @@ class TestSelectorCycles:
             ephemeral_key: bool = False,
         ) -> LpActionExecutionReport:
             executor.calls.append(("mint", symbol, budget_usdc, width_spacings))
-            cast(FakeBalances, runner._balances).stock_units = 3_000_000
+            runner._balances.stock_units = 3_000_000
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
                 "scripted post-swap mint refusal",
@@ -1582,7 +1489,9 @@ class TestSelectorCycles:
         """A target-plan refusal never unstake/withdraws the earning source LP."""
         runner, executor, state_store = selector_runner(
             tmp_path,
-            book=tracked_book(symbol="AAAc"),
+            book=tracked_book(
+                symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)
+            ),
             reads=_tracked_reads(staked=True),
         )
         assert executor is not None
@@ -1627,17 +1536,12 @@ class TestSelectorCycles:
         assert state_store.load().position is not None
 
 
-def _tracked_reads(
-    *, staked: bool = False, penalty_remaining_seconds: int | None = None
-) -> FakeReads:
+def _tracked_reads(*, staked: bool = False) -> FakeReads:
     """Serve one live in-range tracked position for the switch fixtures."""
     reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
     reads.set_status(
         TRACKED_TOKEN_ID,
-        tracked_status(
-            owner=GAUGE_ADDRESS if staked else SAFE_ADDRESS,
-            penalty_remaining_seconds=penalty_remaining_seconds,
-        ),
+        tracked_status(owner=GAUGE_ADDRESS if staked else SAFE_ADDRESS),
     )
     return reads
 

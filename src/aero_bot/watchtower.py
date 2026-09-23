@@ -585,13 +585,13 @@ class RangeWatchtower:
                 f"range [{bounds.tick_lower}, {bounds.tick_upper}); no transaction fired; "
                 "the scheduled policy cycle remains the sole action authority"
             )
-            self._progress(note)
             if fresh_trip:
+                self._progress(note)
                 self._deliver_notice(
-                    f"{self._symbol} range trip observed - no transaction fired",
+                    f"{tracked.symbol} range trip observed - no transaction fired",
                     "\n".join(
                         (
-                            f"Aero Bot range monitor - {self._symbol}",
+                            f"Aero Bot range monitor - {tracked.symbol}",
                             "",
                             note,
                             "",
@@ -752,7 +752,7 @@ class RangeWatchtower:
                 return False
             return True
 
-        symbol = self._symbol
+        symbol = tracked.symbol
         if staked and not run(
             "unstake",
             lambda: self._executor.execute_unstake(
@@ -794,7 +794,7 @@ class RangeWatchtower:
         """
         try:
             status = self._reads.position_status(
-                self._symbol, tracked.token_id, entry_cost_usdc=tracked.committed_usd
+                tracked.symbol, tracked.token_id, entry_cost_usdc=tracked.committed_usd
             )
         except (
             LpExecutionRefusalError,
@@ -870,10 +870,10 @@ class RangeWatchtower:
         self._latch_store.save(
             latch.model_copy(update={"last_read_alert_at": now, "updated_at": now})
         )
-        subject = f"{self._symbol} watchtower unreadable - no exit fired"
+        subject = f"{tracked.symbol} watchtower unreadable - no exit fired"
         body = "\n".join(
             (
-                f"Aero Bot range watchtower - {self._symbol}",
+                f"Aero Bot range watchtower - {tracked.symbol}",
                 "",
                 f"  {message}",
                 "",
@@ -988,7 +988,7 @@ class RangeWatchtower:
             + f", Safe holds {held_quantity} stock"
         )
         reconciliation = CycleReconciliation(
-            symbol=self._symbol,
+            symbol=tracked.symbol,
             safe_usdc_units=safe_usdc,
             relayer_eth_wei=relayer_eth,
             safe_stock_units=stock_units,
@@ -1019,7 +1019,7 @@ class RangeWatchtower:
         return CycleReport(
             started_at=started_at,
             mode=CycleMode.LIVE,
-            symbol=self._symbol,
+            symbol=tracked.symbol,
             reconciliation=reconciliation,
             decision_action="defensive_exit",
             decision_reason="watchtower_range_trip",

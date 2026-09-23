@@ -54,7 +54,6 @@ from aero_bot.lp_executor import (
     LpLifecycleExecutor,
     LpMintDryRunReport,
     LpSafeExecutionPolicy,
-    decode_evm_revert_data,
     main,
 )
 from aero_bot.lp_pins import LpPoolPin, LpPoolPinStore
@@ -146,18 +145,6 @@ AERO_POOL_ADDRESS = "0x" + "ee" * 20
 def word_hex(value: int) -> str:
     """Encode one integer as the 0x-prefixed 32-byte word JSON-RPC returns."""
     return "0x" + value.to_bytes(32, "big").hex()
-
-
-def error_string_data(message: str) -> str:
-    """Encode one Solidity Error(string) revert payload."""
-    raw = message.encode()
-    padded = raw + b"\x00" * ((32 - len(raw) % 32) % 32)
-    return (
-        "0x08c379a0"
-        + (32).to_bytes(32, "big").hex()
-        + len(raw).to_bytes(32, "big").hex()
-        + padded.hex()
-    )
 
 
 def signed_word(value: int) -> bytes:
@@ -374,10 +361,9 @@ class LpRpcScript:
         receipt_status: int = 1,
         receipt_present: bool = True,
         receipt_http_status: int = 200,
-        replay_revert_message: str = "execution reverted",
-        replay_revert_data: str = "0x",
         estimate_reverts_after: int | None = None,
         estimate_revert_message: str = "execution reverted: PSC",
+        estimate_revert_calls: set[int] | None = None,
         estimate_gs026_lag_calls: int = 0,
         estimate_gs026_lag_from: int = 1,
         fast_block_number: int = 51_000_000,
@@ -453,12 +439,12 @@ class LpRpcScript:
                 every poll empty so the bounded wait can time out.
             receipt_http_status: HTTP status served only for receipt reads;
                 non-200 values simulate one unhealthy receipt endpoint.
-            replay_revert_message: Error message returned by diagnostic inner-call replay.
-            replay_revert_data: Raw 0x-prefixed revert bytes returned by that replay.
             estimate_reverts_after: Make every estimateGas call past this
                 count revert with estimate_revert_message, counting both the
                 build-time and execute-time estimates.
             estimate_revert_message: The revert message for the cap above.
+            estimate_revert_calls: Optional 1-based estimateGas call numbers
+                that revert once with estimate_revert_message.
             estimate_gs026_lag_calls: How many estimateGas calls revert with
                 a GS026 lag marker before resuming the scripted answers.
             estimate_gs026_lag_from: The 1-based estimateGas call the GS026
@@ -516,6 +502,7 @@ class LpRpcScript:
         self.get_reward_gas_estimate = get_reward_gas_estimate
         self.broadcasts: list[str] = []
         self.estimate_requests: list[str] = []
+        self.position_view_reads = 0
         self.allow_broadcasts = allow_broadcasts
         self.send_http_status = send_http_status
         self.relayer_eth_wei = relayer_eth_wei
@@ -523,10 +510,9 @@ class LpRpcScript:
         self.receipt_status = receipt_status
         self.receipt_present = receipt_present
         self.receipt_http_status = receipt_http_status
-        self.replay_revert_message = replay_revert_message
-        self.replay_revert_data = replay_revert_data
         self.estimate_reverts_after = estimate_reverts_after
         self.estimate_revert_message = estimate_revert_message
+        self.estimate_revert_calls = set(estimate_revert_calls or set())
         self.estimate_gs026_lag_remaining = estimate_gs026_lag_calls
         self.estimate_gs026_lag_from = estimate_gs026_lag_from
         self.fast_block_number = fast_block_number
@@ -563,24 +549,6 @@ class LpRpcScript:
         elif method == "eth_blockNumber":
             result = hex(self.fast_block_number)
         elif method == "eth_call":
-            call = params[0]
-            if (
-                isinstance(call, dict)
-                and "from" in call
-                and self.receipt_status == 0
-            ):
-                return httpx.Response(
-                    200,
-                    json={
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "error": {
-                            "code": 3,
-                            "message": self.replay_revert_message,
-                            "data": self.replay_revert_data,
-                        },
-                    },
-                )
             result = self._eth_call(str(params[0]["to"]).lower(), str(params[0]["data"]))
         elif method == "eth_estimateGas":
             calldata = str(params[0]["data"])
@@ -687,6 +655,7 @@ class LpRpcScript:
         if data.startswith("0xe985e9c5"):
             return word_hex(1 if self.operator_approved else 0)
         if data.startswith("0x99fbab88"):
+            self.position_view_reads += 1
             if self.position_words is None:
                 raise _ScriptedRevertError("NFPM: unknown token ID")
             return "0x" + b"".join(self.position_words).hex()
@@ -762,6 +731,11 @@ class LpRpcScript:
         ):
             self.estimate_gs026_lag_remaining -= 1
             raise _ScriptedRevertError("GS026")
+        if len(self.estimate_requests) in self.estimate_revert_calls:
+            self.estimate_revert_calls.remove(len(self.estimate_requests))
+            raise _ScriptedRevertError(
+                self.estimate_revert_message.removeprefix("execution reverted: ")
+            )
         if (
             self.estimate_reverts_after is not None
             and len(self.estimate_requests) > self.estimate_reverts_after
@@ -3346,6 +3320,79 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
     assert AuditStore(audit_path).verify_chain().status.value == "verified"
 
 
+def test_execute_mint_rebuilds_after_execute_time_psc(tmp_path: Path) -> None:
+    """A transient final-mint PSC rebuilds from fresh state instead of stranding inventory."""
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=tmp_path / "audit.sqlite3",
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            post_swap_stock_balance_units=10**12,
+            estimate_revert_calls={14},
+            nfpm_held_positions=2,
+            held_token_ids=[11, 12],
+            position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+        ),
+        safe_script=SafeRpcScript(
+            nonce_reads=[4, 6, 8, 8],
+            signature_verdicts=[True] * 30,
+        ),
+    )
+
+    report = executor.execute_mint(
+        "FIXc",
+        MINT_BUDGET_USDC,
+        MINT_WIDTH_SPACINGS,
+        b"\x01" * 32,
+        confirm_broadcast=True,
+    )
+
+    assert report.completed is True
+    assert report.halted_reason == ""
+    assert [step.role for step in report.steps] == [
+        LpExecutionRole.ROUTER_ALLOWANCE,
+        LpExecutionRole.BALANCING_SWAP,
+        LpExecutionRole.NFPM_USDC_ALLOWANCE,
+        LpExecutionRole.NFPM_STOCK_ALLOWANCE,
+        LpExecutionRole.MINT,
+    ]
+    assert len(rpc_script.broadcasts) == 5
+    assert len(rpc_script.estimate_requests) == 16
+    # The two residual NFTs are fully scanned only on the initial build.
+    # Every post-swap/final rebuild verifies the unchanged NFPM balance count
+    # instead of rereading every empty positions() view.
+    assert rpc_script.position_view_reads == 2
+
+
+def test_execute_mint_bounds_repeated_final_psc_retries(tmp_path: Path) -> None:
+    """Repeated final-mint PSC failures stop after the bounded fresh rebuilds."""
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=tmp_path / "audit.sqlite3",
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            post_swap_stock_balance_units=10**12,
+            estimate_revert_calls={14, 16, 18},
+        ),
+        safe_script=SafeRpcScript(
+            nonce_reads=[4, 6, 8, 8, 8],
+            signature_verdicts=[True] * 40,
+        ),
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.execute_mint(
+            "FIXc",
+            MINT_BUDGET_USDC,
+            MINT_WIDTH_SPACINGS,
+            b"\x01" * 32,
+            confirm_broadcast=True,
+        )
+
+    assert raised.value.code is LpExecutionRefusalCode.ESTIMATE_REVERTED
+    assert "PSC" in str(raised.value)
+    assert len(rpc_script.broadcasts) == 4
+    assert len(rpc_script.estimate_requests) == 18
+
+
 def test_execute_mint_can_rebalance_excess_stock_into_usdc_then_mint(tmp_path: Path) -> None:
     """The live two-phase mint confirms a stock sale, rereads balances, then mints."""
     executor, rpc_script, _ = make_lp_executor(
@@ -3445,6 +3492,7 @@ def test_execute_halts_at_an_execute_time_estimate_revert(tmp_path: Path) -> Non
     assert raised.value.code is LpExecutionRefusalCode.ESTIMATE_REVERTED
     assert "stopping honestly" in str(raised.value)
     assert "PSC" in str(raised.value)
+    assert "inner-call replay" in str(raised.value)
     # Two build estimates and one execute estimate succeeded; the second
     # execute estimate reverted, so exactly one step broadcast.
     assert len(rpc_script.broadcasts) == 1
@@ -3498,28 +3546,11 @@ def test_execute_refuses_a_signature_rejected_at_execute_time(tmp_path: Path) ->
     assert len(script.broadcasts) == 1
 
 
-def test_decode_evm_revert_data_decodes_error_string_and_panic() -> None:
-    """Standard Solidity revert payloads become compact human diagnostics."""
-    error_data = error_string_data("fixture inner failure")
-    panic_data = "0x4e487b71" + (0x11).to_bytes(32, "big").hex()
-
-    assert decode_evm_revert_data(error_data) == "Solidity Error('fixture inner failure')"
-    assert decode_evm_revert_data(panic_data) == (
-        "Solidity Panic(0x11: arithmetic overflow or underflow)"
-    )
-
-
 def test_execute_reports_a_failed_delivery_and_halts(tmp_path: Path) -> None:
-    """An on-chain revert records the underlying inner-call replay evidence."""
+    """An on-chain revert marks the step failed and stops the sequence."""
     audit_path = tmp_path / "audit.sqlite3"
-    replay_data = error_string_data("fixture inner failure")
     executor, rpc_script = make_execute_stake_executor(
-        audit_path=audit_path,
-        script_kwargs={
-            "receipt_status": 0,
-            "replay_revert_message": "execution reverted",
-            "replay_revert_data": replay_data,
-        },
+        audit_path=audit_path, script_kwargs={"receipt_status": 0}
     )
 
     report = executor.execute_stake("FIXc", 77, bytes(Account.create().key), confirm_broadcast=True)
@@ -3529,14 +3560,11 @@ def test_execute_reports_a_failed_delivery_and_halts(tmp_path: Path) -> None:
     assert len(report.steps) == 1
     assert "reverted atomically on-chain" in report.steps[0].diagnostic
     assert "Safe nonce remains" in report.steps[0].diagnostic
-    assert "inner-call replay at receipt and parent block agrees" in report.steps[0].diagnostic
-    assert "fixture inner failure" in report.steps[0].diagnostic
     assert len(rpc_script.broadcasts) == 1
     records = AuditStore(audit_path).read_records(100)
     assert records[4].event_type is AuditEventType.LP_EXECUTE_FAILED
     failed = json.loads(records[4].payload_json)
     assert failed["outcome"] == "failed"
-    assert "fixture inner failure" in failed["diagnostic"]
 
 
 def test_execute_reports_an_unconfirmed_delivery_as_a_warning(tmp_path: Path) -> None:

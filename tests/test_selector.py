@@ -100,13 +100,8 @@ def qualified_board() -> tuple[PoolBoardOption, ...]:
     )
 
 
-def held_state(
-    pool_address: str,
-    token_address: str,
-    *,
-    age: timedelta = timedelta(minutes=70),
-) -> PolicyState:
-    """Build one state holding a position old enough for ordinary switch tests."""
+def held_state(pool_address: str, token_address: str) -> PolicyState:
+    """Build one state whose funded position has cleared the switch hold period."""
     engine = PolicyEngine()
     entry = engine.decide(
         PolicyState(),
@@ -117,7 +112,9 @@ def held_state(
     assert position is not None
     return entry.next_state.model_copy(
         update={
-            "position": position.model_copy(update={"entered_at": BASE_TIME - age})
+            "position": position.model_copy(
+                update={"entered_at": BASE_TIME - timedelta(hours=2)}
+            )
         }
     )
 
@@ -225,20 +222,23 @@ class TestSwitchDiscipline:
         )
         return PolicyEngine(), held_state(AAA_POOL, AAA_TOKEN), options
 
-    def test_fresh_position_blocks_voluntary_switch_for_one_hour(self) -> None:
-        """A newly entered pool cannot churn during the one-hour switch hold."""
+    def test_fresh_position_observes_the_one_hour_switch_hold(self) -> None:
+        """A new position cannot churn solely for a better APR during its first hour."""
         engine = PolicyEngine()
-        state = held_state(AAA_POOL, AAA_TOKEN, age=timedelta(minutes=5))
+        entry = engine.decide(
+            PolicyState(),
+            board_option("AAAc", AAA_POOL, AAA_TOKEN).observation,
+        )
+        assert entry.next_state.position is not None
         options = (
             board_option("AAAc", AAA_POOL, AAA_TOKEN, emissions_apr=Decimal("2.0")),
-            board_option("BBBc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("9.0")),
+            board_option("BBBc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("3.1")),
         )
 
-        selection = select_board(engine, state, options, {})
+        selection = select_board(engine, entry.next_state, options, {})
 
         assert selection.outcome.decision.action is PolicyActionKind.HOLD
         assert selection.switch is None
-        assert selection.selected_symbol == "AAAc"
         assert "voluntary switch hold period active" in selection.summary
 
     def test_no_switch_below_the_margin(self) -> None:

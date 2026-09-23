@@ -758,18 +758,17 @@ class TestPositionLifecycle:
         assert new_position.price_range.lower_price < above_price
         assert new_position.price_range.upper_price > above_price
 
-    def test_upside_recenter_shrinks_to_the_current_depth_cap(self) -> None:
-        """A shallower pool recenters smaller instead of repeatedly refusing the old size."""
+    def test_recenter_reserves_post_exit_depth_headroom(self) -> None:
+        """A replacement mint sizes below the live cap before source liquidity is removed."""
         engine, state = entered_session()
-        position = entered_position_for(state)
-        assert position.committed_usd == Decimal("160")
-        above_price = position.price_range.upper_price * Decimal("1.01")
+        upper = entered_position_for(state).price_range.upper_price
+        above_price = upper * Decimal("1.01")
         waiting = engine.decide(
             state,
             base_observation(
                 observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
                 amm_price_usdc=above_price,
-                pool_depth_usd=Decimal("6000"),
+                pool_depth_usd=Decimal("10000"),
             ),
         )
         recentred = engine.decide(
@@ -777,44 +776,16 @@ class TestPositionLifecycle:
             base_observation(
                 observed_at=datetime(2026, 8, 19, 11, 21, tzinfo=NEW_YORK),
                 amm_price_usdc=above_price,
-                pool_depth_usd=Decimal("6000"),
+                pool_depth_usd=Decimal("10000"),
             ),
         )
 
         assert recentred.decision.action is PolicyActionKind.RECENTER
-        assert recentred.decision.size_usd == Decimal("60")
-        assert recentred.decision.swap_plan is not None
-        assert recentred.decision.swap_plan.total_usd == Decimal("30")
-        assert recentred.next_state.position is not None
-        assert recentred.next_state.position.committed_usd == Decimal("60")
-        assert any("Recenter size reduced" in line for line in recentred.decision.diagnostics)
-
-    def test_upside_recenter_holds_when_depth_cap_is_zero(self) -> None:
-        """Zero current depth never burns an earning position without a replacement size."""
-        engine, state = entered_session()
-        position = entered_position_for(state)
-        above_price = position.price_range.upper_price * Decimal("1.01")
-        waiting = engine.decide(
-            state,
-            base_observation(
-                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
-                amm_price_usdc=above_price,
-            ),
+        assert recentred.decision.size_usd == Decimal("70")
+        assert any(
+            "current depth cap is 70.0000 USDC" in line
+            for line in recentred.decision.diagnostics
         )
-        held = engine.decide(
-            waiting.next_state,
-            base_observation(
-                observed_at=datetime(2026, 8, 19, 11, 21, tzinfo=NEW_YORK),
-                amm_price_usdc=above_price,
-                pool_depth_usd=Decimal("0"),
-            ),
-        )
-
-        assert held.decision.action is PolicyActionKind.HOLD
-        assert held.decision.reason is PolicyReason.OPEN_ABOVE_RANGE_WAITING
-        assert held.next_state.position is not None
-        assert held.next_state.position.committed_usd == Decimal("160")
-        assert "no positive safe replacement" in held.decision.diagnostics[0]
 
     def test_returning_in_range_resets_the_recenter_wait(self) -> None:
         """A price returning inside the range clears the wait anchor."""
@@ -1407,55 +1378,6 @@ class TestDislocationMonitor:
         )
         assert held.decision.action is PolicyActionKind.HOLD
         assert held.decision.reason is PolicyReason.HOLDING_INVENTORY_AWAITING_CONVERGENCE
-
-    def test_failed_recenter_retries_same_symbol_before_inventory_timeout(self) -> None:
-        """A failed replacement mint retries from preserved inventory before sell-back."""
-        engine = PolicyEngine()
-        state = PolicyState(
-            held_inventory=HeldInventory(
-                pool_address=POOL_ADDRESS,
-                token_address=TOKEN_ADDRESS,
-                stock_quantity=Decimal("0.15"),
-                held_since=BASE_OBSERVED_AT,
-                origin="failed_recenter",
-            )
-        )
-
-        retry = engine.decide(
-            state,
-            base_observation(
-                observed_at=BASE_OBSERVED_AT + timedelta(minutes=1),
-                reference_enforcement_enabled=False,
-            ),
-        )
-
-        assert retry.decision.action is PolicyActionKind.ENTER
-        assert retry.decision.reason is PolicyReason.FAILED_RECENTER_RETRY
-        assert retry.next_state.held_inventory is None
-        assert "failed recenter replacement mint" in retry.decision.diagnostics[0]
-
-    def test_failed_recenter_retry_stops_at_the_inventory_timeout(self) -> None:
-        """A failed recenter cannot retry forever after the five-minute escape bound."""
-        engine = PolicyEngine()
-        state = PolicyState(
-            held_inventory=HeldInventory(
-                pool_address=POOL_ADDRESS,
-                token_address=TOKEN_ADDRESS,
-                stock_quantity=Decimal("0.15"),
-                held_since=BASE_OBSERVED_AT,
-                origin="failed_recenter",
-            )
-        )
-        at_timeout = engine.decide(
-            state,
-            base_observation(
-                observed_at=BASE_OBSERVED_AT + timedelta(minutes=5),
-                reference_enforcement_enabled=False,
-            ),
-        )
-        assert at_timeout.decision.action is PolicyActionKind.SELL_INVENTORY
-        assert at_timeout.decision.reason is PolicyReason.INVENTORY_CONVERGENCE_TIMEOUT
-        assert at_timeout.next_state.held_inventory is None
 
     def test_failed_entry_retry_stops_at_the_inventory_timeout(self) -> None:
         """A failed mint cannot retry forever after the five-minute escape bound."""

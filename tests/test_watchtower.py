@@ -390,6 +390,7 @@ class WatchtowerHarness:
         refuse: str | None = None,
         config: WatchtowerConfig = ARMED_CONFIG,
         key_loader: RecordingKeyLoader | None = None,
+        watch_symbol: str = "FIXc",
     ) -> None:
         """Wire every fake and store around one mutable clock."""
         self.clock = MutableClock()
@@ -407,7 +408,7 @@ class WatchtowerHarness:
         self.latch_store = WatchtowerLatchStore(tmp_path / "watchtower_state.json")
         self.audit = AuditStore(tmp_path / "audit.sqlite3")
         self.watchtower = RangeWatchtower(
-            symbol="FIXc",
+            symbol=watch_symbol,
             safe_address=SAFE_ADDRESS,
             relayer_address=None,
             config=config,
@@ -570,6 +571,31 @@ class TestTripSemantics:
         assert outcome.state is WatchtowerPollState.FLAT
         assert harness.executor.calls == []
         assert harness.key_loader.loads == 0
+
+    def test_auto_monitor_follows_the_tracked_positions_symbol(self, tmp_path: Path) -> None:
+        """An auto watchtower follows a selector switch without a service restart."""
+        config = WatchtowerConfig(
+            enabled=True,
+            poll_interval_seconds=5.0,
+            cooldown_seconds=900.0,
+            monitor_only=True,
+        )
+        harness = WatchtowerHarness(
+            tmp_path,
+            tick=ABOVE_TICK,
+            status=status_report(range_state=PositionRangeState.ABOVE_RANGE),
+            config=config,
+            watch_symbol="auto",
+        )
+
+        outcome = harness.poll()
+
+        assert outcome.state is WatchtowerPollState.STOOD_DOWN
+        assert harness.statuses.calls == 0
+        assert harness.executor.calls == []
+        assert harness.key_loader.loads == 0
+        assert len(harness.alerts.notices) == 1
+        assert harness.alerts.notices[0][0].startswith("FIXc range trip observed")
 
     def test_monitor_only_trip_alerts_but_can_never_trade(self, tmp_path: Path) -> None:
         """Production monitoring never loads a key or broadcasts."""

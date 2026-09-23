@@ -179,6 +179,11 @@ LP_ROUTER_ALLOWANCE_CAP_CEILING_USDC = Decimal("200")
 # transient GS026 with every predecessor already mined).
 EXECUTE_ESTIMATE_LAG_RETRIES = 3
 EXECUTE_ESTIMATE_LAG_RETRY_SECONDS = 4.0
+# Final minting is uniquely price-sensitive: a build-time estimate can pass and
+# then the execute-time estimate can fail PSC after a sub-tick pool move. Keep
+# retries bounded and rebuild from fresh state instead of loosening minima.
+FINAL_MINT_REBUILD_ROUNDS = 4
+FINAL_MINT_PSC_RETRIES = 2
 # Bounded cross-endpoint receipt wait: poll every backend once per round.
 EXECUTE_RECEIPT_TOTAL_TIMEOUT_SECONDS = 600.0
 EXECUTE_RECEIPT_POLL_SECONDS = 3.0
@@ -539,6 +544,10 @@ class LpMintDryRunReport(BaseModel):
     nfpm_usdc_allowance_units: Annotated[int, Field(ge=0)]
     # The live stock allowance the Safe held for the NFPM at build time.
     nfpm_stock_allowance_units: Annotated[int, Field(ge=0)]
+    # The number of Safe-held NFPM NFTs fully enumerated as empty for this
+    # attempt. Later in-attempt rebuilds may reuse that proof only while the
+    # NFPM balanceOf count remains unchanged.
+    empty_nfpm_position_count: Annotated[int, Field(ge=0)]
     # The Base gas price observed before building.
     gas_price_wei: Annotated[int, Field(ge=0)]
     # The Safe ETH balance observed before building.
@@ -1435,6 +1444,7 @@ class _LpMintContext:
         inventory: SafeInventory,
         width_spacings: int,
         caps: list[str],
+        empty_position_count: int,
     ) -> None:
         """Bind the resolved context fields.
 
@@ -1444,12 +1454,15 @@ class _LpMintContext:
             inventory: The Safe's live token inventory.
             width_spacings: The already-narrowed explicit half width.
             caps: The enforced-cap labels accumulated so far.
+            empty_position_count: Safe-held NFPM NFTs proven to carry no
+                liquidity or owed tokens.
         """
         self.listing = listing
         self.observation = observation
         self.inventory = inventory
         self.width_spacings = width_spacings
         self.caps = caps
+        self.empty_position_count = empty_position_count
 
 
 class _LpPositionContext:
@@ -1863,6 +1876,7 @@ class LpLifecycleExecutor:
             total_build_ms += initial_build.build_duration_ms
             current_build = initial_build
             current_steps = initial_steps
+            known_empty_position_count = initial_build.empty_nfpm_position_count
 
             swap_index = next(
                 (
@@ -1899,8 +1913,10 @@ class LpLifecycleExecutor:
                     ephemeral_key,
                     ExecutionMode.EXECUTE,
                     inventory_only=True,
+                    known_empty_position_count=known_empty_position_count,
                 )
                 total_build_ms += current_build.build_duration_ms
+                known_empty_position_count = current_build.empty_nfpm_position_count
                 if current_build.plan.balancing_swap.required:
                     error = LpExecutionRefusalError(
                         LpExecutionRefusalCode.POST_SWAP_REBALANCE_REQUIRED,
@@ -1965,52 +1981,136 @@ class LpLifecycleExecutor:
                 file=sys.stderr,
                 flush=True,
             )
-            final_build, final_steps = self._build_mint_attempt(
-                symbol,
-                current_build.plan.budget_usdc,
-                width_spacings,
-                key_bytes,
-                ephemeral_key,
-                ExecutionMode.EXECUTE,
-                inventory_only=True,
-                confirmed_nfpm_usdc_allowance_floor=confirmed_usdc_floor,
-                confirmed_nfpm_stock_allowance_floor=confirmed_stock_floor,
-                buffer_nfpm_approvals=False,
-            )
-            total_build_ms += final_build.build_duration_ms
-            if final_build.plan.balancing_swap.required:
-                error = LpExecutionRefusalError(
-                    LpExecutionRefusalCode.POST_SWAP_REBALANCE_REQUIRED,
-                    "the final post-approval price read requires another market rebalance; "
-                    "preserving inventory for the next cycle instead of churning twice",
+            psc_retries = 0
+            final_build = current_build
+            for rebuild_round in range(1, FINAL_MINT_REBUILD_ROUNDS + 1):
+                final_build, final_steps = self._build_mint_attempt(
+                    symbol,
+                    current_build.plan.budget_usdc,
+                    width_spacings,
+                    key_bytes,
+                    ephemeral_key,
+                    ExecutionMode.EXECUTE,
+                    inventory_only=True,
+                    confirmed_nfpm_usdc_allowance_floor=confirmed_usdc_floor,
+                    confirmed_nfpm_stock_allowance_floor=confirmed_stock_floor,
+                    buffer_nfpm_approvals=True,
+                    known_empty_position_count=known_empty_position_count,
                 )
-                error.completed_steps = completed_reports
-                raise error
-            if tuple(step.report.role for step in final_steps) != (LpExecutionRole.MINT,):
-                error = LpExecutionRefusalError(
-                    LpExecutionRefusalCode.POST_APPROVAL_REBUILD_REQUIRED,
-                    "the final post-approval rebuild requires another approval before mint; "
-                    "refusing another delay and preserving inventory for the next cycle",
-                )
-                error.completed_steps = completed_reports
-                raise error
+                total_build_ms += final_build.build_duration_ms
+                known_empty_position_count = final_build.empty_nfpm_position_count
+                if final_build.plan.balancing_swap.required:
+                    error = LpExecutionRefusalError(
+                        LpExecutionRefusalCode.POST_SWAP_REBALANCE_REQUIRED,
+                        "the final mint rebuild requires another market rebalance; preserving "
+                        "inventory for the next cycle instead of churning twice",
+                    )
+                    error.completed_steps = completed_reports
+                    raise error
 
-            mint_reports, halted_reason = self._execute_steps("mint", final_steps, key_bytes)
-            completed_reports += mint_reports
-            built_history.extend(final_steps)
-            authoritative_build = final_build.model_copy(
-                update={
-                    "transactions": tuple(step.report for step in built_history),
-                    "build_duration_ms": total_build_ms,
-                }
+                mint_index = next(
+                    (
+                        index
+                        for index, step in enumerate(final_steps)
+                        if step.report.role == LpExecutionRole.MINT
+                    ),
+                    None,
+                )
+                if mint_index is None:
+                    raise RuntimeError("the final mint rebuild carried no NFPM mint step")
+                final_prerequisites = final_steps[:mint_index]
+                unexpected = tuple(
+                    step.report.role
+                    for step in final_prerequisites
+                    if step.report.role
+                    not in {
+                        LpExecutionRole.NFPM_USDC_ALLOWANCE,
+                        LpExecutionRole.NFPM_STOCK_ALLOWANCE,
+                    }
+                )
+                if unexpected:
+                    raise RuntimeError(
+                        "the final mint rebuild carried unexpected prerequisite roles "
+                        f"{unexpected}"
+                    )
+                if final_prerequisites:
+                    approval_reports, halted_reason = self._execute_steps(
+                        "mint", final_prerequisites, key_bytes
+                    )
+                    completed_reports += approval_reports
+                    built_history.extend(final_prerequisites)
+                    if halted_reason:
+                        return LpActionExecutionReport(
+                            action="mint",
+                            build=final_build,
+                            steps=completed_reports,
+                            completed=False,
+                            halted_reason=halted_reason,
+                        )
+                    for step in final_prerequisites:
+                        if step.report.role == LpExecutionRole.NFPM_USDC_ALLOWANCE:
+                            confirmed_usdc_floor = max(
+                                confirmed_usdc_floor, approval_amount(step)
+                            )
+                        elif step.report.role == LpExecutionRole.NFPM_STOCK_ALLOWANCE:
+                            confirmed_stock_floor = max(
+                                confirmed_stock_floor, approval_amount(step)
+                            )
+                    print(
+                        "[mint] final rebuild changed composition enough to need a fresh "
+                        f"approval; rebuilding again ({rebuild_round}/"
+                        f"{FINAL_MINT_REBUILD_ROUNDS})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+
+                mint_steps = final_steps[mint_index:]
+                if tuple(step.report.role for step in mint_steps) != (LpExecutionRole.MINT,):
+                    raise RuntimeError("the final mint tail was not exactly one mint step")
+                try:
+                    mint_reports, halted_reason = self._execute_steps(
+                        "mint", mint_steps, key_bytes
+                    )
+                except LpExecutionRefusalError as error:
+                    if (
+                        error.code is LpExecutionRefusalCode.ESTIMATE_REVERTED
+                        and "PSC" in str(error)
+                        and psc_retries < FINAL_MINT_PSC_RETRIES
+                    ):
+                        psc_retries += 1
+                        print(
+                            "[mint] execute-time PSC after a fresh build; rereading pool "
+                            f"state and retrying the final mint ({psc_retries}/"
+                            f"{FINAL_MINT_PSC_RETRIES})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+                    raise
+                completed_reports += mint_reports
+                built_history.extend(mint_steps)
+                authoritative_build = final_build.model_copy(
+                    update={
+                        "transactions": tuple(step.report for step in built_history),
+                        "build_duration_ms": total_build_ms,
+                    }
+                )
+                return LpActionExecutionReport(
+                    action="mint",
+                    build=authoritative_build,
+                    steps=completed_reports,
+                    completed=halted_reason == "",
+                    halted_reason=halted_reason,
+                )
+
+            error = LpExecutionRefusalError(
+                LpExecutionRefusalCode.POST_APPROVAL_REBUILD_REQUIRED,
+                "the bounded final-mint rebuild loop exhausted before one stable mint "
+                "could estimate and execute; preserving inventory for the next cycle",
             )
-            return LpActionExecutionReport(
-                action="mint",
-                build=authoritative_build,
-                steps=completed_reports,
-                completed=halted_reason == "",
-                halted_reason=halted_reason,
-            )
+            error.completed_steps = completed_reports
+            raise error
         except (LpExecutionRefusalError, LpPlanRefusalError) as error:
             previous = tuple(getattr(error, "completed_steps", ()))
             if completed_reports and not previous:
@@ -2336,10 +2436,15 @@ class LpLifecycleExecutor:
         confirmed_nfpm_usdc_allowance_floor: int = 0,
         confirmed_nfpm_stock_allowance_floor: int = 0,
         buffer_nfpm_approvals: bool = True,
+        known_empty_position_count: int | None = None,
     ) -> tuple[LpMintDryRunReport, tuple[_BuiltLpStep, ...]]:
         """Build, sign, validate, and estimate the complete mint sequence."""
         build_started = self._timer()
-        context = self._resolve_mint_context(symbol, width_spacings)
+        context = self._resolve_mint_context(
+            symbol,
+            width_spacings,
+            known_empty_position_count=known_empty_position_count,
+        )
         plan = self._plan_from_context(context, budget_usdc)
         if inventory_only and plan.balancing_swap.required:
             observation = context.observation
@@ -2419,6 +2524,7 @@ class LpLifecycleExecutor:
             router_usdc_allowance_units=router_allowance,
             nfpm_usdc_allowance_units=nfpm_usdc_allowance,
             nfpm_stock_allowance_units=nfpm_stock_allowance,
+            empty_nfpm_position_count=context.empty_position_count,
             gas_price_wei=gas_price,
             safe_eth_wei=safe_eth,
             transactions=tuple(step.report for step in built_steps),
@@ -3529,7 +3635,15 @@ class LpLifecycleExecutor:
                 description=f"burn the emptied position NFT {token_id}",
             )
         )
-        mint_context = _LpMintContext(context.listing, observation, inventory, width_spacings, caps)
+        empty_position_count = sum(1 for held_position in held if not held_position.live)
+        mint_context = _LpMintContext(
+            context.listing,
+            observation,
+            inventory,
+            width_spacings,
+            caps,
+            empty_position_count,
+        )
         steps.extend(
             self._compose_mint_steps(
                 mint_context,
@@ -4151,12 +4265,23 @@ class LpLifecycleExecutor:
             ) from error
         return tuple(held)
 
-    def _resolve_mint_context(self, symbol: str, width_spacings: int | None) -> _LpMintContext:
+    def _resolve_mint_context(
+        self,
+        symbol: str,
+        width_spacings: int | None,
+        *,
+        known_empty_position_count: int | None = None,
+    ) -> _LpMintContext:
         """Resolve one mint to its observation, inventory, and shared gates.
 
         Args:
             symbol: The registry-matched B20 stock symbol.
             width_spacings: The explicit half width in tick spacings per side.
+            known_empty_position_count: Within one execute_mint call, the count
+                of Safe-held NFPM NFTs already fully enumerated as empty. When
+                the live NFPM balanceOf count is unchanged, swap/approval-only
+                predecessors cannot have changed those NFTs, so the expensive
+                per-token positions() scan can be reused safely.
 
         Returns:
             The resolved context carrying every gate label enforced so far.
@@ -4181,27 +4306,61 @@ class LpLifecycleExecutor:
             else observation.token1_address
         )
         stock_balance = self._rpc.fetch_token_balance(stock_token, self._safe_address)
-        # The total-exposure cap stays honest by refusing once the Safe holds
-        # LIVE untracked positions this executor cannot value; empty residual
-        # NFTs carry no exposure and no longer block entry.
-        held = self._enumerate_held_positions(observation)
-        live_untracked = [position.token_id for position in held if position.live]
-        if live_untracked:
-            raise LpExecutionRefusalError(
-                LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS,
-                f"the Safe holds {len(live_untracked)} live untracked position NFT(s) "
-                f"(token ids {', '.join(str(token) for token in live_untracked)}) on this "
-                "NFPM, so the total pilot exposure cap cannot be evaluated honestly; "
-                "refuse until they are reconciled or exited",
+
+        held: tuple[LpHeldPosition, ...] | None = None
+        empty_position_count = 0
+        reused_empty_scan = False
+        if known_empty_position_count is not None:
+            live_count = self._read_word(
+                observation.nfpm_address,
+                self._erc20_balance_calldata(self._safe_address),
+                "NFPM balanceOf()",
             )
-        if held:
-            caps.append(
-                f"Safe holds {len(held)} empty residual NFT(s) on this NFPM carrying no exposure"
-            )
-        else:
-            caps.append("Safe holds no untracked position NFTs on this NFPM")
+            if live_count == known_empty_position_count:
+                empty_position_count = live_count
+                reused_empty_scan = True
+                caps.append(
+                    f"Safe NFPM balance remains {live_count}, matching the fully-enumerated "
+                    "empty residual set from this mint attempt"
+                )
+            else:
+                caps.append(
+                    f"Safe NFPM balance changed from {known_empty_position_count} to "
+                    f"{live_count}; rerunning full held-position enumeration"
+                )
+
+        if not reused_empty_scan:
+            # The total-exposure cap stays honest by refusing once the Safe
+            # holds LIVE untracked positions this executor cannot value; empty
+            # residual NFTs carry no exposure and no longer block entry.
+            held = self._enumerate_held_positions(observation)
+            live_untracked = [position.token_id for position in held if position.live]
+            if live_untracked:
+                raise LpExecutionRefusalError(
+                    LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS,
+                    f"the Safe holds {len(live_untracked)} live untracked position NFT(s) "
+                    f"(token ids {', '.join(str(token) for token in live_untracked)}) on this "
+                    "NFPM, so the total pilot exposure cap cannot be evaluated honestly; "
+                    "refuse until they are reconciled or exited",
+                )
+            empty_position_count = len(held)
+            if held:
+                caps.append(
+                    f"Safe holds {len(held)} empty residual NFT(s) on this NFPM carrying "
+                    "no exposure"
+                )
+            else:
+                caps.append("Safe holds no untracked position NFTs on this NFPM")
+
         inventory = SafeInventory(usdc_units=usdc_balance, stock_units=stock_balance)
-        return _LpMintContext(listing, observation, inventory, width_spacings, caps)
+        return _LpMintContext(
+            listing,
+            observation,
+            inventory,
+            width_spacings,
+            caps,
+            empty_position_count,
+        )
 
     def _plan_from_context(self, context: _LpMintContext, budget_usdc: Decimal) -> LpMintPlan:
         """Run the pure planner over one resolved mint context.
@@ -4768,11 +4927,12 @@ class LpLifecycleExecutor:
                     break
                 self._sleep(EXECUTE_ESTIMATE_LAG_RETRY_SECONDS)
         if gas_estimate is None:
+            diagnostic = self._diagnose_estimate_inner_call(step)
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.ESTIMATE_REVERTED,
                 f"the fresh on-chain estimate for the {role.value} transaction reverted "
-                f"with every predecessor mined: {estimate_error}; stopping honestly at "
-                "the completed prefix",
+                f"with every predecessor mined: {estimate_error}; {diagnostic}; stopping "
+                "honestly at the completed prefix",
             )
         estimate_ms = Decimal(self._milliseconds_since(estimate_started))
 
@@ -4962,6 +5122,51 @@ class LpLifecycleExecutor:
             diagnostic=diagnostic,
         )
 
+    def _diagnose_estimate_inner_call(self, step: _BuiltLpStep) -> str:
+        """Replay an estimate-time GS013/outer revert as the exact inner Safe call.
+
+        Execute-time estimation happens before a receipt exists, so anchor the
+        read-only replay at the current canonical block and its parent.  This
+        exposes the underlying target revert whenever the Safe wrapper only
+        reports a generic outer failure.
+        """
+        try:
+            block_number = self._rpc.fetch_block_number()
+        except Exception as error:  # diagnostics must never mask the primary refusal
+            return f"inner-call replay unavailable because the head block is unreadable: {error}"
+        observations: list[tuple[str, str]] = []
+        for label, number in (
+            ("current block", block_number),
+            ("parent block", max(block_number - 1, 0)),
+        ):
+            try:
+                self._rpc.eth_call_from_at(
+                    self._safe_address,
+                    step.transaction.to_address,
+                    step.transaction.data,
+                    hex(number),
+                    step.transaction.value_wei,
+                )
+            except ExecutorRpcRevertError as error:
+                detail = (
+                    decode_evm_revert_data(error.revert_data)
+                    if error.revert_data
+                    else str(error)
+                )
+                observations.append((label, detail[:500]))
+            except Exception as error:  # diagnostics must never mask the primary refusal
+                observations.append((label, f"diagnostic replay unavailable: {error}"[:500]))
+            else:
+                observations.append((label, "inner replay succeeded"))
+        first = observations[0][1]
+        second = observations[1][1]
+        if first == second:
+            return f"inner-call replay at current and parent block agrees: {first}"
+        return (
+            f"inner-call replay is state-sensitive: {observations[0][0]} -> {first}; "
+            f"{observations[1][0]} -> {second}"
+        )
+
     def _diagnose_failed_inner_call(self, step: _BuiltLpStep, block_number: int) -> str:
         """Replay a reverted Safe inner call read-only and summarize its revert evidence.
 
@@ -4990,7 +5195,7 @@ class LpLifecycleExecutor:
                     else str(error)
                 )
                 observations.append((label, detail[:500]))
-            except ExecutionUnavailableError as error:
+            except Exception as error:  # diagnostics must never mask the primary refusal
                 observations.append((label, f"diagnostic replay unavailable: {error}"[:500]))
             else:
                 observations.append((label, "inner replay succeeded"))

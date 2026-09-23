@@ -823,8 +823,9 @@ def assemble_board(
         )
     if not any(listing.symbol in reference_prices for listing in listings):
         notes.append(
-            "no live real-market reference quote is wired yet; every entry blocks "
-            "fail-closed as reference_stale unless per-symbol quotes are injected"
+            "no live real-market reference quote is wired yet; scheduled selector mode "
+            "treats external references as diagnostic-only and uses each resolved "
+            "Aerodrome pool's on-chain state for actions"
         )
     notes.append(
         "fee APR stays zero because a live fee-evidence window needs the "

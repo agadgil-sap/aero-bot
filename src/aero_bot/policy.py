@@ -991,7 +991,16 @@ class PolicyEngine:
         Returns:
             The safe replacement-mint size and any resizing diagnostic.
         """
-        depth_cap = observation.pool_depth_usd * self._parameters.max_position_depth_fraction
+        # Recenter removes our own concentrated liquidity before the replacement
+        # mint lands.  Reserve additional headroom so the replacement budget is
+        # safe against that self-induced depth drop plus small intervening moves.
+        # Selector observations already carry their independent 10% headroom.
+        post_exit_depth_headroom = Decimal("0.70")
+        depth_cap = (
+            observation.pool_depth_usd
+            * self._parameters.max_position_depth_fraction
+            * post_exit_depth_headroom
+        )
         size_usd = min(position.committed_usd, depth_cap)
         if size_usd < position.committed_usd:
             return size_usd, (

@@ -883,7 +883,25 @@ class CycleRunner:
                 reference_prices_by_symbol or {},
             )
             outcome = decision_report.outcome
-            if mode is CycleMode.LIVE and outcome.decision.action is not PolicyActionKind.HOLD:
+            if (
+                mode is CycleMode.LIVE
+                and outcome.decision.action is PolicyActionKind.HOLD
+                and book.position is not None
+                and not reconciliation.tracked_staked
+            ):
+                if self._executor is None or key_bytes is None:
+                    raise ValueError("a live cycle requires its signing key and executor")
+                actions, halted_reason = self._recover_unstaked_position(book, key_bytes)
+                final_reconciliation_verified = self._await_post_action_visibility(tuple(actions))
+                if not final_reconciliation_verified and not halted_reason:
+                    target = max(
+                        (action.confirmed_block_number or 0 for action in actions), default=0
+                    )
+                    halted_reason = (
+                        "post-action stake recovery is unverified because the primary RPC "
+                        f"did not reach confirmed block {target} within the bounded wait"
+                    )
+            elif mode is CycleMode.LIVE and outcome.decision.action is not PolicyActionKind.HOLD:
                 if self._executor is None or key_bytes is None:
                     raise ValueError("a live cycle requires its signing key and executor")
                 actions, halted_reason, book = self._act(
@@ -899,6 +917,19 @@ class CycleRunner:
                         f"did not reach confirmed block {target} within the bounded wait"
                     )
             final_reconciliation = self._reconcile(book)
+            stake_recovery_completed = any(
+                action.action == "stake_recovery" and action.status == "completed"
+                for action in actions
+            )
+            if (
+                stake_recovery_completed
+                and not final_reconciliation.tracked_staked
+                and not halted_reason
+            ):
+                halted_reason = (
+                    "stake recovery was confirmed but final reconciliation still sees the "
+                    "tracked NFT unstaked; leaving the cycle fail-closed for the next retry"
+                )
             if not final_reconciliation_verified:
                 final_reconciliation = final_reconciliation.model_copy(
                     update={
@@ -1019,6 +1050,11 @@ class CycleRunner:
                     f"{tracked_status.position_value_usdc} USDC against "
                     f"{tracked.committed_usd} committed"
                 )
+                if not tracked_staked:
+                    diagnostics.append(
+                        f"tracked position {tracked.token_id} is unstaked in the Safe; "
+                        "a live HOLD cycle will attempt bounded stake recovery before returning"
+                    )
             untracked_live = tuple(token for token in live_ids if token != tracked.token_id)
             if untracked_live and not out_of_band:
                 out_of_band = (
@@ -1646,6 +1682,73 @@ class CycleRunner:
     # ------------------------------------------------------------------
     # Action
     # ------------------------------------------------------------------
+
+    def _recover_unstaked_position(
+        self,
+        book: CycleStateBook,
+        key_bytes: bytes,
+    ) -> tuple[list[CycleActionRecord], str]:
+        """Restake a valid tracked NFT left in the Safe after a partial prior cycle.
+
+        This recovery is intentionally narrow: reconciliation already proved the
+        tracked token is owned by the Safe (not a stranger), the policy verdict is
+        HOLD, and no normal policy action needs the NFT unstaked.  The existing
+        audited stake executor remains the only broadcast surface.
+        """
+        executor = self._executor
+        assert executor is not None  # noqa: S101 - live run validated the boundary
+        tracked = book.position
+        if tracked is None:
+            return [], "stake recovery requested while no position is tracked"
+        try:
+            report = executor.execute_stake(
+                tracked.symbol,
+                tracked.token_id,
+                key_bytes,
+                confirm_broadcast=True,
+            )
+        except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+            code = str(getattr(error, "code", "plan_refused"))
+            completed_steps = tuple(getattr(error, "completed_steps", ()))
+            hashes = tuple(step.transaction_hash for step in completed_steps)
+            fees = sum(step.fee_wei or 0 for step in completed_steps)
+            blocks = tuple(
+                int(step.block_number)
+                for step in completed_steps
+                if step.status == "confirmed" and getattr(step, "block_number", None) is not None
+            )
+            return [
+                CycleActionRecord(
+                    action="stake_recovery",
+                    status="refused",
+                    transaction_hashes=hashes,
+                    fee_wei=fees,
+                    confirmed_block_number=max(blocks) if blocks else None,
+                    refusal_code=code,
+                    diagnostic=str(error),
+                )
+            ], f"the stake recovery action refused [{code}]"
+        except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
+            return [
+                CycleActionRecord(
+                    action="stake_recovery",
+                    status="failed",
+                    diagnostic=str(error),
+                )
+            ], f"the stake recovery action failed: {error}"
+        hashes, fees, confirmed_block = _action_hashes_fees_and_block(report)
+        completed = _action_completed(report)
+        record = CycleActionRecord(
+            action="stake_recovery",
+            status="completed" if completed else "failed",
+            transaction_hashes=hashes,
+            fee_wei=fees,
+            confirmed_block_number=confirmed_block,
+            diagnostic=report.halted_reason,
+        )
+        if not completed:
+            return [record], f"the stake recovery action halted: {report.halted_reason}"
+        return [record], ""
 
     def _act(  # noqa: PLR0915, PLR0912 - one fixed policy mapping, explicit branches
         self,
