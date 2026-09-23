@@ -38,6 +38,7 @@ sudo install -o aero-bot -g aero-bot -m 600 /dev/null /etc/aero-bot/signing-key.
 sudoedit /etc/aero-bot/signing-key.hex   # paste the 64-hex key, no 0x needed
 sudoedit /etc/aero-bot/cycle.env         # Safe + relayer addresses are pre-filled;
                                          # add the alert provider credentials
+sudoedit /etc/aero-bot/daily-report.env  # the Resend overlay for the daily report
 sudoedit /etc/aero-bot/backup.env        # openssl rand -hex 32 + git remote + deploy key
 sudo install -o aero-bot -g aero-bot -m 600 <deploy-key> /etc/aero-bot/backup-deploy.key
 ```
@@ -51,10 +52,11 @@ Discipline, enforced in code: the key file refuses any group/other permission bi
 ```bash
 sudo systemctl enable --now aero-bot-dashboard.service
 sudo systemctl enable --now aero-bot-cycle@auto.timer aero-bot-audit-backup.timer
+sudo systemctl enable --now aero-bot-daily-report.timer
 systemctl list-timers | grep aero-bot
 ```
 
-The production selector timer uses `aero-bot-cycle@auto.timer`; pin a pool such as `@AAPLc.timer` only for an explicit operator override. The timer cadence is set by the installed template/drop-ins. The backup runs daily. Cycles are hardened oneshots: they never overlap, never auto-retry - the next tick reconciles.
+The production selector timer uses `aero-bot-cycle@auto.timer`; pin a pool such as `@AAPLc.timer` only for an explicit operator override. The timer cadence is set by the installed template/drop-ins. The backup runs daily, and the daily report (one dry selector cycle whose summary email is the captain's portfolio report - see [the alerts documentation](docs/alerts.md)) fires at 09:00 Melbourne and stays dark until `/etc/aero-bot/daily-report.env` is sealed. Cycles are hardened oneshots: they never overlap, never auto-retry - the next tick reconciles.
 
 The range watchtower ships dark and arms separately, on its own explicit decision: set `AERO_BOT_WATCHTOWER_ENABLED=1` in `/etc/aero-bot/cycle.env`, then `sudo systemctl enable --now aero-bot-watchtower@AAPLc.service`.
 See [the watchtower documentation](docs/watchtower.md) for the trip semantics, the fail-safe posture, and the day-two triage.

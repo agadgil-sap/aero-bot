@@ -1,0 +1,33 @@
+[Unit]
+Description=Aero Bot daily Resend portfolio report
+Documentation=file:/opt/aero-bot/docs/alerts.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/aero-bot/daily-report.env
+
+[Service]
+Type=oneshot
+User=aero-bot
+Group=aero-bot
+# The report rides the cycle's own alert transport: cycle.env carries the
+# common sealed surface, daily-report.env overlays the Resend credentials
+# and the reporting recipient. Nothing secret is ever stored here.
+EnvironmentFile=/etc/aero-bot/cycle.env
+EnvironmentFile=/etc/aero-bot/daily-report.env
+Environment=HOME=/var/lib/aero-bot
+WorkingDirectory=/var/lib/aero-bot
+StateDirectory=aero-bot
+StateDirectoryMode=0700
+Environment=UMASK=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aero-bot
+# A dry cycle on a cold pool pin can pay one full Sugar sweep; the live
+# 1800 s ceiling keeps the report from timing out mid-enumeration.
+TimeoutStartSec=1800
+ExecStart=/opt/aero-bot/.venv/bin/aero-bot-cycle --symbol auto --dry-run --json
+# A failed report retries on the next daily tick; the cycle's own email
+# hook stays the operational signal.
+Restart=no

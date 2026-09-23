@@ -153,6 +153,19 @@ EOF
     chown root:"${SERVICE_USER}" "${CONFIG_DIR}/cycle.env"
     chmod 0640 "${CONFIG_DIR}/cycle.env"
 fi
+if [[ ! -f "${CONFIG_DIR}/daily-report.env" ]]; then
+    cat >"${CONFIG_DIR}/daily-report.env" <<'EOF'
+# Aero Bot daily-report environment - seal real values here (mode 0640).
+# The daily-report unit overlays this onto cycle.env: the Resend transport
+# (see docs/alerts.md) and the reporting recipient live here, while the
+# cycle's own alert routing stays in cycle.env.
+#AERO_BOT_ALERT_PROVIDER=resend
+#AERO_BOT_ALERT_RESEND_API_KEY=<sealed>
+#AERO_BOT_ALERT_TO=capn@example.com
+EOF
+    chown root:"${SERVICE_USER}" "${CONFIG_DIR}/daily-report.env"
+    chmod 0640 "${CONFIG_DIR}/daily-report.env"
+fi
 if [[ ! -f "${CONFIG_DIR}/backup.env" ]]; then
     cat >"${CONFIG_DIR}/backup.env" <<'EOF'
 # Aero Bot audit-backup environment - seal real values here (mode 0600).
@@ -195,6 +208,6 @@ log "install complete"
 log "units installed (NOT enabled - Phase 2 arms them after secrets and funding):"
 ls -1 "${REPO_ROOT}/deploy/systemd/" | sed 's/^/  /'
 log "next steps, in order - see docs/deployment.md:"
-log "  1. seal the real values into ${CONFIG_DIR}/cycle.env and backup.env"
+log "  1. seal the real values into ${CONFIG_DIR}/cycle.env, daily-report.env, and backup.env"
 log "  2. run the smoke checklist (docs/deployment.md)"
 log "  3. arm one cycle timer: aero-bot-cycle@auto.timer for dynamic B20 selection, or @AAPLc.timer to pin Apple; also arm aero-bot-audit-backup.timer"

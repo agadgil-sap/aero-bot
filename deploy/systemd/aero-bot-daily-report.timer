@@ -1,0 +1,15 @@
+[Unit]
+Description=Send one Aero Bot Resend report per day
+Documentation=file:/opt/aero-bot/docs/alerts.md
+
+[Timer]
+# One portfolio report each Melbourne morning; drop-ins override OnCalendar
+# for a different cadence (systemctl edit aero-bot-daily-report.timer).
+OnCalendar=*-*-* 09:00:00 Australia/Melbourne
+# A missed start (host asleep or down) sends the report promptly on wake.
+Persistent=true
+AccuracySec=1m
+Unit=aero-bot-daily-report.service
+
+[Install]
+WantedBy=timers.target

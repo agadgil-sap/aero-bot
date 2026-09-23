@@ -49,6 +49,7 @@ class TestInstallScript:
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
         assert 'chown root:"${SERVICE_USER}" "${CONFIG_DIR}/cycle.env"' in text
         assert 'chmod 0640 "${CONFIG_DIR}/cycle.env"' in text
+        assert 'chmod 0640 "${CONFIG_DIR}/daily-report.env"' in text
         assert 'chmod 0640 "${CONFIG_DIR}/backup.env"' in text
 
     def test_the_config_dir_is_service_group_traversable(self) -> None:
@@ -73,6 +74,7 @@ class TestInstallScript:
         """Idempotence never overwrites the operator's sealed values."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
         assert '[[ ! -f "${CONFIG_DIR}/cycle.env" ]]' in text
+        assert '[[ ! -f "${CONFIG_DIR}/daily-report.env" ]]' in text
         assert '[[ ! -f "${CONFIG_DIR}/backup.env" ]]' in text
 
     def test_the_venv_builds_locked_and_dev_free(self) -> None:
@@ -125,9 +127,44 @@ class TestDashboardUnit:
             "aero-bot-audit-backup.timer",
             "aero-bot-cycle@.service",
             "aero-bot-cycle@.timer",
+            "aero-bot-daily-report.service",
+            "aero-bot-daily-report.timer",
             "aero-bot-dashboard.service",
             "aero-bot-watchtower@.service",
         ]
+
+
+class TestDailyReportUnit:
+    """The daily Resend report rides the cycle's alert transport."""
+
+    def test_the_report_runs_one_dry_cycle_under_the_sealed_overlay(self) -> None:
+        """The report is the cycle's dry-run surface over both env files."""
+        service = Path("deploy/systemd/aero-bot-daily-report.service").read_text(encoding="utf-8")
+        assert "Type=oneshot" in service
+        assert "EnvironmentFile=/etc/aero-bot/cycle.env" in service
+        assert "EnvironmentFile=/etc/aero-bot/daily-report.env" in service
+        assert "ConditionPathExists=/etc/aero-bot/daily-report.env" in service
+        assert (
+            "ExecStart=/opt/aero-bot/.venv/bin/aero-bot-cycle --symbol auto --dry-run --json"
+            in (service)
+        )
+        assert "TimeoutStartSec=1800" in service
+
+    def test_the_report_is_hardened_like_every_oneshot(self) -> None:
+        """The report carries the kit's standard hardening posture."""
+        service = Path("deploy/systemd/aero-bot-daily-report.service").read_text(encoding="utf-8")
+        assert "NoNewPrivileges=true" in service
+        assert "ProtectSystem=strict" in service
+        assert "ProtectHome=true" in service
+        assert "ReadWritePaths=/var/lib/aero-bot" in service
+        assert "StateDirectoryMode=0700" in service
+
+    def test_the_timer_fires_one_melbourne_morning_report(self) -> None:
+        """One report per day at 09:00 Melbourne, catching up after downtime."""
+        timer = Path("deploy/systemd/aero-bot-daily-report.timer").read_text(encoding="utf-8")
+        assert "OnCalendar=*-*-* 09:00:00 Australia/Melbourne" in timer
+        assert "Persistent=true" in timer
+        assert "Unit=aero-bot-daily-report.service" in timer
 
 
 class TestDeploymentDoc:

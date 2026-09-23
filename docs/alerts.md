@@ -37,3 +37,7 @@ Both floors default above the executor's own hard floors: 0.0005 ETH of relayer 
 ## Wiring
 
 `aero-bot-cycle` calls the hook automatically after printing its report, in dry runs and live cycles alike. The systemd unit's sealed environment file carries the provider variables; the deployment guide's smoke checklist includes one forced test email before the captain leaves.
+
+## The daily report
+
+Beyond the per-cycle emails, the kit ships `aero-bot-daily-report.timer`: one dry selector-mode cycle each morning (09:00 Melbourne by default) whose summary email - sent through the same transport, typically Resend with `AERO_BOT_ALERT_PROVIDER=resend` sealed in `/etc/aero-bot/daily-report.env` overlaid on `cycle.env` - serves as the captain's daily portfolio report. The unit runs the identical `aero-bot-cycle --symbol auto --dry-run --json` surface, so the report is exactly what a manual dry run prints, and it stays dark until the overlay file is sealed (`ConditionPathExists`).
