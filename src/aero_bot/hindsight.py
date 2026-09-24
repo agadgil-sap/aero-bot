@@ -348,6 +348,56 @@ def _bad_outcome_followed(
     return False
 
 
+def _grounded_timeline(episodes: Sequence[TeacherEpisode]) -> list[TeacherEpisode]:
+    """Sort the fact-carrying episodes into the chronological timeline.
+
+    Args:
+        episodes: The corpus's episodes in any order.
+
+    Returns:
+        The grounded episodes oldest first; episodes carry ``created_at`` at
+        pass start but append at pass end, so overlapping passes can land
+        out of timestamp order - file order is never chronology.
+    """
+    return sorted(
+        (episode for episode in episodes if episode.facts is not None),
+        key=lambda episode: episode.created_at,
+    )
+
+
+def episode_verdicts(
+    episodes: Sequence[TeacherEpisode],
+    horizon_hours: float,
+    now: datetime | None = None,
+) -> tuple[tuple[TeacherEpisode, bool | None], ...]:
+    """Compute every grounded episode's bad-outcome verdict, oldest first.
+
+    The verdict is the truth rule applied to one episode: did any later
+    grounded episode within the horizon observe a negative day P&L or a
+    higher halted-cycle count than the episode's own baseline. This is the
+    public export the upgrade loop's divergence digest consumes; the
+    scorer's own desk scores derive from the same computation.
+
+    Args:
+        episodes: The corpus's episodes, oldest first.
+        horizon_hours: How many hours ahead a read may be scored against.
+        now: The pass's reference time; None reads the clock.
+
+    Returns:
+        One ``(episode, verdict)`` pair per grounded episode in
+        chronological order: True when a bad outcome followed inside the
+        horizon, False when the horizon drained with only quiet
+        observations, None while the read stays pending.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    horizon = timedelta(hours=horizon_hours)
+    grounded = _grounded_timeline(episodes)
+    return tuple(
+        (episode, _bad_outcome_followed(episode, grounded[index + 1 :], horizon, moment))
+        for index, episode in enumerate(grounded)
+    )
+
+
 def _score_desk(
     desk: str,
     reads: Sequence[DeskRead],
@@ -428,19 +478,11 @@ def score_corpus(
         The complete scored report.
     """
     moment = now if now is not None else datetime.now(UTC)
-    horizon = timedelta(hours=horizon_hours)
-    # Episodes carry created_at at pass start but append at pass end, so
-    # overlapping passes can land out of timestamp order; the timeline is
-    # the grounded episodes sorted by their own clocks, never file order.
-    grounded = sorted(
-        (episode for episode in episodes if episode.facts is not None),
-        key=lambda episode: episode.created_at,
-    )
-    verdicts: dict[int, bool | None] = {}
-    for index, episode in enumerate(grounded):
-        verdicts[id(episode)] = _bad_outcome_followed(
-            episode, grounded[index + 1 :], horizon, moment
-        )
+    # One shared computation feeds both the desk scores and any consumer
+    # (the upgrade digest) asking for the same truth.
+    scored = episode_verdicts(episodes, horizon_hours, moment)
+    grounded = [episode for episode, _ in scored]
+    verdicts: dict[int, bool | None] = {id(episode): verdict for episode, verdict in scored}
     desks: list[HindsightDeskScore] = []
     for seat in TeacherSeatName:
         desks.append(_score_desk(seat.value, collect_reads(episodes, seat), verdicts))
@@ -630,6 +672,7 @@ __all__ = [
     "HindsightScoreboard",
     "UNASKED_REASONS",
     "collect_reads",
+    "episode_verdicts",
     "main",
     "print_report",
     "resolve_corpus_dir",

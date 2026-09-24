@@ -100,6 +100,6 @@ Generate the four user agents from the Mac checkout:
 bash deploy/launchd/install-mac.sh
 ```
 
-The installer writes `com.aero-bot.teacher-{tactical,daily,news,hindsight}.plist` into `~/Library/LaunchAgents` and never loads them; arming each job is the operator's own `launchctl bootstrap` line (printed by the installer, documented in the teacher guide).
+The installer writes `com.aero-bot.teacher-{tactical,daily,news,hindsight,upgrade}.plist` into `~/Library/LaunchAgents` and never loads them; arming each job is the operator's own `launchctl bootstrap` line (printed by the installer, documented in the teacher guide).
 Because launchd user agents cannot read macOS's TCC-protected folders, the installer also maintains a stateless worktree at `~/.local/state/aero-bot/teacher/repo` (recreated from the checkout's HEAD on every install) and points the agents at it - see the teacher guide for the full story.
 The `gcloud` credential the pull rides is the operator's own login on the Mac.

@@ -176,3 +176,61 @@ Residual accepted and named: the reviewer noted a repeated identical episode obj
 - Turn 4 (hindsight delta): findings 7, 8, 9, 10 fixed; one named residual (id() aliasing under direct-API misuse).
 - No finding was dismissed without either a fix or a written threat-model rationale.
 
+## Turn 5 - the upgrade loop review (gnhf 28)
+
+Prompt: `/tmp/gnhf28-review-full.md`; raw answer: `/tmp/gnhf28-review-out.md`.
+Verdict returned: **request changes** - five moderates, no blockers, no majors; the reviewer confirmed the verdict-to-read alignment, the append-never-replace composition, and the `SeatInvocation` XOR invariant as sound.
+
+Subject: the gnhf 28 delta - `src/aero_bot/upgrade.py` (new) with `tests/test_upgrade.py`, the advisor teaching block in `src/aero_bot/advisor.py`, the `episode_verdicts` export in `src/aero_bot/hindsight.py`, the `run_seat_invocation`/`parse_seat_answer` split in `src/aero_bot/teacher.py`, the fifth launchd agent, and the docs/README/AGENTS/installer edits.
+
+### Finding 1 [moderate] - digest recency selected positionally, not by timestamp
+
+Claim: each class keeps its last 20 entries in iteration order, but episodes append out of timestamp order when passes overlap, so an older-appended entry can displace newer evidence.
+
+Assessment: **confirmed, fixed.**
+The same defect class the scorer's timeline already fixed (gnhf 27): each class is now sorted by `created_at` before the bounded tail, so recency is timestamped, never positional.
+Test: `test_recency_is_timestamped_not_positional` (newest episode first in file; the oldest timestamp is the one dropped).
+
+### Finding 2 [moderate] - a failed report write left the trail appended with no pointer to it
+
+Claim: the dated JSONL is appended before the last report is rewritten; if the report write fails the command exits one while the trail already carries a complete record, which an operator can mistake for a fully recorded pass (or hunt for proposals that were never recorded, under the reverse order).
+
+Assessment: **confirmed, fixed by honest staging, order kept deliberately.**
+The trail-first order is the correct one (the proposals are the valuable artifact and must never be lost to a report failure), so the fix is typed stage messages instead of reordering: a failed trail write names itself; a failed report write says the trail "already carries this pass" and names both paths.
+Tests: `test_a_failed_trail_write_names_itself`, `test_a_failed_report_write_names_the_surviving_trail` (which also pins that the trail line landed).
+
+### Finding 3 [moderate] - undecodable codex last-message file aborted the pass
+
+Claim: reading the `-o` file caught `OSError` but not `UnicodeDecodeError`, so garbage bytes escaped the per-seat typed-absence path and surfaced as a corpus read failure.
+
+Assessment: **confirmed, fixed.**
+The read now maps `UnicodeDecodeError` to a typed `cli_error` absence with the detail "last-message file is not valid UTF-8" - a written-garbage file stays distinguishable from a written-nothing one (which remains `empty_content`).
+Test: `test_codex_undecodable_last_message_is_a_typed_cli_error` (the scripted transport gained a raw-bytes mode).
+
+### Finding 4 [moderate] - malformed corpus lines were indistinguishable from an honest gate
+
+Claim: `load_episodes` silently skips malformed lines, so a truncated line carrying a divergence could make the pass report zero divergences and exit zero as gated.
+
+Assessment: **confirmed, fixed by surfacing, not guessing.**
+The loader grew a counting variant (`load_episodes_with_skips`; `load_episodes` is now a wrapper), the digest carries `malformed_episode_count`, and the human summary prints a `corpus honesty` line whenever it is non-zero - corruption still gates (no fabricated questions over unparsable evidence) but never reads as an honest no-divergence pass.
+Tests: `test_skipped_malformed_lines_surface_never_gate`, `test_a_corrupted_corpus_gates_with_the_honesty_line`, and the loader pin `test_load_episodes_with_skips_counts_what_it_skipped`.
+
+### Finding 5 [moderate] - invalid UTF-8 in the configuration escaped the handler as a traceback
+
+Claim: `load_teacher_config` raises `UnicodeDecodeError` on an undecodable file, which the CLI's `except ValueError` does not catch.
+
+Assessment: **refuted on the language's own hierarchy, verified empirically.**
+`UnicodeDecodeError` subclasses `ValueError` (via `UnicodeError`), so the existing handler already catches it: a probe with a `\xff\xfe` config exits one with a typed message and no traceback.
+The finding's cosmetic core was real though - the message did not name the file path - so `UnicodeDecodeError` joined the loader's caught tuple and every configuration failure now names the path uniformly.
+Test: `test_an_undecodable_configuration_exits_one_named`.
+
+### Turn 5 verification
+
+- Full gates: ruff format, ruff lint, mypy strict, 1179 tests green (32 in `tests/test_upgrade.py`, 2 new in `tests/test_teacher.py`).
+- Live: the pass ran over the real corpus before and after the fixes - both teacher seats proposed real bounded teaching blocks (2694 and 1665 characters, 5 exemplars each, latencies 79 s and 27 s) into `proposals/upgrade-20260924.jsonl`, with the artifacts validating as `upgrade_report/1` and the hindsight desk scores riding the prompt as context.
+
+### Standing decision record (updated)
+
+- Turn 5 (upgrade-loop delta): findings 1-4 fixed; finding 5 refuted with evidence and its cosmetic half fixed anyway.
+- No finding was dismissed without either a fix or a written threat-model rationale.
+

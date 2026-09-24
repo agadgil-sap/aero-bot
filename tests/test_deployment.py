@@ -88,6 +88,13 @@ class TestInstallScript:
         assert "#AERO_BOT_ADVISOR_TIMEOUT_SECONDS=120" in text
         assert "#AERO_BOT_ADVISOR_DISABLE_THINKING=0" in text
 
+    def test_advisor_env_template_names_the_teaching_seal(self) -> None:
+        """The upgrade loop's seal ships commented with its bounds stated."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "#AERO_BOT_ADVISOR_TEACHING_FILE=/etc/aero-bot/advisor-teaching.txt" in text
+        assert "never replaces it" in text
+        assert "fails closed" in text
+
     def test_the_venv_builds_locked_and_dev_free(self) -> None:
         """The venv comes from the lockfile without dev extras."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
@@ -367,10 +374,16 @@ class TestMacTeacherKit:
         ]
         assert executable == []
 
-    def test_the_installer_generates_all_four_jobs(self) -> None:
-        """Tactical, daily, news, and hindsight each get their own job."""
+    def test_the_installer_generates_all_five_jobs(self) -> None:
+        """Tactical, daily, news, hindsight, and upgrade each get their own job."""
         text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
-        for label in ("teacher-tactical", "teacher-daily", "teacher-news", "teacher-hindsight"):
+        for label in (
+            "teacher-tactical",
+            "teacher-daily",
+            "teacher-news",
+            "teacher-hindsight",
+            "teacher-upgrade",
+        ):
             assert f"com.aero-bot.{label}" in text, label
 
     def test_the_cadences_are_thirty_minutes_daily_and_morning_news(self) -> None:
@@ -385,6 +398,18 @@ class TestMacTeacherKit:
         text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
         assert "<key>Minute</key>\n        <integer>50</integer>" in text
         assert text.index("<integer>30</integer>") < text.index("<integer>50</integer>")
+
+    def test_the_upgrade_proposer_runs_after_the_scorer_rewrites(self) -> None:
+        """Proposals land at 10:10, after the 09:50 hindsight report."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        upgrade_block = (
+            "<key>Hour</key>\n"
+            "        <integer>10</integer>\n"
+            "        <key>Minute</key>\n"
+            "        <integer>10</integer>"
+        )
+        assert upgrade_block in text
+        assert text.index("<integer>50</integer>") < text.index(upgrade_block)
 
     def test_the_jobs_run_as_background_priority(self) -> None:
         """Advisory passes never compete with interactive work."""
@@ -403,9 +428,15 @@ class TestMacTeacherKit:
     def test_the_run_script_serves_the_hindsight_scorer(self) -> None:
         """The hindsight argument runs the scorer, not a teacher stream."""
         text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
-        assert "<tactical|daily|news|hindsight>" in text
+        assert "<tactical|daily|news|hindsight|upgrade>" in text
         assert '"$STREAM" == "hindsight"' in text
         assert 'run aero-bot-hindsight >>"$LOG_DIR/${STREAM}.log"' in text
+
+    def test_the_run_script_serves_the_upgrade_proposer(self) -> None:
+        """The upgrade argument runs the proposer, not a teacher stream."""
+        text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
+        assert '"$STREAM" == "upgrade"' in text
+        assert 'run aero-bot-upgrade >>"$LOG_DIR/${STREAM}.log"' in text
 
     def test_the_run_script_streams_into_the_state_logs(self) -> None:
         """Each run appends to the stream's log inside the state directory."""
@@ -446,7 +477,7 @@ class TestMacTeacherKit:
     def test_the_installer_never_rips_the_worktree_from_a_live_pass(self) -> None:
         """Reinstalling mid-run is refused; a live pass keeps its code."""
         text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
-        assert 'pgrep -f "aero-bot-(teacher|hindsight)"' in text
+        assert 'pgrep -f "aero-bot-(teacher|hindsight|upgrade)"' in text
         assert "wait for it to finish before reinstalling" in text
 
     def test_the_installer_refuses_paths_it_does_not_manage(self) -> None:

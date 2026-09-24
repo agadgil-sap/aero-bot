@@ -80,7 +80,7 @@ Every field fails closed: an invalid file exits one naming the path, never the c
 
 ## Deployment on the Mac
 
-`deploy/launchd/install-mac.sh` generates the four user agents into `~/Library/LaunchAgents` - `com.aero-bot.teacher-tactical` (StartInterval 1800), `com.aero-bot.teacher-daily` (09:30, after the box's 09:00 Melbourne morning report), `com.aero-bot.teacher-news` (07:10), and `com.aero-bot.teacher-hindsight` (09:50, after the daily stream drains) - and never loads any of them, mirroring the Ubuntu kit's posture.
+`deploy/launchd/install-mac.sh` generates the five user agents into `~/Library/LaunchAgents` - `com.aero-bot.teacher-tactical` (StartInterval 1800), `com.aero-bot.teacher-daily` (09:30, after the box's 09:00 Melbourne morning report), `com.aero-bot.teacher-news` (07:10), `com.aero-bot.teacher-hindsight` (09:50, after the daily stream drains), and `com.aero-bot.teacher-upgrade` (10:10, after the hindsight report is rewritten) - and never loads any of them, mirroring the Ubuntu kit's posture.
 Arming a stream is the operator's explicit act:
 
 ```
@@ -114,13 +114,61 @@ The four counts (flagged-bad, flagged-quiet, unflagged-bad, unflagged-quiet) plu
 The report is one schema-validated object (`hindsight_report/1`, carrying its own horizon and truth rule) atomically rewritten to `reports/hindsight_last.json` beside the corpus, with the latest equity, day P&L, and bounded sample series for scoreboard context.
 The daily launchd agent `com.aero-bot.teacher-hindsight` (09:50, after the 09:30 daily stream's bounded timeout has drained) makes it the daily report; the command exits zero on an honest empty corpus and one only when the report cannot be written.
 
+## The upgrade loop
+
+The `aero-bot-upgrade` command is the intelligence layer's fourth surface: it turns measured divergence into proposed teaching, never applied.
+The doctrine calls for at-least-daily student upgrades; this surface supplies the proposals and the operator remains the seal, exactly as at every rung below full autonomy.
+It reads the local corpus, asks the seats, and writes under the corpus state directory - no live reads, no signing, no writes on the production box.
+
+```
+uv run aero-bot-upgrade [--corpus-dir PATH] [--horizon-hours H] [--seat NAME]... [--config PATH] [--json]
+```
+
+Exit codes: zero on a clean pass (a gated no-divergence report is honest, not failed), one on configuration, corpus, or write failures.
+
+**Digest first, model second.** Each pass composes a deterministic divergence digest from the corpus and the hindsight verdicts, then asks a question only if the digest is non-empty.
+Three divergence classes exist, and every entry is backed by realized bad truth - only episodes whose hindsight verdict came back True (a negative day P&L or a halt increment followed inside the horizon) may contribute, scoped to the calibrated streams (tactical and daily):
+
+- **Misses** - a teacher flagged anomalies, the student answered unflagged, and bad followed.
+- **Availability gaps** - a teacher answered a brief the student never gave; the entry carries the student's own recorded outcome, empty when the episode carried no observation at all.
+- **Label divergences** - both flagged, but the teacher named labels the student did not.
+
+Pending and quiet episodes contribute only context counts (grounded, bad, and quiet tallies, plus the hindsight desk scores embedded in the prompt) - never entries.
+Each class keeps its most recent twenty entries, every brief snippet is whitespace-collapsed and bounded, and each label list is bounded to five, so the digest stays a bounded object.
+
+**Honest gating.** Zero divergences asks no seat anything: the report records the gate and the seats list stays empty, the same fail-closed shape as every sibling surface.
+Malformed corpus lines are surfaced, never silently folded into a gate: the digest carries a malformed-line count and the human summary prints a `corpus honesty` line whenever it is non-zero, so corruption never reads as an honest no-divergence pass.
+
+**Asking the seats.** When divergences exist, each enabled seat receives one prompt - the upgrade contract, the digest, the hindsight desk scores, and the student's current in-repo system prompt for context - and must answer exactly one JSON object validating as `upgrade_proposal/1`:
+
+- `teaching_block` - the complete teaching block (1-4000 characters, plain instructional text).
+It appends to the student's system prompt behind a fixed separator, so the student's answer contract always survives, and it replaces any previously sealed block wholesale, so it must stand alone.
+- `rationale` - one bounded paragraph (at most 2000 characters) citing digest evidence.
+- `exemplars` - at most five brief exemplars drawn from the provided corpus evidence, each bounded to 600 characters; an empty list is valid.
+
+Every way an answer can be missing is the same typed catalog the streams use (`dark`, `cli_missing`, `timeout`, `cli_error`, `empty_content`, `malformed_json`, `schema_invalid`), recorded per seat with its model tag and latency.
+The seats run with no tools and a 900-second ceiling, the deepest no-tool question they answer.
+
+**Artifacts.** One line per run appends to `proposals/upgrade-<YYYYMMDD>.jsonl` beside the corpus (the dated review trail), and `reports/upgrade_last.json` is atomically rewritten as the one-glance state.
+
+**Sealing a proposal** is the operator's explicit act, and it stays manual until rung-4 autonomy is earned:
+
+1. Review `~/.local/state/aero-bot/teacher/proposals/upgrade-<date>.jsonl` and edit or merge the proposed teaching blocks as judgment dictates.
+2. On the VM, write the chosen block to `/etc/aero-bot/advisor-teaching.txt` (for example with `sudoedit`).
+3. Uncomment `AERO_BOT_ADVISOR_TEACHING_FILE=/etc/aero-bot/advisor-teaching.txt` in `/etc/aero-bot/advisor.env`.
+4. Restart nothing: the next 30-minute advisor pass reads the file, appends it to the in-repo system prompt behind a fixed separator, and fails closed (exit one naming the variable) if the file is unreadable, empty, or beyond 4000 characters.
+5. To un-teach, comment the variable back out; the student reverts to the in-repo prompt alone on the next pass.
+
+The daily launchd agent `com.aero-bot.teacher-upgrade` (10:10, after the 09:50 hindsight report has rewritten its own) makes proposing part of the daily rhythm.
+
 ## Manual runs
 
 ```
 uv run aero-bot-teacher tactical
 AERO_BOT_TEACHER_CORPUS_DIR=/tmp/teacher-probe uv run aero-bot-teacher daily --seat codex
 uv run aero-bot-hindsight --horizon-hours 48
+uv run aero-bot-upgrade --seat claude
 ```
 
 A manual pass is identical to a scheduled one: one pull, one question per enabled seat, one corpus line.
-The hindsight scorer consumes the corpus offline; nothing about the harness depends on it running on any schedule.
+The hindsight scorer and the upgrade proposer consume the corpus offline; nothing about the harness depends on either running on any schedule.

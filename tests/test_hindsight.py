@@ -23,6 +23,7 @@ from aero_bot.hindsight import (
     HindsightDeskScore,
     HindsightReport,
     collect_reads,
+    episode_verdicts,
     resolve_corpus_dir,
     score_corpus,
     write_report,
@@ -121,6 +122,46 @@ def desk_by_name(report: HindsightReport, desk: str) -> HindsightDeskScore:
 def scored(*episodes: TeacherEpisode) -> HindsightReport:
     """Score fixed episodes over the standard horizon and now."""
     return score_corpus(episodes, HORIZON, now=NOW)
+
+
+class TestEpisodeVerdicts:
+    """The public per-episode export the upgrade digest consumes."""
+
+    def test_the_export_matches_the_scores_the_desks_receive(self) -> None:
+        """Every grounded episode's verdict equals the internal truth."""
+        episodes = (
+            episode(T0, seats=(claude_outcome(brief=calm_brief(flagged=True)),)),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="-0.5")),
+            episode(
+                T0 + timedelta(hours=4),
+                facts=facts_picture(day_pnl="0.5"),
+                stream=TeacherStream.DAILY,
+            ),
+            episode(T0 + timedelta(hours=6), pulled=False),
+        )
+        verdicts = episode_verdicts(episodes, HORIZON, now=NOW)
+        # Only the grounded episodes appear, oldest first, in timestamp
+        # order regardless of append order.
+        assert tuple(episode_.created_at for episode_, _ in verdicts) == (
+            episodes[0].created_at,
+            episodes[1].created_at,
+            episodes[2].created_at,
+        )
+        assert dict(verdicts)[episodes[0]] is True
+        # Episode one's own horizon (T0 + 26h) has not drained at NOW, so
+        # its quiet followers keep it pending; and the last grounded
+        # episode has no followers at all - pending, never guessed.
+        assert dict(verdicts)[episodes[1]] is None
+        assert dict(verdicts)[episodes[2]] is None
+
+    def test_an_open_horizon_stays_pending_in_the_export(self) -> None:
+        """The export honors the same pending-never-guessed rule."""
+        episodes = (
+            episode(T0 + timedelta(hours=23), facts=facts_picture(day_pnl="0.5")),
+            episode(T0 + timedelta(hours=25), facts=facts_picture(day_pnl="0.5")),
+        )
+        verdicts = episode_verdicts(episodes, HORIZON, now=NOW)
+        assert dict(verdicts)[episodes[0]] is None
 
 
 class TestTruthRule:

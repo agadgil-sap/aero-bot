@@ -129,6 +129,12 @@ The `aero-bot-hindsight` command closes the loop: it replays the teacher corpus 
 Pending is honest (no later facts, no score), no model grades another model, and the daily launchd agent makes the report the teaching loop's daily scoreboard.
 See [the teacher documentation](docs/teacher.md) for the truth rule, the desk scores, and the daily agent.
 
+## Upgrade loop command
+
+The `aero-bot-upgrade` command turns measured divergence into proposed teaching: it composes a deterministic digest of where the teacher desks beat the student ahead of realized bad outcomes (misses, availability gaps, label divergences), asks each seat for one schema-validated replacement teaching block when - and only when - any divergence is backed by decided truth, and writes the proposals as operator-reviewable artifacts beside the corpus.
+Nothing applies itself: sealing stays the operator's manual act on the VM (one file written, one overlay variable uncommented), and the advisor's append-never-replace composition plus its fail-closed validation keep the student's answer contract untouchable.
+See [the teacher documentation](docs/teacher.md) for the digest classes, the proposal schema, the sealing checklist, and the daily agent.
+
 ## Wallet-free transaction planning
 
 The application can plan deterministic unsigned exact allowances and can pass a revalidated plan only to a read-only simulation interface.

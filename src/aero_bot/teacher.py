@@ -47,7 +47,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Protocol, TextIO
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from aero_bot.advisor import (
     AdvisorBrief,
@@ -249,7 +249,7 @@ def load_teacher_config(path: Path | None) -> TeacherConfig:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         return TeacherConfig.model_validate(raw)
-    except (OSError, json.JSONDecodeError, ValidationError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError) as error:
         raise ValueError(f"the teacher configuration at {path} is invalid: {error}") from error
 
 
@@ -667,6 +667,200 @@ def _claude_served_model(stdout: str, fallback: str) -> str:
     return fallback
 
 
+class SeatInvocation(BaseModel):
+    """Carry one seat invocation's raw outcome before answer parsing.
+
+    The invocation layer is answer-schema agnostic: it resolves the binary,
+    invokes the CLI, and unwraps the envelope down to the answer's text -
+    every downstream surface (the teacher streams' brief schema, the
+    upgrade loop's proposal schema) parses that text against its own
+    bounded schema.
+    """
+
+    # Frozen strict fields keep one invocation's outcome immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The seat that was invoked.
+    seat: TeacherSeatName
+    # The model tag the invocation ran under.
+    model: str
+    # The typed absence reason, else None when content was reached.
+    reason: TeacherAbsentReason | None
+    # The answer's text when content was reached (possibly empty), else None.
+    content: str | None = None
+    # The wall-clock duration in milliseconds.
+    latency_ms: Annotated[int, Field(ge=0)] = 0
+    # A bounded diagnostic tail for cli_error outcomes, else empty.
+    detail: str = ""
+
+    @model_validator(mode="after")
+    def _exactly_one_branch(self) -> "SeatInvocation":
+        """Reject an outcome carrying content and a reason, or neither."""
+        if (self.reason is None) != (self.content is not None):
+            raise ValueError("exactly one of reason or content must be set")
+        return self
+
+
+def run_seat_invocation(
+    seat: TeacherSeatName,
+    seat_config: TeacherSeatConfig,
+    prompt: str,
+    transport: TeacherSeatTransport,
+    *,
+    web_tools: bool,
+    default_timeout_seconds: float,
+    work_dir: Path,
+) -> SeatInvocation:
+    """Invoke one seat CLI and unwrap its envelope to answer text.
+
+    Args:
+        seat: The seat implementation to invoke.
+        seat_config: The seat's configuration overrides.
+        prompt: The bounded prompt text.
+        transport: The subprocess surface; failures become typed absences.
+        web_tools: Whether the pass allows the seat web tools.
+        default_timeout_seconds: The stream's default timeout.
+        work_dir: The scratch directory for seat artifacts.
+
+    Returns:
+        Exactly one of the answer's text or a typed absence reason.
+    """
+    if not seat_config.enabled:
+        return SeatInvocation(
+            seat=seat,
+            model=seat_config.model or DEFAULT_SEAT_MODELS[seat],
+            reason=TeacherAbsentReason.DARK,
+        )
+    label = seat_config.model or DEFAULT_SEAT_MODELS[seat]
+    binary = seat_config.binary.strip()
+    if not binary:
+        resolved = shutil.which(seat.value)
+        binary = resolved or ""
+    if not binary:
+        return SeatInvocation(
+            seat=seat,
+            model=label,
+            reason=TeacherAbsentReason.CLI_MISSING,
+        )
+    timeout_seconds = seat_config.timeout_seconds or default_timeout_seconds
+    started = time.monotonic()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    last_message_path = work_dir / f"{seat.value}-last-message.txt"
+    # A stale final-message file must never masquerade as this pass's
+    # answer; the codex CLI only writes -o on a completed turn.
+    last_message_path.unlink(missing_ok=True)
+    if seat is TeacherSeatName.CLAUDE:
+        argv = build_claude_argv(binary, web_tools=web_tools)
+    else:
+        argv = build_codex_argv(binary, label, last_message_path)
+    try:
+        result = transport.invoke(
+            argv,
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+            cwd=work_dir,
+        )
+    except TeacherSeatTimeoutError:
+        return SeatInvocation(
+            seat=seat,
+            model=label,
+            reason=TeacherAbsentReason.TIMEOUT,
+            latency_ms=int(round((time.monotonic() - started) * 1000)),
+        )
+    except OSError as error:
+        return SeatInvocation(
+            seat=seat,
+            model=label,
+            reason=TeacherAbsentReason.CLI_ERROR,
+            latency_ms=int(round((time.monotonic() - started) * 1000)),
+            detail=_bounded_detail(str(error)),
+        )
+    latency_ms = int(round((time.monotonic() - started) * 1000))
+    if seat is TeacherSeatName.CLAUDE:
+        served = _claude_served_model(result.stdout, label)
+        if result.exit_code != 0:
+            return SeatInvocation(
+                seat=seat,
+                model=served,
+                reason=TeacherAbsentReason.CLI_ERROR,
+                latency_ms=latency_ms,
+                detail=_bounded_detail(result.stderr or result.stdout),
+            )
+        try:
+            envelope = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return SeatInvocation(
+                seat=seat,
+                model=served,
+                reason=TeacherAbsentReason.CLI_ERROR,
+                latency_ms=latency_ms,
+                detail=_bounded_detail(result.stdout),
+            )
+        if not isinstance(envelope, Mapping):
+            # Valid JSON in the wrong shape (a list, a bare string) is a
+            # broken envelope, never an exception out of the pass.
+            return SeatInvocation(
+                seat=seat,
+                model=served,
+                reason=TeacherAbsentReason.CLI_ERROR,
+                latency_ms=latency_ms,
+                detail=_bounded_detail(result.stdout),
+            )
+        if envelope.get("is_error") or envelope.get("subtype") != "success":
+            subtype = str(envelope.get("subtype") or "error")
+            return SeatInvocation(
+                seat=seat,
+                model=served,
+                reason=TeacherAbsentReason.CLI_ERROR,
+                latency_ms=latency_ms,
+                detail=_bounded_detail(f"{subtype}: {envelope.get('result', '')}"),
+            )
+        content = envelope.get("result")
+        return SeatInvocation(
+            seat=seat,
+            model=served,
+            reason=None,
+            content=content if isinstance(content, str) else "",
+            latency_ms=latency_ms,
+        )
+    served = label
+    if result.exit_code != 0:
+        return SeatInvocation(
+            seat=seat,
+            model=served,
+            reason=TeacherAbsentReason.CLI_ERROR,
+            latency_ms=latency_ms,
+            detail=_bounded_detail(result.stderr),
+        )
+    try:
+        content_text = last_message_path.read_text(encoding="utf-8")
+    except OSError:
+        return SeatInvocation(
+            seat=seat,
+            model=served,
+            reason=TeacherAbsentReason.EMPTY_CONTENT,
+            latency_ms=latency_ms,
+        )
+    except UnicodeDecodeError:
+        # Garbage bytes from the CLI are its fault, not an absent answer:
+        # the typed detail separates a written-nothing file from a
+        # written-garbage one.
+        return SeatInvocation(
+            seat=seat,
+            model=served,
+            reason=TeacherAbsentReason.CLI_ERROR,
+            latency_ms=latency_ms,
+            detail="last-message file is not valid UTF-8",
+        )
+    return SeatInvocation(
+        seat=seat,
+        model=served,
+        reason=None,
+        content=content_text,
+        latency_ms=latency_ms,
+    )
+
+
 def ask_seat(
     seat: TeacherSeatName,
     seat_config: TeacherSeatConfig,
@@ -691,118 +885,19 @@ def ask_seat(
     Returns:
         Exactly one of an accepted brief or a typed absence reason.
     """
-    if not seat_config.enabled:
-        return TeacherSeatOutcome(
-            seat=seat,
-            model=seat_config.model or DEFAULT_SEAT_MODELS[seat],
-            outcome=TeacherAbsentReason.DARK.value,
-        )
-    label = seat_config.model or DEFAULT_SEAT_MODELS[seat]
-    binary = seat_config.binary.strip()
-    if not binary:
-        resolved = shutil.which(seat.value)
-        binary = resolved or ""
-    if not binary:
-        return TeacherSeatOutcome(
-            seat=seat,
-            model=label,
-            outcome=TeacherAbsentReason.CLI_MISSING.value,
-        )
-    timeout_seconds = seat_config.timeout_seconds or default_timeout_seconds
-    started = time.monotonic()
-    work_dir.mkdir(parents=True, exist_ok=True)
-    last_message_path = work_dir / f"{seat.value}-last-message.txt"
-    # A stale final-message file must never masquerade as this pass's
-    # answer; the codex CLI only writes -o on a completed turn.
-    last_message_path.unlink(missing_ok=True)
-    if seat is TeacherSeatName.CLAUDE:
-        argv = build_claude_argv(binary, web_tools=web_tools)
-    else:
-        argv = build_codex_argv(binary, label, last_message_path)
-    try:
-        result = transport.invoke(
-            argv,
-            prompt=prompt,
-            timeout_seconds=timeout_seconds,
-            cwd=work_dir,
-        )
-    except TeacherSeatTimeoutError:
-        return TeacherSeatOutcome(
-            seat=seat,
-            model=label,
-            outcome=TeacherAbsentReason.TIMEOUT.value,
-            latency_ms=int(round((time.monotonic() - started) * 1000)),
-        )
-    except OSError as error:
-        return TeacherSeatOutcome(
-            seat=seat,
-            model=label,
-            outcome=TeacherAbsentReason.CLI_ERROR.value,
-            latency_ms=int(round((time.monotonic() - started) * 1000)),
-            detail=_bounded_detail(str(error)),
-        )
-    latency_ms = int(round((time.monotonic() - started) * 1000))
-    if seat is TeacherSeatName.CLAUDE:
-        served = _claude_served_model(result.stdout, label)
-        if result.exit_code != 0:
-            return _absent(
-                seat,
-                served,
-                TeacherAbsentReason.CLI_ERROR,
-                latency_ms,
-                _bounded_detail(result.stderr or result.stdout),
-            )
-        try:
-            envelope = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return _absent(
-                seat,
-                served,
-                TeacherAbsentReason.CLI_ERROR,
-                latency_ms,
-                _bounded_detail(result.stdout),
-            )
-        if not isinstance(envelope, Mapping):
-            # Valid JSON in the wrong shape (a list, a bare string) is a
-            # broken envelope, never an exception out of the pass.
-            return _absent(
-                seat,
-                served,
-                TeacherAbsentReason.CLI_ERROR,
-                latency_ms,
-                _bounded_detail(result.stdout),
-            )
-        if envelope.get("is_error") or envelope.get("subtype") != "success":
-            subtype = str(envelope.get("subtype") or "error")
-            return _absent(
-                seat,
-                served,
-                TeacherAbsentReason.CLI_ERROR,
-                latency_ms,
-                _bounded_detail(f"{subtype}: {envelope.get('result', '')}"),
-            )
-        content = envelope.get("result")
-        content_text = content if isinstance(content, str) else ""
-    else:
-        served = label
-        if result.exit_code != 0:
-            return _absent(
-                seat,
-                served,
-                TeacherAbsentReason.CLI_ERROR,
-                latency_ms,
-                _bounded_detail(result.stderr),
-            )
-        try:
-            content_text = last_message_path.read_text(encoding="utf-8")
-        except OSError:
-            return _absent(
-                seat,
-                served,
-                TeacherAbsentReason.EMPTY_CONTENT,
-                latency_ms,
-            )
-    return _parse_brief(seat, served, content_text, latency_ms)
+    invocation = run_seat_invocation(
+        seat,
+        seat_config,
+        prompt,
+        transport,
+        web_tools=web_tools,
+        default_timeout_seconds=default_timeout_seconds,
+        work_dir=work_dir,
+    )
+    if invocation.reason is not None or invocation.content is None:
+        reason = invocation.reason or TeacherAbsentReason.EMPTY_CONTENT
+        return _absent(seat, invocation.model, reason, invocation.latency_ms, invocation.detail)
+    return _parse_brief(seat, invocation.model, invocation.content, invocation.latency_ms)
 
 
 def _absent(
@@ -822,6 +917,32 @@ def _absent(
     )
 
 
+def parse_seat_answer[SeatAnswerT: BaseModel](
+    content: str,
+    answer_type: type[SeatAnswerT],
+) -> SeatAnswerT | TeacherAbsentReason:
+    """Parse one seat's answer text against a bounded answer schema.
+
+    Args:
+        content: The unwrapped answer text, possibly empty or fence-wrapped.
+        answer_type: The strict schema the answer must validate against.
+
+    Returns:
+        The validated answer, else the typed absence reason (empty,
+        unparseable, or schema-invalid - never an exception).
+    """
+    if not content.strip():
+        return TeacherAbsentReason.EMPTY_CONTENT
+    try:
+        answer = json.loads(extract_json_object(content))
+    except json.JSONDecodeError:
+        return TeacherAbsentReason.MALFORMED_JSON
+    try:
+        return answer_type.model_validate(answer)
+    except ValidationError:
+        return TeacherAbsentReason.SCHEMA_INVALID
+
+
 def _parse_brief(
     seat: TeacherSeatName,
     model: str,
@@ -829,21 +950,14 @@ def _parse_brief(
     latency_ms: int,
 ) -> TeacherSeatOutcome:
     """Validate one seat's answer text against the bounded brief schema."""
-    if not content.strip():
-        return _absent(seat, model, TeacherAbsentReason.EMPTY_CONTENT, latency_ms)
-    try:
-        answer = json.loads(extract_json_object(content))
-    except json.JSONDecodeError:
-        return _absent(seat, model, TeacherAbsentReason.MALFORMED_JSON, latency_ms)
-    try:
-        brief = AdvisorBrief.model_validate(answer)
-    except ValidationError:
-        return _absent(seat, model, TeacherAbsentReason.SCHEMA_INVALID, latency_ms)
+    answer = parse_seat_answer(content, AdvisorBrief)
+    if isinstance(answer, TeacherAbsentReason):
+        return _absent(seat, model, answer, latency_ms)
     return TeacherSeatOutcome(
         seat=seat,
         model=model,
         outcome="brief",
-        brief=brief,
+        brief=answer,
         latency_ms=latency_ms,
     )
 
@@ -1157,18 +1271,21 @@ class TeacherEpisode(BaseModel):
     seats: tuple[TeacherSeatOutcome, ...] = ()
 
 
-def load_episodes(path: Path) -> tuple[TeacherEpisode, ...]:
-    """Load the corpus's episodes, skipping and counting malformed lines.
+def load_episodes_with_skips(path: Path) -> tuple[tuple[TeacherEpisode, ...], int]:
+    """Load the corpus's episodes while counting malformed lines.
 
     Args:
         path: The corpus JSONL path.
 
     Returns:
-        Every parseable episode, oldest first.
+        Every parseable episode oldest first, and how many non-empty lines
+        were skipped as malformed (the honesty count surfaces that gate on
+        the corpus - the upgrade loop's digest - carry).
     """
     if not path.exists():
-        return ()
+        return (), 0
     episodes: list[TeacherEpisode] = []
+    malformed = 0
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             text = line.strip()
@@ -1177,8 +1294,20 @@ def load_episodes(path: Path) -> tuple[TeacherEpisode, ...]:
             try:
                 episodes.append(TeacherEpisode.model_validate(json.loads(text)))
             except (json.JSONDecodeError, ValidationError):
-                continue
-    return tuple(episodes)
+                malformed += 1
+    return tuple(episodes), malformed
+
+
+def load_episodes(path: Path) -> tuple[TeacherEpisode, ...]:
+    """Load the corpus's episodes, skipping malformed lines.
+
+    Args:
+        path: The corpus JSONL path.
+
+    Returns:
+        Every parseable episode, oldest first.
+    """
+    return load_episodes_with_skips(path)[0]
 
 
 class TeacherHarness:
@@ -1482,6 +1611,7 @@ __all__ = [
     "NEWS_SYSTEM_PROMPT",
     "STREAM_TIMEOUT_SECONDS",
     "StudentWindowBrief",
+    "SeatInvocation",
     "SubprocessTeacherTransport",
     "TACTICAL_SYSTEM_PROMPT",
     "TEACHER_CONFIG_PATH_ENV",
@@ -1523,9 +1653,12 @@ __all__ = [
     "build_tactical_user_prompt",
     "extract_student_answer",
     "load_episodes",
+    "load_episodes_with_skips",
     "load_teacher_config",
     "main",
+    "parse_seat_answer",
     "parse_window_payload",
     "resolve_config_path",
     "resolve_corpus_dir",
+    "run_seat_invocation",
 ]

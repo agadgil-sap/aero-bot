@@ -16,6 +16,10 @@ from aero_bot.advisor import (
     ADVISOR_MAX_TOKENS_ENV,
     ADVISOR_MODEL_ENV,
     ADVISOR_REPORT_PATH_ENV,
+    ADVISOR_SYSTEM_PROMPT,
+    ADVISOR_TEACHING_FILE_ENV,
+    ADVISOR_TEACHING_MAX_CHARS,
+    ADVISOR_TEACHING_SEPARATOR,
     ADVISOR_TIMEOUT_ENV,
     ADVISOR_URL_ENV,
     AdvisorAbsentReason,
@@ -30,6 +34,7 @@ from aero_bot.advisor import (
     AdvisorUnreachableError,
     HttpxAdvisorTransport,
     build_user_prompt,
+    compose_system_prompt,
     compose_window_facts,
     main,
     parse_advisor_config,
@@ -649,3 +654,97 @@ def test_cli_runs_one_pass_and_prints_the_brief(
     assert "advisor pass" in captured.out
     assert "long_range_wait" in captured.out
     assert report_path.exists()
+
+
+class TestTeachingBlock:
+    """The sealed teaching block appends, never replaces, fail-closed."""
+
+    def test_without_a_teaching_file_the_default_prompt_stands(self) -> None:
+        """An unset teaching file keeps the in-repo system prompt alone."""
+        composed = compose_system_prompt(AdvisorConfig(url="http://plane", model="m"))
+        assert composed == ADVISOR_SYSTEM_PROMPT
+
+    def test_the_block_appends_behind_the_fixed_separator(self, tmp_path: Path) -> None:
+        """A sealed block appends behind the separator, contract intact."""
+        block = "Watch the halt counter across adjacent snapshots."
+        teaching = tmp_path / "teaching.txt"
+        teaching.write_text(f"\n  {block}  \n", encoding="utf-8")
+        config = AdvisorConfig(url="http://plane", model="m", teaching_file=str(teaching))
+        composed = compose_system_prompt(config)
+        assert composed == ADVISOR_SYSTEM_PROMPT + ADVISOR_TEACHING_SEPARATOR + block
+        # The answer contract always survives a sealed block.
+        assert composed.index("exactly one JSON object") < composed.index(block)
+
+    def test_missing_empty_oversized_and_binary_files_fail_closed(self, tmp_path: Path) -> None:
+        """Every unreadable or invalid teaching file names the variable."""
+        missing = AdvisorConfig(
+            url="http://plane", model="m", teaching_file=str(tmp_path / "absent.txt")
+        )
+        with pytest.raises(ValueError, match=ADVISOR_TEACHING_FILE_ENV):
+            compose_system_prompt(missing)
+        empty = tmp_path / "empty.txt"
+        empty.write_text("   \n", encoding="utf-8")
+        with pytest.raises(ValueError, match=ADVISOR_TEACHING_FILE_ENV):
+            compose_system_prompt(
+                AdvisorConfig(url="http://plane", model="m", teaching_file=str(empty))
+            )
+        oversized = tmp_path / "oversized.txt"
+        oversized.write_text("x" * (ADVISOR_TEACHING_MAX_CHARS + 1), encoding="utf-8")
+        with pytest.raises(ValueError, match=ADVISOR_TEACHING_FILE_ENV):
+            compose_system_prompt(
+                AdvisorConfig(url="http://plane", model="m", teaching_file=str(oversized))
+            )
+        binary = tmp_path / "binary.txt"
+        binary.write_bytes(b"\xff\xfe\x00")
+        with pytest.raises(ValueError, match=ADVISOR_TEACHING_FILE_ENV):
+            compose_system_prompt(
+                AdvisorConfig(url="http://plane", model="m", teaching_file=str(binary))
+            )
+
+    def test_the_configuration_requires_an_absolute_path(self) -> None:
+        """A relative teaching path is rejected at parse time."""
+        parsed = parse_advisor_config(
+            {ADVISOR_URL_ENV: "http://plane", ADVISOR_TEACHING_FILE_ENV: "/etc/aero-bot/t.txt"}
+        )
+        assert parsed.teaching_file == "/etc/aero-bot/t.txt"
+        with pytest.raises(ValueError, match=ADVISOR_TEACHING_FILE_ENV):
+            parse_advisor_config({ADVISOR_TEACHING_FILE_ENV: "relative.txt"})
+
+    def test_the_monitor_threads_the_composed_prompt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """run_once asks the plane with the teaching block appended."""
+        teaching = tmp_path / "teaching.txt"
+        block = "Prefer halt-count deltas over single snapshots."
+        teaching.write_text(block, encoding="utf-8")
+        transport = ScriptedTransport(
+            response=AdvisorHttpResponse(
+                status_code=200, body=completion_body(json.dumps(accepted_answer()))
+            )
+        )
+        monitor = AdvisorMonitor(
+            AuditStore(tmp_path / "audit" / "audit.sqlite3"),
+            CycleStateStore(tmp_path / "cycle_state.json"),
+            AdvisorConfig(url="http://plane", model="m", teaching_file=str(teaching)),
+            transport,
+            tmp_path / "advisor_last_report.json",
+        )
+        monitor.run_once(now=LATER_AT)
+        messages = cast("list[Mapping[str, object]]", transport.requests[0][1]["messages"])
+        assert messages[0]["role"] == "system"
+        assert cast("str", messages[0]["content"]).endswith(ADVISOR_TEACHING_SEPARATOR + block)
+
+    def test_the_cli_fails_closed_when_the_seal_is_broken(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A configured but unreadable teaching file exits one, named."""
+        monkeypatch.setenv("AERO_BOT_AUDIT_DATABASE_PATH", str(tmp_path / "audit.sqlite3"))
+        monkeypatch.setenv(CYCLE_STATE_PATH_ENV, str(tmp_path / "cycle_state.json"))
+        monkeypatch.setenv(ADVISOR_URL_ENV, "http://plane")
+        monkeypatch.setenv(ADVISOR_MODEL_ENV, "m")
+        monkeypatch.setenv(ADVISOR_TEACHING_FILE_ENV, str(tmp_path / "absent.txt"))
+        assert main(["--max-runs", "1"]) == 1
+        assert ADVISOR_TEACHING_FILE_ENV in capsys.readouterr().err

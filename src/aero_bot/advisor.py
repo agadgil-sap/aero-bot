@@ -65,6 +65,16 @@ ADVISOR_DISABLE_THINKING_ENV = "AERO_BOT_ADVISOR_DISABLE_THINKING"
 # Environment variable overriding the persisted report's path (default:
 # advisor_last_report.json beside the audit store).
 ADVISOR_REPORT_PATH_ENV = "AERO_BOT_ADVISOR_REPORT_PATH"
+# Environment variable naming the optional sealed teaching file whose
+# content is appended to the system prompt; this is the upgrade loop's
+# seal, written by the operator from a teacher proposal.
+ADVISOR_TEACHING_FILE_ENV = "AERO_BOT_ADVISOR_TEACHING_FILE"
+# The bounded teaching block the sealed file may carry; proposals are
+# composed under the same bound.
+ADVISOR_TEACHING_MAX_CHARS = 4000
+# The fixed separator isolating a teaching block from the default prompt;
+# the block appends, never replaces, so the answer contract survives.
+ADVISOR_TEACHING_SEPARATOR = "\n\nTeaching block (sealed by the operator):\n"
 
 # The default request timeout: short enough that a slow plane never delays
 # an operator loop, long enough for a local model's first token.
@@ -186,6 +196,9 @@ class AdvisorConfig(BaseModel):
     # Whether to ask reasoning models not to think, where the plane
     # supports the Ollama think parameter.
     disable_thinking: bool = False
+    # The optional sealed teaching file appended to the system prompt;
+    # empty keeps the default prompt alone.
+    teaching_file: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -347,12 +360,16 @@ def parse_advisor_config(environ: Mapping[str, str] | None = None) -> AdvisorCon
     }:
         raise ValueError(f"{ADVISOR_DISABLE_THINKING_ENV} must be a boolean")
     disable_thinking = disable_thinking_text in {"1", "true", "yes"}
+    teaching_file = source.get(ADVISOR_TEACHING_FILE_ENV, "").strip()
+    if teaching_file and not teaching_file.startswith("/"):
+        raise ValueError(f"{ADVISOR_TEACHING_FILE_ENV} must be an absolute path")
     return AdvisorConfig(
         url=url,
         model=source.get(ADVISOR_MODEL_ENV, "").strip(),
         timeout_seconds=timeout_seconds,
         max_tokens=max_tokens,
         disable_thinking=disable_thinking,
+        teaching_file=teaching_file,
     )
 
 
@@ -616,6 +633,42 @@ def build_user_prompt(facts: AdvisorWindowFacts) -> str:
     )
 
 
+def compose_system_prompt(config: AdvisorConfig) -> str:
+    """Compose the system prompt, appending any sealed teaching block.
+
+    The block appends behind a fixed separator, never replaces: the JSON
+    answer contract inlined in the default prompt always survives a sealed
+    teaching block.
+
+    Args:
+        config: The advisory configuration; an empty teaching file keeps
+            the default prompt alone.
+
+    Returns:
+        The full system prompt text.
+
+    Raises:
+        ValueError: A configured teaching file is missing, unreadable,
+            invalid UTF-8, empty, or beyond the bounded size; the message
+            names the variable, never the content. The pass fails closed
+            rather than silently dropping the block.
+    """
+    if not config.teaching_file:
+        return ADVISOR_SYSTEM_PROMPT
+    try:
+        raw = Path(config.teaching_file).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(f"{ADVISOR_TEACHING_FILE_ENV} could not be read: {error}") from error
+    block = raw.strip()
+    if not block:
+        raise ValueError(f"{ADVISOR_TEACHING_FILE_ENV} is empty")
+    if len(block) > ADVISOR_TEACHING_MAX_CHARS:
+        raise ValueError(
+            f"{ADVISOR_TEACHING_FILE_ENV} must be at most {ADVISOR_TEACHING_MAX_CHARS} characters"
+        )
+    return ADVISOR_SYSTEM_PROMPT + ADVISOR_TEACHING_SEPARATOR + block
+
+
 class AdvisorMonitor:
     """Run one advisory pass over the local audit history and book."""
 
@@ -685,7 +738,7 @@ class AdvisorMonitor:
         )
         outcome = request_brief(
             self._config,
-            ADVISOR_SYSTEM_PROMPT,
+            compose_system_prompt(self._config),
             build_user_prompt(facts),
             self._transport,
         )
@@ -932,6 +985,9 @@ __all__ = [
     "ADVISOR_MODEL_ENV",
     "ADVISOR_REPORT_PATH_ENV",
     "ADVISOR_SYSTEM_PROMPT",
+    "ADVISOR_TEACHING_FILE_ENV",
+    "ADVISOR_TEACHING_MAX_CHARS",
+    "ADVISOR_TEACHING_SEPARATOR",
     "ADVISOR_TIMEOUT_ENV",
     "ADVISOR_URL_ENV",
     "ADVISOR_WINDOW_RECORDS",
@@ -951,6 +1007,7 @@ __all__ = [
     "AdvisorWindowFacts",
     "HttpxAdvisorTransport",
     "build_user_prompt",
+    "compose_system_prompt",
     "compose_window_facts",
     "extract_json_object",
     "main",

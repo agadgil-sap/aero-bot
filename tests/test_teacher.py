@@ -40,6 +40,7 @@ from aero_bot.teacher import (
     build_tactical_user_prompt,
     extract_student_answer,
     load_episodes,
+    load_episodes_with_skips,
     load_teacher_config,
     main,
     parse_window_payload,
@@ -139,10 +140,12 @@ class ScriptedSeatTransport:
         results: Sequence[TeacherProcessResult | Exception],
         *,
         last_message: str = "",
+        last_message_bytes: bytes | None = None,
     ) -> None:
         """Queue one answer per expected invocation."""
         self._results = list(results)
         self._last_message = last_message
+        self._last_message_bytes = last_message_bytes
         self.invocations: list[tuple[list[str], str]] = []
 
     def invoke(
@@ -162,7 +165,10 @@ class ScriptedSeatTransport:
         if "-o" in argv_list:
             message_path = Path(argv_list[argv_list.index("-o") + 1])
             message_path.parent.mkdir(parents=True, exist_ok=True)
-            message_path.write_text(self._last_message, encoding="utf-8")
+            if self._last_message_bytes is not None:
+                message_path.write_bytes(self._last_message_bytes)
+            else:
+                message_path.write_text(self._last_message, encoding="utf-8")
         return result
 
 
@@ -555,6 +561,24 @@ class TestAskSeat:
         )
         assert outcome.outcome == TeacherAbsentReason.EMPTY_CONTENT.value
 
+    def test_codex_undecodable_last_message_is_a_typed_cli_error(self, tmp_path: Path) -> None:
+        """Garbage bytes in the last-message file abort no pass."""
+        transport = ScriptedSeatTransport(
+            [TeacherProcessResult(exit_code=0, stdout="", stderr="")],
+            last_message_bytes=b"\xff\xfe not utf-8",
+        )
+        outcome = ask_seat(
+            TeacherSeatName.CODEX,
+            TeacherSeatConfig(binary="/bin/codex"),
+            "prompt",
+            transport,
+            web_tools=False,
+            default_timeout_seconds=10.0,
+            work_dir=tmp_path,
+        )
+        assert outcome.outcome == TeacherAbsentReason.CLI_ERROR.value
+        assert "UTF-8" in outcome.detail
+
     def test_malformed_json_is_typed(self, tmp_path: Path) -> None:
         """Unparseable answer content is a malformed_json absence."""
         transport = ScriptedSeatTransport(
@@ -881,6 +905,27 @@ class TestCorpusLoading:
         episodes = load_episodes(corpus)
         assert len(episodes) == 1
         assert episodes[0].created_at == CREATED_AT
+
+    def test_load_episodes_with_skips_counts_what_it_skipped(self, tmp_path: Path) -> None:
+        """The honesty count separates corruption from an honest corpus."""
+        good = TeacherEpisode(
+            stream=TeacherStream.TACTICAL,
+            created_at=CREATED_AT,
+            window_outcome=TEACHER_WINDOW_PULLED,
+        )
+        corpus = tmp_path / "corpus.jsonl"
+        corpus.write_text(
+            "{broken\n" + good.model_dump_json() + "\n" + '{"also": broken\n',
+            encoding="utf-8",
+        )
+        episodes, malformed = load_episodes_with_skips(corpus)
+        assert len(episodes) == 1
+        assert malformed == 2
+        # Blank lines are structure, not corruption.
+        blank = tmp_path / "blank.jsonl"
+        blank.write_text("\n\n" + good.model_dump_json() + "\n", encoding="utf-8")
+        assert load_episodes_with_skips(blank) == ((good,), 0)
+        assert load_episodes_with_skips(tmp_path / "absent.jsonl") == ((), 0)
 
     def test_load_episodes_on_a_missing_file(self, tmp_path: Path) -> None:
         """A missing corpus file yields no episodes."""

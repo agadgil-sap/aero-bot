@@ -193,6 +193,11 @@ if [[ ! -f "${CONFIG_DIR}/advisor.env" ]]; then
 # (default 4096); set 1 to ask thinking models not to think at all.
 #AERO_BOT_ADVISOR_MAX_TOKENS=4096
 #AERO_BOT_ADVISOR_DISABLE_THINKING=0
+# The upgrade loop's seal: a teaching block proposed by the teachers and
+# written by the operator (see docs/teacher.md). It appends to the system
+# prompt, never replaces it, and the pass fails closed if the file is
+# unreadable, empty, or beyond 4000 characters.
+#AERO_BOT_ADVISOR_TEACHING_FILE=/etc/aero-bot/advisor-teaching.txt
 EOF
     chown root:"${SERVICE_USER}" "${CONFIG_DIR}/advisor.env"
     chmod 0640 "${CONFIG_DIR}/advisor.env"

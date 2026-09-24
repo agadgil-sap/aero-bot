@@ -20,6 +20,7 @@ The surface is dark until the operator seals both values, normally in `/etc/aero
 | `AERO_BOT_ADVISOR_TIMEOUT_SECONDS` | The bounded wall-clock request timeout (default 15, range 1-120). A cold reasoning-model pass thinks for tens of seconds - one live 35B-A3B brief measured 55 s - so a sealed plane deployment sets 120. |
 | `AERO_BOT_ADVISOR_MAX_TOKENS` | The bounded generation budget (default 4096, range 200-32768). |
 | `AERO_BOT_ADVISOR_DISABLE_THINKING` | `1` asks reasoning models not to think (Ollama's `think` parameter); default off. |
+| `AERO_BOT_ADVISOR_TEACHING_FILE` | Optional sealed teaching block (an absolute path, normally `/etc/aero-bot/advisor-teaching.txt`); unset keeps the in-repo system prompt alone. See [the teaching block](#the-teaching-block). |
 | `AERO_BOT_ADVISOR_REPORT_PATH` | Overrides the persisted report path (default `advisor_last_report.json` beside the audit store). |
 
 The Mac-hosted plane (see the project's inference-plane notes) binds tailnet-only, so the URL is a `100.x.y.z` address only the tailnet can reach; the VM reaches it as `http://100.106.111.37:11434` once it joins the tailnet.
@@ -31,6 +32,13 @@ Everything in the prompt is deterministic and grounded - the composed facts are 
 2. **Request one bounded answer.** The prompt asks for exactly one JSON object - a brief of at most three sentences and at most ten anomaly flags, each with a bounded confidence and one-line rationale - at temperature zero.
 3. **Validate fail-closed.** The answer must parse and validate against the strict schema; a reasoning model's separate `reasoning` field is ignored, and the token budget must cover thinking plus answer (a length-cutoff plane answering empty content is a typed absence, not a hang).
 4. **Record.** The pass prints a human summary, atomically rewrites `advisor_last_report.json` beside the audit store, and appends one `advisor_reported` audit record carrying the accepted brief or the stable absence reason, the model, the latency, and the window size.
+
+## The teaching block
+
+The student learns to be taught through one optional sealed file, proposed by the teacher harness's upgrade loop and written by the operator (the checklist lives in [the teacher documentation](teacher.md#the-upgrade-loop)).
+When `AERO_BOT_ADVISOR_TEACHING_FILE` is set, every pass reads the file and appends its content to the in-repo system prompt behind a fixed separator - **append, never replace**, so the JSON answer contract inlined in the default prompt can never be dropped by a bad block.
+Validation fails closed: the path must be absolute (checked at configuration load), and the file must exist, decode as UTF-8, be non-empty after stripping, and stay within 4000 characters; any violation fails the pass with exit one naming the variable, never a silent fallback to the untaught prompt.
+The block replaces any previously sealed block wholesale (the proposals are written as complete stand-alone blocks), and commenting the variable back out un-teaches on the next pass - no restart, since the file is read fresh every 30-minute run.
 
 ## The absence catalog
 
