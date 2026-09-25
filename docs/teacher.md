@@ -80,7 +80,7 @@ Every field fails closed: an invalid file exits one naming the path, never the c
 
 ## Deployment on the Mac
 
-`deploy/launchd/install-mac.sh` generates the five user agents into `~/Library/LaunchAgents` - `com.aero-bot.teacher-tactical` (StartInterval 1800), `com.aero-bot.teacher-daily` (09:30, after the box's 09:00 Melbourne morning report), `com.aero-bot.teacher-news` (07:10), `com.aero-bot.teacher-hindsight` (09:50, after the daily stream drains), and `com.aero-bot.teacher-upgrade` (10:10, after the hindsight report is rewritten) - and never loads any of them, mirroring the Ubuntu kit's posture.
+`deploy/launchd/install-mac.sh` generates the six user agents into `~/Library/LaunchAgents` - `com.aero-bot.teacher-tactical` (StartInterval 1800), `com.aero-bot.teacher-daily` (09:30, after the box's 09:00 Melbourne morning report), `com.aero-bot.teacher-news` (07:10), `com.aero-bot.teacher-hindsight` (09:50, after the daily stream drains), `com.aero-bot.teacher-upgrade` (10:10, after the hindsight report is rewritten), and `com.aero-bot.teacher-risk-manager` (10:00, between the scorer and the proposer) - and never loads any of them, mirroring the Ubuntu kit's posture.
 Arming a stream is the operator's explicit act:
 
 ```
@@ -132,6 +132,7 @@ Three divergence classes exist, and every entry is backed by realized bad truth 
 - **Misses** - a teacher flagged anomalies, the student answered unflagged, and bad followed.
 - **Availability gaps** - a teacher answered a brief the student never gave; the entry carries the student's own recorded outcome, empty when the episode carried no observation at all.
 - **Label divergences** - both flagged, but the teacher named labels the student did not.
+- **Posture misses** - the deterministic risk desk (see [the risk-manager documentation](risk-manager.md)) found a posture problem and the student's accepted brief stayed quiet; backed by the finding itself, realized deterministic truth, never a pending read or a hindsight verdict.
 
 Pending and quiet episodes contribute only context counts (grounded, bad, and quiet tallies, plus the hindsight desk scores embedded in the prompt) - never entries.
 Each class keeps its most recent twenty entries, every brief snippet is whitespace-collapsed and bounded, and each label list is bounded to five, so the digest stays a bounded object.
@@ -161,6 +162,13 @@ The seats run with no tools and a 900-second ceiling, the deepest no-tool questi
 
 The daily launchd agent `com.aero-bot.teacher-upgrade` (10:10, after the 09:50 hindsight report has rewritten its own) makes proposing part of the daily rhythm.
 
+## The risk manager
+
+The `aero-bot-risk-manager` command is the intelligence layer's fifth surface: the separation-of-duties counterparty desk that independently audits the corpus's posture snapshots - the day-P&L identity, the five-percent halt line and its entry discipline, exposure against the 100 USDC hard cap and the eighty-percent sizing fraction - and records every desk whose accepted brief stayed quiet over a flagged posture.
+It is deterministic and offline like the scorer, its report lands as `reports/risk_manager_last.json` beside the corpus, and the upgrade loop consumes the same pure audit as its fourth evidence class.
+The full contract - the finding kinds, the contradiction rule, the upgrade wiring - lives in [the risk-manager documentation](risk-manager.md).
+The daily launchd agent `com.aero-bot.teacher-risk-manager` (10:00, between the scorer's 09:50 report and the 10:10 proposer) makes the audit part of the same morning rhythm.
+
 ## Manual runs
 
 ```
@@ -168,6 +176,7 @@ uv run aero-bot-teacher tactical
 AERO_BOT_TEACHER_CORPUS_DIR=/tmp/teacher-probe uv run aero-bot-teacher daily --seat codex
 uv run aero-bot-hindsight --horizon-hours 48
 uv run aero-bot-upgrade --seat claude
+uv run aero-bot-risk-manager
 ```
 
 A manual pass is identical to a scheduled one: one pull, one question per enabled seat, one corpus line.

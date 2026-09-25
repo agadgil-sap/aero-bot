@@ -18,6 +18,7 @@ from aero_bot.advisor import (
     AdvisorWindowFacts,
 )
 from aero_bot.hindsight import episode_verdicts
+from aero_bot.risk_manager import RiskFindingKind, audit_corpus_posture
 from aero_bot.teacher import (
     StudentWindowBrief,
     TeacherConfig,
@@ -35,6 +36,7 @@ from aero_bot.upgrade import (
     UPGRADE_DIGEST_ENTRY_MAX,
     UPGRADE_PROPOSAL_SCHEMA,
     UPGRADE_RATIONALE_MAX_CHARS,
+    SeatUpgradeOutcome,
     UpgradeDivergenceDigest,
     UpgradeProposal,
     UpgradeReport,
@@ -42,6 +44,7 @@ from aero_bot.upgrade import (
     build_divergence_digest,
     build_upgrade_user_prompt,
     main,
+    print_upgrade_report,
     run_upgrade_pass,
     write_upgrade_artifacts,
 )
@@ -174,6 +177,41 @@ def miss_episode(
 def bad_follower(at: datetime = T0 + timedelta(hours=2)) -> TeacherEpisode:
     """Build the later episode whose facts realize the bad truth."""
     return episode(at, facts=facts_picture(day_pnl="-0.5"))
+
+
+def posture_picture(
+    *,
+    equity: str | None = "100.0",
+    day_start: str | None = "100.0",
+    day_pnl: str | None = "0.0",
+    committed: str | None = None,
+    action: str | None = None,
+) -> AdvisorWindowFacts:
+    """Build one window snapshot with the given posture fields."""
+    return AdvisorWindowFacts(
+        record_count=5,
+        tracked_symbol="SPCXc" if committed is not None else None,
+        committed_usdc=committed,
+        equity_usdc=equity,
+        day_start_equity_usdc=day_start,
+        day_pnl_usdc=day_pnl,
+        latest_action=action,
+    )
+
+
+def posture_flagged_episode(
+    *,
+    student_brief: AdvisorBrief | None = None,
+    student_quiet: bool = False,
+) -> TeacherEpisode:
+    """Build one episode whose posture the deterministic desk flags."""
+    return episode(
+        T0,
+        facts=posture_picture(equity="90.0", day_pnl="-10.0"),
+        student=student_payload(brief=brief_with(()) if student_quiet else student_brief)
+        if (student_quiet or student_brief is not None)
+        else None,
+    )
 
 
 class ScriptedSeatTransport:
@@ -766,6 +804,49 @@ class TestCliContract:
         assert main([]) == 1
         assert str(config_path) in capsys.readouterr().err
 
+    def test_an_undecodable_corpus_exits_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Invalid UTF-8 in the corpus is a typed failure, not a traceback."""
+        corpus_dir = tmp_path / "corpus"
+        corpus_dir.mkdir()
+        (corpus_dir / "corpus.jsonl").write_bytes(b"\xff\xfe not utf-8")
+        monkeypatch.setenv("AERO_BOT_TEACHER_CORPUS_DIR", str(corpus_dir))
+        assert main([]) == 1
+        assert "could not be read" in capsys.readouterr().err
+
+    def test_an_unwritable_corpus_directory_exits_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A corpus path that cannot hold artifacts fails named."""
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+        monkeypatch.setenv("AERO_BOT_TEACHER_CORPUS_DIR", str(blocker))
+        assert main([]) == 1
+        assert "failed" in capsys.readouterr().err
+
+    def test_the_human_summary_prints_absent_seats_with_detail(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An absent seat prints its reason and bounded detail tail."""
+        outcome = SeatUpgradeOutcome(
+            seat=TeacherSeatName.CODEX,
+            model="gpt-6-luna",
+            outcome="cli_error",
+            detail="spawn failed",
+        )
+        assert outcome.status == "cli_error"
+        report = UpgradeReport(
+            created_at=T0,
+            horizon_hours=HORIZON,
+            gated=False,
+            digest=UpgradeDivergenceDigest(horizon_hours=HORIZON),
+            seats=(outcome,),
+        )
+        print_upgrade_report(report)
+        captured = capsys.readouterr()
+        assert "codex: absent cli_error - spawn failed" in captured.out
+
     def test_a_corrupted_corpus_gates_with_the_honesty_line(
         self,
         tmp_path: Path,
@@ -801,3 +882,117 @@ class TestCliContract:
         with pytest.raises(SystemExit) as raised:
             main(["--horizon-hours", "0.5"])
         assert raised.value.code == 2
+
+
+class TestPostureWiring:
+    """The deterministic risk desk feeds the digest's fourth evidence class."""
+
+    def test_a_quiet_student_over_a_flagged_posture_is_a_posture_miss(self) -> None:
+        """The counterparty finding backs a scorable miss on its own truth."""
+        flagged = posture_flagged_episode(student_quiet=True)
+        audit = audit_corpus_posture((flagged,))
+        digest = build_divergence_digest((flagged,), (), HORIZON, posture_audit=audit)
+        assert digest.posture_finding_count == 1
+        assert digest.total_divergences == 1
+        miss = digest.posture_misses[0]
+        assert miss.finding_kinds == (RiskFindingKind.HALT_THRESHOLD_BREACHED,)
+        assert miss.student_brief
+        assert miss.day_pnl_usdc == "-10.0"
+        assert miss.halted_count == 0
+
+    def test_multiple_findings_carry_their_kinds_bounded(self) -> None:
+        """One episode can miss several findings at once."""
+        flagged = episode(
+            T0,
+            facts=posture_picture(
+                equity="120.0",
+                day_start="100.0",
+                day_pnl="-10.0",
+                committed="120.0",
+                action="enter",
+            ),
+            student=student_payload(brief=brief_with(())),
+        )
+        audit = audit_corpus_posture((flagged,))
+        digest = build_divergence_digest((flagged,), (), HORIZON, posture_audit=audit)
+        assert digest.posture_finding_count == 3
+        assert len(digest.posture_misses) == 1
+        assert set(digest.posture_misses[0].finding_kinds) == {
+            RiskFindingKind.DAY_PNL_CONTRADICTION,
+            RiskFindingKind.HARD_CAP_BREACH,
+            RiskFindingKind.SIZING_CAP_BREACH,
+        }
+
+    def test_a_flagged_student_never_contributes_a_posture_miss(self) -> None:
+        """A desk that raised any label gave a verdict, not a miss."""
+        flagged = posture_flagged_episode(student_brief=brief_with(("drawdown",)))
+        audit = audit_corpus_posture((flagged,))
+        digest = build_divergence_digest((flagged,), (), HORIZON, posture_audit=audit)
+        assert digest.posture_misses == ()
+        assert digest.posture_finding_count == 1
+        assert digest.total_divergences == 0
+
+    def test_an_absent_student_is_not_a_posture_miss(self) -> None:
+        """The finding still counts as context; the miss needs an answer."""
+        flagged = posture_flagged_episode()
+        audit = audit_corpus_posture((flagged,))
+        digest = build_divergence_digest((flagged,), (), HORIZON, posture_audit=audit)
+        assert digest.posture_misses == ()
+        assert digest.posture_finding_count == 1
+
+    def test_the_gate_opens_on_a_posture_miss_alone(self, tmp_path: Path) -> None:
+        """No teacher ever flagged; the deterministic desk alone asks the seats."""
+        corpus_dir = tmp_path / "corpus"
+        write_corpus(corpus_dir, posture_flagged_episode(student_quiet=True))
+        transport = ScriptedSeatTransport(
+            [proposal_result(), proposal_result()], last_message=json.dumps(PROPOSAL_ANSWER)
+        )
+        report = run_upgrade_pass(
+            seeded_config(),
+            cast("TeacherSeatTransport", transport),
+            corpus_dir,
+            HORIZON,
+            now=NOW,
+        )
+        assert not report.gated
+        assert len(transport.invocations) == 2
+        prompt = transport.invocations[0][1]
+        assert "risk_manager" in prompt
+        assert "posture_finding_counts" in prompt
+        assert len(report.digest.posture_misses) == 1
+        assert all(outcome.proposal is not None for outcome in report.seats)
+
+    def test_the_prompt_carries_the_risk_manager_block(self) -> None:
+        """The counterparty seat's rules and counts ride the prompt."""
+        flagged = posture_flagged_episode(student_quiet=True)
+        audit = audit_corpus_posture((flagged,))
+        digest = build_divergence_digest((flagged,), (), HORIZON, posture_audit=audit)
+        prompt = build_upgrade_user_prompt(digest, (), audit)
+        assert '"risk_manager"' in prompt
+        assert "daily-loss-halt line" in prompt
+        assert '"kind": "halt_threshold_breached"' in prompt
+        assert '"count": 1' in prompt
+
+    def test_without_an_audit_the_digest_stays_three_classed(self) -> None:
+        """The audit is optional; the legacy composition is unchanged."""
+        digest = digest_for(miss_episode(), bad_follower())
+        assert digest.posture_misses == ()
+        assert digest.posture_finding_count == 0
+        prompt = build_upgrade_user_prompt(digest, ())
+        assert "risk_manager" not in prompt
+
+    def test_the_live_pass_always_audits_the_corpus(self, tmp_path: Path) -> None:
+        """run_upgrade_pass carries the counterparty count even when gated."""
+        corpus_dir = tmp_path / "corpus"
+        write_corpus(corpus_dir, bad_follower())
+        transport = ScriptedSeatTransport([])
+        report = run_upgrade_pass(
+            seeded_config(),
+            cast("TeacherSeatTransport", transport),
+            corpus_dir,
+            HORIZON,
+            now=NOW,
+        )
+        assert report.gated
+        assert report.digest.posture_finding_count == 1
+        assert report.digest.posture_misses == ()

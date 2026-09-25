@@ -568,11 +568,19 @@ class TestCorpusWriting:
         corpus.mkdir()
         with (corpus / "corpus.jsonl").open("w", encoding="utf-8") as handle:
             handle.write(episode(T0, seats=(claude_outcome(),)).model_dump_json() + "\n")
+            handle.write(
+                episode(
+                    T0 + timedelta(hours=1),
+                    seats=(claude_outcome(outcome="timeout"),),
+                ).model_dump_json()
+                + "\n"
+            )
         code = hindsight_main(["--corpus-dir", str(corpus)])
         captured = capsys.readouterr()
         assert code == 0
         assert "hindsight report" in captured.out
-        assert "claude [GLM 5.3]: 1/1 briefs" in captured.out
+        assert "claude [GLM 5.3]: 1/2 briefs" in captured.out
+        assert "absent timeout: 1" in captured.out
         assert "scoreboard: equity 100.0 USDC" in captured.out
         assert "truth:" in captured.out
 

@@ -75,6 +75,12 @@ aero-bot-hindsight = "aero_bot.hindsight:main"
 # seat for one teaching-block proposal written as an operator-reviewable
 # artifact; sealing stays the operator's explicit act.
 aero-bot-upgrade = "aero_bot.upgrade:main"
+# The risk-manager command audits the corpus's posture snapshots as the
+# independent counterparty desk: capital-posture arithmetic, halt state
+# and discipline, exposure against the locked caps, and every desk's
+# quiet verdict over a flagged posture; the report beside the corpus is
+# the entire effect.
+aero-bot-risk-manager = "aero_bot.risk_manager:main"
 
 [tool.hatch.build.targets.wheel]
 # The wheel contains only the application package under the src layout.

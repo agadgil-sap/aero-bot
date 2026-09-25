@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -54,6 +55,7 @@ from aero_bot.hindsight import (
     episode_verdicts,
     score_corpus,
 )
+from aero_bot.risk_manager import RISK_POSTURE_RULES, PostureAudit, audit_corpus_posture
 from aero_bot.teacher import (
     DEFAULT_SEAT_MODELS,
     TEACHER_CORPUS_NAME,
@@ -164,6 +166,28 @@ class LabelDivergence(BaseModel):
     student_labels: tuple[str, ...]
 
 
+class PostureMiss(BaseModel):
+    """Carry one episode the deterministic risk desk flagged and the student read as quiet."""
+
+    # Frozen strict fields keep one miss entry immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # When the flagged episode ran.
+    created_at: datetime
+    # The stream the episode served.
+    stream: str
+    # The stable posture-finding kinds the audit raised, bounded.
+    finding_kinds: tuple[str, ...]
+    # The audit's bounded detail lines, collapsed and joined.
+    finding_detail: str
+    # The student's quiet brief, bounded.
+    student_brief: str
+    # The episode's observed day P&L, else None.
+    day_pnl_usdc: str | None = None
+    # The episode's halted-cycle baseline.
+    halted_count: Annotated[int, Field(ge=0)] = 0
+
+
 class UpgradeDivergenceDigest(BaseModel):
     """Carry the deterministic divergence digest the seats propose over."""
 
@@ -183,17 +207,30 @@ class UpgradeDivergenceDigest(BaseModel):
     # How many non-empty corpus lines were skipped as malformed, so a
     # corrupted corpus is never indistinguishable from an honest gate.
     malformed_episode_count: Annotated[int, Field(ge=0)] = 0
+    # How many posture findings the deterministic risk desk recorded over
+    # the corpus (context: the counterparty seat's own count, while the
+    # misses below carry only the episodes the student answered quiet).
+    posture_finding_count: Annotated[int, Field(ge=0)] = 0
     # Teachers flagged what followed; the student stayed quiet.
     misses: tuple[DivergenceMiss, ...] = ()
     # Teachers answered; the student surface had nothing on record.
     availability_gaps: tuple[AvailabilityGap, ...] = ()
     # Both answered; the teacher alone raised labels.
     label_divergences: tuple[LabelDivergence, ...] = ()
+    # The deterministic risk desk flagged the posture; the student
+    # answered quiet. Backed by the finding itself - realized
+    # deterministic truth, never a pending read.
+    posture_misses: tuple[PostureMiss, ...] = ()
 
     @property
     def total_divergences(self) -> int:
-        """Count every scorable divergence across all three classes."""
-        return len(self.misses) + len(self.availability_gaps) + len(self.label_divergences)
+        """Count every scorable divergence across all four classes."""
+        return (
+            len(self.misses)
+            + len(self.availability_gaps)
+            + len(self.label_divergences)
+            + len(self.posture_misses)
+        )
 
 
 class UpgradeProposal(BaseModel):
@@ -286,15 +323,20 @@ def build_divergence_digest(
     horizon_hours: float,
     *,
     malformed_episode_count: int = 0,
+    posture_audit: PostureAudit | None = None,
 ) -> UpgradeDivergenceDigest:
     """Compose the deterministic divergence digest over decided truth.
 
-    Every entry is backed by realized bad truth: only episodes whose
-    hindsight verdict came back True (a negative day P&L or a higher
-    halted-cycle count followed inside the horizon) may contribute, and
-    only the window-grounded streams (tactical and daily) qualify - the
-    same scoping the scorer's calibration applies. Pending and quiet
-    episodes contribute context counts, never entries.
+    Every entry is backed by realized truth: the teacher-divergence
+    classes draw only from episodes whose hindsight verdict came back
+    True (a negative day P&L or a higher halted-cycle count followed
+    inside the horizon), scoped to the window-grounded streams (tactical
+    and daily) - the same scoping the scorer's calibration applies. The
+    fourth class draws from the deterministic risk desk's posture audit
+    instead: a posture miss is backed by the finding itself, realized
+    deterministic truth at the episode's timestamp, so it needs no
+    hindsight verdict and no stream scoping. Pending and quiet episodes
+    contribute context counts, never entries.
 
     Args:
         episodes: The corpus's episodes, oldest first.
@@ -303,6 +345,9 @@ def build_divergence_digest(
         horizon_hours: The horizon the verdicts were scored against.
         malformed_episode_count: How many corpus lines the loader skipped
             as malformed, surfaced so corruption never reads as a gate.
+        posture_audit: The deterministic risk desk's audit over the same
+            episodes, else None to compose the digest without the
+            posture class (the live pass always audits).
 
     Returns:
         The immutable digest, each class bounded to its most recent
@@ -316,6 +361,7 @@ def build_divergence_digest(
     misses: list[DivergenceMiss] = []
     gaps: list[AvailabilityGap] = []
     label_divergences: list[LabelDivergence] = []
+    posture_misses: list[PostureMiss] = []
     for index, episode in enumerate(episodes):
         if episode.facts is None or episode.stream not in CALIBRATED_STREAMS:
             continue
@@ -389,12 +435,41 @@ def build_divergence_digest(
                         student_labels=student_labels,
                     )
                 )
+    posture_finding_count = 0
+    if posture_audit is not None:
+        posture_finding_count = len(posture_audit.findings)
+        for index, episode in enumerate(episodes):
+            episode_findings = posture_audit.findings_by_episode.get(id(episode))
+            if not episode_findings:
+                continue
+            student_read = student_reads[index]
+            if student_read.brief is None or student_read.brief.anomalies:
+                continue
+            posture_misses.append(
+                PostureMiss(
+                    created_at=episode.created_at,
+                    stream=episode.stream.value,
+                    finding_kinds=tuple(finding.kind for finding in episode_findings)[
+                        :UPGRADE_DIGEST_LABELS_PER_ENTRY
+                    ],
+                    finding_detail=_bounded_head(
+                        "; ".join(finding.detail for finding in episode_findings),
+                        UPGRADE_DIGEST_BRIEF_MAX_CHARS,
+                    ),
+                    student_brief=_bounded_head(
+                        student_read.brief.brief, UPGRADE_DIGEST_BRIEF_MAX_CHARS
+                    ),
+                    day_pnl_usdc=episode.facts.day_pnl_usdc if episode.facts is not None else None,
+                    halted_count=episode.facts.halted_count if episode.facts is not None else 0,
+                )
+            )
     return UpgradeDivergenceDigest(
         horizon_hours=horizon_hours,
         grounded_episode_count=grounded,
         bad_episode_count=bad,
         quiet_episode_count=quiet,
         malformed_episode_count=malformed_episode_count,
+        posture_finding_count=posture_finding_count,
         misses=tuple(
             sorted(misses, key=lambda entry: entry.created_at)[-UPGRADE_DIGEST_ENTRY_MAX:]
         ),
@@ -405,6 +480,9 @@ def build_divergence_digest(
             sorted(label_divergences, key=lambda entry: entry.created_at)[
                 -UPGRADE_DIGEST_ENTRY_MAX:
             ]
+        ),
+        posture_misses=tuple(
+            sorted(posture_misses, key=lambda entry: entry.created_at)[-UPGRADE_DIGEST_ENTRY_MAX:]
         ),
     )
 
@@ -444,16 +522,22 @@ UPGRADE_SYSTEM_PROMPT = (
 def build_upgrade_user_prompt(
     digest: UpgradeDivergenceDigest,
     desk_scores: Sequence[HindsightDeskScore],
+    posture_audit: PostureAudit | None = None,
 ) -> str:
     """Render the upgrade prompt from the digest and its context.
 
     Args:
         digest: The deterministic divergence digest.
         desk_scores: The hindsight desk scores for calibration context.
+        posture_audit: The deterministic risk desk's audit when the pass
+            ran one, else None; the prompt then carries the counterparty
+            seat's posture rules and finding counts so proposals can
+            cite them.
 
     Returns:
-        The prompt text carrying the digest, the scores, and the
-        student's current instructions as JSON.
+        The prompt text carrying the digest, the scores, the risk
+        desk's context when present, and the student's current
+        instructions as JSON.
     """
     document: dict[str, object] = {
         "digest": json.loads(digest.model_dump_json()),
@@ -464,6 +548,18 @@ def build_upgrade_user_prompt(
             "semantics": "appended behind a fixed separator; replaces any previously sealed block",
         },
     }
+    if posture_audit is not None:
+        finding_counter: Counter[str] = Counter(finding.kind for finding in posture_audit.findings)
+        document["risk_manager"] = {
+            "posture_rules": RISK_POSTURE_RULES,
+            "posture_finding_count": len(posture_audit.findings),
+            "posture_finding_counts": [
+                {"kind": kind, "count": count}
+                for kind, count in sorted(
+                    finding_counter.items(), key=lambda item: (-item[1], item[0])
+                )
+            ],
+        }
     return (
         "The divergence digest, the hindsight desk scores, and the "
         "student's current instructions follow. Interpret them per your "
@@ -556,13 +652,25 @@ def run_upgrade_pass(
     moment = now if now is not None else datetime.now(UTC)
     episodes, malformed = load_episodes_with_skips(corpus_dir / TEACHER_CORPUS_NAME)
     verdicts = episode_verdicts(episodes, horizon_hours, moment)
+    # The counterparty seat always audits: its findings are deterministic
+    # truth and back the digest's fourth evidence class whether or not
+    # any teacher ever flagged the posture.
+    posture_audit = audit_corpus_posture(episodes)
     digest = build_divergence_digest(
-        episodes, verdicts, horizon_hours, malformed_episode_count=malformed
+        episodes,
+        verdicts,
+        horizon_hours,
+        malformed_episode_count=malformed,
+        posture_audit=posture_audit,
     )
     desk_scores = score_corpus(episodes, horizon_hours, moment).desks
     outcomes: list[SeatUpgradeOutcome] = []
     if digest.total_divergences:
-        prompt = UPGRADE_SYSTEM_PROMPT + "\n\n" + build_upgrade_user_prompt(digest, desk_scores)
+        prompt = (
+            UPGRADE_SYSTEM_PROMPT
+            + "\n\n"
+            + build_upgrade_user_prompt(digest, desk_scores, posture_audit)
+        )
         work_dir = corpus_dir / "scratch"
         for seat in TeacherSeatName:
             if seat_filter is not None and seat not in seat_filter:
@@ -639,7 +747,8 @@ def print_upgrade_report(report: UpgradeReport) -> None:
     print(
         f"  divergences: {digest.total_divergences} "
         f"({len(digest.misses)} misses, {len(digest.availability_gaps)} availability gaps, "
-        f"{len(digest.label_divergences)} label divergences) over "
+        f"{len(digest.label_divergences)} label divergences, "
+        f"{len(digest.posture_misses)} posture misses) over "
         f"{digest.grounded_episode_count} grounded episodes "
         f"({digest.bad_episode_count} bad, {digest.quiet_episode_count} quiet)"
     )
@@ -763,6 +872,7 @@ __all__ = [
     "DEFAULT_SEAT_MODELS",
     "DivergenceMiss",
     "LabelDivergence",
+    "PostureMiss",
     "SeatUpgradeOutcome",
     "UPGRADE_DIGEST_BRIEF_MAX_CHARS",
     "UPGRADE_DIGEST_ENTRY_MAX",

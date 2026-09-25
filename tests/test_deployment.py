@@ -374,8 +374,8 @@ class TestMacTeacherKit:
         ]
         assert executable == []
 
-    def test_the_installer_generates_all_five_jobs(self) -> None:
-        """Tactical, daily, news, hindsight, and upgrade each get their own job."""
+    def test_the_installer_generates_all_six_jobs(self) -> None:
+        """Tactical, daily, news, hindsight, upgrade, and risk-manager each get their own job."""
         text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
         for label in (
             "teacher-tactical",
@@ -383,6 +383,7 @@ class TestMacTeacherKit:
             "teacher-news",
             "teacher-hindsight",
             "teacher-upgrade",
+            "teacher-risk-manager",
         ):
             assert f"com.aero-bot.{label}" in text, label
 
@@ -411,6 +412,24 @@ class TestMacTeacherKit:
         assert upgrade_block in text
         assert text.index("<integer>50</integer>") < text.index(upgrade_block)
 
+    def test_the_risk_manager_audits_between_the_scorer_and_the_proposer(self) -> None:
+        """The counterparty audit lands at 10:00: after 09:50, before 10:10."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        risk_block = (
+            "<key>Hour</key>\n"
+            "        <integer>10</integer>\n"
+            "        <key>Minute</key>\n"
+            "        <integer>0</integer>"
+        )
+        assert risk_block in text
+        # The generation order mirrors the morning cadence: scorer,
+        # then the audit it feeds, then the proposer.
+        assert (
+            text.index('generate_plist "com.aero-bot.teacher-hindsight"')
+            < text.index('generate_plist "com.aero-bot.teacher-upgrade"')
+            < text.index('generate_plist "com.aero-bot.teacher-risk-manager"')
+        )
+
     def test_the_jobs_run_as_background_priority(self) -> None:
         """Advisory passes never compete with interactive work."""
         text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
@@ -428,7 +447,7 @@ class TestMacTeacherKit:
     def test_the_run_script_serves_the_hindsight_scorer(self) -> None:
         """The hindsight argument runs the scorer, not a teacher stream."""
         text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
-        assert "<tactical|daily|news|hindsight|upgrade>" in text
+        assert "<tactical|daily|news|hindsight|upgrade|risk-manager>" in text
         assert '"$STREAM" == "hindsight"' in text
         assert 'run aero-bot-hindsight >>"$LOG_DIR/${STREAM}.log"' in text
 
@@ -437,6 +456,13 @@ class TestMacTeacherKit:
         text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
         assert '"$STREAM" == "upgrade"' in text
         assert 'run aero-bot-upgrade >>"$LOG_DIR/${STREAM}.log"' in text
+
+    def test_the_run_script_serves_the_risk_manager(self) -> None:
+        """The risk-manager argument runs the audit, not a teacher stream."""
+        text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
+        assert "<tactical|daily|news|hindsight|upgrade|risk-manager>" in text
+        assert '"$STREAM" == "risk-manager"' in text
+        assert 'run aero-bot-risk-manager >>"$LOG_DIR/${STREAM}.log"' in text
 
     def test_the_run_script_streams_into_the_state_logs(self) -> None:
         """Each run appends to the stream's log inside the state directory."""
@@ -477,7 +503,7 @@ class TestMacTeacherKit:
     def test_the_installer_never_rips_the_worktree_from_a_live_pass(self) -> None:
         """Reinstalling mid-run is refused; a live pass keeps its code."""
         text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
-        assert 'pgrep -f "aero-bot-(teacher|hindsight|upgrade)"' in text
+        assert 'pgrep -f "aero-bot-(teacher|hindsight|upgrade|risk-manager)"' in text
         assert "wait for it to finish before reinstalling" in text
 
     def test_the_installer_refuses_paths_it_does_not_manage(self) -> None:
