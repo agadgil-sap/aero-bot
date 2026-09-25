@@ -131,9 +131,15 @@ See [the teacher documentation](docs/teacher.md) for the truth rule, the desk sc
 
 ## Upgrade loop command
 
-The `aero-bot-upgrade` command turns measured divergence into proposed teaching: it composes a deterministic digest of where the teacher desks beat the student ahead of realized bad outcomes (misses, availability gaps, label divergences), asks each seat for one schema-validated replacement teaching block when - and only when - any divergence is backed by decided truth, and writes the proposals as operator-reviewable artifacts beside the corpus.
+The `aero-bot-upgrade` command turns measured divergence into proposed teaching: it composes a deterministic digest of where the teacher desks beat the student ahead of realized bad outcomes (misses, availability gaps, label divergences) plus the posture misses the deterministic risk desk caught, asks each seat for one schema-validated replacement teaching block when - and only when - any divergence is backed by decided truth, and writes the proposals as operator-reviewable artifacts beside the corpus.
 Nothing applies itself: sealing stays the operator's manual act on the VM (one file written, one overlay variable uncommented), and the advisor's append-never-replace composition plus its fail-closed validation keep the student's answer contract untouchable.
 See [the teacher documentation](docs/teacher.md) for the digest classes, the proposal schema, the sealing checklist, and the daily agent.
+
+## Risk manager command
+
+The `aero-bot-risk-manager` command is the intelligence layer's separation-of-duties seat: a deterministic counterparty desk that replays the corpus's posture snapshots offline and verifies the capital-posture arithmetic (day P&L equal to equity minus the day-start anchor), the halt state (the five-percent latch line and its entry discipline), and exposure against the locked caps (the 100 USDC hard ceiling, the eighty-percent sizing fraction), recording every desk whose accepted brief stayed quiet over a flagged posture.
+Its findings feed the upgrade loop's digest as a fourth evidence class, its report lands beside the corpus, and nothing it finds authorizes anything by itself.
+See [the risk-manager documentation](docs/risk-manager.md) for the finding kinds, the contradiction rule, the upgrade wiring, and the daily agent.
 
 ## Wallet-free transaction planning
 

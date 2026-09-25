@@ -748,3 +748,12 @@ class TestTeachingBlock:
         monkeypatch.setenv(ADVISOR_TEACHING_FILE_ENV, str(tmp_path / "absent.txt"))
         assert main(["--max-runs", "1"]) == 1
         assert ADVISOR_TEACHING_FILE_ENV in capsys.readouterr().err
+
+    def test_usage_errors_exit_two(self) -> None:
+        """The bounded flags refuse zero runs and negative intervals."""
+        with pytest.raises(SystemExit) as raised:
+            main(["--max-runs", "0"])
+        assert raised.value.code == 2
+        with pytest.raises(SystemExit) as raised:
+            main(["--max-runs", "2", "--interval-seconds", "-1"])
+        assert raised.value.code == 2

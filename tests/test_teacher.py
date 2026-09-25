@@ -5,8 +5,10 @@ import subprocess
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
+from pydantic import ValidationError
 
 from aero_bot.advisor import AdvisorReportedAuditPayload, AdvisorWindowFacts
 from aero_bot.audit import AuditEventType, AuditRecord
@@ -21,6 +23,8 @@ from aero_bot.teacher import (
     TEACHER_JSON_CONTRACT,
     TEACHER_WINDOW_PULLED,
     TEACHER_WINDOW_UNREACHABLE,
+    SeatInvocation,
+    StudentWindowBrief,
     SubprocessTeacherTransport,
     TeacherAbsentReason,
     TeacherConfig,
@@ -29,7 +33,9 @@ from aero_bot.teacher import (
     TeacherProcessResult,
     TeacherSeatConfig,
     TeacherSeatName,
+    TeacherSeatOutcome,
     TeacherSeatTimeoutError,
+    TeacherSeatTransport,
     TeacherStream,
     TeacherWindowError,
     ask_seat,
@@ -972,3 +978,256 @@ class TestCli:
         corpus = tmp_path / "corpus.jsonl"
         assert corpus.exists()
         assert len(load_episodes(corpus)) == 1
+
+    def test_an_unreachable_window_prints_its_typed_absence(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A failed pull still prints one honest episode summary."""
+        transport = both_seats_accepted()
+        monkeypatch.setenv(TEACHER_CORPUS_DIR_ENV, str(tmp_path))
+        monkeypatch.setattr(
+            "aero_bot.teacher.SubprocessTeacherTransport",
+            lambda *_, **__: transport,
+        )
+
+        def refused(self: TeacherHarness) -> object:
+            raise TeacherWindowError("the pull failed")
+
+        monkeypatch.setattr(TeacherHarness, "pull_window", refused)
+        assert main(["tactical"]) == 0
+        captured = capsys.readouterr()
+        assert TEACHER_WINDOW_UNREACHABLE in captured.out
+        assert "absent window_unreachable" in captured.out
+
+
+class TestFailClosedBranches:
+    """Every narrow failure branch stays typed, never an exception."""
+
+    def test_a_valid_provided_remote_path_passes_validation(self) -> None:
+        """The validator's happy branch accepts a plain absolute path."""
+        config = TeacherConfig.model_validate({"pull": {"book_path": "/var/lib/ok.json"}})
+        assert config.pull.book_path == "/var/lib/ok.json"
+
+    def test_the_outcome_status_exposes_its_one_word_state(self) -> None:
+        """The status property mirrors the recorded outcome."""
+        outcome = TeacherSeatOutcome(
+            seat=TeacherSeatName.CLAUDE, model="glm-5.3", outcome="brief", brief=None
+        )
+        assert outcome.status == "brief"
+
+    def test_a_missing_usage_envelope_falls_back_to_the_label(self, tmp_path: Path) -> None:
+        """No usage envelope means the seat's default model tag."""
+        body = json.dumps(
+            {
+                "is_error": False,
+                "subtype": "success",
+                "result": json.dumps(ACCEPTED_ANSWER),
+            }
+        )
+        transport = ScriptedSeatTransport(
+            [TeacherProcessResult(exit_code=0, stdout=body, stderr="")]
+        )
+        outcome = ask_seat(
+            TeacherSeatName.CLAUDE,
+            TeacherSeatConfig(binary="/bin/claude"),
+            "prompt",
+            transport,
+            web_tools=False,
+            default_timeout_seconds=10.0,
+            work_dir=tmp_path,
+        )
+        assert outcome.outcome == "brief"
+        assert outcome.model == DEFAULT_SEAT_MODELS[TeacherSeatName.CLAUDE]
+
+    def test_an_invocation_carrying_both_reason_and_content_is_refused(self) -> None:
+        """The model validator keeps reason XOR content."""
+        with pytest.raises(ValidationError, match="exactly one"):
+            SeatInvocation(
+                seat=TeacherSeatName.CLAUDE,
+                model="glm-5.3",
+                reason=TeacherAbsentReason.TIMEOUT,
+                content="stray answer",
+            )
+
+    def test_a_transport_timeout_is_a_typed_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """subprocess.TimeoutExpired surfaces as the timeout absence."""
+
+        def runner(argv: Sequence[str], **_: object) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=5.0)
+
+        transport = SubprocessTeacherTransport(runner=runner)
+        outcome = ask_seat(
+            TeacherSeatName.CLAUDE,
+            TeacherSeatConfig(binary="/bin/claude"),
+            "prompt",
+            transport,
+            web_tools=False,
+            default_timeout_seconds=10.0,
+            work_dir=tmp_path,
+        )
+        assert outcome.outcome == TeacherAbsentReason.TIMEOUT.value
+
+    def test_a_transport_spawn_failure_is_a_typed_cli_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An OSError from the spawn surface is a cli_error with detail."""
+
+        def runner(argv: Sequence[str], **_: object) -> subprocess.CompletedProcess[str]:
+            raise OSError("no such file")
+
+        transport = SubprocessTeacherTransport(runner=runner)
+        outcome = ask_seat(
+            TeacherSeatName.CLAUDE,
+            TeacherSeatConfig(binary="/bin/claude"),
+            "prompt",
+            transport,
+            web_tools=False,
+            default_timeout_seconds=10.0,
+            work_dir=tmp_path,
+        )
+        assert outcome.outcome == TeacherAbsentReason.CLI_ERROR.value
+        assert "no such file" in outcome.detail
+
+    def test_a_silent_last_message_file_is_empty_content(self, tmp_path: Path) -> None:
+        """An exit-zero codex pass that wrote no file answers nothing."""
+
+        class SilentTransport:
+            def invoke(
+                self,
+                argv: Sequence[str],
+                *,
+                prompt: str,
+                timeout_seconds: float,
+                cwd: Path,
+            ) -> TeacherProcessResult:
+                return TeacherProcessResult(exit_code=0, stdout="", stderr="")
+
+        outcome = ask_seat(
+            TeacherSeatName.CODEX,
+            TeacherSeatConfig(binary="/bin/codex"),
+            "prompt",
+            cast("TeacherSeatTransport", SilentTransport()),
+            web_tools=False,
+            default_timeout_seconds=10.0,
+            work_dir=tmp_path,
+        )
+        assert outcome.outcome == TeacherAbsentReason.EMPTY_CONTENT.value
+
+    def test_the_digest_skips_ungrounded_episodes_and_names_absent_desks(self) -> None:
+        """Facts-free episodes drop out; absent desks surface by outcome."""
+        ungrounded = TeacherEpisode(
+            stream=TeacherStream.TACTICAL,
+            created_at=CREATED_AT,
+            window_outcome=TEACHER_WINDOW_UNREACHABLE,
+        )
+        absent_student = TeacherEpisode(
+            stream=TeacherStream.DAILY,
+            created_at=LATER_AT,
+            window_outcome=TEACHER_WINDOW_PULLED,
+            facts=AdvisorWindowFacts(record_count=1, halted_count=1),
+            student=StudentWindowBrief(
+                created_at=LATER_AT,
+                payload=AdvisorReportedAuditPayload(
+                    outcome="timeout",
+                    model="qwen3.6:35b-a3b",
+                    brief="",
+                    latency_ms=1,
+                    window_records=1,
+                ),
+            ),
+            seats=(
+                TeacherSeatOutcome(
+                    seat=TeacherSeatName.CLAUDE,
+                    model="glm-5.3",
+                    outcome="timeout",
+                ),
+            ),
+        )
+        digest = build_digest((ungrounded, absent_student), window_hours=24)
+        assert digest.episode_count == 1
+        assert digest.halted_episode_count == 1
+        assert digest.seat_outcomes["student"] == {"timeout": 1}
+        assert digest.seat_outcomes["claude"] == {"timeout": 1}
+        assert digest.latest_absences == {"student": "timeout", "claude": "timeout"}
+
+    def test_an_undecodable_envelope_is_a_typed_cli_error(self, tmp_path: Path) -> None:
+        """Exit-zero stdout that is not JSON is cli_error, never a crash."""
+        transport = ScriptedSeatTransport(
+            [TeacherProcessResult(exit_code=0, stdout="plain prose, not json", stderr="")]
+        )
+        outcome = ask_seat(
+            TeacherSeatName.CLAUDE,
+            TeacherSeatConfig(binary="/bin/claude"),
+            "prompt",
+            transport,
+            web_tools=False,
+            default_timeout_seconds=10.0,
+            work_dir=tmp_path,
+        )
+        assert outcome.outcome == TeacherAbsentReason.CLI_ERROR.value
+        assert "plain prose" in outcome.detail
+
+    def test_multi_run_passes_sleep_between_runs_and_failures_exit_one(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The loop sleeps between runs; a failed pass exits one named."""
+        records = [cycle_record(1, CREATED_AT)]
+        document = pull_document(records)
+        pair = [
+            TeacherProcessResult(exit_code=0, stdout=claude_body(ACCEPTED_ANSWER), stderr=""),
+            TeacherProcessResult(exit_code=0, stdout="", stderr=""),
+        ]
+        transport = ScriptedSeatTransport(pair + pair, last_message=json.dumps(ACCEPTED_ANSWER))
+        monkeypatch.setenv(TEACHER_CORPUS_DIR_ENV, str(tmp_path))
+        monkeypatch.setattr(
+            "aero_bot.teacher.SubprocessTeacherTransport",
+            lambda *_, **__: transport,
+        )
+        monkeypatch.setattr(
+            TeacherHarness, "pull_window", lambda self: parse_window_payload(document)
+        )
+        monkeypatch.setattr("time.sleep", lambda seconds: None)
+        assert main(["tactical", "--max-runs", "2"]) == 0
+        assert len(load_episodes(tmp_path / "corpus.jsonl")) == 2
+
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+        monkeypatch.setenv(TEACHER_CORPUS_DIR_ENV, str(blocker))
+        assert main(["tactical"]) == 1
+        assert "the teacher pass failed" in capsys.readouterr().err
+
+    def test_pull_timeouts_and_spawn_failures_are_typed_window_errors(self, tmp_path: Path) -> None:
+        """Both pull failure modes raise the typed window error."""
+        transport = both_seats_accepted()
+
+        def timeout_runner(argv: Sequence[str], **_: object) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=120.0)
+
+        harness = TeacherHarness(
+            TeacherConfig(corpus_dir=tmp_path),
+            transport,
+            tmp_path,
+            pull_runner=timeout_runner,
+        )
+        with pytest.raises(TeacherWindowError, match="timed out"):
+            harness.pull_window()
+
+        def spawn_runner(argv: Sequence[str], **_: object) -> subprocess.CompletedProcess[str]:
+            raise OSError("gcloud missing")
+
+        harness = TeacherHarness(
+            TeacherConfig(corpus_dir=tmp_path),
+            transport,
+            tmp_path,
+            pull_runner=spawn_runner,
+        )
+        with pytest.raises(TeacherWindowError, match="could not run"):
+            harness.pull_window()
