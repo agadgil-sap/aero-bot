@@ -94,7 +94,8 @@ The SSH transport and remote path default to the production box (`gcloud compute
 ## The Mac-side teacher kit
 
 The teacher harness (see [the teacher documentation](teacher.md)) runs on the operator's Mac, not this box: its launchd agents pull one read-only window over `gcloud compute ssh` and ask the advisory seats, so the box itself needs nothing new - the pull only reads the audit database and cycle book through the existing `sudo` path.
-Generate the six user agents from the Mac checkout:
+The same installer also generates the student seat's dedicated Ollama plane (`com.aero-bot.student-ollama`, the always-alive server that pins the advisor's model resident on `100.106.111.37:11435`; see [the advisor documentation](advisor.md#the-student-plane)) - the VM's sealed `AERO_BOT_ADVISOR_URL` points at it with the shared instance sealed as the unreachable-fallback.
+Generate the seven user agents from the Mac checkout:
 
 ```
 bash deploy/launchd/install-mac.sh

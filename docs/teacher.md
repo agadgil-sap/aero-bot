@@ -80,7 +80,7 @@ Every field fails closed: an invalid file exits one naming the path, never the c
 
 ## Deployment on the Mac
 
-`deploy/launchd/install-mac.sh` generates the six user agents into `~/Library/LaunchAgents` - `com.aero-bot.teacher-tactical` (StartInterval 1800), `com.aero-bot.teacher-daily` (09:30, after the box's 09:00 Melbourne morning report), `com.aero-bot.teacher-news` (07:10), `com.aero-bot.teacher-hindsight` (09:50, after the daily stream drains), `com.aero-bot.teacher-upgrade` (10:10, after the hindsight report is rewritten), and `com.aero-bot.teacher-risk-manager` (10:00, between the scorer and the proposer) - and never loads any of them, mirroring the Ubuntu kit's posture.
+`deploy/launchd/install-mac.sh` generates the seven user agents into `~/Library/LaunchAgents` - `com.aero-bot.teacher-tactical` (StartInterval 1800), `com.aero-bot.teacher-daily` (09:30, after the box's 09:00 Melbourne morning report), `com.aero-bot.teacher-news` (07:10), `com.aero-bot.teacher-hindsight` (09:50, after the daily stream drains), `com.aero-bot.teacher-upgrade` (10:10, after the hindsight report is rewritten), `com.aero-bot.teacher-risk-manager` (10:00, between the scorer and the proposer), and `com.aero-bot.student-ollama` (the student seat's dedicated Ollama plane - RunAtLoad plus KeepAlive, not a scheduled pass; see [the advisor documentation](advisor.md#the-student-plane)) - and never loads any of them, mirroring the Ubuntu kit's posture.
 Arming a stream is the operator's explicit act:
 
 ```

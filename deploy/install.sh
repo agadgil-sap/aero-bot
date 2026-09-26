@@ -184,15 +184,35 @@ if [[ ! -f "${CONFIG_DIR}/advisor.env" ]]; then
 # plane's URL and model live here (see docs/advisor.md). The command is
 # dark until both values are uncommented, and it stays advisory-only no
 # matter what this file carries.
-#AERO_BOT_ADVISOR_URL=http://100.106.111.37:11434
+# The student seat's dedicated plane: the Mac-side Ollama instance that
+# pins the model resident (OLLAMA_KEEP_ALIVE=-1, one inference slot), so
+# no window pays the ~22 GB cold reload and no other consumer can evict
+# or starve the seat.
+#AERO_BOT_ADVISOR_URL=http://100.106.111.37:11435
+# The shared plane behind it: consulted ONLY when the dedicated plane is
+# unreachable, so a downed plane costs availability once instead of for
+# every window. The payload (and model) never change between attempts.
+#AERO_BOT_ADVISOR_FALLBACK_URL=http://100.106.111.37:11434
 #AERO_BOT_ADVISOR_MODEL=qwen3.6:35b-a3b
-# A cold reasoning-model pass thinks for tens of seconds (observed 55 s on
-# the 35B-A3B plane); the 15 s default cuts those off, so seal 120.
-#AERO_BOT_ADVISOR_TIMEOUT_SECONDS=120
+# The timeout is sized against the model's measured WARM latency plus
+# margin: measured warm brief latency 2.1-3.8 s over three replayed real
+# windows (native protocol, thinking off, JSON mode on) against a cold
+# load of 3.3 s page-cached, so 90 s carries a >20x warm margin and fully
+# covers a post-reboot cold window while a wedged plane still fails
+# bounded.
+#AERO_BOT_ADVISOR_TIMEOUT_SECONDS=90
 # Reasoning models: the budget must cover thinking plus the JSON answer
-# (default 4096); set 1 to ask thinking models not to think at all.
+# (default 4096).
 #AERO_BOT_ADVISOR_MAX_TOKENS=4096
-#AERO_BOT_ADVISOR_DISABLE_THINKING=0
+# Thinking is OFF by default (the hardened posture): observed thinking
+# chains ran to 9.7k tokens and blew the seat's clock, while anomaly
+# briefs over deterministic facts do not need deliberation. Seal 0 only
+# with eyes open - availability outranks deliberation for this seat.
+#AERO_BOT_ADVISOR_DISABLE_THINKING=1
+# JSON mode is ON by default: the plane constrains generation to valid
+# JSON so malformed_json absences are eliminated at the source. Seal 0
+# only for a strict plane that rejects the native JSON format field.
+#AERO_BOT_ADVISOR_JSON_MODE=1
 # The upgrade loop's seal: a teaching block proposed by the teachers and
 # written by the operator (see docs/teacher.md). It appends to the system
 # prompt, never replaces it, and the pass fails closed if the file is

@@ -24,6 +24,15 @@ Discipline:
 - **Bounded output.** The model must answer in one JSON object validated
   against a strict schema (a short brief, at most ten anomaly flags with
   bounded confidence); anything else is a schema-invalid absence.
+- **Native protocol.** The transport speaks Ollama's native ``/api/chat``
+  surface, the only one that expresses the availability levers this seat
+  needs: the per-request residency pin (``keep_alive: -1``), the thinking
+  cap (``think: false``), and JSON-constrained generation (``format``);
+  the OpenAI-compatible surface ignores the first two entirely (verified
+  live against Ollama 0.34.3), which is what starved the seat before the
+  hardening - every window paid a cold reload plus an invisible reasoning
+  chain (see ``docs/advisor.md``'s student-plane section for the measured
+  latencies and the fallback contract).
 - **Dark by default.** The URL defaults empty and the systemd unit ships
   installed but gated on a sealed overlay file, so nothing runs until the
   deploy operator arms it (see ``docs/advisor.md``).
@@ -55,13 +64,21 @@ from aero_bot.domain import IMMUTABLE_MODEL_CONFIG
 ADVISOR_URL_ENV = "AERO_BOT_ADVISOR_URL"
 # Environment variable naming the model the plane serves for this surface.
 ADVISOR_MODEL_ENV = "AERO_BOT_ADVISOR_MODEL"
+# Environment variable carrying the fallback plane's base URL, consulted only
+# when the primary plane is unreachable (the dedicated student plane's
+# fail-closed companion; empty disables the retry).
+ADVISOR_FALLBACK_URL_ENV = "AERO_BOT_ADVISOR_FALLBACK_URL"
 # Environment variable carrying the request timeout in seconds.
 ADVISOR_TIMEOUT_ENV = "AERO_BOT_ADVISOR_TIMEOUT_SECONDS"
 # Environment variable overriding the bounded generation budget in tokens.
 ADVISOR_MAX_TOKENS_ENV = "AERO_BOT_ADVISOR_MAX_TOKENS"
-# Environment variable disabling reasoning-model thinking where the plane
-# supports it (Ollama's think parameter); empty leaves thinking on.
+# Environment variable toggling reasoning-model thinking off where the
+# plane supports it (Ollama's think parameter); empty keeps the hardened
+# default (thinking off, see DEFAULT_ADVISOR_DISABLE_THINKING).
 ADVISOR_DISABLE_THINKING_ENV = "AERO_BOT_ADVISOR_DISABLE_THINKING"
+# Environment variable disabling the native JSON generation format for
+# strict planes that reject it; empty keeps JSON mode on.
+ADVISOR_JSON_MODE_ENV = "AERO_BOT_ADVISOR_JSON_MODE"
 # Environment variable overriding the persisted report's path (default:
 # advisor_last_report.json beside the audit store).
 ADVISOR_REPORT_PATH_ENV = "AERO_BOT_ADVISOR_REPORT_PATH"
@@ -76,6 +93,14 @@ ADVISOR_TEACHING_MAX_CHARS = 4000
 # the block appends, never replaces, so the answer contract survives.
 ADVISOR_TEACHING_SEPARATOR = "\n\nTeaching block (sealed by the operator):\n"
 
+# The default thinking posture: OFF. A reasoning model's unbounded thinking
+# chain is the seat's dominant availability risk - one observed qwen3.6
+# 35B-A3B pass spent 9.7k tokens thinking before a three-sentence brief,
+# blowing the seat's clock - while anomaly briefs over deterministic facts
+# do not need deliberation (the detection record was earned with thinking
+# on, but the seat cannot detect anything while absent). Operators who want
+# deliberation seal AERO_BOT_ADVISOR_DISABLE_THINKING=0.
+DEFAULT_ADVISOR_DISABLE_THINKING = True
 # The default request timeout: short enough that a slow plane never delays
 # an operator loop, long enough for a local model's first token.
 DEFAULT_ADVISOR_TIMEOUT_SECONDS = 15.0
@@ -194,11 +219,20 @@ class AdvisorConfig(BaseModel):
         int, Field(ge=ADVISOR_MAX_TOKENS_BOUNDS[0], le=ADVISOR_MAX_TOKENS_BOUNDS[1])
     ] = ADVISOR_MAX_OUTPUT_TOKENS
     # Whether to ask reasoning models not to think, where the plane
-    # supports the Ollama think parameter.
-    disable_thinking: bool = False
+    # supports the Ollama think parameter. Defaults to True: the seat's
+    # availability outranks its deliberation (see DEFAULT_ADVISOR_DISABLE_THINKING).
+    disable_thinking: bool = DEFAULT_ADVISOR_DISABLE_THINKING
+    # Whether requests carry the native JSON generation format so the
+    # plane constrains generation to valid JSON, eliminating
+    # malformed_json absences at the source. Defaults to True; strict
+    # planes that reject the field seal AERO_BOT_ADVISOR_JSON_MODE=0.
+    json_mode: bool = True
     # The optional sealed teaching file appended to the system prompt;
     # empty keeps the default prompt alone.
     teaching_file: str = ""
+    # The fallback plane's base URL, consulted only when the primary plane
+    # is unreachable; empty keeps the single-endpoint posture.
+    fallback_url: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -227,8 +261,9 @@ class AdvisorTransport(Protocol):
         """Deliver one request and return the raw response.
 
         Args:
-            url: The complete chat-completions endpoint URL.
-            payload: The OpenAI-compatible request body.
+            url: The complete chat endpoint URL (Ollama's native
+                ``/api/chat``).
+            payload: The Ollama-native request body.
             timeout_seconds: The bounded wall-clock request timeout.
 
         Returns:
@@ -266,11 +301,12 @@ class HttpxAdvisorTransport:
         payload: Mapping[str, object],
         timeout_seconds: float,
     ) -> AdvisorHttpResponse:
-        """Post one OpenAI-compatible chat completion request.
+        """Post one Ollama-native chat request.
 
         Args:
-            url: The complete chat-completions endpoint URL.
-            payload: The OpenAI-compatible request body.
+            url: The complete chat endpoint URL (Ollama's native
+                ``/api/chat``).
+            payload: The Ollama-native request body.
             timeout_seconds: The bounded wall-clock request timeout.
 
         Returns:
@@ -333,6 +369,9 @@ def parse_advisor_config(environ: Mapping[str, str] | None = None) -> AdvisorCon
     url = source.get(ADVISOR_URL_ENV, "").strip()
     if url and not url.startswith(("http://", "https://")):
         raise ValueError(f"{ADVISOR_URL_ENV} must be an http or https URL")
+    fallback_url = source.get(ADVISOR_FALLBACK_URL_ENV, "").strip()
+    if fallback_url and not fallback_url.startswith(("http://", "https://")):
+        raise ValueError(f"{ADVISOR_FALLBACK_URL_ENV} must be an http or https URL")
     timeout_text = source.get(ADVISOR_TIMEOUT_ENV, "").strip()
     timeout_seconds = (
         _positive_float(timeout_text, ADVISOR_TIMEOUT_ENV)
@@ -359,7 +398,15 @@ def parse_advisor_config(environ: Mapping[str, str] | None = None) -> AdvisorCon
         "no",
     }:
         raise ValueError(f"{ADVISOR_DISABLE_THINKING_ENV} must be a boolean")
-    disable_thinking = disable_thinking_text in {"1", "true", "yes"}
+    disable_thinking = (
+        DEFAULT_ADVISOR_DISABLE_THINKING
+        if not disable_thinking_text
+        else disable_thinking_text in {"1", "true", "yes"}
+    )
+    json_mode_text = source.get(ADVISOR_JSON_MODE_ENV, "").strip().lower()
+    if json_mode_text and json_mode_text not in {"1", "true", "yes", "0", "false", "no"}:
+        raise ValueError(f"{ADVISOR_JSON_MODE_ENV} must be a boolean")
+    json_mode = json_mode_text not in {"0", "false", "no"}
     teaching_file = source.get(ADVISOR_TEACHING_FILE_ENV, "").strip()
     if teaching_file and not teaching_file.startswith("/"):
         raise ValueError(f"{ADVISOR_TEACHING_FILE_ENV} must be an absolute path")
@@ -369,7 +416,9 @@ def parse_advisor_config(environ: Mapping[str, str] | None = None) -> AdvisorCon
         timeout_seconds=timeout_seconds,
         max_tokens=max_tokens,
         disable_thinking=disable_thinking,
+        json_mode=json_mode,
         teaching_file=teaching_file,
+        fallback_url=fallback_url,
     )
 
 
@@ -424,36 +473,77 @@ def request_brief(
     """
     if not config.enabled:
         return AdvisorOutcome(reason=AdvisorAbsentReason.DARK)
-    endpoint = config.url.rstrip("/") + "/v1/chat/completions"
+    # The endpoints to ask, primary first: an unreachable primary plane
+    # retries once against the sealed fallback (the shared instance behind
+    # the dedicated student plane) so a downed plane costs availability
+    # once, not for every window. A timeout does NOT retry - the bounded
+    # clock is already spent, and a second cold load would only blow it
+    # again. The payload (and therefore the model) never changes between
+    # attempts, so the fallback can never serve a silent wrong-model call;
+    # only the residency pin differs (below).
+    primary_base = config.url.rstrip("/")
+    endpoints = [primary_base + "/api/chat"]
+    fallback_base = config.fallback_url.rstrip("/")
+    if fallback_base and fallback_base != primary_base:
+        endpoints.append(fallback_base + "/api/chat")
     payload: dict[str, object] = {
         "model": config.model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0,
+        "stream": False,
         # The budget covers reasoning tokens plus the short JSON answer.
-        "max_tokens": config.max_tokens,
+        "options": {"temperature": 0, "num_predict": config.max_tokens},
     }
+    if config.json_mode:
+        # Ollama's native JSON format: the plane constrains generation to
+        # valid JSON so a pressured pass cannot emit prose-wrapped or
+        # truncated bodies; the strict schema gate downstream stays.
+        payload["format"] = "json"
     if config.disable_thinking:
-        # Ollama's think parameter; reasoning-capable planes honor it and
-        # strict OpenAI-compatible servers only see it when the operator
-        # sealed the switch.
+        # Ollama's native think switch - honored on this endpoint (the
+        # OpenAI-compatible surface provably ignores it on this build,
+        # leaving ~2.4k-token reasoning chains invisible in the latency).
         payload["think"] = False
+    # The residency pin: never evict what this seat loads. Like think, the
+    # pin is only expressible through the native protocol (verified live:
+    # the OpenAI-compatible surface ignores per-request keep_alive in both
+    # numeric and string forms), which is why the transport speaks native.
+    pinned_payload: dict[str, object] = {**payload, "keep_alive": -1}
     started = time.monotonic()
-    try:
-        response = transport.complete(endpoint, payload, config.timeout_seconds)
-    except AdvisorTimeoutError:
-        return AdvisorOutcome(reason=AdvisorAbsentReason.TIMEOUT)
-    except AdvisorUnreachableError:
-        return AdvisorOutcome(reason=AdvisorAbsentReason.UNREACHABLE)
+    response: AdvisorHttpResponse | None = None
+    unreachable = False
+    for index, endpoint in enumerate(endpoints):
+        # Only the sealed primary plane earns the pin: a fallback window
+        # leaves the shared instance's own eviction policy alone so one
+        # answered window never permanently claims its VRAM.
+        attempt = pinned_payload if index == 0 else payload
+        try:
+            response = transport.complete(endpoint, attempt, config.timeout_seconds)
+            unreachable = False
+            break
+        except AdvisorTimeoutError:
+            return AdvisorOutcome(reason=AdvisorAbsentReason.TIMEOUT)
+        except AdvisorUnreachableError:
+            unreachable = True
     elapsed = time.monotonic() - started
+    if unreachable or response is None:
+        return AdvisorOutcome(reason=AdvisorAbsentReason.UNREACHABLE)
     if response.status_code != 200:
         return AdvisorOutcome(reason=AdvisorAbsentReason.HTTP_STATUS)
     try:
         body = json.loads(response.body)
-        content = body["choices"][0]["message"]["content"]
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+    except json.JSONDecodeError:
+        return AdvisorOutcome(reason=AdvisorAbsentReason.MALFORMED_JSON)
+    if isinstance(body, dict) and "error" in body:
+        # The native plane answers some internal failures (for example a
+        # Metal compute error under memory pressure) as a 200 carrying an
+        # error envelope; that is a plane failure, not a parse failure.
+        return AdvisorOutcome(reason=AdvisorAbsentReason.HTTP_STATUS)
+    try:
+        content = body["message"]["content"]
+    except (KeyError, IndexError, TypeError):
         return AdvisorOutcome(reason=AdvisorAbsentReason.MALFORMED_JSON)
     if not isinstance(content, str) or not content.strip():
         return AdvisorOutcome(reason=AdvisorAbsentReason.EMPTY_CONTENT)
@@ -979,6 +1069,8 @@ __all__ = [
     "ADVISOR_ANOMALY_MAX_COUNT",
     "ADVISOR_BRIEF_MAX_CHARS",
     "ADVISOR_DISABLE_THINKING_ENV",
+    "ADVISOR_FALLBACK_URL_ENV",
+    "ADVISOR_JSON_MODE_ENV",
     "ADVISOR_MAX_OUTPUT_TOKENS",
     "ADVISOR_MAX_TOKENS_BOUNDS",
     "ADVISOR_MAX_TOKENS_ENV",
