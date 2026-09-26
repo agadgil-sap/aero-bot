@@ -114,6 +114,7 @@ See [the watchtower documentation](docs/watchtower.md) for the trip semantics, t
 ## Shadow advisor command
 
 The `aero-bot-advisor` command is the intelligence layer's advisory surface: it composes the audited factual picture - the tracked position, day economics, fee evidence, decision cadence - and asks one language model on the operator's private inference plane for a bounded brief and anomaly flags.
+The plane is the student seat's dedicated Mac-side Ollama instance (the model pinned resident, thinking capped, generation JSON-constrained, a sealed shared-instance fallback), so the seat answers every window in seconds instead of paying a cold reload - see the advisor documentation's student-plane section for the measured latencies.
 It is fail-closed (every failure is a typed absence, never a guess), advisory-only (it sends nothing, signs nothing, and never writes the cycle book), and dark until the sealed plane values arm it.
 See [the advisor documentation](docs/advisor.md) for the sealed environment, the absence catalog, the systemd wiring, and the bake-off harness.
 

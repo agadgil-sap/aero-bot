@@ -13,6 +13,8 @@ from pydantic import BaseModel
 
 from aero_bot.advisor import (
     ADVISOR_DISABLE_THINKING_ENV,
+    ADVISOR_FALLBACK_URL_ENV,
+    ADVISOR_JSON_MODE_ENV,
     ADVISOR_MAX_TOKENS_ENV,
     ADVISOR_MODEL_ENV,
     ADVISOR_REPORT_PATH_ENV,
@@ -90,15 +92,48 @@ class ScriptedTransport:
         return self.response
 
 
+class SequencedTransport:
+    """Serve scripted per-call answers or failures, in call order."""
+
+    def __init__(
+        self,
+        script: list[tuple[AdvisorHttpResponse | None, Exception | None]],
+    ) -> None:
+        """Hold one (response, failure) pair per expected call.
+
+        Args:
+            script: One entry per call; a None pair answers a bare 200.
+        """
+        self.script = script
+        self.requests: list[tuple[str, Mapping[str, object], float]] = []
+
+    def complete(
+        self,
+        url: str,
+        payload: Mapping[str, object],
+        timeout_seconds: float,
+    ) -> AdvisorHttpResponse:
+        """Record one request and serve the next scripted entry."""
+        self.requests.append((url, payload, timeout_seconds))
+        response, failure = self.script[len(self.requests) - 1]
+        if failure is not None:
+            raise failure
+        assert response is not None
+        return response
+
+
 class ForeignPayload(BaseModel):
     """Provide one non-cycle payload proving window filtering."""
 
     detail: str
 
 
-def completion_body(content: str) -> str:
-    """Wrap model content in one OpenAI-compatible chat completion body."""
-    return json.dumps({"choices": [{"message": {"role": "assistant", "content": content}}]})
+def chat_body(content: str, *, reasoning: str = "") -> str:
+    """Wrap model content in one Ollama-native chat answer body."""
+    message: dict[str, object] = {"role": "assistant", "content": content}
+    if reasoning:
+        message["reasoning"] = reasoning
+    return json.dumps({"model": "m", "message": message, "done_reason": "stop"})
 
 
 def accepted_answer() -> dict[str, object]:
@@ -223,19 +258,9 @@ def test_request_brief_dark_config_never_touches_the_transport() -> None:
 
 def test_request_brief_ignores_reasoning_models_separate_thinking_field() -> None:
     """A reasoning model's sibling reasoning field never reaches the schema."""
-    reasoning_body = json.dumps(
-        {
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps(accepted_answer()),
-                        "reasoning": "I should think about <think> braces }</think> noise.",
-                    }
-                }
-            ],
-            "finish_reason": "stop",
-        }
+    reasoning_body = chat_body(
+        json.dumps(accepted_answer()),
+        reasoning="I should think about <think> braces }</think> noise.",
     )
     outcome = request_brief(
         AdvisorConfig(url="http://plane", model="qwen3.6:35b-a3b"),
@@ -247,65 +272,81 @@ def test_request_brief_ignores_reasoning_models_separate_thinking_field() -> Non
     assert outcome.result.brief.anomalies[0].label == "long_range_wait"
 
 
-def test_request_brief_threads_the_thinking_aware_budget() -> None:
-    """The sealed token budget rides the payload; think is opt-in only."""
+def test_request_brief_threads_the_native_payload_contract() -> None:
+    """The sealed knobs ride the Ollama-native payload exactly once each."""
     transport = ScriptedTransport(
-        response=AdvisorHttpResponse(
-            status_code=200, body=completion_body(json.dumps(accepted_answer()))
-        )
+        response=AdvisorHttpResponse(status_code=200, body=chat_body(json.dumps(accepted_answer())))
     )
     request_brief(
         AdvisorConfig(url="http://plane", model="m", max_tokens=2048), "s", "u", transport
     )
     url, payload, timeout = transport.requests[0]
-    assert payload["max_tokens"] == 2048
-    assert "think" not in payload
+    assert url == "http://plane/api/chat"
+    assert payload["model"] == "m"
+    assert payload["stream"] is False
+    assert payload["options"] == {"temperature": 0, "num_predict": 2048}
+    # The hardened defaults ride every request: JSON-constrained generation,
+    # thinking off, and the residency pin on the sealed primary plane.
+    assert payload["format"] == "json"
+    assert payload["think"] is False
+    assert payload["keep_alive"] == -1
+    assert timeout == 15.0
 
-    thinking_off = ScriptedTransport(
-        response=AdvisorHttpResponse(
-            status_code=200, body=completion_body(json.dumps(accepted_answer()))
-        )
+    thinking_on = ScriptedTransport(
+        response=AdvisorHttpResponse(status_code=200, body=chat_body(json.dumps(accepted_answer())))
     )
     request_brief(
-        AdvisorConfig(url="http://plane", model="m", max_tokens=512, disable_thinking=True),
+        AdvisorConfig(url="http://plane", model="m", disable_thinking=False, json_mode=False),
         "s",
         "u",
-        thinking_off,
+        thinking_on,
     )
-    _, sealed_payload, _ = thinking_off.requests[0]
-    assert sealed_payload["max_tokens"] == 512
-    assert sealed_payload["think"] is False
+    _, unsealed_payload, _ = thinking_on.requests[0]
+    assert "think" not in unsealed_payload
+    assert "format" not in unsealed_payload
+    # The residency pin survives the knobs: it is the seat's contract, not
+    # an operator toggle.
+    assert unsealed_payload["keep_alive"] == -1
 
 
-def test_config_parses_the_thinking_knobs_and_names_bad_variables() -> None:
-    """The budget and thinking switches parse; malformed values name variables."""
+def test_config_parses_the_hardening_knobs_and_names_bad_variables() -> None:
+    """The budget, thinking, JSON-mode, and fallback switches parse."""
     sealed = parse_advisor_config(
         {
             ADVISOR_URL_ENV: "http://plane",
             ADVISOR_MODEL_ENV: "m",
             ADVISOR_MAX_TOKENS_ENV: "8192",
-            ADVISOR_DISABLE_THINKING_ENV: "true",
+            ADVISOR_DISABLE_THINKING_ENV: "false",
+            ADVISOR_JSON_MODE_ENV: "0",
+            ADVISOR_FALLBACK_URL_ENV: "http://shared",
         }
     )
     assert sealed.max_tokens == 8192
-    assert sealed.disable_thinking is True
-    assert parse_advisor_config(
-        {ADVISOR_URL_ENV: "http://p", ADVISOR_MODEL_ENV: "m"}
-    ).max_tokens == (4096)
+    assert sealed.disable_thinking is False
+    assert sealed.json_mode is False
+    assert sealed.fallback_url == "http://shared"
+    # The hardened defaults: thinking off, JSON mode on, no fallback.
+    defaults = parse_advisor_config({ADVISOR_URL_ENV: "http://p", ADVISOR_MODEL_ENV: "m"})
+    assert defaults.max_tokens == 4096
+    assert defaults.disable_thinking is True
+    assert defaults.json_mode is True
+    assert defaults.fallback_url == ""
     with pytest.raises(ValueError, match=ADVISOR_MAX_TOKENS_ENV):
         parse_advisor_config({ADVISOR_MAX_TOKENS_ENV: "not-tokens"})
     with pytest.raises(ValueError, match=ADVISOR_MAX_TOKENS_ENV):
         parse_advisor_config({ADVISOR_MAX_TOKENS_ENV: "10"})
     with pytest.raises(ValueError, match=ADVISOR_DISABLE_THINKING_ENV):
         parse_advisor_config({ADVISOR_DISABLE_THINKING_ENV: "maybe"})
+    with pytest.raises(ValueError, match=ADVISOR_JSON_MODE_ENV):
+        parse_advisor_config({ADVISOR_JSON_MODE_ENV: "maybe"})
+    with pytest.raises(ValueError, match=ADVISOR_FALLBACK_URL_ENV):
+        parse_advisor_config({ADVISOR_FALLBACK_URL_ENV: "ftp://shared"})
 
 
 def test_request_brief_accepts_schema_valid_answer_and_threads_metadata() -> None:
     """One valid JSON answer validates into a brief with serving metadata."""
     transport = ScriptedTransport(
-        response=AdvisorHttpResponse(
-            status_code=200, body=completion_body(json.dumps(accepted_answer()))
-        )
+        response=AdvisorHttpResponse(status_code=200, body=chat_body(json.dumps(accepted_answer())))
     )
     outcome = request_brief(
         AdvisorConfig(url="http://plane/", model="qwen3.6:35b-a3b"), "s", "u", transport
@@ -316,9 +357,10 @@ def test_request_brief_accepts_schema_valid_answer_and_threads_metadata() -> Non
     assert outcome.result.brief.anomalies[0].label == "long_range_wait"
     assert outcome.status == "brief"
     url, payload, timeout = transport.requests[0]
-    assert url == "http://plane/v1/chat/completions"
+    assert url == "http://plane/api/chat"
     assert payload["model"] == "qwen3.6:35b-a3b"
-    assert payload["temperature"] == 0
+    options = cast("Mapping[str, object]", payload["options"])
+    assert options["temperature"] == 0
     assert timeout == 15.0
 
 
@@ -329,9 +371,7 @@ def test_request_brief_tolerates_fenced_json_answers() -> None:
         AdvisorConfig(url="http://plane", model="m"),
         "s",
         "u",
-        ScriptedTransport(
-            response=AdvisorHttpResponse(status_code=200, body=completion_body(fenced))
-        ),
+        ScriptedTransport(response=AdvisorHttpResponse(status_code=200, body=chat_body(fenced))),
     )
     assert outcome.result is not None
     assert outcome.result.brief.anomalies[0].confidence == 0.42
@@ -340,28 +380,32 @@ def test_request_brief_tolerates_fenced_json_answers() -> None:
 @pytest.mark.parametrize(
     ("status", "body", "expected"),
     [
-        (500, completion_body(json.dumps(accepted_answer())), AdvisorAbsentReason.HTTP_STATUS),
+        (500, chat_body(json.dumps(accepted_answer())), AdvisorAbsentReason.HTTP_STATUS),
+        # The native plane answers some internal failures (a Metal compute
+        # error under memory pressure, observed live) as a 200 carrying an
+        # error envelope; that is a plane failure, not a parse failure.
+        (200, json.dumps({"error": "Compute error."}), AdvisorAbsentReason.HTTP_STATUS),
         (200, "not-json", AdvisorAbsentReason.MALFORMED_JSON),
-        (200, json.dumps({"choices": []}), AdvisorAbsentReason.MALFORMED_JSON),
+        (200, json.dumps({"message": {}}), AdvisorAbsentReason.MALFORMED_JSON),
         (
             200,
-            json.dumps({"choices": [{"message": {"content": ""}}]}),
+            json.dumps({"message": {"role": "assistant", "content": ""}}),
             AdvisorAbsentReason.EMPTY_CONTENT,
         ),
-        (200, completion_body("prose without any object"), AdvisorAbsentReason.MALFORMED_JSON),
+        (200, chat_body("prose without any object"), AdvisorAbsentReason.MALFORMED_JSON),
         (
             200,
-            completion_body(json.dumps({"brief": "missing anomalies"})),
+            chat_body(json.dumps({"brief": "missing anomalies"})),
             AdvisorAbsentReason.SCHEMA_INVALID,
         ),
         (
             200,
-            completion_body(json.dumps({"brief": "x" * 2001, "anomalies": []})),
+            chat_body(json.dumps({"brief": "x" * 2001, "anomalies": []})),
             AdvisorAbsentReason.SCHEMA_INVALID,
         ),
         (
             200,
-            completion_body(
+            chat_body(
                 json.dumps(
                     {
                         "brief": "ok",
@@ -406,6 +450,111 @@ def test_request_brief_maps_transport_failures_to_timeout_and_unreachable() -> N
     assert unreachable.reason is AdvisorAbsentReason.UNREACHABLE
 
 
+def test_unreachable_primary_retries_once_against_the_fallback() -> None:
+    """A downed dedicated plane answers through the shared fallback."""
+    transport = SequencedTransport(
+        [
+            (None, AdvisorUnreachableError("dedicated down")),
+            (
+                AdvisorHttpResponse(status_code=200, body=chat_body(json.dumps(accepted_answer()))),
+                None,
+            ),
+        ]
+    )
+    outcome = request_brief(
+        AdvisorConfig(url="http://dedicated", model="m", fallback_url="http://shared/"),
+        "s",
+        "u",
+        transport,
+    )
+    assert outcome.result is not None
+    assert outcome.result.brief.anomalies[0].label == "long_range_wait"
+    assert len(transport.requests) == 2
+    first_url, first_payload, _ = transport.requests[0]
+    second_url, second_payload, _ = transport.requests[1]
+    assert first_url == "http://dedicated/api/chat"
+    assert second_url == "http://shared/api/chat"
+    # The model and prompt never change between attempts: the fallback can
+    # never serve a silent wrong-model call.
+    assert first_payload["model"] == second_payload["model"]
+    assert first_payload["messages"] == second_payload["messages"]
+    # Only the residency pin differs: the fallback leaves the shared
+    # instance's own eviction policy alone so one answered window never
+    # permanently claims its VRAM.
+    assert first_payload["keep_alive"] == -1
+    assert "keep_alive" not in second_payload
+
+
+def test_unreachable_primary_without_fallback_stays_one_attempt() -> None:
+    """Without a sealed fallback the single attempt stands as the absence."""
+    transport = ScriptedTransport(failure=AdvisorUnreachableError("down"))
+    outcome = request_brief(AdvisorConfig(url="http://plane", model="m"), "s", "u", transport)
+    assert outcome.reason is AdvisorAbsentReason.UNREACHABLE
+    assert len(transport.requests) == 1
+
+
+def test_both_planes_unreachable_answers_the_typed_absence() -> None:
+    """A fallback that is also down costs exactly one retry, never a loop."""
+    transport = SequencedTransport(
+        [
+            (None, AdvisorUnreachableError("dedicated down")),
+            (None, AdvisorUnreachableError("shared down")),
+        ]
+    )
+    outcome = request_brief(
+        AdvisorConfig(url="http://dedicated", model="m", fallback_url="http://shared"),
+        "s",
+        "u",
+        transport,
+    )
+    assert outcome.reason is AdvisorAbsentReason.UNREACHABLE
+    assert len(transport.requests) == 2
+
+
+def test_a_timeout_never_burns_a_second_attempt() -> None:
+    """A timed-out primary answers timeout; the clock is already spent."""
+    transport = SequencedTransport([(None, AdvisorTimeoutError("wedged"))])
+    outcome = request_brief(
+        AdvisorConfig(url="http://dedicated", model="m", fallback_url="http://shared"),
+        "s",
+        "u",
+        transport,
+    )
+    assert outcome.reason is AdvisorAbsentReason.TIMEOUT
+    assert len(transport.requests) == 1
+
+
+def test_a_fallback_equal_to_the_primary_never_retries() -> None:
+    """The same base URL sealed twice is one endpoint, not a retry loop."""
+    transport = ScriptedTransport(failure=AdvisorUnreachableError("down"))
+    outcome = request_brief(
+        AdvisorConfig(url="http://plane/", model="m", fallback_url="http://plane"),
+        "s",
+        "u",
+        transport,
+    )
+    assert outcome.reason is AdvisorAbsentReason.UNREACHABLE
+    assert len(transport.requests) == 1
+
+
+def test_a_fallback_http_failure_is_not_retried_further() -> None:
+    """A reached fallback answering a failure stands as the typed absence."""
+    transport = SequencedTransport(
+        [
+            (None, AdvisorUnreachableError("dedicated down")),
+            (AdvisorHttpResponse(status_code=503, body="unavailable"), None),
+        ]
+    )
+    outcome = request_brief(
+        AdvisorConfig(url="http://dedicated", model="m", fallback_url="http://shared"),
+        "s",
+        "u",
+        transport,
+    )
+    assert outcome.reason is AdvisorAbsentReason.HTTP_STATUS
+    assert len(transport.requests) == 2
+
+
 def test_outcome_rejects_both_branches_and_neither() -> None:
     """Exactly one of result or reason must be set on every outcome."""
     brief = AdvisorBrief(
@@ -427,13 +576,13 @@ def test_httpx_transport_serves_status_and_body(monkeypatch: pytest.MonkeyPatch)
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(200, text=completion_body(json.dumps(accepted_answer())))
+        return httpx.Response(200, text=chat_body(json.dumps(accepted_answer())))
 
     transport = HttpxAdvisorTransport(client=httpx.Client(transport=httpx.MockTransport(handler)))
-    answer = transport.complete("http://plane/v1/chat/completions", {"model": "m"}, 5.0)
+    answer = transport.complete("http://plane/api/chat", {"model": "m"}, 5.0)
     assert answer.status_code == 200
-    assert "choices" in answer.body
-    assert seen[0].url == "http://plane/v1/chat/completions"
+    assert "message" in answer.body
+    assert seen[0].url == "http://plane/api/chat"
 
     def failing(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused")
@@ -496,9 +645,7 @@ def test_monitor_persists_reports_and_audits_the_outcome(tmp_path: Path) -> None
     state = tmp_path / "cycle_state.json"
     CycleStateStore(state).save(tracked_book())
     transport = ScriptedTransport(
-        response=AdvisorHttpResponse(
-            status_code=200, body=completion_body(json.dumps(accepted_answer()))
-        )
+        response=AdvisorHttpResponse(status_code=200, body=chat_body(json.dumps(accepted_answer())))
     )
     report_path = tmp_path / "advisor_last_report.json"
     monitor = AdvisorMonitor(
@@ -573,7 +720,7 @@ def test_monitor_over_an_empty_store_composes_an_empty_picture(tmp_path: Path) -
         AdvisorConfig(url="http://plane", model="m"),
         ScriptedTransport(
             response=AdvisorHttpResponse(
-                status_code=200, body=completion_body('{"brief": "Nothing yet.", "anomalies": []}')
+                status_code=200, body=chat_body('{"brief": "Nothing yet.", "anomalies": []}')
             )
         ),
         tmp_path / "advisor_last_report.json",
@@ -642,9 +789,7 @@ def test_cli_runs_one_pass_and_prints_the_brief(
     monkeypatch.setenv(ADVISOR_MODEL_ENV, "qwen3.6:35b-a3b")
 
     scripted = ScriptedTransport(
-        response=AdvisorHttpResponse(
-            status_code=200, body=completion_body(json.dumps(accepted_answer()))
-        )
+        response=AdvisorHttpResponse(status_code=200, body=chat_body(json.dumps(accepted_answer())))
     )
     monkeypatch.setattr(
         "aero_bot.advisor.HttpxAdvisorTransport", lambda: cast("HttpxAdvisorTransport", scripted)
@@ -719,7 +864,7 @@ class TestTeachingBlock:
         teaching.write_text(block, encoding="utf-8")
         transport = ScriptedTransport(
             response=AdvisorHttpResponse(
-                status_code=200, body=completion_body(json.dumps(accepted_answer()))
+                status_code=200, body=chat_body(json.dumps(accepted_answer()))
             )
         )
         monitor = AdvisorMonitor(

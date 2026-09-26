@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Generate the aero-bot teacher harness launchd user agents on macOS.
 #
-# Mirrors the Ubuntu kit's posture: this installer writes the six job
+# Mirrors the Ubuntu kit's posture: this installer writes the seven job
 # definitions (three teacher streams, the daily hindsight scorer, the
-# daily upgrade proposer, and the daily risk-manager audit) into
-# ~/Library/LaunchAgents and NEVER loads any of them.
+# daily upgrade proposer, the daily risk-manager audit, and the student
+# seat's dedicated Ollama plane) into ~/Library/LaunchAgents and NEVER loads
+# any of them.
 # Arming a stream is the operator's explicit Phase 2 act (the launchctl
 # bootstrap lines it prints); the harness itself is advisory-only and owns
 # no trading authority of any kind.
@@ -21,11 +22,17 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WRAPPER_SRC="$REPO_ROOT/deploy/launchd/teacher-run.sh"
+STUDENT_OLLAMA_SRC="$REPO_ROOT/deploy/launchd/student-ollama.sh"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 STATE_DIR="${AERO_BOT_TEACHER_STATE_DIR:-$HOME/.local/state/aero-bot/teacher}"
 WORKTREE="${AERO_BOT_TEACHER_REPO:-$STATE_DIR/repo}"
 STATE_BIN="$STATE_DIR/bin"
 STATE_WRAPPER="$STATE_BIN/teacher-run.sh"
+STATE_STUDENT_OLLAMA="$STATE_BIN/student-ollama.sh"
+# The dedicated student plane's bind, baked into the generated agent (the
+# Mac's tailnet address with a distinct port; the production VM reaches the
+# plane exactly like the shared one - over the tailnet, never the LAN).
+STUDENT_OLLAMA_HOST="${AERO_BOT_STUDENT_OLLAMA_HOST:-100.106.111.37:11435}"
 
 if [[ "$(uname)" != "Darwin" ]]; then
     echo "install-mac.sh targets macOS; this host runs $(uname)" >&2
@@ -33,6 +40,10 @@ if [[ "$(uname)" != "Darwin" ]]; then
 fi
 if [[ ! -f "$WRAPPER_SRC" ]]; then
     echo "install-mac.sh: missing $WRAPPER_SRC" >&2
+    exit 1
+fi
+if [[ ! -f "$STUDENT_OLLAMA_SRC" ]]; then
+    echo "install-mac.sh: missing $STUDENT_OLLAMA_SRC" >&2
     exit 1
 fi
 
@@ -61,6 +72,8 @@ git -C "$REPO_ROOT" worktree add --detach --quiet "$WORKTREE" HEAD
 
 cp "$WRAPPER_SRC" "$STATE_WRAPPER"
 chmod 755 "$STATE_WRAPPER"
+cp "$STUDENT_OLLAMA_SRC" "$STATE_STUDENT_OLLAMA"
+chmod 755 "$STATE_STUDENT_OLLAMA"
 
 # Escape XML metacharacters so an unusual configured path cannot corrupt
 # the generated plist.
@@ -172,12 +185,60 @@ generate_plist "com.aero-bot.teacher-hindsight" "hindsight" "$HINDSIGHT_BLOCK"
 generate_plist "com.aero-bot.teacher-upgrade" "upgrade" "$UPGRADE_BLOCK"
 generate_plist "com.aero-bot.teacher-risk-manager" "risk-manager" "$RISK_MANAGER_BLOCK"
 
+# The student seat's dedicated Ollama plane is a server, not a pass: it
+# starts at login, launchd keeps it alive, and its wrapper (copied beside
+# the teacher wrapper) bakes the keep-alive pin and the single inference
+# slot (see student-ollama.sh). The bind is stamped at install time so the
+# agent survives Mac reboots without the GUI instance's fragile runtime
+# OLLAMA_HOST state.
+STUDENT_OLLAMA_WRAPPER="$(xml_escape "$STATE_STUDENT_OLLAMA")"
+STUDENT_OLLAMA_BIND="$(xml_escape "$STUDENT_OLLAMA_HOST")"
+STUDENT_OLLAMA_LOG_DIR="$(xml_escape "$STATE_DIR/logs")"
+cat >"$LAUNCH_AGENTS_DIR/com.aero-bot.student-ollama.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aero-bot.student-ollama</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${STUDENT_OLLAMA_WRAPPER}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AERO_BOT_STUDENT_OLLAMA_HOST</key>
+        <string>${STUDENT_OLLAMA_BIND}</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>0</integer>
+    <key>StandardOutPath</key>
+    <string>${STUDENT_OLLAMA_LOG_DIR}/student-ollama-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>${STUDENT_OLLAMA_LOG_DIR}/student-ollama-launchd.log</string>
+</dict>
+</plist>
+EOF
+
 echo "Refreshed the teacher worktree at $WORKTREE (detached at HEAD, stateless)."
-echo "Generated teacher launchd agents (none loaded):"
-ls -1 "$LAUNCH_AGENTS_DIR"/com.aero-bot.teacher-*.plist
+echo "Generated teacher launchd agents plus the student plane (none loaded):"
+ls -1 "$LAUNCH_AGENTS_DIR"/com.aero-bot.teacher-*.plist "$LAUNCH_AGENTS_DIR/com.aero-bot.student-ollama.plist"
 echo
 echo "Arm a stream by loading its agent, for example:"
 echo "  launchctl bootstrap gui/$(id -u) $LAUNCH_AGENTS_DIR/com.aero-bot.teacher-tactical.plist"
 echo "  launchctl kickstart gui/$(id -u)/com.aero-bot.teacher-tactical"
+echo
+echo "Arm the student seat's dedicated Ollama plane the same way:"
+echo "  launchctl bootstrap gui/$(id -u) $LAUNCH_AGENTS_DIR/com.aero-bot.student-ollama.plist"
+echo "It binds $STUDENT_OLLAMA_HOST with OLLAMA_KEEP_ALIVE=-1 and OLLAMA_NUM_PARALLEL=1;"
+echo "seal AERO_BOT_ADVISOR_URL=http://$STUDENT_OLLAMA_HOST and"
+echo "AERO_BOT_ADVISOR_FALLBACK_URL=http://100.106.111.37:11434 on the VM to wire the"
+echo "student seat to it (see docs/advisor.md, 'The student plane')."
 echo
 echo "The harness is advisory-only and ships no trading authority; see docs/teacher.md."
