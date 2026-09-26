@@ -16,8 +16,11 @@ from aero_bot.advisor import (
     AdvisorBrief,
     AdvisorReportedAuditPayload,
     AdvisorWindowFacts,
+    PositionVerdict,
+    PositionView,
+    ViewConfidence,
 )
-from aero_bot.hindsight import episode_verdicts
+from aero_bot.hindsight import episode_verdicts, grade_corpus_views
 from aero_bot.risk_manager import RiskFindingKind, audit_corpus_posture
 from aero_bot.teacher import (
     StudentWindowBrief,
@@ -119,6 +122,8 @@ def student_payload(
             )
             for anomaly in (answered.anomalies if answered is not None else ())
         ),
+        view=answered.view if answered is not None else None,
+        view_declined=answered.view_declined if answered is not None else None,
         latency_ms=1000,
         window_records=5,
     )
@@ -422,6 +427,189 @@ class TestDigest:
         assert "\n" not in digest.misses[0].student_brief
 
 
+def conviction_digest(
+    *episodes: TeacherEpisode,
+    horizon: float = HORIZON,
+    now: datetime = NOW,
+) -> UpgradeDivergenceDigest:
+    """Compute the digest with the conviction layer threaded in."""
+    verdicts = episode_verdicts(episodes, horizon, now=now)
+    view_grades = grade_corpus_views(episodes, horizon, now=now)
+    return build_divergence_digest(episodes, verdicts, horizon, view_grades=view_grades)
+
+
+def stated_view(
+    verdict: PositionVerdict,
+    confidence: ViewConfidence = ViewConfidence.HIGH,
+) -> PositionView:
+    """Build one stated view citing the locked policy."""
+    return PositionView(
+        verdict=verdict,
+        confidence=confidence,
+        reason="In range with emissions above the locked floor.",
+    )
+
+
+def brief_with_view(
+    verdict: PositionVerdict | None,
+    *,
+    labels: tuple[str, ...] = (),
+    declined: bool = False,
+) -> AdvisorBrief:
+    """Build one accepted answer carrying a view, a decline, or neither."""
+    return AdvisorBrief(
+        brief="a window reading worth teaching from",
+        anomalies=tuple(
+            AdvisorAnomaly(label=label, confidence=0.8, rationale="deterministic")
+            for label in labels
+        ),
+        view=None if verdict is None or declined else stated_view(verdict),
+        view_declined="the window is too stale to defend a verdict" if declined else None,
+    )
+
+
+def conviction_episode(
+    at: datetime = T0,
+    *,
+    teacher_verdict: PositionVerdict = PositionVerdict.HOLD,
+    student_verdict: PositionVerdict | None = PositionVerdict.EXIT,
+    student_declined: bool = False,
+) -> TeacherEpisode:
+    """Build one episode where the teacher holds a view over the student's."""
+    return episode(
+        at,
+        seats=(
+            seat_outcome(TeacherSeatName.CLAUDE, brief=brief_with_view(teacher_verdict)),
+            seat_outcome(TeacherSeatName.CODEX, brief=None, outcome="dark"),
+        ),
+        student=student_payload(
+            brief=brief_with_view(
+                student_verdict,
+                declined=student_declined,
+            )
+            if student_verdict is not None or student_declined
+            else brief_with(())
+        ),
+    )
+
+
+def quiet_follower(at: datetime = T0 + timedelta(hours=2)) -> TeacherEpisode:
+    """Build the later episode whose quiet facts drain the horizon."""
+    return episode(at, facts=facts_picture(day_pnl="0.5"))
+
+
+class TestConvictionDigest:
+    """The fifth evidence class: measured conviction, pinned end to end."""
+
+    def test_a_teacher_right_where_the_student_was_wrong_is_a_miss(self) -> None:
+        """The quiet-drained truth backs the entry without any bad outcome."""
+        digest = conviction_digest(conviction_episode(), quiet_follower())
+        assert len(digest.conviction_misses) == 1
+        miss = digest.conviction_misses[0]
+        assert miss.seat == "claude"
+        assert miss.teacher_verdict == "hold"
+        assert miss.teacher_confidence == "high"
+        assert "locked floor" in miss.teacher_reason
+        assert miss.student_state == "stated"
+        assert miss.student_verdict == "exit"
+        assert miss.day_pnl_usdc == "1.0"
+        assert digest.total_divergences == 1
+
+    def test_a_student_decline_against_a_right_teacher_is_a_miss(self) -> None:
+        """An explicit no-view declaration diverges from measured conviction."""
+        digest = conviction_digest(
+            conviction_episode(student_verdict=None, student_declined=True),
+            quiet_follower(),
+        )
+        assert len(digest.conviction_misses) == 1
+        assert digest.conviction_misses[0].student_state == "declined"
+        assert digest.conviction_misses[0].student_verdict is None
+
+    def test_a_student_view_gap_against_a_right_teacher_is_a_miss(self) -> None:
+        """A positioned episode the student answered without a view counts."""
+        digest = conviction_digest(
+            conviction_episode(student_verdict=None),
+            quiet_follower(),
+        )
+        assert len(digest.conviction_misses) == 1
+        assert digest.conviction_misses[0].student_state == "missing"
+
+    def test_a_right_student_view_is_never_a_miss(self) -> None:
+        """Matching conviction is not divergence."""
+        digest = conviction_digest(
+            conviction_episode(student_verdict=PositionVerdict.HOLD),
+            quiet_follower(),
+        )
+        assert digest.conviction_misses == ()
+        assert digest.total_divergences == 0
+
+    def test_only_decided_teacher_truth_opens_the_class(self) -> None:
+        """Pending and ungradeable teacher views never contribute."""
+        open_now = T0 + timedelta(hours=3)
+        digest = conviction_digest(conviction_episode(), quiet_follower(), now=open_now)
+        assert digest.conviction_misses == ()
+
+    def test_news_episodes_are_out_of_scope(self) -> None:
+        """The outside-world stream carries no deterministic view truth."""
+        digest = conviction_digest(
+            episode(
+                T0,
+                stream=TeacherStream.NEWS,
+                seats=(
+                    seat_outcome(
+                        TeacherSeatName.CLAUDE, brief=brief_with_view(PositionVerdict.HOLD)
+                    ),
+                ),
+                student=student_payload(brief=brief_with_view(PositionVerdict.EXIT)),
+            ),
+            quiet_follower(),
+        )
+        assert digest.conviction_misses == ()
+
+    def test_the_legacy_composition_without_view_grades_stays_valid(self) -> None:
+        """Direct digest calls without the conviction layer stay available."""
+        episodes = (conviction_episode(), quiet_follower())
+        verdicts = episode_verdicts(episodes, HORIZON, now=NOW)
+        digest = build_divergence_digest(episodes, verdicts, HORIZON)
+        assert digest.conviction_misses == ()
+        assert digest.total_divergences == 0
+
+    def test_entries_are_bounded_and_most_recent(self) -> None:
+        """The conviction class keeps only its most recent bounded entries."""
+        episodes: list[TeacherEpisode] = []
+        for index in range(UPGRADE_DIGEST_ENTRY_MAX + 5):
+            at = T0 + timedelta(minutes=12 * index)
+            episodes.append(conviction_episode(at))
+            episodes.append(quiet_follower(at + timedelta(hours=2)))
+        digest = conviction_digest(*episodes, now=T0 + timedelta(hours=48))
+        assert len(digest.conviction_misses) == UPGRADE_DIGEST_ENTRY_MAX
+        newest = max(entry.created_at for entry in digest.conviction_misses)
+        assert digest.conviction_misses[-1].created_at == newest
+
+    def test_the_human_summary_names_conviction_misses(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The printed divergence line carries the fifth class."""
+        episodes = (conviction_episode(), quiet_follower())
+        verdicts = episode_verdicts(episodes, HORIZON, now=NOW)
+        view_grades = grade_corpus_views(episodes, HORIZON, now=NOW)
+        digest = build_divergence_digest(
+            episodes,
+            verdicts,
+            HORIZON,
+            view_grades=view_grades,
+        )
+        report = UpgradeReport(
+            created_at=NOW,
+            horizon_hours=HORIZON,
+            gated=False,
+            digest=digest,
+        )
+        print_upgrade_report(report)
+        summary = capsys.readouterr().out
+        assert "1 conviction misses" in summary
+
+
 class TestProposalSchema:
     """The bounded proposal object a seat must answer with."""
 
@@ -620,6 +808,37 @@ class TestUpgradePass:
         assert "halt-count rise" in prompt
         assert "hindsight_desk_scores" in prompt
         assert any(desk.desk == "student" for desk in report.desk_scores)
+
+    def test_a_conviction_miss_alone_opens_the_gate(self, tmp_path: Path) -> None:
+        """Measured conviction asks the seats with no anomaly divergence.
+
+        The teacher's hold view graded right against the quiet-drained
+        horizon while the student's exit view graded wrong: decided view
+        truth, no bad outcome anywhere, a clean posture.
+        """
+        corpus_dir = tmp_path / "corpus"
+        write_corpus(corpus_dir, conviction_episode(), quiet_follower())
+        transport = ScriptedSeatTransport(
+            [proposal_result(), proposal_result()], last_message=json.dumps(PROPOSAL_ANSWER)
+        )
+        report = run_upgrade_pass(
+            seeded_config(),
+            cast("TeacherSeatTransport", transport),
+            corpus_dir,
+            HORIZON,
+            now=NOW,
+        )
+        assert not report.gated
+        assert len(report.seats) == 2
+        assert len(report.digest.conviction_misses) == 1
+        assert report.digest.misses == ()
+        assert report.digest.posture_misses == ()
+        # The seats' prompt carries the measured conviction: the digest
+        # entry and the per-desk view scores riding the hindsight block.
+        prompt = transport.invocations[0][1]
+        assert "conviction_misses" in prompt
+        assert '"views"' in prompt
+        assert '"teacher_verdict": "hold"' in prompt
 
     def test_the_seat_filter_restricts_the_pass(self, tmp_path: Path) -> None:
         """A filtered pass asks one seat and records only it."""

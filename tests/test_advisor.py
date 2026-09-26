@@ -9,7 +9,7 @@ from typing import cast
 
 import httpx
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from aero_bot.advisor import (
     ADVISOR_DISABLE_THINKING_ENV,
@@ -22,6 +22,8 @@ from aero_bot.advisor import (
     ADVISOR_TEACHING_SEPARATOR,
     ADVISOR_TIMEOUT_ENV,
     ADVISOR_URL_ENV,
+    ADVISOR_VIEW_CONTRACT,
+    VIEW_REASON_MAX_CHARS,
     AdvisorAbsentReason,
     AdvisorAnomaly,
     AdvisorBrief,
@@ -30,9 +32,13 @@ from aero_bot.advisor import (
     AdvisorMonitor,
     AdvisorMonitorReport,
     AdvisorOutcome,
+    AdvisorReportedAuditPayload,
     AdvisorTimeoutError,
     AdvisorUnreachableError,
     HttpxAdvisorTransport,
+    PositionVerdict,
+    PositionView,
+    ViewConfidence,
     build_user_prompt,
     compose_system_prompt,
     compose_window_facts,
@@ -654,6 +660,185 @@ def test_cli_runs_one_pass_and_prints_the_brief(
     assert "advisor pass" in captured.out
     assert "long_range_wait" in captured.out
     assert report_path.exists()
+
+
+def viewed_answer(verdict: str = "hold", confidence: str = "high") -> dict[str, object]:
+    """Build one schema-valid answer carrying a stated position view."""
+    return {
+        "brief": "The bot holds SNDKc out of range above; day P&L is calm.",
+        "anomalies": [],
+        "view": {
+            "verdict": verdict,
+            "confidence": confidence,
+            "reason": "In range with emissions above the locked floor.",
+        },
+    }
+
+
+class TestPositionViewSchema:
+    """The conviction layer's stated-view schema, pinned."""
+
+    def test_every_verdict_and_band_combination_is_accepted(self) -> None:
+        """The four verdicts and three bands validate in every mix."""
+        for verdict in PositionVerdict:
+            for confidence in ViewConfidence:
+                view = PositionView(
+                    verdict=verdict,
+                    confidence=confidence,
+                    reason="Cites the locked policy's own rules.",
+                )
+                assert view.verdict is verdict
+                assert view.confidence is confidence
+
+    def test_unknown_verdicts_and_bands_are_rejected(self) -> None:
+        """The enums admit exactly the four verdicts and three bands."""
+        for junk in ("buy", "HOLD", "", "flatten"):
+            with pytest.raises(ValidationError):
+                PositionView.model_validate({"verdict": junk, "confidence": "high", "reason": "r"})
+        for junk in ("certain", "HIGH", "0.9", ""):
+            with pytest.raises(ValidationError):
+                PositionView.model_validate({"verdict": "hold", "confidence": junk, "reason": "r"})
+
+    def test_the_reason_is_bounded_to_one_sentence_field(self) -> None:
+        """Empty and oversized reasons are schema violations."""
+        with pytest.raises(ValidationError):
+            PositionView.model_validate({"verdict": "hold", "confidence": "high", "reason": ""})
+        with pytest.raises(ValidationError):
+            PositionView.model_validate(
+                {
+                    "verdict": "hold",
+                    "confidence": "high",
+                    "reason": "x" * (VIEW_REASON_MAX_CHARS + 1),
+                }
+            )
+
+
+class TestBriefViewFields:
+    """The brief schema's backward-compatible view carriage."""
+
+    def test_answers_without_views_still_validate(self) -> None:
+        """The pre-conviction answer shape parses untouched."""
+        brief = AdvisorBrief.model_validate(accepted_answer())
+        assert brief.view is None
+        assert brief.view_declined is None
+
+    def test_a_stated_view_rides_the_brief(self) -> None:
+        """The extended answer shape parses with its view."""
+        brief = AdvisorBrief.model_validate(viewed_answer("exit", "medium"))
+        assert brief.view is not None
+        assert brief.view.verdict is PositionVerdict.EXIT
+        assert brief.view.confidence is ViewConfidence.MEDIUM
+
+    def test_an_explicit_decline_rides_the_brief(self) -> None:
+        """A desk that cannot form a view says so explicitly."""
+        brief = AdvisorBrief.model_validate(
+            {"brief": "a reading", "anomalies": [], "view_declined": "the window is stale"}
+        )
+        assert brief.view is None
+        assert brief.view_declined == "the window is stale"
+
+    def test_a_brief_cannot_state_and_decline_at_once(self) -> None:
+        """The two fields are mutually exclusive."""
+        answer = viewed_answer()
+        answer["view_declined"] = "also declining"
+        with pytest.raises(ValidationError):
+            AdvisorBrief.model_validate(answer)
+
+    def test_the_contract_text_pins_the_view_requirements(self) -> None:
+        """The shared contract demands views on positions and forbids defaulting."""
+        assert '"view"' in ADVISOR_VIEW_CONTRACT
+        assert '"view_declined"' in ADVISOR_VIEW_CONTRACT
+        assert "tracked position" in ADVISOR_VIEW_CONTRACT
+        assert "never default a missing view to hold" in ADVISOR_VIEW_CONTRACT
+        assert "locked policy's own rules" in ADVISOR_VIEW_CONTRACT
+        assert ADVISOR_VIEW_CONTRACT in ADVISOR_SYSTEM_PROMPT
+
+
+class TestViewAuditing:
+    """The stated view rides the accepted answer into the audit chain."""
+
+    def test_an_accepted_view_survives_the_request_contract(self) -> None:
+        """A schema-valid viewed answer parses into the accepted brief."""
+        outcome = request_brief(
+            AdvisorConfig(url="http://plane", model="m"),
+            ADVISOR_SYSTEM_PROMPT,
+            "facts",
+            ScriptedTransport(
+                response=AdvisorHttpResponse(
+                    status_code=200, body=completion_body(json.dumps(viewed_answer("recenter")))
+                )
+            ),
+        )
+        assert outcome.result is not None
+        assert outcome.result.brief.view is not None
+        assert outcome.result.brief.view.verdict is PositionVerdict.RECENTER
+
+    def test_the_monitor_audits_the_accepted_view(self, tmp_path: Path) -> None:
+        """One monitor pass threads the view into the advisor_reported record."""
+        store = seeded_store(tmp_path)
+        state = tmp_path / "cycle_state.json"
+        CycleStateStore(state).save(tracked_book())
+        transport = ScriptedTransport(
+            response=AdvisorHttpResponse(
+                status_code=200, body=completion_body(json.dumps(viewed_answer("exit", "low")))
+            )
+        )
+        monitor = AdvisorMonitor(
+            store,
+            CycleStateStore(state),
+            AdvisorConfig(url="http://plane", model="qwen3.6:35b-a3b"),
+            transport,
+            tmp_path / "advisor_last_report.json",
+        )
+        report = monitor.run_once(now=LATER_AT)
+        assert report.outcome.result is not None
+        assert report.outcome.result.brief.view is not None
+        records = store.read_records(limit=10, offset=0)
+        payload = next(
+            AdvisorReportedAuditPayload.model_validate(json.loads(record.payload_json))
+            for record in records
+            if record.event_type is AuditEventType.ADVISOR_REPORTED
+        )
+        assert payload.view is not None
+        assert payload.view.verdict is PositionVerdict.EXIT
+        assert payload.view.confidence is ViewConfidence.LOW
+        assert payload.view_declined is None
+
+    def test_a_declined_view_audits_as_its_own_shape(self, tmp_path: Path) -> None:
+        """The explicit decline rides the audit record beside the view."""
+        store = seeded_store(tmp_path)
+        state = tmp_path / "cycle_state.json"
+        CycleStateStore(state).save(tracked_book())
+        transport = ScriptedTransport(
+            response=AdvisorHttpResponse(
+                status_code=200,
+                body=completion_body(
+                    json.dumps(
+                        {
+                            "brief": "a reading",
+                            "anomalies": [],
+                            "view_declined": "the window is too stale to defend a verdict",
+                        }
+                    )
+                ),
+            )
+        )
+        monitor = AdvisorMonitor(
+            store,
+            CycleStateStore(state),
+            AdvisorConfig(url="http://plane", model="qwen3.6:35b-a3b"),
+            transport,
+            tmp_path / "advisor_last_report.json",
+        )
+        monitor.run_once(now=LATER_AT)
+        records = store.read_records(limit=10, offset=0)
+        payload = next(
+            AdvisorReportedAuditPayload.model_validate(json.loads(record.payload_json))
+            for record in records
+            if record.event_type is AuditEventType.ADVISOR_REPORTED
+        )
+        assert payload.view is None
+        assert payload.view_declined == "the window is too stale to defend a verdict"
 
 
 class TestTeachingBlock:

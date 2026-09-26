@@ -6,9 +6,12 @@ reads the recent ``cycle_reported`` audit records plus the cycle book,
 composes a deterministic factual picture (held position and its day
 economics, fee evidence, decision cadence, cooldown churn, halted flags),
 and asks one language model - served from a private inference plane behind
-an ``AERO_BOT_ADVISOR_URL`` the operator seals - for a concise brief and
-anomaly flags. The result is printed, persisted beside the audit store, and
-appended to the audit chain as one ``advisor_reported`` record.
+an ``AERO_BOT_ADVISOR_URL`` the operator seals - for a concise brief,
+anomaly flags, and, while a position is tracked, a stated position view
+(verdict, confidence band, and a policy-tied reason, or an explicit
+decline; the conviction layer's schema extension). The result is printed,
+persisted beside the audit store, and appended to the audit chain as one
+``advisor_reported`` record.
 
 The fail-closed posture is absolute: the advisor is dark until a URL and
 model are configured, every transport failure, timeout, malformed body, or
@@ -129,6 +132,54 @@ class AdvisorAnomaly(BaseModel):
     rationale: Annotated[str, Field(min_length=1, max_length=400)]
 
 
+class PositionVerdict(StrEnum):
+    """Name the four position verdicts a desk's view may defend."""
+
+    # Keep holding the tracked position as the policy would.
+    HOLD = "hold"
+    # Close the tracked position.
+    EXIT = "exit"
+    # Recenter the tracked position's range (maintenance).
+    RECENTER = "recenter"
+    # Commit capital into a position while the book is flat.
+    ENTER = "enter"
+
+
+class ViewConfidence(StrEnum):
+    """Name the three coarse confidence bands a stated view carries."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+# The bounded one-sentence reason a stated view carries; the contract
+# demands it cite the locked policy's own rules or name the deviation.
+VIEW_REASON_MAX_CHARS = 400
+
+
+class PositionView(BaseModel):
+    """Carry one desk's stated position view: verdict, band, and reason.
+
+    The conviction layer's unit of measurement: a desk that holds a view
+    states it in this bounded shape so hindsight can grade it against
+    realized outcomes. A desk that cannot form a view declines
+    explicitly on the brief instead (``view_declined``), never defaulting
+    to hold.
+    """
+
+    # Frozen strict fields keep one stated view immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The action the desk would defend for the position.
+    verdict: PositionVerdict
+    # The desk's coarse confidence band in its own verdict.
+    confidence: ViewConfidence
+    # One sentence tying the verdict to the locked policy's own rules or
+    # naming the deviation from them.
+    reason: Annotated[str, Field(min_length=1, max_length=VIEW_REASON_MAX_CHARS)]
+
+
 class AdvisorBrief(BaseModel):
     """Validate the bounded JSON object the advisory contract demands."""
 
@@ -139,6 +190,21 @@ class AdvisorBrief(BaseModel):
     brief: Annotated[str, Field(min_length=1, max_length=ADVISOR_BRIEF_MAX_CHARS)]
     # Zero or more anomaly flags; absence of anomalies is a valid answer.
     anomalies: Annotated[tuple[AdvisorAnomaly, ...], Field(max_length=ADVISOR_ANOMALY_MAX_COUNT)]
+    # The stated position view, else None; older briefs (and answers over
+    # a flat book) carry none, so the field stays optional and every
+    # recorded corpus line keeps parsing.
+    view: PositionView | None = None
+    # One sentence saying why no view could be formed, else None; a desk
+    # that cannot form a view says so explicitly rather than defaulting
+    # to hold. Mutually exclusive with ``view``.
+    view_declined: Annotated[str, Field(max_length=VIEW_REASON_MAX_CHARS)] | None = None
+
+    @model_validator(mode="after")
+    def _view_xor_declined(self) -> "AdvisorBrief":
+        """Reject a brief stating a view and declining one at once."""
+        if self.view is not None and self.view_declined is not None:
+            raise ValueError("a brief cannot state a view and decline one at once")
+        return self
 
 
 class AdvisorResult(BaseModel):
@@ -605,16 +671,33 @@ def compose_window_facts(
     )
 
 
+ADVISOR_VIEW_CONTRACT = (
+    'The answer may also carry a position view: "view" as {"verdict": '
+    'one of "hold", "exit", "recenter", "enter"; "confidence": one of '
+    '"low", "medium", "high"; "reason": string} and "view_declined" as a '
+    "string, never both at once. When the facts show a tracked position "
+    "(tracked_symbol is present) you must state exactly one of them: either "
+    "a view whose reason is one sentence of at most 400 characters tied to "
+    "the locked policy's own rules or naming your deviation from them, or a "
+    "one-sentence view_declined saying why you cannot form a view - never "
+    "default a missing view to hold. When no position is tracked you may "
+    "state an enter view or omit both fields."
+)
+
 ADVISOR_SYSTEM_PROMPT = (
     "You are the shadow advisor for an autonomous emissions-farming bot. "
     "You observe audited facts and interpret them. You have no authority "
     "and no ability to trade. Answer with exactly one JSON object and no "
     'other text: {"brief": string, "anomalies": [{"label": string, '
-    '"confidence": number, "rationale": string}]}. The brief is at most '
+    '"confidence": number, "rationale": string}], "view": {"verdict": '
+    'string, "confidence": string, "reason": string} or null, '
+    '"view_declined": string or null}. The brief is at most '
     "three sentences describing what happened. Anomalies list at most ten "
     "concerning observations (label at most 120 characters, confidence "
     "between 0 and 1, rationale one sentence); an empty list is a valid "
-    "answer. Ground every statement in the provided facts; never invent "
+    "answer. "
+    + ADVISOR_VIEW_CONTRACT
+    + " Ground every statement in the provided facts; never invent "
     "numbers."
 )
 
@@ -794,6 +877,12 @@ class AdvisorMonitor:
                     )
                 ),
                 window_records=report.facts.record_count,
+                view=report.outcome.result.brief.view
+                if report.outcome.result is not None
+                else None,
+                view_declined=report.outcome.result.brief.view_declined
+                if report.outcome.result is not None
+                else None,
             ),
             report.created_at,
         )
@@ -831,6 +920,11 @@ class AdvisorReportedAuditPayload(BaseModel):
     latency_ms: Annotated[int, Field(ge=0)] = 0
     # How many cycle summaries the window examined.
     window_records: Annotated[int, Field(ge=0)] = 0
+    # The accepted position view, else None; older records carry none and
+    # keep parsing (the conviction layer extended the payload in place).
+    view: PositionView | None = None
+    # The explicit no-view declaration, else None.
+    view_declined: Annotated[str, Field(max_length=VIEW_REASON_MAX_CHARS)] | None = None
 
 
 def _store_depth(store: AuditStore) -> int:
@@ -902,6 +996,13 @@ def _print_report(report: AdvisorMonitorReport, stream: TextIO) -> None:
         print(f"  brief [{outcome.result.model}]: {outcome.result.brief.brief}")
         for anomaly in outcome.result.brief.anomalies:
             print(f"  anomaly: {anomaly.label} (confidence {anomaly.confidence:.2f})")
+        view = outcome.result.brief.view
+        if view is not None:
+            print(
+                f"  view: {view.verdict.value} (confidence {view.confidence.value}) - {view.reason}"
+            )
+        elif outcome.result.brief.view_declined is not None:
+            print(f"  view declined: {outcome.result.brief.view_declined}")
     else:
         print(f"  advisor absent: {outcome.reason and outcome.reason.value}")
 
@@ -990,6 +1091,7 @@ __all__ = [
     "ADVISOR_TEACHING_SEPARATOR",
     "ADVISOR_TIMEOUT_ENV",
     "ADVISOR_URL_ENV",
+    "ADVISOR_VIEW_CONTRACT",
     "ADVISOR_WINDOW_RECORDS",
     "AdvisorAbsentReason",
     "AdvisorAnomaly",
@@ -1006,6 +1108,10 @@ __all__ = [
     "AdvisorUnreachableError",
     "AdvisorWindowFacts",
     "HttpxAdvisorTransport",
+    "PositionVerdict",
+    "PositionView",
+    "VIEW_REASON_MAX_CHARS",
+    "ViewConfidence",
     "build_user_prompt",
     "compose_system_prompt",
     "compose_window_facts",

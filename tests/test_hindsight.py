@@ -12,6 +12,9 @@ from aero_bot.advisor import (
     AdvisorBrief,
     AdvisorReportedAuditPayload,
     AdvisorWindowFacts,
+    PositionVerdict,
+    PositionView,
+    ViewConfidence,
 )
 from aero_bot.hindsight import (
     DEFAULT_HINDSIGHT_HORIZON_HOURS,
@@ -19,11 +22,18 @@ from aero_bot.hindsight import (
     HINDSIGHT_REPORT_SCHEMA,
     HINDSIGHT_SERIES_MAX,
     HINDSIGHT_TRUTH_RULE,
+    HINDSIGHT_VIEW_RULE,
     HindsightCalibration,
     HindsightDeskScore,
     HindsightReport,
+    HindsightViewScore,
+    ViewCounterfactual,
+    ViewGrade,
+    ViewGrades,
+    ViewState,
     collect_reads,
     episode_verdicts,
+    grade_corpus_views,
     resolve_corpus_dir,
     score_corpus,
     write_report,
@@ -55,15 +65,19 @@ def facts_picture(
     day_start: str | None = "99.0",
     day_pnl: str | None = "1.0",
     halted: int = 0,
+    committed: str | None = None,
+    action: str | None = None,
 ) -> AdvisorWindowFacts:
     """Build one grounded window snapshot with deterministic economics."""
     return AdvisorWindowFacts(
         record_count=5,
         tracked_symbol="SPCXc",
+        committed_usdc=committed,
         equity_usdc=equity,
         day_start_equity_usdc=day_start,
         day_pnl_usdc=day_pnl,
         halted_count=halted,
+        latest_action=action,
     )
 
 
@@ -612,6 +626,662 @@ class TestCorpusWriting:
         captured = capsys.readouterr()
         assert code == 1
         assert "could not be read" in captured.err
+
+
+def stated_view(
+    verdict: PositionVerdict = PositionVerdict.HOLD,
+    confidence: ViewConfidence = ViewConfidence.HIGH,
+) -> PositionView:
+    """Build one stated view citing the locked policy."""
+    return PositionView(
+        verdict=verdict,
+        confidence=confidence,
+        reason="in range with emissions above the locked floor",
+    )
+
+
+def viewed_brief(
+    verdict: PositionVerdict = PositionVerdict.HOLD,
+    confidence: ViewConfidence = ViewConfidence.HIGH,
+    *,
+    declined: bool = False,
+) -> AdvisorBrief:
+    """Build one accepted answer carrying a view or a decline."""
+    return AdvisorBrief(
+        brief="a calm window reading",
+        anomalies=(),
+        view=None if declined else stated_view(verdict, confidence),
+        view_declined="the window is too stale to defend a verdict" if declined else None,
+    )
+
+
+def flat_picture(
+    *,
+    day_pnl: str | None = "0.0",
+    tracked: str | None = None,
+    committed: str | None = None,
+    halted: int = 0,
+    action: str | None = None,
+) -> AdvisorWindowFacts:
+    """Build one window snapshot with the position fields given."""
+    return AdvisorWindowFacts(
+        record_count=5,
+        tracked_symbol=tracked,
+        committed_usdc=committed,
+        equity_usdc="100.0",
+        day_start_equity_usdc="100.0",
+        day_pnl_usdc=day_pnl,
+        halted_count=halted,
+        latest_action=action,
+    )
+
+
+def claude_views(
+    *episodes_views: AdvisorBrief | None,
+) -> tuple[TeacherSeatOutcome, ...]:
+    """Build the claude seat's outcome per episode, briefs in order."""
+    return tuple(
+        TeacherSeatOutcome(
+            seat=TeacherSeatName.CLAUDE,
+            model="GLM 5.3",
+            outcome="brief" if brief is not None else "timeout",
+            brief=brief,
+        )
+        for brief in episodes_views
+    )
+
+
+def desk_view_score(report: HindsightReport, desk: str = "claude") -> HindsightViewScore:
+    """Find one desk's view score in a report."""
+    return desk_by_name(report, desk).views
+
+
+class TestViewGrading:
+    """The conviction layer: stated views graded against realized outcomes."""
+
+    def test_hold_is_right_over_a_drained_quiet_horizon(self) -> None:
+        """A stay that stayed safe through a filled horizon grades right."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.HOLD))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.stated == 1
+        assert views.right == 1
+        assert views.wrong == 0
+        assert views.ungradeable == 0
+        assert views.pending == 0
+
+    def test_hold_is_wrong_when_bad_follows_while_held(self) -> None:
+        """A stay that ate a realized bad outcome grades wrong."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.HOLD))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="-0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.wrong == 1
+        assert views.right == 0
+
+    def test_hold_is_ungradeable_when_the_position_leaves(self) -> None:
+        """A stay the policy overrode is never graded from what followed."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.HOLD))),
+            episode(
+                T0 + timedelta(hours=2),
+                facts=flat_picture(day_pnl="0.5"),
+            ),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.ungradeable == 1
+        assert views.right == 0
+        assert views.wrong == 0
+
+    def test_hold_stays_pending_over_an_open_horizon(self) -> None:
+        """A quiet stay inside an unfilled horizon is never guessed."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.HOLD))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+        )
+        views = desk_view_score(score_corpus(episodes, HORIZON, now=T0 + timedelta(hours=3)))
+        assert views.pending == 1
+        assert views.right == 0
+
+    def test_exit_is_right_when_bad_follows_while_held(self) -> None:
+        """A leave claim vindicated by realized trouble grades right."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.EXIT))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="-0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.right == 1
+
+    def test_exit_is_wrong_over_a_drained_quiet_horizon(self) -> None:
+        """A leave claim the quiet horizon contradicts grades wrong."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.EXIT))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.wrong == 1
+
+    def test_recenter_is_right_when_a_recenter_action_follows(self) -> None:
+        """A maintenance claim the policy's own recenter vindicates grades right."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.RECENTER))),
+            episode(
+                T0 + timedelta(hours=2),
+                facts=facts_picture(day_pnl="0.5", action="recenter"),
+            ),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.right == 1
+
+    def test_recenter_is_wrong_over_a_quiet_horizon_with_no_recenter(self) -> None:
+        """A maintenance claim nothing acted on through a quiet horizon grades wrong."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.RECENTER))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.wrong == 1
+
+    def test_recenter_is_ungradeable_when_bad_follows_with_no_recenter(self) -> None:
+        """Trouble without maintenance cannot be attributed to the range."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.RECENTER))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="-0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.ungradeable == 1
+        assert views.wrong == 0
+
+    def test_enter_is_right_when_an_entry_follows_and_nothing_bad_fell(self) -> None:
+        """A commit claim vindicated by a quiet realized entry grades right."""
+        episodes = (
+            episode(
+                T0,
+                facts=flat_picture(),
+                seats=claude_views(viewed_brief(PositionVerdict.ENTER)),
+            ),
+            episode(
+                T0 + timedelta(hours=2),
+                facts=flat_picture(tracked="SPCXc", committed="80.0"),
+            ),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.right == 1
+
+    def test_enter_is_wrong_when_bad_falls_inside_the_window(self) -> None:
+        """A commit claim into a bleeding book grades wrong."""
+        episodes = (
+            episode(
+                T0,
+                facts=flat_picture(),
+                seats=claude_views(viewed_brief(PositionVerdict.ENTER)),
+            ),
+            episode(T0 + timedelta(hours=2), facts=flat_picture(day_pnl="-0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.wrong == 1
+
+    def test_enter_is_ungradeable_over_a_quiet_flat_horizon(self) -> None:
+        """A missed opportunity the store cannot price grades ungradeable."""
+        episodes = (
+            episode(
+                T0,
+                facts=flat_picture(),
+                seats=claude_views(viewed_brief(PositionVerdict.ENTER)),
+            ),
+            episode(T0 + timedelta(hours=2), facts=flat_picture(day_pnl="0.0")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.ungradeable == 1
+
+    def test_enter_is_right_only_once_the_horizon_drains(self) -> None:
+        """A realized entry inside an open horizon stays pending."""
+        episodes = (
+            episode(
+                T0,
+                facts=flat_picture(),
+                seats=claude_views(viewed_brief(PositionVerdict.ENTER)),
+            ),
+            episode(
+                T0 + timedelta(hours=2),
+                facts=flat_picture(tracked="SPCXc", committed="80.0"),
+            ),
+        )
+        views = desk_view_score(score_corpus(episodes, HORIZON, now=T0 + timedelta(hours=3)))
+        assert views.pending == 1
+        assert views.right == 0
+
+
+class TestViewHonesty:
+    """Declines, gaps, and incoherent verdicts are counted, never graded."""
+
+    def test_an_explicit_decline_is_counted_never_graded(self) -> None:
+        """A desk that cannot form a view says so and is not scored."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(declined=True))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="-0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.declined == 1
+        assert views.stated == 0
+        assert views.right == 0 and views.wrong == 0 and views.pending == 0
+
+    def test_a_positioned_episode_without_a_view_counts_missing(self) -> None:
+        """An answered brief over a tracked position with no view is a gap."""
+        episodes = (
+            episode(T0, seats=claude_views(calm_brief())),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.missing == 1
+        assert views.stated == 0
+
+    def test_a_flat_episode_without_a_view_counts_nothing(self) -> None:
+        """The view is optional while no position is tracked."""
+        episodes = (
+            episode(T0, facts=flat_picture(), seats=claude_views(calm_brief())),
+            episode(T0 + timedelta(hours=2), facts=flat_picture()),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.missing == 0
+        assert views.stated == 0
+        assert views.declined == 0
+
+    def test_an_enter_verdict_while_tracked_is_incoherent(self) -> None:
+        """A verdict contradicting the episode's own facts is counted."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.ENTER))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.incoherent == 1
+        assert views.stated == 0
+
+    def test_a_hold_verdict_while_flat_is_incoherent(self) -> None:
+        """The flat-book mirror of the same incoherence."""
+        episodes = (
+            episode(
+                T0,
+                facts=flat_picture(),
+                seats=claude_views(viewed_brief(PositionVerdict.HOLD)),
+            ),
+            episode(T0 + timedelta(hours=2), facts=flat_picture()),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.incoherent == 1
+
+    def test_news_episodes_never_score_views(self) -> None:
+        """The outside-world stream carries no deterministic view truth."""
+        episodes = (
+            episode(
+                T0,
+                stream=TeacherStream.NEWS,
+                seats=claude_views(viewed_brief(PositionVerdict.HOLD)),
+            ),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.stated == 0
+        assert views.missing == 0
+
+    def test_absent_seats_never_score_views(self) -> None:
+        """A typed absence gave no view and is never a gap."""
+        episodes = (
+            episode(T0, seats=claude_views(None)),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.missing == 0
+        assert views.stated == 0
+
+    def test_the_student_view_rides_the_audit_payload(self) -> None:
+        """The student desk's stated view projects from its audited answer."""
+        payload = AdvisorReportedAuditPayload(
+            outcome="brief",
+            model="qwen3.6:35b-a3b",
+            brief="the student read",
+            view=stated_view(PositionVerdict.EXIT, ViewConfidence.LOW),
+        )
+        episodes = (
+            episode(T0, student=payload),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="-0.5")),
+        )
+        views = desk_view_score(scored(*episodes), desk="student")
+        assert views.stated == 1
+        assert views.right == 1
+
+
+class TestViewCalibration:
+    """The confidence bands: high must be right more often than low."""
+
+    @staticmethod
+    def _band_corpus(
+        *,
+        early_bad: bool,
+        late_bad: bool,
+        early_confidence: ViewConfidence,
+        late_confidence: ViewConfidence,
+        early_count: int = 2,
+        late_count: int = 2,
+    ) -> tuple[TeacherEpisode, ...]:
+        """Build two view families whose windows cannot pollute each other.
+
+        The early family's windows close before the late family's
+        episodes begin, so each family's truth stays its own; the early
+        quiet windows drain under the fixed clock while the late bad
+        windows decide the moment their bad follower lands.
+        """
+        episodes: list[TeacherEpisode] = []
+        for index in range(early_count):
+            at = T0 + timedelta(hours=4 * index)
+            episodes.append(
+                episode(
+                    at, seats=claude_views(viewed_brief(PositionVerdict.EXIT, early_confidence))
+                )
+            )
+            episodes.append(
+                episode(
+                    at + timedelta(hours=2),
+                    facts=facts_picture(day_pnl="-0.5" if early_bad else "0.5"),
+                )
+            )
+        for index in range(late_count):
+            at = T0 + timedelta(hours=30 + 4 * index)
+            episodes.append(
+                episode(at, seats=claude_views(viewed_brief(PositionVerdict.EXIT, late_confidence)))
+            )
+            episodes.append(
+                episode(
+                    at + timedelta(hours=2),
+                    facts=facts_picture(day_pnl="-0.5" if late_bad else "0.5"),
+                )
+            )
+        return tuple(episodes)
+
+    def test_high_right_more_often_than_low_is_calibrated(self) -> None:
+        """Right highs against wrong lows calibrate the bands."""
+        episodes = self._band_corpus(
+            early_bad=False,
+            late_bad=True,
+            early_confidence=ViewConfidence.LOW,
+            late_confidence=ViewConfidence.HIGH,
+        )
+        views = desk_view_score(score_corpus(episodes, HORIZON, now=T0 + timedelta(hours=48)))
+        assert views.calibration == "calibrated"
+        bands = {band.band: band for band in views.bands}
+        assert bands["high"].right == 2
+        assert bands["low"].wrong == 2
+
+    def test_low_right_more_often_than_high_is_miscalibrated(self) -> None:
+        """The inverted ordering fails the calibration requirement."""
+        episodes = self._band_corpus(
+            early_bad=False,
+            late_bad=True,
+            early_confidence=ViewConfidence.HIGH,
+            late_confidence=ViewConfidence.LOW,
+        )
+        views = desk_view_score(score_corpus(episodes, HORIZON, now=T0 + timedelta(hours=48)))
+        assert views.calibration == "miscalibrated"
+
+    def test_one_decided_band_is_insufficient(self) -> None:
+        """Calibration needs decided views in both extreme bands."""
+        episodes = self._band_corpus(
+            early_bad=False,
+            late_bad=True,
+            early_confidence=ViewConfidence.HIGH,
+            late_confidence=ViewConfidence.HIGH,
+            early_count=0,
+            late_count=1,
+        )
+        views = desk_view_score(score_corpus(episodes, HORIZON, now=T0 + timedelta(hours=48)))
+        assert views.calibration == "insufficient"
+
+
+class TestViewCounterfactual:
+    """The view-versus-policy comparison, computed only where priced."""
+
+    def _exit_window(
+        self,
+        *,
+        committed: str,
+        later_committed: str | None,
+        later_pnl: str = "0.5",
+    ) -> tuple[TeacherEpisode, ...]:
+        """Build one exit view over a tracked mark path."""
+        return (
+            episode(
+                T0,
+                facts=facts_picture(committed=committed),
+                seats=claude_views(viewed_brief(PositionVerdict.EXIT)),
+            ),
+            episode(
+                T0 + timedelta(hours=2),
+                facts=facts_picture(
+                    committed=later_committed,
+                    day_pnl=later_pnl,
+                ),
+            ),
+        )
+
+    def test_a_declined_exit_over_a_falling_mark_would_have_beaten_the_stay(self) -> None:
+        """The one computable family: the committed-mark path prices it."""
+        episodes = self._exit_window(committed="80.0", later_committed="70.0")
+        views = desk_view_score(scored(*episodes))
+        assert views.counterfactuals.view_better == 1
+        assert views.counterfactuals.policy_better == 0
+
+    def test_a_declined_exit_over_a_rising_mark_loses_to_the_stay(self) -> None:
+        """The rising mark rewards the policy's actual choice."""
+        episodes = self._exit_window(committed="70.0", later_committed="80.0")
+        views = desk_view_score(scored(*episodes))
+        assert views.counterfactuals.policy_better == 1
+
+    def test_a_flat_mark_delta_is_equal(self) -> None:
+        """An unchanged committed mark prices no difference."""
+        episodes = self._exit_window(committed="75.0", later_committed="75.0")
+        views = desk_view_score(scored(*episodes))
+        assert views.counterfactuals.equal == 1
+
+    def test_missing_mark_readings_are_uncomputable(self) -> None:
+        """A path the store never observed is never fabricated."""
+        episodes = (
+            episode(
+                T0,
+                facts=facts_picture(),
+                seats=claude_views(viewed_brief(PositionVerdict.EXIT)),
+            ),
+            episode(
+                T0 + timedelta(hours=2),
+                facts=facts_picture(day_pnl="0.5"),
+            ),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.counterfactuals.uncomputable == 1
+
+    def test_an_exit_window_that_has_not_settled_stays_pending(self) -> None:
+        """The comparison waits for the window like the grade does."""
+        episodes = self._exit_window(committed="80.0", later_committed="70.0")
+        views = desk_view_score(score_corpus(episodes, HORIZON, now=T0 + timedelta(hours=3)))
+        assert views.counterfactuals.pending == 1
+        assert views.counterfactuals.view_better == 0
+
+    def test_a_hold_the_policy_honored_is_equal(self) -> None:
+        """Acting on a hold the policy took is the identical path."""
+        episodes = (
+            episode(
+                T0,
+                facts=facts_picture(),
+                seats=claude_views(viewed_brief(PositionVerdict.HOLD)),
+            ),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.counterfactuals.equal == 1
+
+    def test_a_hold_overridden_by_an_exit_is_uncomputable(self) -> None:
+        """The corpus never observed the kept-position path."""
+        episodes = (
+            episode(
+                T0,
+                facts=facts_picture(),
+                seats=claude_views(viewed_brief(PositionVerdict.HOLD)),
+            ),
+            episode(T0 + timedelta(hours=2), facts=flat_picture(day_pnl="0.5")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.counterfactuals.uncomputable == 1
+
+    def test_a_recenter_the_policy_performed_is_equal(self) -> None:
+        """A matching maintenance action prices as identical."""
+        episodes = (
+            episode(
+                T0,
+                facts=facts_picture(),
+                seats=claude_views(viewed_brief(PositionVerdict.RECENTER)),
+            ),
+            episode(
+                T0 + timedelta(hours=2),
+                facts=facts_picture(day_pnl="0.5", action="recenter"),
+            ),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.counterfactuals.equal == 1
+
+    def test_an_enter_the_policy_declined_is_uncomputable(self) -> None:
+        """The committed path the view would have taken is unobserved."""
+        episodes = (
+            episode(
+                T0,
+                facts=flat_picture(),
+                seats=claude_views(viewed_brief(PositionVerdict.ENTER)),
+            ),
+            episode(T0 + timedelta(hours=2), facts=flat_picture(day_pnl="0.0")),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.counterfactuals.uncomputable == 1
+
+    def test_the_exit_mark_window_ends_at_the_position_leave(self) -> None:
+        """A late switch prices the held-too-long path, not what followed."""
+        episodes = (
+            episode(
+                T0,
+                facts=facts_picture(committed="80.0"),
+                seats=claude_views(viewed_brief(PositionVerdict.EXIT)),
+            ),
+            episode(
+                T0 + timedelta(hours=2),
+                facts=facts_picture(committed="60.0"),
+            ),
+            episode(
+                T0 + timedelta(hours=4),
+                facts=flat_picture(tracked="MSTRc", committed="90.0", day_pnl="5.0"),
+            ),
+        )
+        views = desk_view_score(scored(*episodes))
+        assert views.counterfactuals.view_better == 1
+
+
+class TestViewBackwardCompatibility:
+    """Older corpora and reports stay valid beside the conviction layer."""
+
+    def test_view_free_corpora_parse_and_measure_their_gaps(self) -> None:
+        """A corpus recorded before the layer parses and measures honestly.
+
+        Old briefs over a tracked position count as view gaps - the
+        honest measurement, never a silently ignored field - while the
+        pre-existing calibration axis is untouched.
+        """
+        episodes = (
+            episode(T0, seats=(claude_outcome(),)),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="-0.5")),
+        )
+        report = scored(*episodes)
+        claude = desk_by_name(report, "claude")
+        assert claude.views.stated == 0
+        assert claude.views.missing == 1
+        assert claude.calibration.unflagged_bad == 1
+
+    def test_view_free_reports_parse_with_defaulted_view_fields(self) -> None:
+        """A report written before the layer validates with its defaults."""
+        legacy = {
+            "schema_version": HINDSIGHT_REPORT_SCHEMA,
+            "created_at": T0.isoformat(),
+            "horizon_hours": HORIZON,
+            "episode_count": 1,
+            "grounded_episode_count": 1,
+            "desks": [],
+        }
+        report = HindsightReport.model_validate(legacy)
+        assert report.view_rule == HINDSIGHT_VIEW_RULE
+        assert report.truth_rule == HINDSIGHT_TRUTH_RULE
+
+    def test_corpus_episodes_without_views_round_trip(self) -> None:
+        """Old corpus lines revalidate after the schema extension."""
+        first = episode(T0, seats=(claude_outcome(),))
+        document = json.loads(first.model_dump_json())
+        assert "view" in json.loads(json.dumps(document))["seats"][0]["brief"]
+        revalidated = TeacherEpisode.model_validate(document)
+        assert revalidated.seats[0].brief is not None
+        assert revalidated.seats[0].brief.view is None
+
+
+class TestViewReportShape:
+    """The scored report carries the view axis beside the calibration."""
+
+    def test_the_report_pins_its_view_rule(self) -> None:
+        """Every scored report explains its own view grading rule."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.HOLD))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+        )
+        report = scored(*episodes)
+        assert report.view_rule == HINDSIGHT_VIEW_RULE
+
+    def test_every_desk_carries_a_view_score(self) -> None:
+        """Teacher seats and the student all carry the view axis."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.HOLD))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+        )
+        report = scored(*episodes)
+        assert all(desk.views is not None for desk in report.desks)
+        assert desk_by_name(report, "claude").views.right == 1
+
+    def test_the_grades_export_joins_per_episode_by_desk(self) -> None:
+        """The digest-facing export keys entries by episode identity."""
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.EXIT))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="-0.5")),
+        )
+        grades = grade_corpus_views(episodes, HORIZON, now=T0 + timedelta(hours=3))
+        assert isinstance(grades, ViewGrades)
+        by_desk = grades.by_episode(episodes[0])
+        entry = by_desk["claude"]
+        assert entry.state is ViewState.STATED
+        # The bad follower decides the grade immediately while the
+        # comparison waits for the window to settle.
+        assert entry.grade is ViewGrade.RIGHT
+        assert entry.counterfactual is ViewCounterfactual.PENDING
+
+    def test_the_human_summary_prints_the_view_line(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The printed summary names the view axis and its bands."""
+        from aero_bot.hindsight import print_report
+
+        episodes = (
+            episode(T0, seats=claude_views(viewed_brief(PositionVerdict.HOLD))),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+        )
+        print_report(scored(*episodes))
+        summary = capsys.readouterr().out
+        assert "views: 1 stated" in summary
+        assert "bands" in summary
+        assert "counterfactuals" in summary
+        assert "view rule:" in summary
 
 
 class TestCliContract:

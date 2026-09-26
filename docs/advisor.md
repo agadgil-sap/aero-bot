@@ -29,9 +29,19 @@ The Mac-hosted plane (see the project's inference-plane notes) binds tailnet-onl
 
 1. **Compose the facts.** The monitor reads the most recent audit records (default window 40), filters to `cycle_reported` summaries, and joins the cycle book: the tracked position and its committed value, the persisted out-of-range wait, the latest report's day economics and fee evidence, halt and action counts, the distinct decision reasons, and re-entry cooldowns.
 Everything in the prompt is deterministic and grounded - the composed facts are audited or read from the self-healing book, never scraped or guessed.
-2. **Request one bounded answer.** The prompt asks for exactly one JSON object - a brief of at most three sentences and at most ten anomaly flags, each with a bounded confidence and one-line rationale - at temperature zero.
+2. **Request one bounded answer.** The prompt asks for exactly one JSON object - a brief of at most three sentences, at most ten anomaly flags each with a bounded confidence and one-line rationale, and (when the facts show a tracked position) a stated position view - at temperature zero.
 3. **Validate fail-closed.** The answer must parse and validate against the strict schema; a reasoning model's separate `reasoning` field is ignored, and the token budget must cover thinking plus answer (a length-cutoff plane answering empty content is a typed absence, not a hang).
 4. **Record.** The pass prints a human summary, atomically rewrites `advisor_last_report.json` beside the audit store, and appends one `advisor_reported` audit record carrying the accepted brief or the stable absence reason, the model, the latency, and the window size.
+
+## The position view
+
+The conviction layer (the captain's answer to desks that describe state and defer) extends the shared brief schema backward-compatibly: every desk - the student here, the teacher seats in the harness - may carry a position view beside its prose.
+When the composed facts show a tracked position the view is required: either a verdict (hold, exit, recenter, or enter), a coarse confidence band (low, medium, high), and a one-sentence reason of at most 400 characters tied to the locked policy's own rules or naming the deviation from them - or an explicit `view_declined` saying why no view can be formed.
+A desk that cannot form a view says so; it never defaults a missing view to hold.
+While the book is flat the view is optional (an enter view is the coherent form).
+The fields are optional in the schema itself so every brief already recorded in the audit chain or the teacher corpus keeps parsing; older briefs over a tracked position surface as honest view gaps in the hindsight scorer's measurement, never as parse failures.
+The accepted view rides the `advisor_reported` audit record beside the brief, so the corpus and every offline surface see the same stated conviction.
+Advisory only, like everything here: a view is a measurement input, not an instruction - the locked policy engine keeps every trading decision, and nothing in this layer can authorize, block, or execute anything.
 
 ## The teaching block
 

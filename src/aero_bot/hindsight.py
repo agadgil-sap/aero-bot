@@ -4,7 +4,8 @@ The intelligence layer's third surface closes the loop the teacher harness
 opened: episodes accumulate in the local corpus, and this scorer replays
 them offline against the deterministic facts later episodes carry, scoring
 every desk - both teacher seats and the student whose audited brief rides
-each episode - on availability and anomaly calibration.
+each episode - on availability, anomaly calibration, and the conviction
+layer's view grading.
 
 The corpus is self-contained truth: every pulled episode snapshots the
 window facts at its timestamp, so the realized outcome of an earlier
@@ -21,9 +22,15 @@ Discipline:
 - **Pending, never guessed.** A brief whose horizon contains no later
   facts is pending, not scored; absences are counted per typed reason and
   never scored at all (see ``docs/teacher.md``).
+- **Conviction is measured, not asserted.** A stated position view is
+  graded against the same deterministic later facts under the report's
+  own view rule; explicit declines, view gaps, and incoherent verdicts
+  are counted, never graded, and the view-versus-policy counterfactual
+  is computed only where the corpus prices it - never fabricated.
 - **One uniform shape.** The report is one frozen schema-validated object
   (``hindsight_report/1``) rewritten atomically, so a month-old report
-  explains itself: the horizon and the truth rule ride inside it.
+  explains itself: the horizon, the truth rule, and the view rule ride
+  inside it.
 """
 
 import argparse
@@ -35,12 +42,21 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 from pydantic import BaseModel, Field
 
-from aero_bot.advisor import AdvisorAnomaly, AdvisorBrief
+from aero_bot.advisor import (
+    AdvisorAnomaly,
+    AdvisorBrief,
+    AdvisorWindowFacts,
+    PositionVerdict,
+    PositionView,
+    ViewConfidence,
+)
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG
 from aero_bot.teacher import (
     DEFAULT_TEACHER_CORPUS_DIR,
@@ -75,6 +91,80 @@ UNASKED_REASONS = frozenset({"dark", "window_unreachable"})
 # The streams whose briefs are window-grounded and therefore scoreable;
 # news judges the outside world, which carries no follow-up truth here.
 CALIBRATED_STREAMS = frozenset({TeacherStream.TACTICAL, TeacherStream.DAILY})
+# The self-describing rule every stated view is graded against, pinned
+# into every report beside the anomaly truth rule.
+HINDSIGHT_VIEW_RULE = (
+    "a stated view is graded against the deterministic facts later "
+    "episodes carry within the horizon: hold is right when the position "
+    "stayed tracked through a drained quiet horizon and wrong when a bad "
+    "outcome followed while it stayed tracked; exit is right when a bad "
+    "outcome followed while the position stayed tracked and wrong when a "
+    "quiet horizon drained with it still tracked; recenter is right when "
+    "a recenter action followed while tracked and wrong when a quiet "
+    "horizon drained with no recenter, ungradeable when a bad outcome "
+    "followed with no recenter or the position left; enter is right when "
+    "an entry followed with no bad outcome inside the window and wrong "
+    "when any bad outcome fell inside it, ungradeable when a quiet "
+    "horizon drained with no entry; a view whose position left before "
+    "its horizon drained is ungradeable and a view whose horizon has not "
+    "filled is pending, never guessed; explicit declines, missing views "
+    "on positioned episodes, and verdicts incoherent with the facts are "
+    "counted, never graded. The counterfactual is computed only where "
+    "the corpus prices it: an exit view the policy declined is compared "
+    "against the tracked position's committed-mark path over the same "
+    "window - a falling mark means the view would have beaten the "
+    "policy's stay, a rising mark means the stay won, a flat mark is "
+    "equal - first order and blind to emissions, fees, gas, and "
+    "slippage; a hold view the policy honored through a drained horizon "
+    "is equal and a view that matched the policy's realized action is "
+    "equal; every other comparison - a hold overridden by an exit, any "
+    "recenter or enter view the policy declined - is uncomputable "
+    "because the corpus never observed the counterfactual path"
+)
+
+
+class ViewGrade(StrEnum):
+    """Name the four grades a stated view's correctness can take."""
+
+    # The view's directional claim held against realized outcomes.
+    RIGHT = "right"
+    # The realized outcomes contradicted the claim.
+    WRONG = "wrong"
+    # The window settled but its outcomes cannot grade this verdict
+    # (the position left, or trouble followed without the verdict's
+    # matching action).
+    UNGRADEABLE = "ungradeable"
+    # The horizon has not filled; never guessed.
+    PENDING = "pending"
+
+
+class ViewCounterfactual(StrEnum):
+    """Name the verdicts the view-versus-policy comparison can take."""
+
+    # Acting on the view would have beaten the policy's actual choice.
+    VIEW_BETTER = "view_better"
+    # The policy's actual choice beat acting on the view.
+    POLICY_BETTER = "policy_better"
+    # No difference the store can price (identical paths or a flat
+    # mark delta).
+    EQUAL = "equal"
+    # The corpus cannot support the comparison; never fabricated.
+    UNCOMPUTABLE = "uncomputable"
+    # The window has not settled; never guessed.
+    PENDING = "pending"
+
+
+class ViewState(StrEnum):
+    """Name what one desk's brief carried on a positioned episode."""
+
+    # A coherent stated view.
+    STATED = "stated"
+    # An explicit no-view declaration.
+    DECLINED = "declined"
+    # A positioned episode answered with neither a view nor a decline.
+    MISSING = "missing"
+    # A stated verdict incoherent with the episode's own facts.
+    INCOHERENT = "incoherent"
 
 
 class HindsightCalibration(BaseModel):
@@ -120,6 +210,100 @@ class CountedReason(BaseModel):
     count: Annotated[int, Field(ge=1)]
 
 
+class ViewBandScore(BaseModel):
+    """Carry one confidence band's decided-view counts."""
+
+    # Frozen strict fields keep one band's counts immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The band's stable name (low, medium, high).
+    band: str
+    # Decided views in this band that came back right.
+    right: Annotated[int, Field(ge=0)]
+    # Decided views in this band that came back wrong.
+    wrong: Annotated[int, Field(ge=0)]
+
+    @property
+    def decided(self) -> int:
+        """Count this band's decided views."""
+        return self.right + self.wrong
+
+    @property
+    def right_rate(self) -> float | None:
+        """Report the band's right rate over decided views, else None."""
+        decided = self.decided
+        return self.right / decided if decided else None
+
+
+class ViewCounterfactualScore(BaseModel):
+    """Carry one desk's view-versus-policy comparison counts."""
+
+    # Frozen strict fields keep one desk's counts immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # Windows where acting on the view would have beaten the policy.
+    view_better: Annotated[int, Field(ge=0)] = 0
+    # Windows where the policy's actual choice beat the view.
+    policy_better: Annotated[int, Field(ge=0)] = 0
+    # Windows the store prices as identical (matched actions, flat marks).
+    equal: Annotated[int, Field(ge=0)] = 0
+    # Windows the corpus cannot support; never fabricated.
+    uncomputable: Annotated[int, Field(ge=0)] = 0
+    # Windows still waiting to settle; never guessed.
+    pending: Annotated[int, Field(ge=0)] = 0
+
+    @property
+    def decided(self) -> int:
+        """Count every settled comparison."""
+        return self.view_better + self.policy_better + self.equal + self.uncomputable
+
+
+class HindsightViewScore(BaseModel):
+    """Carry one desk's stated-view grading over the corpus."""
+
+    # Frozen strict fields keep one desk's view score immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # Coherent stated views entering grading.
+    stated: Annotated[int, Field(ge=0)] = 0
+    # Explicit no-view declarations; honest, never graded.
+    declined: Annotated[int, Field(ge=0)] = 0
+    # Positioned episodes answered with neither a view nor a decline.
+    missing: Annotated[int, Field(ge=0)] = 0
+    # Stated verdicts incoherent with the episode's own facts.
+    incoherent: Annotated[int, Field(ge=0)] = 0
+    # Stated views graded right against realized outcomes.
+    right: Annotated[int, Field(ge=0)] = 0
+    # Stated views graded wrong against realized outcomes.
+    wrong: Annotated[int, Field(ge=0)] = 0
+    # Settled windows whose outcomes cannot grade the verdict.
+    ungradeable: Annotated[int, Field(ge=0)] = 0
+    # Views still waiting for their horizon; never guessed.
+    pending: Annotated[int, Field(ge=0)] = 0
+    # The decided counts per confidence band, low through high.
+    bands: tuple[ViewBandScore, ...] = ()
+    # The view-versus-policy comparison counts.
+    counterfactuals: ViewCounterfactualScore = ViewCounterfactualScore()
+
+    @property
+    def calibration(self) -> str:
+        """Verdict on the confidence bands' ordering.
+
+        High-confidence views must be right more often than low-
+        confidence ones; the verdict needs at least one decided view in
+        each of the low and high bands, else the corpus is insufficient.
+        """
+        by_band = {band.band: band for band in self.bands}
+        low = by_band.get(ViewConfidence.LOW.value)
+        high = by_band.get(ViewConfidence.HIGH.value)
+        if low is None or high is None or not low.decided or not high.decided:
+            return "insufficient"
+        # The decided guards above make both rates real numbers.
+        high_rate = cast(float, high.right_rate)
+        low_rate = cast(float, low.right_rate)
+        return "calibrated" if high_rate > low_rate else "miscalibrated"
+
+
 class HindsightDeskScore(BaseModel):
     """Carry one desk's availability and calibration over the corpus."""
 
@@ -140,6 +324,9 @@ class HindsightDeskScore(BaseModel):
     # episodes count for availability only because the outside world has
     # no deterministic follow-up truth in this corpus.
     calibration: HindsightCalibration
+    # The stated-view grading over the same window-grounded streams;
+    # defaults empty so older reports and view-free corpora stay valid.
+    views: HindsightViewScore = HindsightViewScore()
 
     @property
     def availability(self) -> float | None:
@@ -181,6 +368,9 @@ class HindsightReport(BaseModel):
     horizon_hours: Annotated[float, Field(gt=0.0)]
     # The self-describing rule the calibration scored against.
     truth_rule: str = HINDSIGHT_TRUTH_RULE
+    # The self-describing rule the stated views were graded against;
+    # defaults onto older reports that predate the conviction layer.
+    view_rule: str = HINDSIGHT_VIEW_RULE
     # Every episode the corpus loaded, all streams.
     episode_count: Annotated[int, Field(ge=0)]
     # How many episodes carried pulled facts (the scoreable timeline).
@@ -235,6 +425,8 @@ def _student_read(episode: TeacherEpisode) -> DeskRead:
                 )
                 for anomaly in payload.anomalies
             ),
+            view=payload.view,
+            view_declined=payload.view_declined,
         )
     return DeskRead(
         episode,
@@ -398,10 +590,401 @@ def episode_verdicts(
     )
 
 
+@dataclass(frozen=True)
+class ViewGradeEntry:
+    """Carry one desk's stated view on one episode with its grades."""
+
+    # The grounded episode the view was stated on.
+    episode: TeacherEpisode
+    # The desk's stable name: a teacher seat or the student.
+    desk: str
+    # The stated view itself.
+    view: PositionView | None
+    # What the brief carried: stated, declined, missing, or incoherent.
+    state: ViewState
+    # The correctness grade, None for every ungraded state.
+    grade: ViewGrade | None
+    # The view-versus-policy comparison, None for every ungraded state.
+    counterfactual: ViewCounterfactual | None
+
+
+@dataclass(frozen=True)
+class ViewGrades:
+    """Carry every desk's view grading over the corpus, joinable per episode."""
+
+    # Every entry in chronological order.
+    entries: tuple[ViewGradeEntry, ...] = ()
+
+    def by_episode(self, episode: TeacherEpisode) -> Mapping[str, ViewGradeEntry]:
+        """Join the entries back to one episode, keyed by desk name.
+
+        Args:
+            episode: The corpus episode to look up.
+
+        Returns:
+            The desk-name-to-entry mapping for that episode; keyed the
+            same way the posture audit's per-episode join keys, over the
+            same loader objects.
+        """
+        return {entry.desk: entry for entry in self.entries if entry.episode is episode}
+
+    def for_desk(self, desk: str) -> tuple[ViewGradeEntry, ...]:
+        """List one desk's entries in chronological order.
+
+        Args:
+            desk: The desk's stable name.
+
+        Returns:
+            The desk's entries; empty when the desk stated nothing.
+        """
+        return tuple(entry for entry in self.entries if entry.desk == desk)
+
+
+def _parse_mark(value: str | None) -> Decimal | None:
+    """Parse one committed-mark string into a finite Decimal, honestly.
+
+    Args:
+        value: The facts field's string form, else None.
+
+    Returns:
+        The parsed finite Decimal, else None when absent, malformed, or
+        non-finite; exactly the risk manager's posture discipline.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation:
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+@dataclass(frozen=True)
+class _ViewWindowScan:
+    """Carry the realized facts one stated view is graded against."""
+
+    # Whether the horizon has fully elapsed at scoring time.
+    drained: bool
+    # Whether any in-window follower was observed at all; quiet grades
+    # need observations, mirroring the anomaly truth rule.
+    observed: bool
+    # Whether the tracked symbol left (book flat or switched) inside the
+    # window; the tracked position's own path ends there.
+    position_left: bool
+    # Whether a bad outcome was observed before any leave (tracked
+    # views) - the same bad truth the anomaly calibration scores.
+    bad_while_held: bool
+    # Whether any bad outcome fell inside the window (flat views).
+    bad_in_window: bool
+    # Whether a recenter action was observed before any leave.
+    recenter_seen: bool
+    # Whether a position appeared in the window (enter views).
+    entry_seen: bool
+    # The last valid committed-mark reading while the same symbol stayed
+    # tracked, else None; the exit counterfactual's terminal reading.
+    final_committed: str | None
+
+
+def _scan_view_window(
+    facts: AdvisorWindowFacts,
+    created_at: datetime,
+    grounded_tail: Sequence[TeacherEpisode],
+    horizon: timedelta,
+    now: datetime,
+) -> _ViewWindowScan:
+    """Scan the later grounded episodes one stated view grades against.
+
+    Args:
+        facts: The episode's composed facts; they define the baseline
+            symbol, halt count, and committed mark.
+        created_at: The episode's timestamp.
+        grounded_tail: Every chronologically later grounded episode.
+        horizon: How far ahead the truth may be observed.
+        now: The scoring pass's reference time.
+
+    Returns:
+        The realized window facts; malformed and non-finite economics
+        are absences, never guesses, throughout.
+    """
+    symbol = facts.tracked_symbol
+    limit = created_at + horizon
+    drained = now >= limit
+    observed = False
+    position_left = False
+    bad_while_held = False
+    bad_in_window = False
+    recenter_seen = False
+    entry_seen = False
+    final_committed: str | None = None
+    for follower in grounded_tail:
+        follower_facts = follower.facts
+        if follower_facts is None:
+            continue
+        if not created_at < follower.created_at <= limit:
+            continue
+        observed = True
+        day_pnl = _parse_usdc(follower_facts.day_pnl_usdc)
+        bad = (day_pnl is not None and day_pnl < 0.0) or (
+            follower_facts.halted_count > facts.halted_count
+        )
+        if symbol is None:
+            if follower_facts.tracked_symbol is not None:
+                entry_seen = True
+            if bad:
+                bad_in_window = True
+            continue
+        if follower_facts.tracked_symbol != symbol:
+            # The tracked position's own path ends here: later facts
+            # describe a different book and never grade the stay.
+            position_left = True
+            break
+        if bad:
+            bad_while_held = True
+        if follower_facts.latest_action == "recenter":
+            recenter_seen = True
+        if _parse_mark(follower_facts.committed_usdc) is not None:
+            final_committed = follower_facts.committed_usdc
+    return _ViewWindowScan(
+        drained=drained,
+        observed=observed,
+        position_left=position_left,
+        bad_while_held=bad_while_held,
+        bad_in_window=bad_in_window,
+        recenter_seen=recenter_seen,
+        entry_seen=entry_seen,
+        final_committed=final_committed,
+    )
+
+
+def _grade_stated_view(
+    view: PositionView, scan: _ViewWindowScan, facts: AdvisorWindowFacts
+) -> tuple[ViewGrade, ViewCounterfactual]:
+    """Grade one coherent stated view and its policy comparison.
+
+    Args:
+        view: The stated view.
+        scan: The realized window facts the view grades against.
+        facts: The episode's own composed facts; the committed mark
+            anchors the exit counterfactual.
+
+    Returns:
+        The correctness grade and the counterfactual verdict, per the
+        rule pinned into every report (``HINDSIGHT_VIEW_RULE``).
+    """
+    if view.verdict is PositionVerdict.HOLD:
+        if scan.bad_while_held:
+            return ViewGrade.WRONG, ViewCounterfactual.PENDING
+        if scan.position_left:
+            return ViewGrade.UNGRADEABLE, ViewCounterfactual.UNCOMPUTABLE
+        if scan.drained and scan.observed:
+            return ViewGrade.RIGHT, ViewCounterfactual.EQUAL
+        return ViewGrade.PENDING, ViewCounterfactual.PENDING
+    if view.verdict is PositionVerdict.EXIT:
+        if scan.bad_while_held:
+            grade = ViewGrade.RIGHT
+        elif scan.position_left:
+            grade = ViewGrade.UNGRADEABLE
+        elif scan.drained and scan.observed:
+            grade = ViewGrade.WRONG
+        else:
+            grade = ViewGrade.PENDING
+        if not (scan.drained or scan.position_left):
+            # The window is still accruing truth; the comparison waits
+            # for settlement even when the bad outcome already decided
+            # the grade.
+            return grade, ViewCounterfactual.PENDING
+        # The one computable comparison: the committed-mark path of the
+        # stay the policy actually chose, first order and blind to
+        # emissions, fees, gas, and slippage.
+        baseline_mark = _parse_mark(facts.committed_usdc)
+        final_mark = _parse_mark(scan.final_committed)
+        if baseline_mark is None or final_mark is None:
+            return grade, ViewCounterfactual.UNCOMPUTABLE
+        delta = final_mark - baseline_mark
+        if delta < 0:
+            return grade, ViewCounterfactual.VIEW_BETTER
+        if delta > 0:
+            return grade, ViewCounterfactual.POLICY_BETTER
+        return grade, ViewCounterfactual.EQUAL
+    if view.verdict is PositionVerdict.RECENTER:
+        if scan.recenter_seen:
+            return ViewGrade.RIGHT, ViewCounterfactual.EQUAL
+        if scan.position_left:
+            return ViewGrade.UNGRADEABLE, ViewCounterfactual.UNCOMPUTABLE
+        if scan.drained and scan.observed:
+            if scan.bad_while_held:
+                return ViewGrade.UNGRADEABLE, ViewCounterfactual.UNCOMPUTABLE
+            return ViewGrade.WRONG, ViewCounterfactual.UNCOMPUTABLE
+        return ViewGrade.PENDING, ViewCounterfactual.PENDING
+    # The enter verdict: stated while flat, graded over the whole window.
+    if scan.bad_in_window:
+        return ViewGrade.WRONG, ViewCounterfactual.PENDING
+    if scan.entry_seen:
+        if scan.drained:
+            return ViewGrade.RIGHT, ViewCounterfactual.EQUAL
+        return ViewGrade.PENDING, ViewCounterfactual.PENDING
+    if scan.drained and scan.observed:
+        return ViewGrade.UNGRADEABLE, ViewCounterfactual.UNCOMPUTABLE
+    return ViewGrade.PENDING, ViewCounterfactual.PENDING
+
+
+def _view_state(read: DeskRead) -> tuple[ViewState, PositionView | None] | None:
+    """Classify one desk read's view carriage on a positioned-or-flat episode.
+
+    Args:
+        read: The desk's projected read.
+
+    Returns:
+        The read's view state and the stated view when present, else
+        None when the episode carries no brief, sits outside the
+        calibrated streams, or offers no view surface (a flat book the
+        brief read cleanly).
+    """
+    episode = read.episode
+    brief = read.brief
+    facts = episode.facts
+    if brief is None or facts is None or episode.stream not in CALIBRATED_STREAMS:
+        return None
+    tracked = facts.tracked_symbol is not None
+    if brief.view is not None:
+        verdict = brief.view.verdict
+        coherent = (
+            verdict is PositionVerdict.ENTER
+            if not tracked
+            else verdict is not PositionVerdict.ENTER
+        )
+        return (ViewState.INCOHERENT if not coherent else ViewState.STATED, brief.view)
+    if brief.view_declined is not None:
+        return ViewState.DECLINED, None
+    if tracked:
+        return ViewState.MISSING, None
+    # A flat book with no view: the view was optional, nothing to count.
+    return None
+
+
+def grade_corpus_views(
+    episodes: Sequence[TeacherEpisode],
+    horizon_hours: float,
+    now: datetime | None = None,
+) -> ViewGrades:
+    """Grade every desk's stated views over the corpus.
+
+    The conviction layer's truth pass: every answered brief on a
+    window-grounded episode carries either a stated view, an explicit
+    decline, or (on a positioned episode) a measurable gap. Stated views
+    are graded against the deterministic facts later episodes carry
+    within the horizon, their confidence bands bucketed for calibration,
+    and their policy comparison marked computable only where the corpus
+    prices it (see ``HINDSIGHT_VIEW_RULE``). No model judges another
+    model; every grade is recomputable by hand.
+
+    Args:
+        episodes: The corpus's episodes, oldest first.
+        horizon_hours: How many hours ahead a view may be graded against.
+        now: The pass's reference time; None reads the clock.
+
+    Returns:
+        Every desk's view entries in chronological order, joinable per
+        episode for the upgrade digest's conviction class.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    horizon = timedelta(hours=horizon_hours)
+    grounded = _grounded_timeline(episodes)
+    desks: list[tuple[str, TeacherSeatName | None]] = [
+        (seat.value, seat) for seat in TeacherSeatName
+    ]
+    desks.append(("student", None))
+    entries: list[ViewGradeEntry] = []
+    for index, episode in enumerate(grounded):
+        facts = episode.facts
+        if facts is None:
+            # The grounded timeline guarantees this never trips.
+            continue
+        tail = grounded[index + 1 :]
+        for name, seat in desks:
+            read = collect_reads((episode,), seat)[0]
+            classified = _view_state(read)
+            if classified is None:
+                continue
+            state, view = classified
+            grade: ViewGrade | None = None
+            counterfactual: ViewCounterfactual | None = None
+            if state is ViewState.STATED and view is not None:
+                scan = _scan_view_window(facts, episode.created_at, tail, horizon, moment)
+                grade, counterfactual = _grade_stated_view(view, scan, facts)
+            entries.append(
+                ViewGradeEntry(
+                    episode=episode,
+                    desk=name,
+                    view=view,
+                    state=state,
+                    grade=grade,
+                    counterfactual=counterfactual,
+                )
+            )
+    entries.sort(key=lambda entry: entry.episode.created_at)
+    return ViewGrades(entries=tuple(entries))
+
+
+def _compose_view_score(entries: Sequence[ViewGradeEntry]) -> HindsightViewScore:
+    """Aggregate one desk's view entries into the frozen score.
+
+    Args:
+        entries: One desk's chronological entries.
+
+    Returns:
+        The counts, bands, and counterfactuals; decided views alone feed
+        the bands, and every state feeds its own count.
+    """
+    counts = dict.fromkeys(ViewState, 0)
+    grades = dict.fromkeys(ViewGrade, 0)
+    band_counts = {
+        band: {"right": 0, "wrong": 0}
+        for band in (ViewConfidence.LOW, ViewConfidence.MEDIUM, ViewConfidence.HIGH)
+    }
+    comparisons = dict.fromkeys(ViewCounterfactual, 0)
+    for entry in entries:
+        counts[entry.state] += 1
+        if entry.grade is not None:
+            grades[entry.grade] += 1
+        if entry.counterfactual is not None:
+            comparisons[entry.counterfactual] += 1
+        if entry.state is ViewState.STATED and entry.grade in (ViewGrade.RIGHT, ViewGrade.WRONG):
+            # The stated state always carries its view; the static type
+            # cannot see that construction.
+            view = cast(PositionView, entry.view)
+            band_counts[view.confidence][
+                "right" if entry.grade is ViewGrade.RIGHT else "wrong"
+            ] += 1
+    bands = tuple(
+        ViewBandScore(band=band.value, right=tallies["right"], wrong=tallies["wrong"])
+        for band, tallies in band_counts.items()
+    )
+    return HindsightViewScore(
+        stated=counts[ViewState.STATED],
+        declined=counts[ViewState.DECLINED],
+        missing=counts[ViewState.MISSING],
+        incoherent=counts[ViewState.INCOHERENT],
+        right=grades[ViewGrade.RIGHT],
+        wrong=grades[ViewGrade.WRONG],
+        ungradeable=grades[ViewGrade.UNGRADEABLE],
+        pending=grades[ViewGrade.PENDING],
+        bands=bands,
+        counterfactuals=ViewCounterfactualScore(
+            view_better=comparisons[ViewCounterfactual.VIEW_BETTER],
+            policy_better=comparisons[ViewCounterfactual.POLICY_BETTER],
+            equal=comparisons[ViewCounterfactual.EQUAL],
+            uncomputable=comparisons[ViewCounterfactual.UNCOMPUTABLE],
+            pending=comparisons[ViewCounterfactual.PENDING],
+        ),
+    )
+
+
 def _score_desk(
     desk: str,
     reads: Sequence[DeskRead],
     verdicts: Mapping[int, bool | None],
+    view_entries: Sequence[ViewGradeEntry] = (),
 ) -> HindsightDeskScore:
     """Score one desk's reads into availability and calibration counts.
 
@@ -410,6 +993,8 @@ def _score_desk(
         reads: The desk's projected reads, oldest first.
         verdicts: The per-episode bad-outcome verdicts keyed by episode
             object identity.
+        view_entries: The desk's view grading entries from
+            :func:`grade_corpus_views`, else empty for a view-free score.
 
     Returns:
         The desk's complete score.
@@ -459,6 +1044,7 @@ def _score_desk(
             unflagged_quiet=counts["unflagged_quiet"],
             pending=pending,
         ),
+        views=_compose_view_score(view_entries),
     )
 
 
@@ -483,10 +1069,22 @@ def score_corpus(
     scored = episode_verdicts(episodes, horizon_hours, moment)
     grounded = [episode for episode, _ in scored]
     verdicts: dict[int, bool | None] = {id(episode): verdict for episode, verdict in scored}
+    view_grades = grade_corpus_views(episodes, horizon_hours, moment)
     desks: list[HindsightDeskScore] = []
     for seat in TeacherSeatName:
-        desks.append(_score_desk(seat.value, collect_reads(episodes, seat), verdicts))
-    desks.append(_score_desk("student", collect_reads(episodes, None), verdicts))
+        desks.append(
+            _score_desk(
+                seat.value,
+                collect_reads(episodes, seat),
+                verdicts,
+                view_grades.for_desk(seat.value),
+            )
+        )
+    desks.append(
+        _score_desk(
+            "student", collect_reads(episodes, None), verdicts, view_grades.for_desk("student")
+        )
+    )
     scoreboard = HindsightScoreboard()
     latest = grounded[-1].facts if grounded else None
     if latest is not None:
@@ -582,12 +1180,30 @@ def print_report(report: HindsightReport) -> None:
                 f"{calibration.unflagged_quiet} unflagged-quiet), "
                 f"{calibration.pending} pending"
             )
+        views = desk.views
+        if views.stated or views.declined or views.missing or views.incoherent:
+            bands = ", ".join(f"{band.band} {band.right}/{band.decided}" for band in views.bands)
+            comparisons = views.counterfactuals
+            print(
+                f"    views: {views.stated} stated "
+                f"({views.right} right, {views.wrong} wrong, "
+                f"{views.ungradeable} ungradeable, {views.pending} pending), "
+                f"{views.declined} declined, {views.missing} missing, "
+                f"{views.incoherent} incoherent; bands {bands} "
+                f"({views.calibration}); counterfactuals "
+                f"{comparisons.view_better} view-better, "
+                f"{comparisons.policy_better} policy-better, "
+                f"{comparisons.equal} equal, "
+                f"{comparisons.uncomputable} uncomputable, "
+                f"{comparisons.pending} pending"
+            )
     scoreboard = report.scoreboard
     if scoreboard.latest_equity_usdc is not None:
         day_pnl = scoreboard.latest_day_pnl_usdc
         pnl_note = f", day P&L {day_pnl}" if day_pnl is not None else ""
         print(f"  scoreboard: equity {scoreboard.latest_equity_usdc} USDC{pnl_note}")
     print(f"  truth: {report.truth_rule}")
+    print(f"  view rule: {report.view_rule}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -666,13 +1282,23 @@ __all__ = [
     "HINDSIGHT_REPORT_SCHEMA",
     "HINDSIGHT_SERIES_MAX",
     "HINDSIGHT_TRUTH_RULE",
+    "HINDSIGHT_VIEW_RULE",
     "HindsightCalibration",
     "HindsightDeskScore",
     "HindsightReport",
     "HindsightScoreboard",
+    "HindsightViewScore",
     "UNASKED_REASONS",
+    "ViewBandScore",
+    "ViewCounterfactual",
+    "ViewCounterfactualScore",
+    "ViewGrade",
+    "ViewGradeEntry",
+    "ViewGrades",
+    "ViewState",
     "collect_reads",
     "episode_verdicts",
+    "grade_corpus_views",
     "main",
     "print_report",
     "resolve_corpus_dir",

@@ -113,9 +113,9 @@ See [the watchtower documentation](docs/watchtower.md) for the trip semantics, t
 
 ## Shadow advisor command
 
-The `aero-bot-advisor` command is the intelligence layer's advisory surface: it composes the audited factual picture - the tracked position, day economics, fee evidence, decision cadence - and asks one language model on the operator's private inference plane for a bounded brief and anomaly flags.
-It is fail-closed (every failure is a typed absence, never a guess), advisory-only (it sends nothing, signs nothing, and never writes the cycle book), and dark until the sealed plane values arm it.
-See [the advisor documentation](docs/advisor.md) for the sealed environment, the absence catalog, the systemd wiring, and the bake-off harness.
+The `aero-bot-advisor` command is the intelligence layer's advisory surface: it composes the audited factual picture - the tracked position, day economics, fee evidence, decision cadence - and asks one language model on the operator's private inference plane for a bounded brief, anomaly flags, and (while a position is tracked) a stated position view - verdict, confidence band, and a policy-tied reason, or an explicit decline.
+It is fail-closed (every failure is a typed absence, never a guess), advisory-only (it sends nothing, signs nothing, and never touches the cycle book), and dark until the sealed plane values arm it.
+See [the advisor documentation](docs/advisor.md) for the sealed environment, the absence catalog, the position view, the systemd wiring, and the bake-off harness.
 
 ## Teacher harness command
 
@@ -125,13 +125,13 @@ See [the teacher documentation](docs/teacher.md) for the three streams, the read
 
 ## Hindsight scoring command
 
-The `aero-bot-hindsight` command closes the loop: it replays the teacher corpus offline against itself, scoring every desk (both teacher seats and the student) on availability and anomaly calibration against deterministic later facts - a negative day P&L or a higher halted-cycle count observed within the horizon - and rewrites one schema-validated report beside the corpus.
+The `aero-bot-hindsight` command closes the loop: it replays the teacher corpus offline against itself, scoring every desk (both teacher seats and the student) on availability, anomaly calibration against deterministic later facts - a negative day P&L or a higher halted-cycle count observed within the horizon - and the conviction layer's view grading: each stated position view graded right or wrong against realized outcomes, its confidence band calibrated (high must be right more often than low), and its view-versus-policy counterfactual computed only where the corpus prices it and marked uncomputable everywhere else.
 Pending is honest (no later facts, no score), no model grades another model, and the daily launchd agent makes the report the teaching loop's daily scoreboard.
-See [the teacher documentation](docs/teacher.md) for the truth rule, the desk scores, and the daily agent.
+See [the teacher documentation](docs/teacher.md) for the truth rule, the view rule, the desk scores, and the daily agent.
 
 ## Upgrade loop command
 
-The `aero-bot-upgrade` command turns measured divergence into proposed teaching: it composes a deterministic digest of where the teacher desks beat the student ahead of realized bad outcomes (misses, availability gaps, label divergences) plus the posture misses the deterministic risk desk caught, asks each seat for one schema-validated replacement teaching block when - and only when - any divergence is backed by decided truth, and writes the proposals as operator-reviewable artifacts beside the corpus.
+The `aero-bot-upgrade` command turns measured divergence into proposed teaching: it composes a deterministic digest of where the teacher desks beat the student ahead of realized bad outcomes (misses, availability gaps, label divergences) plus the posture misses the deterministic risk desk caught and the conviction misses where a teacher's stated view proved right while the student's did not, asks each seat for one schema-validated replacement teaching block when - and only when - any divergence is backed by decided truth, and writes the proposals as operator-reviewable artifacts beside the corpus.
 Nothing applies itself: sealing stays the operator's manual act on the VM (one file written, one overlay variable uncommented), and the advisor's append-never-replace composition plus its fail-closed validation keep the student's answer contract untouchable.
 See [the teacher documentation](docs/teacher.md) for the digest classes, the proposal schema, the sealing checklist, and the daily agent.
 

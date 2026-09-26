@@ -42,6 +42,7 @@ The timeline is the grounded episodes sorted by episode timestamp, never file or
 
 The upgrade loop consumes the same pure audit (`audit_corpus_posture`) on every pass, so its digest carries a fourth evidence class beside the three teacher divergences: **posture misses**, episodes where the deterministic risk desk found a posture problem and the student's accepted brief stayed quiet.
 A posture miss is backed by the finding itself - realized deterministic truth at the episode's timestamp - so it needs no hindsight verdict and opens the honest gate on its own: a corpus where no teacher ever flagged anything still asks the seats for proposals when the counterparty desk caught what the student missed.
+(The conviction layer later joined a fifth class, conviction misses, beside this one; see [the teacher documentation](teacher.md).)
 The digest also carries the audit's total finding count as context, and the seats' prompt embeds the posture rules and per-kind counts so proposals can cite them.
 The `upgrade_last.json` report keeps its `upgrade_report/1` shape; the new fields default to empty, so older reports stay valid.
 
