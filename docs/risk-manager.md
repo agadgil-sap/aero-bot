@@ -26,6 +26,9 @@ A marked drawdown of at least five percent of the day-start anchor (the locked p
 An entry-kind action (`enter`, `pool_switch`) observed later on the same anchor day - the same New York session date and the same day-start anchor - records a `halt_discipline_violation`, because the halt blocks new entries for the rest of that day while recenters stay armed as maintenance.
 - **Exposure versus caps.**
 Committed exposure above the 1000 USDC hard ceiling (raised from the trial's 100 by the captain's 2026-09-27 performance ruling) records a `hard_cap_breached`, and an entry committing above eighty percent of current equity - the locked sizing fraction - records a `sizing_cap_breach`.
+- **Portfolio posture.**
+The allocator ruling (gnhf 33) adds the portfolio-level checks: the largest single position holding above the thirty-five percent concentration cap of equity records a `concentration_cap_breach`, and more than ten tracked positions records a `count_cap_breach`.
+Both read the composed portfolio facts (position count, per-name committed values) beside the equity the halt already measures.
 - **Contradictions.**
 A desk's accepted brief that carried no anomaly flags on an episode with any finding records a `DeskContradiction` naming the desk: it read a flagged posture as quiet.
 The student is checked first, then each teacher seat.

@@ -49,7 +49,7 @@ from aero_bot.advisor import (
     request_brief,
     resolve_report_path,
 )
-from aero_bot.audit import AuditEventType, AuditStore
+from aero_bot.audit import AuditEventType, AuditRecord, AuditStore
 from aero_bot.config import Settings
 from aero_bot.cycle import (
     CYCLE_STATE_PATH_ENV,
@@ -156,6 +156,25 @@ def accepted_answer() -> dict[str, object]:
     }
 
 
+def seeded_records_with_equity(equity: str, tmp_path: Path) -> tuple[AuditRecord, ...]:
+    """Build two cycle summaries whose latest carries the given equity."""
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    store.append(
+        AuditEventType.CYCLE_REPORTED,
+        CycleReportPayload(
+            mode="live",
+            symbol="SNDKc",
+            action="hold",
+            reason="open_in_range",
+            equity_usdc=equity,
+            day_start_equity_usdc=equity,
+            day_pnl_usdc="0",
+        ),
+        CREATED_AT,
+    )
+    return store.read_records(limit=10, offset=0)
+
+
 def seeded_store(tmp_path: Path) -> AuditStore:
     """Build one audit chain carrying two cycle summaries and one foreign record."""
     store = AuditStore(tmp_path / "audit" / "audit.sqlite3")
@@ -203,14 +222,16 @@ def seeded_store(tmp_path: Path) -> AuditStore:
 def tracked_book() -> CycleStateBook:
     """Build one book tracking an out-of-range position with one cooldown."""
     return CycleStateBook(
-        position=TrackedPosition(
-            symbol="SNDKc",
-            token_id=123,
-            pool_address="0x" + "ab" * 20,
-            committed_usd=Decimal("80"),
-            entered_at=CREATED_AT - timedelta(days=2),
-            out_of_range_since=CREATED_AT - timedelta(minutes=300),
-            out_of_range_side="above",
+        positions=(
+            TrackedPosition(
+                symbol="SNDKc",
+                token_id=123,
+                pool_address="0x" + "ab" * 20,
+                committed_usd=Decimal("80"),
+                entered_at=CREATED_AT - timedelta(days=2),
+                out_of_range_since=CREATED_AT - timedelta(minutes=300),
+                out_of_range_side="above",
+            ),
         ),
         reentry_cooldowns=(
             ReentryCooldown(symbol="TSLAc", blocked_until=CREATED_AT + timedelta(hours=4)),
@@ -643,6 +664,52 @@ def test_compose_window_facts_over_empty_records_stays_all_absent() -> None:
     assert facts.equity_usdc is None
     assert facts.halted_count == 0
     assert facts.reasons == ()
+
+
+def test_compose_window_facts_carries_the_portfolio_picture(tmp_path: Path) -> None:
+    """The portfolio facts compose from the book and the latest equity."""
+    records = seeded_store(tmp_path).read_records(limit=10, offset=0)
+    facts = compose_window_facts(
+        records,
+        tracked_symbol="BBBc",
+        committed_usdc="175",
+        out_of_range_side=None,
+        out_of_range_since=None,
+        cooldown_symbols=(),
+        now=LATER_AT,
+        position_count=2,
+        tracked_symbols=("BBBc", "AAAc"),
+        total_committed_usdc="295",
+        position_committed_usdc=("175", "120"),
+    )
+    assert facts.position_count == 2
+    assert facts.tracked_symbols == ("BBBc", "AAAc")
+    assert facts.total_committed_usdc == "295"
+    # The largest position's share of the latest audited equity (175 of
+    # 99.50 would exceed one, so the share reads above it honestly).
+    assert facts.largest_position_share is not None
+    share = Decimal(facts.largest_position_share)
+    assert share == Decimal("175") / Decimal("99.50")
+
+
+def test_compose_window_facts_share_is_absent_without_equity(tmp_path: Path) -> None:
+    """No equity or no positions leaves the share absent, never guessed."""
+    empty = compose_window_facts(
+        [], None, None, None, None, (), LATER_AT, position_committed_usdc=("175",)
+    )
+    assert empty.largest_position_share is None
+    zero_equity = seeded_records_with_equity("0", tmp_path)
+    share = compose_window_facts(
+        zero_equity,
+        None,
+        None,
+        None,
+        None,
+        (),
+        LATER_AT,
+        position_committed_usdc=("175", "120"),
+    )
+    assert share.largest_position_share is None
 
 
 def test_monitor_persists_reports_and_audits_the_outcome(tmp_path: Path) -> None:

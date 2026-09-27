@@ -1,7 +1,7 @@
 """Pin the scheduled decision cycle's reconcile-decide-act behavior."""
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 from pathlib import Path
@@ -23,13 +23,18 @@ from test_lp_executor import (
     make_candidate,
 )
 
+from aero_bot.allocator import PortfolioParameters
 from aero_bot.audit import AuditEventType, AuditRecord, AuditStore
 from aero_bot.cycle import (
     CYCLE_AERO_CONVERSION_MIN_ENV,
+    CYCLE_CONCENTRATION_CAP_ENV,
+    CYCLE_MAX_POSITIONS_ENV,
+    CYCLE_MIN_POSITION_USDC_ENV,
     CYCLE_OUT_OF_RANGE_GRACE_ENV,
     CYCLE_REFERENCE_PRICE_ENV,
     CYCLE_SWITCH_MARGIN_ENV,
     CYCLE_SYMBOL_ENV,
+    CYCLE_TIER_BAND_ENV,
     DEFAULT_AERO_CONVERSION_MIN_USDC,
     CycleMode,
     CycleRunner,
@@ -40,6 +45,7 @@ from aero_bot.cycle import (
     TrackedPosition,
     _aero_conversion_min_from_environment,
     _out_of_range_grace_from_environment,
+    _portfolio_parameters_from_environment,
     _reference_price_from_environment,
     _switch_margin_from_environment,
     _symbol_from_arguments_and_environment,
@@ -257,6 +263,9 @@ class FakeExecutor:
         self.calls: list[tuple[object, ...]] = []
         self.refuse_next: str | None = None
         self.mint_receipt_token_id: int | None = TRACKED_TOKEN_ID
+        # Successive mints pop distinct token ids so a portfolio's positions
+        # never alias onto one NFT; None falls back to the single default.
+        self.mint_token_ids: list[int] | None = None
         self.mint_executed_budget: Decimal | None = None
         self.fee_wei_per_step = 90_000
         self.confirmed_block_number = 51_000_000
@@ -301,6 +310,7 @@ class FakeExecutor:
         budget_usdc: Decimal | None,
         key_bytes: bytes,
         ephemeral_key: bool = False,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> object:
         """Preflight one replacement without mutating the scripted chain state."""
         self.calls.append(("recenter_preflight", symbol, token_id, width_spacings, budget_usdc))
@@ -320,6 +330,7 @@ class FakeExecutor:
         budget_usdc: Decimal,
         key_bytes: bytes,
         ephemeral_key: bool = False,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> object:
         """Preflight one cross-pool replacement without mutating chain state."""
         self.calls.append(
@@ -341,6 +352,7 @@ class FakeExecutor:
         *,
         confirm_broadcast: bool,
         ephemeral_key: bool = False,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> LpActionExecutionReport:
         """Complete one mint, minting the scripted token id on-chain."""
         self.calls.append(("mint", symbol, budget_usdc, width_spacings))
@@ -348,6 +360,8 @@ class FakeExecutor:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING, "scripted refusal"
             )
+        if self.mint_token_ids:
+            self.mint_receipt_token_id = self.mint_token_ids.pop(0)
         if self.mint_receipt_token_id is not None:
             self._balances.receipts[MINT_TX_HASH] = mint_receipt(self.mint_receipt_token_id)
         else:
@@ -502,6 +516,67 @@ def inventory_with(token_id: int) -> LpSafePositionsSnapshot:
     )
 
 
+def inventory_with_ids(token_ids: tuple[int, ...]) -> LpSafePositionsSnapshot:
+    """Build one inventory snapshot holding every given live position."""
+    from aero_bot.lp_executor import LpHeldPosition
+
+    return LpSafePositionsSnapshot(
+        symbol="FIXc",
+        pool_address=POOL_ADDRESS,
+        nfpm_address=NFPM_ADDRESS,
+        positions=tuple(
+            LpHeldPosition(
+                token_id=token_id, liquidity=10**10, tokens_owed0_units=0, tokens_owed1_units=0
+            )
+            for token_id in token_ids
+        ),
+        snapshot_block=123,
+        observed_at=QUIET_INSTANT,
+        caps_enforced=("fixture",),
+        diagnostics=(f"{len(token_ids)} live positions",),
+    )
+
+
+def portfolio_book() -> CycleStateBook:
+    """Build one book tracking the fixture's two-position portfolio."""
+    second_id = TRACKED_TOKEN_ID + 1
+    return CycleStateBook(
+        positions=(
+            TrackedPosition(
+                symbol="BBBc",
+                token_id=TRACKED_TOKEN_ID,
+                pool_address=SELECTOR_BBB_POOL,
+                committed_usd=Decimal("175"),
+                entered_at=QUIET_INSTANT - timedelta(hours=2),
+            ),
+            TrackedPosition(
+                symbol="AAAc",
+                token_id=second_id,
+                pool_address=POOL_ADDRESS,
+                committed_usd=Decimal("120"),
+                entered_at=QUIET_INSTANT - timedelta(hours=2),
+            ),
+        ),
+        updated_at=QUIET_INSTANT,
+    )
+
+
+def portfolio_reads(*, fee_growth: int | None = None, earned_aero: int | None = None) -> FakeReads:
+    """Serve both portfolio positions as staked with matching statuses."""
+    reads = FakeReads(inventory_with_ids((TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1)))
+    for token_id in (TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1):
+        reads.set_status(
+            token_id,
+            tracked_status(
+                owner=GAUGE_ADDRESS,
+                accrued_aero_units=earned_aero,
+                fee_growth_inside0_x128=fee_growth,
+                fee_growth_inside1_x128=fee_growth,
+            ).model_copy(update={"token_id": token_id}),
+        )
+    return reads
+
+
 def tracked_status(
     *,
     owner: str = SAFE_ADDRESS,
@@ -564,12 +639,14 @@ def tracked_book(
 ) -> CycleStateBook:
     """Build one book tracking the fixture position."""
     return CycleStateBook(
-        position=TrackedPosition(
-            symbol=symbol,
-            token_id=TRACKED_TOKEN_ID,
-            pool_address=POOL_ADDRESS,
-            committed_usd=committed,
-            entered_at=entered_at,
+        positions=(
+            TrackedPosition(
+                symbol=symbol,
+                token_id=TRACKED_TOKEN_ID,
+                pool_address=POOL_ADDRESS,
+                committed_usd=committed,
+                entered_at=entered_at,
+            ),
         ),
         updated_at=QUIET_INSTANT,
     )
@@ -1415,6 +1492,10 @@ class TestLiveRelayerGuard:
 # A second stock token and pool for the cross-board selector fixtures.
 SELECTOR_BBB_TOKEN = "0xbb0000000000000000000078ee7ce2fe4908108c"  # noqa: S105
 SELECTOR_BBB_POOL = "0x2222222222222222222222222222222222222222"
+# The selector fixtures run an allocator-era book: five hundred USDC of
+# cash, so the eighty-USDC minimum position and the thirty-five percent
+# concentration bound bind exactly as the captain's ruling intends.
+SELECTOR_BOOK_USDC_UNITS = 500_000_000
 # Both pools quote the same fixture price, so one reference map serves both.
 SELECTOR_REFERENCES = {"AAAc": FIXTURE_AMM_PRICE, "BBBc": FIXTURE_AMM_PRICE}
 
@@ -1483,21 +1564,27 @@ def selector_runner(
     reads: FakeReads | None = None,
     executor: object | None = None,
     sources: SelectorCycleSources | None = None,
+    balances: FakeBalances | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, CycleStateStore]:
     """Assemble one selector-mode cycle runner over the scripted board."""
     runner, fake_executor, _, state_store = make_runner(
         tmp_path,
         book=book,
         reads=reads,
-        sources=sources if sources is not None else SelectorCycleSources(),
+        sources=sources
+        if sources is not None
+        else SelectorCycleSources(usdc_units=SELECTOR_BOOK_USDC_UNITS),
         executor=executor,
         symbol=None,
+        balances=balances
+        if balances is not None
+        else FakeBalances(usdc_units=SELECTOR_BOOK_USDC_UNITS),
     )
     return runner, fake_executor, state_store
 
 
 class TestSelectorCycles:
-    """Cross-board selection cycles: entry, hysteresis, and one position."""
+    """Cross-board portfolio cycles: tiers, hysteresis, and rebalancing."""
 
     def test_flat_selector_cycle_uses_pool_authority_without_references(
         self, tmp_path: Path
@@ -1511,6 +1598,23 @@ class TestSelectorCycles:
         assert any("diagnostic-only" in note for note in report.input_notes)
         assert any("10% headroom" in note for note in report.input_notes)
         assert any("board [" in note for note in report.input_notes)
+        assert any("funds 2 tranche(s)" in note for note in report.input_notes)
+
+    def test_a_thin_book_never_deploys_below_the_minimum_position(self, tmp_path: Path) -> None:
+        """A ten-USDC trial book stays cash under the eighty-USDC floor."""
+        runner, executor, state_store = selector_runner(
+            tmp_path, sources=SelectorCycleSources(), balances=FakeBalances()
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "hold"
+        assert executor.calls == []
+        assert state_store.load().positions == ()
+        assert any("below_min_position_size" in note for note in report.input_notes)
 
     def test_selector_counts_tracked_lp_in_daily_loss_equity(self, tmp_path: Path) -> None:
         """Deployed LP capital cannot masquerade as a selector-mode daily loss."""
@@ -1536,15 +1640,17 @@ class TestSelectorCycles:
 
         assert "daily_loss_halt_active" not in " ".join(report.input_notes)
         assert any(
-            "selector equity includes tracked LP marked value 8 USDC" in note
+            "selector equity includes 8 USDC of tracked LP marked value across 1 position(s)"
+            in note
             for note in report.input_notes
         )
         assert state_store.load().halted_day is None
 
-    def test_selector_enters_the_best_qualifying_pool(self, tmp_path: Path) -> None:
-        """The live cycle mints and stakes the higher-APR pool only."""
+    def test_selector_funds_the_tiered_portfolio_in_rank_order(self, tmp_path: Path) -> None:
+        """The live cycle mints and stakes every funded tier, best pool first."""
         runner, executor, state_store = selector_runner(tmp_path)
         assert executor is not None
+        executor.mint_token_ids = [TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1]
         report = runner.run(
             CycleMode.LIVE,
             key_bytes=b"\x01" * 32,
@@ -1553,16 +1659,28 @@ class TestSelectorCycles:
         assert report.decision_action == "enter"
         assert report.decision_reason == "entry_threshold_met"
         assert report.symbol == "BBBc"
-        assert [call[0] for call in executor.calls] == ["mint", "stake"]
+        assert [call[0] for call in executor.calls] == [
+            "mint",
+            "stake",
+            "mint",
+            "stake",
+        ]
         assert executor.calls[0][1] == "BBBc"
+        assert executor.calls[2][1] == "AAAc"
         book = state_store.load()
-        assert book.position is not None
-        assert book.position.symbol == "BBBc"
-        assert book.position.committed_usd == EXPECTED_ENTER_SIZE
+        assert [position.symbol for position in book.positions] == ["BBBc", "AAAc"]
+        # The top tier clamps at the thirty-five percent concentration
+        # bound of the 500 USDC book; the second tier takes its weight share.
+        assert book.positions[0].committed_usd == Decimal("175")
+        assert book.positions[1].committed_usd == Decimal("166.6666666666666666666666667")
 
-    def test_selector_holds_below_the_switch_margin(self, tmp_path: Path) -> None:
-        """A funded position stays when no pool clears the thirty percent margin."""
-        sources = SelectorCycleSources().with_listings(selector_listings(1))
+    def test_selector_holds_a_funded_pool_inside_the_margin_while_cash_deploys(
+        self, tmp_path: Path
+    ) -> None:
+        """No churn inside the margin, but dry powder still funds the tier."""
+        sources = SelectorCycleSources(usdc_units=SELECTOR_BOOK_USDC_UNITS).with_listings(
+            selector_listings(1)
+        )
         runner, executor, state_store = selector_runner(
             tmp_path,
             book=tracked_book(symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)),
@@ -1570,16 +1688,20 @@ class TestSelectorCycles:
             sources=sources,
         )
         assert executor is not None
-        # BBBc at ten percent over AAAc sits inside the default thirty
-        # percent margin, so no switch fires: hold the funded AAAc position.
+        # BBBc at ten percent over AAAc sits inside the thirty percent
+        # margin, so the funded AAAc position stays; the cash still deploys
+        # into the qualifying BBBc tier as a second position.
         report = runner.run(
             CycleMode.LIVE,
             key_bytes=b"\x01" * 32,
             reference_prices_by_symbol=SELECTOR_REFERENCES,
         )
-        assert report.decision_action == "hold"
-        assert executor.calls == []
-        assert state_store.load().position is not None
+        assert report.decision_action == "enter"
+        assert executor.calls[0][0] == "mint"
+        assert executor.calls[0][1] == "BBBc"
+        assert "unstake" not in [call[0] for call in executor.calls]
+        book = state_store.load()
+        assert [position.symbol for position in book.positions] == ["AAAc", "BBBc"]
 
     def test_selector_switches_above_the_margin(self, tmp_path: Path) -> None:
         """A wide-enough margin breach exits the held pool and enters the winner."""
@@ -1665,6 +1787,7 @@ class TestSelectorCycles:
             *,
             confirm_broadcast: bool,
             ephemeral_key: bool = False,
+            portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
         ) -> LpActionExecutionReport:
             executor.calls.append(("mint", symbol, budget_usdc, width_spacings))
             cast(FakeBalances, runner._balances).stock_units = 3_000_000
@@ -1788,6 +1911,76 @@ class TestCycleConfiguration:
         assert captured.get("reference_price_usdc") is None
         assert captured.get("reference_prices_by_symbol") is None
 
+    def test_the_allocator_flags_parse_and_reach_the_runner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The portfolio flags override the sealed defaults end to end."""
+        from aero_bot import cycle as cycle_module
+
+        built: dict[str, object] = {}
+
+        class FakeRunner:
+            def run(self, mode: CycleMode, **kwargs: object) -> object:
+                raise RuntimeError("selector reached runner")
+
+        def fake_build(
+            settings: object,
+            symbol: object,
+            safe_address: object,
+            relayer: object,
+            switch_margin: object,
+            parameters: object,
+            aero_min: object,
+            portfolio: PortfolioParameters | None = None,
+        ) -> object:
+            built["portfolio"] = portfolio
+            return FakeRunner()
+
+        monkeypatch.setattr(cycle_module, "build_cycle_runner", fake_build)
+        monkeypatch.setenv(CYCLE_TIER_BAND_ENV, "0.6")
+        exit_code = cycle_module.main(
+            [
+                "--symbol",
+                "auto",
+                "--dry-run",
+                "--tier-band",
+                "0.7",
+                "--max-positions",
+                "6",
+                "--min-position-usdc",
+                "95",
+                "--concentration-cap",
+                "0.3",
+            ]
+        )
+        assert exit_code == 1
+        portfolio = cast(PortfolioParameters, built["portfolio"])
+        assert portfolio.tier_band_fraction == Decimal("0.7")  # the flag wins
+        assert portfolio.max_concurrent_positions == 6
+        assert portfolio.min_position_usdc == Decimal("95")
+        assert portfolio.concentration_cap_fraction == Decimal("0.3")
+
+    def test_the_allocator_flags_refuse_nonpositive_values(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each bound rejects zero, negatives, and sub-one counts."""
+        from aero_bot import cycle as cycle_module
+
+        monkeypatch.setattr(
+            cycle_module,
+            "build_cycle_runner",
+            lambda *args, **kwargs: pytest.fail("the runner must not build"),
+        )
+        for argv in (
+            ["--dry-run", "--tier-band", "0"],
+            ["--dry-run", "--min-position-usdc", "-5"],
+            ["--dry-run", "--concentration-cap", "0"],
+            ["--dry-run", "--max-positions", "0"],
+        ):
+            with pytest.raises(SystemExit) as raised:
+                cycle_module.main(argv)
+            assert raised.value.code == 2
+
     def test_switch_margin_defaults_and_overrides(self) -> None:
         """The margin defaults to the ruling's thirty percent."""
         assert _switch_margin_from_environment({}) == Decimal("0.30")
@@ -1822,6 +2015,35 @@ class TestCycleConfiguration:
             _out_of_range_grace_from_environment({CYCLE_OUT_OF_RANGE_GRACE_ENV: "0"})
         with pytest.raises(ValueError, match="positive"):
             _out_of_range_grace_from_environment({CYCLE_OUT_OF_RANGE_GRACE_ENV: "-5"})
+
+    def test_portfolio_bounds_default_and_override(self) -> None:
+        """The allocator bounds default locked and refuse loose overrides."""
+        defaults = _portfolio_parameters_from_environment({}, Decimal("0.30"))
+        assert defaults.tier_band_fraction == Decimal("0.50")
+        assert defaults.max_concurrent_positions == 10
+        assert defaults.min_position_usdc == Decimal("80")
+        assert defaults.concentration_cap_fraction == Decimal("0.35")
+        assert defaults.switch_margin_fraction == Decimal("0.30")
+        tuned = _portfolio_parameters_from_environment(
+            {
+                CYCLE_TIER_BAND_ENV: "0.6",
+                CYCLE_MAX_POSITIONS_ENV: "5",
+                CYCLE_MIN_POSITION_USDC_ENV: "90",
+                CYCLE_CONCENTRATION_CAP_ENV: "0.25",
+            },
+            Decimal("0.5"),
+        )
+        assert tuned.tier_band_fraction == Decimal("0.6")
+        assert tuned.max_concurrent_positions == 5
+        assert tuned.min_position_usdc == Decimal("90")
+        assert tuned.concentration_cap_fraction == Decimal("0.25")
+        assert tuned.switch_margin_fraction == Decimal("0.5")
+        with pytest.raises(ValueError, match="positive"):
+            _portfolio_parameters_from_environment({CYCLE_TIER_BAND_ENV: "0"}, Decimal("0.3"))
+        with pytest.raises(ValueError, match="at least one"):
+            _portfolio_parameters_from_environment({CYCLE_MAX_POSITIONS_ENV: "0"}, Decimal("0.3"))
+        with pytest.raises(ValueError, match="hard ceiling"):
+            _portfolio_parameters_from_environment({CYCLE_MAX_POSITIONS_ENV: "11"}, Decimal("0.3"))
 
     def test_aero_conversion_min_defaults_and_overrides(self) -> None:
         """The conversion threshold defaults to five USDC and refuses negatives."""
@@ -1944,6 +2166,395 @@ class TestRewardConversion:
         assert any("unclaimed AERO" in note for note in report.input_notes)
 
 
+class TestPortfolioCycles:
+    """The tiered book: per-position attribution, payloads, and safety."""
+
+    def test_the_human_print_names_the_portfolio(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The human summary lists every position and its attribution slice."""
+        from aero_bot.cycle import _print_report
+
+        runner, _, _ = selector_runner(
+            tmp_path,
+            book=portfolio_book(),
+            reads=portfolio_reads(fee_growth=2 << 128, earned_aero=2 * 10**18),
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=SELECTOR_REFERENCES)
+        _print_report(report)
+        printed = capsys.readouterr().out
+        assert "portfolio: 2 tracked position(s)" in printed
+        assert "BBBc #" in printed and "AAAc #" in printed
+        assert "attribution: aero" in printed
+        assert "yield attribution (day pnl decomposition):" in printed
+
+    def test_per_position_attribution_rolls_up_across_positions(self, tmp_path: Path) -> None:
+        """Each position's AERO, fees, and MTM measure at its own price."""
+        runner, _, state_store = selector_runner(
+            tmp_path,
+            book=portfolio_book(),
+            reads=portfolio_reads(fee_growth=2 << 128, earned_aero=2 * 10**18),
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        first = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=SELECTOR_REFERENCES)
+        assert first.yield_attribution is not None
+        assert first.yield_attribution.aero_rewards_usdc == Decimal("0")
+
+        # Both positions advance their fee words and AERO, and the shared
+        # fixture price moves one percent.
+        reads = portfolio_reads(fee_growth=3 << 128, earned_aero=7 * 10**18)
+        runner, _, _ = selector_runner(
+            tmp_path,
+            book=state_store.load(),
+            reads=reads,
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        later = runner.run(
+            CycleMode.DRY_RUN,
+            reference_prices_by_symbol={
+                symbol: FIXTURE_AMM_PRICE * Decimal("1.01") for symbol in ("AAAc", "BBBc")
+            },
+        )
+        attribution = later.yield_attribution
+        assert attribution is not None
+        rows = {row.symbol: row for row in attribution.positions}
+        assert set(rows) == {"AAAc", "BBBc"}
+        for row in rows.values():
+            assert row.fees_earned_usdc is not None and row.fees_earned_usdc > 0
+            # Five more AERO at the observed 0.6 price per position.
+            assert row.aero_rewards_usdc == Decimal("3")
+            assert row.stock_mark_to_market_usdc is not None
+        # The rollup sums the rows: ten AERO total, both fee streams, both
+        # mark-to-markets.
+        assert attribution.aero_rewards_usdc == Decimal("6")
+        assert attribution.fees_earned_usdc == sum(
+            row.fees_earned_usdc or Decimal("0") for row in rows.values()
+        )
+        assert attribution.stock_mark_to_market_usdc == sum(
+            row.stock_mark_to_market_usdc or Decimal("0") for row in rows.values()
+        )
+        assert attribution.unattributed_usdc is not None
+        assert attribution.day_pnl_usdc == (
+            attribution.aero_rewards_usdc
+            + attribution.fees_earned_usdc
+            + attribution.stock_mark_to_market_usdc
+            + attribution.unattributed_usdc
+        )
+
+    def test_report_and_payload_carry_the_portfolio_fields(self, tmp_path: Path) -> None:
+        """Positions ride the report and the audited cycle summary."""
+        runner, _, _ = selector_runner(
+            tmp_path,
+            book=portfolio_book(),
+            reads=portfolio_reads(),
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=SELECTOR_REFERENCES)
+        assert [row.symbol for row in report.positions] == ["BBBc", "AAAc"]
+        assert all(row.staked for row in report.positions)
+        assert [row.committed_usd for row in report.positions] == [
+            Decimal("175"),
+            Decimal("120"),
+        ]
+        audit = AuditStore(tmp_path / "audit.sqlite3")
+        latest = audit.read_records(1)[-1]
+        assert latest.event_type is AuditEventType.CYCLE_REPORTED
+        payload = json.loads(latest.payload_json)
+        assert payload["position_count"] == 2
+        assert payload["total_committed_usdc"] == "295"
+        assert payload["largest_position_share"] is not None
+
+    def test_a_safety_exit_spares_the_other_position(self, tmp_path: Path) -> None:
+        """A stop-out on one name never touches its sibling."""
+        stopped = tracked_status(owner=GAUGE_ADDRESS).model_copy(
+            update={
+                "position": SimpleNamespace(
+                    tick_lower=-90,
+                    tick_upper=-75,
+                    token0_address=BASE_USDC_ADDRESS,
+                    token1_address=STOCK_TOKEN_ADDRESS,
+                    liquidity=12_345,
+                )
+            }
+        )
+        reads = FakeReads(inventory_with_ids((TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1)))
+        reads.set_status(TRACKED_TOKEN_ID, stopped)
+        reads.set_status(TRACKED_TOKEN_ID + 1, tracked_status(owner=GAUGE_ADDRESS))
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=portfolio_book(),
+            reads=reads,
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "stop_out"
+        # Only the stopped position unwinds: three calls, one symbol.
+        assert [call[0] for call in executor.calls] == [
+            "unstake",
+            "withdraw",
+            "exit_swap",
+        ]
+        assert all(call[1] == "BBBc" for call in executor.calls)
+        book = state_store.load()
+        assert [position.symbol for position in book.positions] == ["AAAc"]
+
+    def test_a_recenter_step_replaces_only_its_position(self, tmp_path: Path) -> None:
+        """A per-position recenter prefights, burns, and re-mints in place."""
+        above_range = tracked_status(owner=GAUGE_ADDRESS).model_copy(
+            update={
+                "position": SimpleNamespace(
+                    tick_lower=-15,
+                    tick_upper=-5,
+                    token0_address=BASE_USDC_ADDRESS,
+                    token1_address=STOCK_TOKEN_ADDRESS,
+                    liquidity=12_345,
+                )
+            }
+        )
+        reads = FakeReads(inventory_with_ids((TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1)))
+        reads.set_status(TRACKED_TOKEN_ID, above_range)
+        reads.set_status(TRACKED_TOKEN_ID + 1, tracked_status(owner=GAUGE_ADDRESS))
+        book = portfolio_book().model_copy(
+            update={
+                "positions": (
+                    portfolio_book()
+                    .positions[0]
+                    .model_copy(
+                        update={
+                            "out_of_range_since": QUIET_INSTANT - timedelta(minutes=30),
+                            "out_of_range_side": "above",
+                        }
+                    ),
+                    portfolio_book().positions[1],
+                )
+            }
+        )
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=book,
+            reads=reads,
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "recenter"
+        assert [call[0] for call in executor.calls] == [
+            "recenter_preflight",
+            "unstake",
+            "withdraw",
+            "mint",
+            "stake",
+        ]
+        assert all(call[1] == "BBBc" for call in executor.calls if len(call) > 1)
+        # The recentered slot replaces in place; the sibling never moves.
+        book_after = state_store.load()
+        assert sorted(position.symbol for position in book_after.positions) == ["AAAc", "BBBc"]
+
+    def test_held_inventory_resolves_through_its_own_step(self, tmp_path: Path) -> None:
+        """The convergence timeout sells the held stock without touching LPs."""
+        reads = FakeReads(inventory_with_ids((TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1)))
+        for token_id in (TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1):
+            reads.set_status(token_id, tracked_status(owner=GAUGE_ADDRESS))
+        book = portfolio_book().model_copy(
+            update={
+                "held_inventory": HeldInventoryRecord(
+                    symbol="AAAc",
+                    token_address=B20_ADDRESS,
+                    stock_quantity=Decimal("0.5"),
+                    held_since=QUIET_INSTANT - timedelta(minutes=10),
+                    origin="stale_low_exit",
+                )
+            }
+        )
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=book,
+            reads=reads,
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "sell_inventory"
+        assert [call[0] for call in executor.calls] == ["exit_swap"]
+        assert executor.calls[0][1] == "AAAc"
+        saved = state_store.load()
+        assert saved.held_inventory is None
+        assert len(saved.positions) == 2
+
+    def test_a_grace_exit_routes_the_withdrawn_stock_to_convergence(self, tmp_path: Path) -> None:
+        """A below-range grace exit holds the stock and arms the cooldown."""
+        below_edge = tracked_status(owner=GAUGE_ADDRESS).model_copy(
+            update={
+                "position": SimpleNamespace(
+                    tick_lower=-60,
+                    tick_upper=-50,
+                    token0_address=BASE_USDC_ADDRESS,
+                    token1_address=STOCK_TOKEN_ADDRESS,
+                    liquidity=12_345,
+                )
+            }
+        )
+        reads = FakeReads(inventory_with_ids((TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1)))
+        reads.set_status(TRACKED_TOKEN_ID, below_edge)
+        reads.set_status(TRACKED_TOKEN_ID + 1, tracked_status(owner=GAUGE_ADDRESS))
+        book = portfolio_book().model_copy(
+            update={
+                "positions": (
+                    portfolio_book()
+                    .positions[0]
+                    .model_copy(
+                        update={
+                            "out_of_range_since": QUIET_INSTANT - timedelta(minutes=30),
+                            "out_of_range_side": "below",
+                        }
+                    ),
+                    portfolio_book().positions[1],
+                )
+            }
+        )
+        parameters = LOCKED_POLICY_PARAMETERS.model_copy(
+            update={"downside_recenter_max_payback_days": Decimal("0.000001")}
+        )
+        balances = FakeBalances(stock_units=5 * 10**8)
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=book,
+            reads=reads,
+            sources=SelectorCycleSources(),
+            balances=balances,
+        )
+        # The runner needs the tightened parameters for the failing payback.
+        runner._parameters = parameters
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "range_grace_exit"
+        assert [call[0] for call in executor.calls] == ["unstake", "withdraw"]
+        saved = state_store.load()
+        assert [position.symbol for position in saved.positions] == ["AAAc"]
+        assert saved.held_inventory is not None
+        assert saved.held_inventory.symbol == "BBBc"
+        assert saved.held_inventory.origin == "out_of_range_exit"
+        assert any(cooldown.symbol.lower() == "bbbc" for cooldown in saved.reentry_cooldowns)
+
+    def test_a_refused_recenter_preflight_halts_the_portfolio(self, tmp_path: Path) -> None:
+        """A recenter preflight refusal leaves the position untouched."""
+        above_range = tracked_status(owner=GAUGE_ADDRESS).model_copy(
+            update={
+                "position": SimpleNamespace(
+                    tick_lower=-15,
+                    tick_upper=-5,
+                    token0_address=BASE_USDC_ADDRESS,
+                    token1_address=STOCK_TOKEN_ADDRESS,
+                    liquidity=12_345,
+                )
+            }
+        )
+        reads = FakeReads(inventory_with_ids((TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1)))
+        reads.set_status(TRACKED_TOKEN_ID, above_range)
+        reads.set_status(TRACKED_TOKEN_ID + 1, tracked_status(owner=GAUGE_ADDRESS))
+        book = portfolio_book().model_copy(
+            update={
+                "positions": (
+                    portfolio_book()
+                    .positions[0]
+                    .model_copy(
+                        update={
+                            "out_of_range_since": QUIET_INSTANT - timedelta(minutes=30),
+                            "out_of_range_side": "above",
+                        }
+                    ),
+                    portfolio_book().positions[1],
+                )
+            }
+        )
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            book=book,
+            reads=reads,
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        assert executor is not None
+        executor.refuse_next = "recenter_preflight"
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert [call[0] for call in executor.calls] == ["recenter_preflight"]
+        assert "recenter preflight refused" in report.halted_reason
+        assert len(state_store.load().positions) == 2
+
+    def test_an_undecodable_portfolio_mint_halts_the_cycle(self, tmp_path: Path) -> None:
+        """A mint whose receipt carries no position id halts honestly."""
+        runner, executor, state_store = selector_runner(
+            tmp_path,
+            sources=SelectorCycleSources(usdc_units=SELECTOR_BOOK_USDC_UNITS),
+            balances=FakeBalances(usdc_units=SELECTOR_BOOK_USDC_UNITS),
+        )
+        assert executor is not None
+        executor.mint_receipt_token_id = None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert "could not be decoded" in report.halted_reason
+        assert state_store.load().positions == ()
+
+    def test_the_conversion_collects_from_every_staked_position(self, tmp_path: Path) -> None:
+        """Each position's earned counts and each penalty window binds its own."""
+        reads = FakeReads(inventory_with_ids((TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1)))
+        for token_id in (TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1):
+            reads.set_status(
+                token_id,
+                tracked_status(owner=GAUGE_ADDRESS, accrued_aero_units=5 * 10**18),
+            )
+        runner, executor, _ = selector_runner(
+            tmp_path,
+            book=portfolio_book(),
+            reads=reads,
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        assert executor is not None
+        executor.collect_aero_units = 5 * 10**18
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        actions = [action.action for action in report.actions]
+        assert actions == ["collect_rewards", "collect_rewards", "aero_swap"]
+        assert report.unclaimed_aero_units == 10 * 10**18
+        assert report.unclaimed_aero_value_usdc == Decimal("6")
+
+
 class TestYieldAttribution:
     """The day P&L decomposition into the yield-duration components."""
 
@@ -2021,7 +2632,7 @@ class TestYieldAttribution:
         assert book.position is not None
         state_store.save(
             book.model_copy(
-                update={"position": book.position.model_copy(update={"token_id": fresh_id})}
+                update={"positions": (book.positions[0].model_copy(update={"token_id": fresh_id}),)}
             )
         )
         reads.set_inventory(inventory_with(fresh_id))
@@ -2091,14 +2702,16 @@ class TestGraceExitMapping:
         balances = FakeBalances(stock_units=5 * 10**8)
         expired_book = tracked_book().model_copy(
             update={
-                "position": TrackedPosition(
-                    symbol="FIXc",
-                    token_id=TRACKED_TOKEN_ID,
-                    pool_address=POOL_ADDRESS,
-                    committed_usd=Decimal("7"),
-                    entered_at=QUIET_INSTANT - timedelta(minutes=30),
-                    out_of_range_since=QUIET_INSTANT - timedelta(minutes=15),
-                    out_of_range_side="below",
+                "positions": (
+                    TrackedPosition(
+                        symbol="FIXc",
+                        token_id=TRACKED_TOKEN_ID,
+                        pool_address=POOL_ADDRESS,
+                        committed_usd=Decimal("7"),
+                        entered_at=QUIET_INSTANT - timedelta(minutes=30),
+                        out_of_range_since=QUIET_INSTANT - timedelta(minutes=15),
+                        out_of_range_side="below",
+                    ),
                 )
             }
         )
@@ -2163,7 +2776,11 @@ def test_token1_stock_in_range_clears_stale_recenter_anchor(tmp_path: Path) -> N
     assert book.position is not None
     stale_anchor = QUIET_INSTANT - timedelta(minutes=30)
     book = book.model_copy(
-        update={"position": book.position.model_copy(update={"out_of_range_since": stale_anchor})}
+        update={
+            "positions": (
+                book.positions[0].model_copy(update={"out_of_range_since": stale_anchor}),
+            )
+        }
     )
 
     reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))

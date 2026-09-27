@@ -25,8 +25,8 @@ Exit codes: zero on any verdict (a hold is a decision, not a failure), one when 
 ## Pinned symbol versus the cross-board selector
 
 An explicit `--symbol AAPLc` pins one pool and decides exactly that pool, as this surface always has.
-`auto` - which is also the default when `--symbol` is omitted - runs the cross-board selector over every verified B20 pool: the same complete locked entry gate chain evaluates each pool, the best-qualifying pool by qualifying emissions APR wins (ties break on the lexicographically smallest symbol so runs are reproducible), and while a position is held another pool only displaces it past the relative switch margin with the exit-plus-entry gas economics passing.
-The selector's pure mathematics live in `src/aero_bot/selector.py`; [the cycle documentation](docs/cycle.md) carries the full selector doctrine (margin, per-pool cooldowns, the single-position invariant).
+`auto` - which is also the default when `--symbol` is omitted - runs the cross-board selector over every verified B20 pool: the same complete locked entry gate chain evaluates each pool, the ranked qualifying board feeds the portfolio allocator, and the tiered book emerges under the count, minimum-size, and concentration bounds (the captain's gnhf 33 ruling).
+The selector's pure mathematics live in `src/aero_bot/selector.py` and the portfolio mathematics in `src/aero_bot/allocator.py`; [the cycle documentation](docs/cycle.md) carries the full allocator doctrine (tiers, count-as-output, margins, per-pool cooldowns, sequencing).
 
 Selector mode needs per-symbol reference quotes: `--reference-price AAPLc=318.5,FIXc=100` (or the same grammar in `AERO_BOT_CYCLE_REFERENCE_PRICE_USDC`).
 The single-number form still quotes one pinned symbol.

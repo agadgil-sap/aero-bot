@@ -77,6 +77,11 @@ RISK_MANAGER_REPORT_NAME = "risk_manager_last.json"
 DAILY_LOSS_HALT_FRACTION = Decimal("0.05")
 # The locked sizing fraction at entry (docs/policy-engine.md).
 POSITION_EQUITY_FRACTION = Decimal("0.80")
+# The locked per-name concentration cap of book equity (the allocator
+# ruling, gnhf 33; docs/policy-engine.md).
+CONCENTRATION_CAP_FRACTION = Decimal("0.35")
+# The locked ceiling on concurrent positions (the allocator ruling).
+MAX_CONCURRENT_POSITIONS = 10
 # The LP executor's hard exposure ceilings in USDC (raised from 100 to
 # 1000 by the captain's 2026-09-27 performance ruling; the one-percent
 # depth gate remains the binding protection).
@@ -104,9 +109,12 @@ RISK_POSTURE_RULES = (
     "action observed later on the same anchor day violates the halt "
     "discipline; committed exposure above 1000 USDC breaches the hard cap; "
     "an entry committing above eighty percent of equity breaches the "
-    "sizing fraction; and a desk's accepted brief with no anomaly flags "
-    "on an episode carrying any finding is a contradiction. Malformed or "
-    "non-finite readings are absences, never guesses"
+    "sizing fraction; the largest single position above thirty-five "
+    "percent of equity breaches the concentration cap; more than ten "
+    "tracked positions breaches the count ceiling; and a desk's accepted "
+    "brief with no anomaly flags on an episode carrying any finding is a "
+    "contradiction. Malformed or non-finite readings are absences, never "
+    "guesses"
 )
 
 
@@ -124,6 +132,10 @@ class RiskFindingKind:
     HARD_CAP_BREACH = "hard_cap_breach"
     # An entry committed above eighty percent of current equity.
     SIZING_CAP_BREACH = "sizing_cap_breach"
+    # One name sits above the thirty-five percent concentration cap.
+    CONCENTRATION_CAP_BREACH = "concentration_cap_breach"
+    # The book tracks more positions than the ten-position ceiling.
+    COUNT_CAP_BREACH = "count_cap_breach"
 
 
 class RiskFinding(BaseModel):
@@ -357,6 +369,22 @@ def _posture_findings(
             f"entry action {action} committed {facts.committed_usdc} above "
             f"the eighty-percent sizing bound {bound} of equity "
             f"{facts.equity_usdc}",
+        )
+    # Portfolio posture (the allocator ruling): the per-name concentration
+    # bound and the count ceiling, both read from the composed facts.
+    if facts.position_count > MAX_CONCURRENT_POSITIONS:
+        _record(
+            RiskFindingKind.COUNT_CAP_BREACH,
+            f"the book tracks {facts.position_count} positions above the "
+            f"{MAX_CONCURRENT_POSITIONS}-position ceiling",
+        )
+    share = _parse_usdc(facts.largest_position_share)
+    if share is not None and share > CONCENTRATION_CAP_FRACTION + POSTURE_TOLERANCE_USDC:
+        _record(
+            RiskFindingKind.CONCENTRATION_CAP_BREACH,
+            f"the largest position holds {facts.largest_position_share} of "
+            f"equity {facts.equity_usdc} above the "
+            f"{CONCENTRATION_CAP_FRACTION} concentration cap",
         )
     return tuple(findings)
 
@@ -633,10 +661,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "CONCENTRATION_CAP_FRACTION",
     "DAILY_LOSS_HALT_FRACTION",
     "DeskContradiction",
     "ENTRY_ACTIONS",
     "EXPOSURE_HARD_CAP_USDC",
+    "MAX_CONCURRENT_POSITIONS",
     "NEW_YORK",
     "POSITION_EQUITY_FRACTION",
     "POSTURE_TOLERANCE_USDC",

@@ -170,7 +170,7 @@ The daily launchd agent `com.aero-bot.teacher-upgrade` (10:10, after the 09:50 h
 
 ## The risk manager
 
-The `aero-bot-risk-manager` command is the intelligence layer's fifth surface: the separation-of-duties counterparty desk that independently audits the corpus's posture snapshots - the day-P&L identity, the five-percent halt line and its entry discipline, exposure against the 1000 USDC hard cap and the eighty-percent sizing fraction - and records every desk whose accepted brief stayed quiet over a flagged posture.
+The `aero-bot-risk-manager` command is the intelligence layer's fifth surface: the separation-of-duties counterparty desk that independently audits the corpus's posture snapshots - the day-P&L identity, the five-percent halt line and its entry discipline, exposure against the 1000 USDC hard cap and the eighty-percent sizing fraction, and the portfolio posture (the thirty-five percent concentration cap and the ten-position ceiling) - and records every desk whose accepted brief stayed quiet over a flagged posture.
 It is deterministic and offline like the scorer, its report lands as `reports/risk_manager_last.json` beside the corpus, and the upgrade loop consumes the same pure audit as its fourth evidence class.
 The full contract - the finding kinds, the contradiction rule, the upgrade wiring - lives in [the risk-manager documentation](risk-manager.md).
 The daily launchd agent `com.aero-bot.teacher-risk-manager` (10:00, between the scorer's 09:50 report and the 10:10 proposer) makes the audit part of the same morning rhythm.

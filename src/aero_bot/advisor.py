@@ -50,6 +50,7 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Protocol, TextIO, cast
@@ -666,6 +667,14 @@ class AdvisorWindowFacts(BaseModel):
     cooldown_symbols: tuple[str, ...] = ()
     # The most recent cycle's action.
     latest_action: str | None = None
+    # How many positions the book tracked at the pass (the allocator).
+    position_count: Annotated[int, Field(ge=0)] = 0
+    # The book's tracked symbols, most recent first, bounded.
+    tracked_symbols: tuple[str, ...] = ()
+    # The total committed USDC across every tracked position, else None.
+    total_committed_usdc: str | None = None
+    # The largest single position's share of book equity, else None.
+    largest_position_share: str | None = None
 
 
 class AdvisorMonitorReport(BaseModel):
@@ -690,6 +699,10 @@ def compose_window_facts(
     out_of_range_since: datetime | None,
     cooldown_symbols: tuple[str, ...],
     now: datetime,
+    position_count: int = 0,
+    tracked_symbols: tuple[str, ...] = (),
+    total_committed_usdc: str | None = None,
+    position_committed_usdc: tuple[str, ...] = (),
 ) -> AdvisorWindowFacts:
     """Compose the deterministic factual picture from audited records.
 
@@ -702,6 +715,11 @@ def compose_window_facts(
         out_of_range_since: The book's persisted range-wait anchor, else None.
         cooldown_symbols: The book's cooldown symbols.
         now: The pass's reference time, timezone-aware.
+        position_count: How many positions the book tracks.
+        tracked_symbols: The book's tracked symbols.
+        total_committed_usdc: The book's total committed value, else None.
+        position_committed_usdc: Each tracked position's committed value
+            as a string, book order.
 
     Returns:
         The immutable composed facts.
@@ -758,7 +776,39 @@ def compose_window_facts(
         reasons=tuple(reasons[:8]),
         cooldown_symbols=cooldown_symbols,
         latest_action=str(latest["action"]) if latest is not None and "action" in latest else None,
+        position_count=position_count,
+        tracked_symbols=tracked_symbols[:10],
+        total_committed_usdc=total_committed_usdc,
+        largest_position_share=_largest_position_share(
+            position_committed_usdc, _text("equity_usdc")
+        ),
     )
+
+
+def _largest_position_share(
+    position_committed_usdc: tuple[str, ...], equity_usdc: str | None
+) -> str | None:
+    """Compute the largest position's share of equity, honestly.
+
+    Args:
+        position_committed_usdc: Each position's committed value string.
+        equity_usdc: The latest audited equity string, else None.
+
+    Returns:
+        The share as a string, or None when either side is absent,
+        malformed, or the equity is not positive.
+    """
+    if not position_committed_usdc or equity_usdc is None:
+        return None
+    try:
+        equity = Decimal(equity_usdc)
+        largest = max(Decimal(value) for value in position_committed_usdc)
+    except (InvalidOperation, ValueError):
+        return None
+    if equity <= 0 or not equity.is_finite():
+        return None
+    share = largest / equity
+    return str(share) if share.is_finite() else None
 
 
 ADVISOR_VIEW_CONTRACT = (
@@ -894,20 +944,23 @@ class AdvisorMonitor:
             if depth
             else ()
         )
+        primary = book.positions[0] if book.positions else None
+        committed_values = [str(position.committed_usd) for position in book.positions]
+        total_committed = str(
+            sum((position.committed_usd for position in book.positions), Decimal("0"))
+        )
         facts = compose_window_facts(
             records,
-            tracked_symbol=book.position.symbol if book.position is not None else None,
-            committed_usdc=(
-                str(book.position.committed_usd) if book.position is not None else None
-            ),
-            out_of_range_side=(
-                book.position.out_of_range_side if book.position is not None else None
-            ),
-            out_of_range_since=(
-                book.position.out_of_range_since if book.position is not None else None
-            ),
+            tracked_symbol=primary.symbol if primary is not None else None,
+            committed_usdc=str(primary.committed_usd) if primary is not None else None,
+            out_of_range_side=primary.out_of_range_side if primary is not None else None,
+            out_of_range_since=primary.out_of_range_since if primary is not None else None,
             cooldown_symbols=tuple(cooldown.symbol for cooldown in book.reentry_cooldowns),
             now=moment,
+            position_count=len(book.positions),
+            tracked_symbols=tuple(position.symbol for position in book.positions),
+            total_committed_usdc=total_committed if book.positions else None,
+            position_committed_usdc=tuple(committed_values),
         )
         outcome = request_brief(
             self._config,

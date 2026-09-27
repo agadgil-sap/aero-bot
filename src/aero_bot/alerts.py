@@ -606,6 +606,26 @@ def compose_cycle_email(report: CycleReport, alerts: tuple[str, ...]) -> tuple[s
                 lines.append(f"    tx {transaction_hash}")
             if action.diagnostic:
                 lines.append(f"    {_humanize_numbers(action.diagnostic)}")
+    if report.positions:
+        lines.extend(["", _section("portfolio"), ""])
+        for row in report.positions:
+            custody = "staked" if row.staked else "unstaked"
+            value = _format_quantity(row.value_usdc) if row.value_usdc is not None else "unvalued"
+            lines.append(
+                f"  {row.symbol:<10}#{row.token_id} {row.committed_usd} committed, "
+                f"value {value} USDC, {custody}"
+            )
+            if row.yield_attribution is not None:
+
+                def _slice_value(value: Decimal | None) -> str:
+                    return _format_quantity(value) if value is not None else "-"
+
+                slice_ = row.yield_attribution
+                lines.append(
+                    f"  {'':<10}day: aero {_slice_value(slice_.aero_rewards_usdc)} | "
+                    f"fees {_slice_value(slice_.fees_earned_usdc)} | "
+                    f"mtm {_slice_value(slice_.stock_mark_to_market_usdc)}"
+                )
     lines.extend(["", _section("outcome"), ""])
     if report.pnl_vs_entry_usdc is not None:
         pnl = f"{_format_quantity(report.pnl_vs_entry_usdc)} USDC"

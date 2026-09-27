@@ -23,6 +23,10 @@ The engine never signs, broadcasts, or touches a wallet.
 | Position cap | 80 percent of current equity per pool (raised from 20 percent by the captain's 2026-09-09 sizing ruling, inside the 1000/1000 USDC hard ceilings of the 2026-09-27 performance ruling) |
 | Depth hard gate | 1 percent of observed pool depth |
 | Daily loss halt | 5 percent of day-start equity, plus the continuous latch from the running equity high-water mark carried across the New York day boundary (captain's 2026-09-27 ruling) |
+| Portfolio tier band | 50 percent of the top's weighted qualifying APR (captain's gnhf 33 allocator ruling; `AERO_BOT_CYCLE_TIER_BAND_FRACTION`) |
+| Maximum concurrent positions | 10 (locked hard ceiling; `AERO_BOT_CYCLE_MAX_POSITIONS`) - the deployed count is an output of qualification |
+| Minimum position size | 80 USDC (`AERO_BOT_CYCLE_MIN_POSITION_USDC`); below it cash stays cash |
+| Per-name concentration cap | 35 percent of book equity (`AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION`) |
 | Starting equity | 200 USDC |
 | Reference staleness bound (entries) | 300 seconds |
 | Reference staleness bound (open position) | 900 seconds, then a defensive exit |
@@ -152,6 +156,7 @@ The peak only ever ratchets upward; the continuous latch releases only when equi
 
 The strategy is yield duration: real income is the boosted AERO emissions (plus pool fees), a duration-based stream that accrues per unit of time staked in range - never per swap - so the objective is maximizing time-in-range times the pool's qualifying emissions APR, with range placement and pool selection as the optimization variables.
 Every minute out of range forgoes income at that APR, which is why the out-of-range grace window bounds every hold; stock drift and fees ride beside the stream rather than driving it.
+The allocator (the captain's gnhf 33 ruling) expresses the same thesis at portfolio scale: the ranked qualifying board funds weight-proportional tiers inside the band of the top, the deployed count emerges from qualification under the bounds, and cash is dry powder for APR spikes - never force-deployed.
 The range-width-versus-volatility tradeoff is a future tuning surface (wider ranges raise time-in-range at a lower per-cell APR), and selector ranking by qualifying APR stays exactly as locked in this lane - whether ranking should blend width-adjusted expected yield is the documented follow-up question, not a changed behavior.
 
 ## Position composition

@@ -16,9 +16,13 @@ held, another pool only displaces it when its qualifying emissions APR
 exceeds the held pool's by the configurable relative switch margin (default
 thirty percent) AND the exit-plus-entry gas economics still pass the locked
 cost-share bound. Safety exits, maintenance, and held-inventory resolution on
-the held pool always take precedence over any switch, and the board never
-enters while a position or unsold inventory exists, so at most one position
-is ever held inside the unchanged 100 USDC total exposure cap.
+the held pool always take precedence over any switch.
+
+This module's single-verdict selection feeds the decision-only surfaces; the
+scheduled cycle composes the tiered portfolio over the same entry-gate
+evaluations through `aero_bot.allocator` (the captain's gnhf 33 ruling), so
+the ranked board this module produces is the allocator's input, never a
+competitor to it.
 """
 
 from collections.abc import Mapping, Sequence
@@ -179,6 +183,21 @@ def _board_summary(evaluations: Sequence[PoolEntryEvaluation], selected_symbol: 
     if selected_symbol is not None:
         return f"{board}; selected {selected_symbol}"
     return board
+
+
+def board_summary_line(
+    evaluations: Sequence[PoolEntryEvaluation], selected_symbol: str | None
+) -> str:
+    """Compose the public board evidence line for reports.
+
+    Args:
+        evaluations: The board's complete entry-gate evaluations.
+        selected_symbol: The held or selected symbol, or None.
+
+    Returns:
+        One line naming every pool's qualification outcome and the selection.
+    """
+    return _board_summary(evaluations, selected_symbol)
 
 
 def evaluate_pool_entries(

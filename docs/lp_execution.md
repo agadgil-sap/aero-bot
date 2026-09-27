@@ -370,6 +370,12 @@ A dry-run form (`dry-run exit-swap`) builds and validates the same sequence with
 Accordingly, the mint and recenter gates now refuse only on LIVE untracked positions (nonzero liquidity or owed fees, named by token id in the refusal); empty residual NFTs - like the campaign Safe's leftover 5703026 - carry no exposure and no longer block entry.
 Any mid-enumeration revert refuses fail-closed as `enumeration_unreadable`.
 
+### The portfolio-aware total cap (the allocator ruling, gnhf 33)
+
+The cycle book tracks a portfolio of positions, so the live mint and switch-preflight surfaces accept the book's tracked live positions as `(token id, committed USDC)` pairs (`portfolio_live_positions`): those NFTs are expected exposure, not strangers, and their committed values ride `existing_position_value_usdc` so the 1000 USDC total pilot cap spans every position across the whole book.
+A live NFT beyond the tracked set still refuses as `untracked_existing_positions`, exactly as before - the cap can only be evaluated honestly over positions the cycle can value.
+The switch preflight applies the same treatment on its target side: the target NFPM may carry the book's other tracked positions, and their committed values count toward the projected target's cap headroom.
+
 Each execute runs the complete dry-run build first - every cap, refusal, live `checkSignatures` validation, and audit record, carrying `mode: execute` - and then broadcasts one Safe nonce at a time:
 
 1. The built step is rebuilt from its exact transaction and the SafeTx hash is pinned byte-for-byte against the report's; any mismatch refuses as `rebuild_hash_mismatch` so substituted content can never broadcast.

@@ -1,10 +1,12 @@
 """Pin the range watchtower's trip, fail-safe, latch, and wiring contract."""
 
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from test_alerts import SMTP_ENV, FakeTransport
@@ -90,17 +92,18 @@ class MutableClock:
 class FakeTickReader:
     """Serve one mutable pool tick, optionally failing."""
 
-    def __init__(self, tick: int) -> None:
-        """Start every poll at one tick."""
+    def __init__(self, tick: int, by_pool: dict[str, int] | None = None) -> None:
+        """Start every poll at one tick, or one tick per pool."""
         self.tick = tick
+        self.by_pool = by_pool or {}
         self.fail = False
 
     def read_current_tick(self, pool_address: str) -> int:
         """Return the served tick or fail like an RPC outage."""
-        assert pool_address == POOL_ADDRESS
+        assert pool_address == POOL_ADDRESS or pool_address in self.by_pool
         if self.fail:
             raise ExecutionUnavailableError("the endpoint is unavailable")
-        return self.tick
+        return self.by_pool.get(pool_address, self.tick)
 
 
 def position_view(*, liquidity: int = 10**10) -> LpPositionView:
@@ -124,11 +127,14 @@ def position_view(*, liquidity: int = 10**10) -> LpPositionView:
 class FakeBoundsReader:
     """Serve the tracked position's immutable view, optionally failing."""
 
-    def __init__(self, view: LpPositionView | None = None) -> None:
-        """Serve one view for the tracked token id."""
+    def __init__(
+        self, view: LpPositionView | None = None, extra: dict[int, LpPositionView] | None = None
+    ) -> None:
+        """Serve one view for the tracked token id, plus any extras."""
         self._views: dict[int, LpPositionView] = {
             TRACKED_TOKEN_ID: view if view is not None else position_view()
         }
+        self._views.update(extra or {})
         self.fail = False
 
     def read_position_bounds(self, nfpm_address: str, token_id: int) -> LpPositionView:
@@ -251,6 +257,7 @@ class FakeCloseExecutor:
         budget_usdc: Decimal | None,
         key_bytes: bytes,
         ephemeral_key: bool = False,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> object:
         """The watchtower never recenters; refuse if asked."""
         raise AssertionError("the watchtower must never recenter")
@@ -264,6 +271,7 @@ class FakeCloseExecutor:
         budget_usdc: Decimal,
         key_bytes: bytes,
         ephemeral_key: bool = False,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> object:
         """The watchtower never switches pools; refuse if asked."""
         raise AssertionError("the watchtower must never switch pools")
@@ -340,6 +348,7 @@ class FakeCloseExecutor:
         *,
         confirm_broadcast: bool,
         ephemeral_key: bool = False,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> LpActionExecutionReport:
         """The watchtower never mints; refuse if asked."""
         raise AssertionError("the watchtower must never mint")
@@ -390,12 +399,14 @@ class AlertRecorder:
 def tracked_book() -> CycleStateBook:
     """Build one book tracking the fixture position."""
     return CycleStateBook(
-        position=TrackedPosition(
-            symbol="FIXc",
-            token_id=TRACKED_TOKEN_ID,
-            pool_address=POOL_ADDRESS,
-            committed_usd=COMMITTED_USD,
-            entered_at=QUIET_INSTANT,
+        positions=(
+            TrackedPosition(
+                symbol="FIXc",
+                token_id=TRACKED_TOKEN_ID,
+                pool_address=POOL_ADDRESS,
+                committed_usd=COMMITTED_USD,
+                entered_at=QUIET_INSTANT,
+            ),
         ),
         updated_at=QUIET_INSTANT,
     )
@@ -521,6 +532,83 @@ class TestWatchtowerConfigParsing:
         assert WatchtowerLatchStore(path).load().tripped is False
         path.write_text('{"tripped": "not-a-bool"}', encoding="utf-8")
         assert WatchtowerLatchStore(path).load().tripped is False
+
+
+class TestPortfolioWatching:
+    """The watchtower watches every tracked position on its own pool."""
+
+    def test_one_tripped_position_fires_while_its_sibling_stays(self, tmp_path: Path) -> None:
+        """A portfolio poll closes the tripped name and spares the calm one."""
+        second_pool = "0x" + "33" * 20
+        second_id = TRACKED_TOKEN_ID + 1
+        book = tracked_book().model_copy(
+            update={
+                "positions": (
+                    tracked_book().positions[0],
+                    TrackedPosition(
+                        symbol="FIXc",
+                        token_id=second_id,
+                        pool_address=second_pool,
+                        committed_usd=Decimal("80"),
+                        entered_at=QUIET_INSTANT,
+                    ),
+                )
+            }
+        )
+        harness = WatchtowerHarness(
+            tmp_path,
+            tick=BELOW_TICK,
+            status=status_report(owner=GAUGE_ADDRESS),
+            book=book,
+        )
+        harness.ticks.by_pool = {second_pool: IN_RANGE_TICK}
+        harness.bounds._views[second_id] = position_view()
+
+        outcome = harness.poll()
+
+        assert outcome.state is WatchtowerPollState.FIRED
+        # The close only touched the tripped position's token.
+        calls: list[dict[str, object]] = list(harness.executor.calls)
+        unstaked = [
+            cast(tuple[object, ...], call["args"])[1]
+            for call in calls
+            if call["action"] == "unstake"
+        ]
+        assert unstaked == [TRACKED_TOKEN_ID]
+        # The calm sibling stays tracked for the next poll.
+        remaining = harness.state_store.load().positions
+        assert [position.token_id for position in remaining] == [second_id]
+
+    def test_all_positions_in_range_polls_calmly(self, tmp_path: Path) -> None:
+        """A fully in-range portfolio reports one calm outcome."""
+        second_pool = "0x" + "33" * 20
+        second_id = TRACKED_TOKEN_ID + 1
+        book = tracked_book().model_copy(
+            update={
+                "positions": (
+                    tracked_book().positions[0],
+                    TrackedPosition(
+                        symbol="FIXc",
+                        token_id=second_id,
+                        pool_address=second_pool,
+                        committed_usd=Decimal("80"),
+                        entered_at=QUIET_INSTANT,
+                    ),
+                )
+            }
+        )
+        harness = WatchtowerHarness(
+            tmp_path,
+            tick=IN_RANGE_TICK,
+            status=status_report(owner=GAUGE_ADDRESS),
+            book=book,
+        )
+        harness.ticks.by_pool = {second_pool: IN_RANGE_TICK}
+        harness.bounds._views[second_id] = position_view()
+
+        outcome = harness.poll()
+
+        assert outcome.state is WatchtowerPollState.IN_RANGE
 
 
 class TestTripSemantics:

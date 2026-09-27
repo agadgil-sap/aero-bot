@@ -27,6 +27,7 @@ from typing import Annotated, Protocol
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
+from aero_bot.allocator import PortfolioRebalancePlan
 from aero_bot.audit import AuditEventType, AuditStore
 from aero_bot.config import Settings
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
@@ -122,6 +123,15 @@ class StrategyDecisionReport(BaseModel):
     board: tuple[PoolEntryEvaluation, ...] = ()
     # The qualified cross-pool switch directive, selector mode only.
     switch: SwitchDirective | None = None
+    # The portfolio rebalance plan, selector mode only (the allocator
+    # ruling): the ordered steps the act layer executes per position.
+    portfolio_plan: PortfolioRebalancePlan | None = None
+    # Each held position's own engine fold outcome, keyed by symbol, so
+    # the book rebuild threads per-position maintenance state.
+    held_folds: dict[str, PolicyOutcome] = Field(default_factory=dict)
+    # The post-fold session state carrying the day anchors and the halt
+    # latch the book rebuild threads in portfolio mode.
+    session_state: PolicyState | None = None
     # One human evidence line summarizing the selector's pass.
     board_summary: str = ""
 
@@ -960,7 +970,12 @@ def run_selection(
         decision_observation.token_address,
         engine.calendar,
     )
-    notes = notes + (selection.summary,)
+    notes = notes + (
+        selection.summary,
+        "the decision-only surface reports the ranked single-position verdict; "
+        "the scheduled cycle composes the tiered portfolio over this same ranked "
+        "board through the allocator (docs/cycle.md, The portfolio allocator)",
+    )
     return StrategyDecisionReport(
         symbol=decision_pool.symbol,
         pool_address=decision_pool.pool.pool_address,

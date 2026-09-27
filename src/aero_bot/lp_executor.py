@@ -1791,7 +1791,11 @@ class LpLifecycleExecutor:
         return self._safe_address
 
     def plan_mint(
-        self, symbol: str, budget_usdc: Decimal, width_spacings: int | None
+        self,
+        symbol: str,
+        budget_usdc: Decimal,
+        width_spacings: int | None,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> LpMintPlan:
         """Plan one capped mint against live discovery and inventory.
 
@@ -1800,6 +1804,9 @@ class LpLifecycleExecutor:
             budget_usdc: The total USDC value the position commits.
             width_spacings: The explicit half width in tick spacings per side;
                 None refuses until the solver-derived width path lands.
+            portfolio_live_positions: The cycle book's tracked live positions
+                as (token id, committed USDC) pairs; their committed values
+                ride the total pilot cap beside this mint.
 
         Returns:
             The complete capped mint plan with every cap evaluation.
@@ -1809,7 +1816,9 @@ class LpLifecycleExecutor:
             LpPlanRefusalError: If any planning cap refuses.
         """
         try:
-            context = self._resolve_mint_context(symbol, width_spacings)
+            context = self._resolve_mint_context(
+                symbol, width_spacings, portfolio_live_positions=portfolio_live_positions
+            )
             plan = self._plan_from_context(context, budget_usdc)
             self._record_mint_plan(ExecutionMode.DRY_RUN, plan)
             return plan
@@ -1988,6 +1997,7 @@ class LpLifecycleExecutor:
         budget_usdc: Decimal | None,
         key_bytes: bytes,
         ephemeral_key: bool = False,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> LpRecenterDryRunReport:
         """Fully build and validate one recenter batch without broadcasting.
 
@@ -1997,6 +2007,9 @@ class LpLifecycleExecutor:
         at the requested width, and stage the gauge operator approval for
         the restake follow-up.
 
+        The cycle book's other tracked positions (the allocator ruling) are
+        expected exposure the recenter's total cap counts.
+
         Args:
             symbol: The registry-matched B20 stock symbol.
             token_id: The old position NFT being recentered.
@@ -2005,6 +2018,9 @@ class LpLifecycleExecutor:
                 position's snapshot value.
             key_bytes: Exactly 32 raw signing-key bytes used for this build.
             ephemeral_key: Whether the key was generated for this dry run.
+            portfolio_live_positions: The cycle book's tracked live positions
+                as (token id, committed USDC) pairs; their committed values
+                ride the total pilot cap beside the recentered replacement.
 
         Returns:
             The complete dry-run report; nothing was broadcast.
@@ -2015,7 +2031,13 @@ class LpLifecycleExecutor:
         """
         try:
             return self._dry_run_recenter(
-                symbol, token_id, width_spacings, budget_usdc, key_bytes, ephemeral_key
+                symbol,
+                token_id,
+                width_spacings,
+                budget_usdc,
+                key_bytes,
+                ephemeral_key,
+                portfolio_live_positions,
             )
         except (LpExecutionRefusalError, LpPlanRefusalError) as error:
             self._record_refusal("recenter", ExecutionMode.DRY_RUN, error, symbol)
@@ -2030,14 +2052,16 @@ class LpLifecycleExecutor:
         budget_usdc: Decimal,
         key_bytes: bytes,
         ephemeral_key: bool = False,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> LpMintPlan:
         """Preflight a cross-pool switch without touching the live position.
 
         The source LP is projected through a complete decrease/collect and a
         conservative full stock-to-USDC exit. The target mint is then planned
         against that projected USDC inventory while allowing only the tracked
-        source NFT to exist. This proves the replacement can be funded before
-        the cycle unstake/withdraws the currently earning position.
+        source NFT and the cycle book's other tracked portfolio positions
+        (the allocator ruling) to exist. This proves the replacement can be
+        funded before the cycle unstake/withdraws the earning position.
         """
         try:
             return self._dry_run_switch(
@@ -2048,6 +2072,7 @@ class LpLifecycleExecutor:
                 budget_usdc,
                 key_bytes,
                 ephemeral_key,
+                portfolio_live_positions,
             )
         except (LpExecutionRefusalError, LpPlanRefusalError) as error:
             self._record_refusal("switch", ExecutionMode.DRY_RUN, error, to_symbol)
@@ -2062,6 +2087,7 @@ class LpLifecycleExecutor:
         *,
         confirm_broadcast: bool,
         ephemeral_key: bool = False,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> LpActionExecutionReport:
         """Build and broadcast one capped mint with a late-bound final mint.
 
@@ -2070,6 +2096,9 @@ class LpLifecycleExecutor:
         mined do we reread pool state, inventory, allowances and Safe nonce,
         rebuild the mint one final time, estimate it, and broadcast it. This
         removes approval-mining latency from the mint's price observation.
+
+        The portfolio's tracked live positions (the allocator ruling) are
+        expected exposure the total pilot cap counts beside this mint.
         """
         if not confirm_broadcast:
             error = LpExecutionRefusalError(
@@ -2097,6 +2126,7 @@ class LpLifecycleExecutor:
                 key_bytes,
                 ephemeral_key,
                 ExecutionMode.EXECUTE,
+                portfolio_live_positions=portfolio_live_positions,
             )
             total_build_ms += initial_build.build_duration_ms
             current_build = initial_build
@@ -2139,6 +2169,7 @@ class LpLifecycleExecutor:
                     ExecutionMode.EXECUTE,
                     inventory_only=True,
                     known_empty_position_count=known_empty_position_count,
+                    portfolio_live_positions=portfolio_live_positions,
                 )
                 total_build_ms += current_build.build_duration_ms
                 known_empty_position_count = current_build.empty_nfpm_position_count
@@ -2221,6 +2252,7 @@ class LpLifecycleExecutor:
                     confirmed_nfpm_stock_allowance_floor=confirmed_stock_floor,
                     buffer_nfpm_approvals=True,
                     known_empty_position_count=known_empty_position_count,
+                    portfolio_live_positions=portfolio_live_positions,
                 )
                 total_build_ms += final_build.build_duration_ms
                 known_empty_position_count = final_build.empty_nfpm_position_count
@@ -2940,6 +2972,7 @@ class LpLifecycleExecutor:
         confirmed_nfpm_stock_allowance_floor: int = 0,
         buffer_nfpm_approvals: bool = True,
         known_empty_position_count: int | None = None,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> tuple[LpMintDryRunReport, tuple[_BuiltLpStep, ...]]:
         """Build, sign, validate, and estimate the complete mint sequence."""
         build_started = self._timer()
@@ -2947,6 +2980,7 @@ class LpLifecycleExecutor:
             symbol,
             width_spacings,
             known_empty_position_count=known_empty_position_count,
+            portfolio_live_positions=portfolio_live_positions,
         )
         plan = self._plan_from_context(context, budget_usdc)
         if inventory_only and plan.balancing_swap.required:
@@ -3835,6 +3869,7 @@ class LpLifecycleExecutor:
         budget_usdc: Decimal,
         key_bytes: bytes,
         ephemeral_key: bool,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> LpMintPlan:
         """Project a full source exit and prove the target mint can be funded."""
         if from_symbol.strip().lower() == to_symbol.strip().lower():
@@ -3852,16 +3887,19 @@ class LpLifecycleExecutor:
 
         source = self._resolve_position(from_symbol, token_id)
         source_observation = source.observation
+        tracked_ids = {tracked_id for tracked_id, _ in (portfolio_live_positions or ())}
         held_source = self._enumerate_held_positions(source_observation)
         live_others = [
-            held.token_id for held in held_source if held.live and held.token_id != token_id
+            held.token_id
+            for held in held_source
+            if held.live and held.token_id != token_id and held.token_id not in tracked_ids
         ]
         if live_others:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS,
                 "the Safe holds live position NFT(s) "
                 f"{', '.join(str(value) for value in live_others)} besides the tracked switch "
-                "source; refusing to project a second pool",
+                "source and the book's tracked positions; refusing to project a second pool",
             )
         if source.staked:
             accrued = self._read_gauge_reward_word(
@@ -3898,18 +3936,33 @@ class LpLifecycleExecutor:
         same_nfpm = (
             target_observation.nfpm_address.lower() == source_observation.nfpm_address.lower()
         )
+        tracked_by_id = dict(portfolio_live_positions or ())
         target_live_others = [
             held.token_id
             for held in target_held
-            if held.live and not (same_nfpm and held.token_id == token_id)
+            if held.live
+            and not (same_nfpm and held.token_id == token_id)
+            and held.token_id not in tracked_by_id
         ]
         if target_live_others:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS,
                 f"the target NFPM carries live position NFT(s) "
                 f"{', '.join(str(value) for value in target_live_others)} beyond the tracked "
-                "switch source; refusing before the source LP is touched",
+                "switch source and the book's tracked positions; refusing before the source "
+                "LP is touched",
             )
+        # The book's other tracked positions - every live tracked NFT beside
+        # the exiting source - count their committed values toward the total
+        # pilot cap the projected target mint must fit inside.
+        other_tracked_value = sum(
+            (
+                committed
+                for tracked_id, committed in tracked_by_id.items()
+                if not (same_nfpm and tracked_id == token_id)
+            ),
+            Decimal("0"),
+        )
         target_stock = (
             target_observation.token0_address
             if target_observation.stock_is_token0
@@ -3919,6 +3972,7 @@ class LpLifecycleExecutor:
         inventory = SafeInventory(
             usdc_units=projected_target_usdc,
             stock_units=target_stock_units,
+            existing_position_value_usdc=other_tracked_value,
         )
         directive = MintDirective(
             budget_usdc=budget_usdc,
@@ -3952,6 +4006,7 @@ class LpLifecycleExecutor:
         budget_usdc: Decimal | None,
         key_bytes: bytes,
         ephemeral_key: bool,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> LpRecenterDryRunReport:
         """Build, sign, validate, and estimate the complete recenter batch."""
         build_started = self._timer()
@@ -3966,20 +4021,25 @@ class LpLifecycleExecutor:
             )
         position = context.position
         observation = context.observation
+        tracked_others = dict(portfolio_live_positions or ())
         held = self._enumerate_held_positions(observation)
         live_others = [
             held_position.token_id
             for held_position in held
-            if held_position.live and held_position.token_id != token_id
+            if held_position.live
+            and held_position.token_id != token_id
+            and held_position.token_id not in tracked_others
         ]
         if live_others:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS,
                 f"the Safe holds {len(live_others)} live untracked position NFT(s) "
                 f"(token ids {', '.join(str(token) for token in live_others)}) on this NFPM "
-                "beyond the one being recentered, so the total pilot exposure cap cannot "
-                "be evaluated honestly; refuse until they are reconciled or exited",
+                "beyond the one being recentered and the book's tracked positions, so the "
+                "total pilot exposure cap cannot be evaluated honestly; refuse until they "
+                "are reconciled or exited",
             )
+        others_value = sum(tracked_others.values(), Decimal("0"))
         accrued_earned = 0
         if context.staked:
             accrued_earned = self._read_gauge_reward_word(
@@ -4020,6 +4080,7 @@ class LpLifecycleExecutor:
         inventory = SafeInventory(
             usdc_units=projected_usdc,
             stock_units=projected_stock,
+            existing_position_value_usdc=others_value,
         )
         directive = MintDirective(
             budget_usdc=recycled_budget,
@@ -4907,6 +4968,7 @@ class LpLifecycleExecutor:
         width_spacings: int | None,
         *,
         known_empty_position_count: int | None = None,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> _LpMintContext:
         """Resolve one mint to its observation, inventory, and shared gates.
 
@@ -4918,6 +4980,10 @@ class LpLifecycleExecutor:
                 the live NFPM balanceOf count is unchanged, swap/approval-only
                 predecessors cannot have changed those NFTs, so the expensive
                 per-token positions() scan can be reused safely.
+            portfolio_live_positions: The cycle book's tracked live positions
+                as (token id, committed USDC) pairs (the allocator ruling):
+                these NFTs are expected exposure, not strangers, and their
+                committed values ride the total pilot cap beside this mint.
 
         Returns:
             The resolved context carrying every gate label enforced so far.
@@ -4965,12 +5031,20 @@ class LpLifecycleExecutor:
                     f"{live_count}; rerunning full held-position enumeration"
                 )
 
+        tracked_value = Decimal("0")
         if not reused_empty_scan:
             # The total-exposure cap stays honest by refusing once the Safe
-            # holds LIVE untracked positions this executor cannot value; empty
-            # residual NFTs carry no exposure and no longer block entry.
+            # holds LIVE positions this executor cannot value; the cycle's
+            # tracked portfolio positions are expected exposure whose
+            # committed values count toward the cap (the allocator ruling),
+            # and empty residual NFTs carry no exposure and never block entry.
+            tracked_by_id = dict(portfolio_live_positions or ())
             held = self._enumerate_held_positions(observation)
-            live_untracked = [position.token_id for position in held if position.live]
+            live_untracked = [
+                position.token_id
+                for position in held
+                if position.live and position.token_id not in tracked_by_id
+            ]
             if live_untracked:
                 raise LpExecutionRefusalError(
                     LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS,
@@ -4979,16 +5053,34 @@ class LpLifecycleExecutor:
                     "NFPM, so the total pilot exposure cap cannot be evaluated honestly; "
                     "refuse until they are reconciled or exited",
                 )
-            empty_position_count = len(held)
-            if held:
+            tracked_live_ids = [
+                position.token_id
+                for position in held
+                if position.live and position.token_id in tracked_by_id
+            ]
+            tracked_value = sum(
+                (tracked_by_id[token_id] for token_id in tracked_live_ids), Decimal("0")
+            )
+            if tracked_live_ids:
                 caps.append(
-                    f"Safe holds {len(held)} empty residual NFT(s) on this NFPM carrying "
-                    "no exposure"
+                    f"the book tracks {len(tracked_live_ids)} live position NFT(s) "
+                    f"(token ids {', '.join(str(token) for token in tracked_live_ids)}) "
+                    f"committed {tracked_value} USDC toward the total pilot cap"
                 )
-            else:
+            empty_position_count = len(held) - len(tracked_live_ids)
+            if empty_position_count:
+                caps.append(
+                    f"Safe holds {empty_position_count} empty residual NFT(s) on this NFPM "
+                    "carrying no exposure"
+                )
+            elif not tracked_live_ids:
                 caps.append("Safe holds no untracked position NFTs on this NFPM")
 
-        inventory = SafeInventory(usdc_units=usdc_balance, stock_units=stock_balance)
+        inventory = SafeInventory(
+            usdc_units=usdc_balance,
+            stock_units=stock_balance,
+            existing_position_value_usdc=tracked_value,
+        )
         return _LpMintContext(
             listing,
             observation,

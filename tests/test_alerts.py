@@ -37,7 +37,14 @@ from aero_bot.alerts import (
     evaluate_alerts,
     parse_alert_config,
 )
-from aero_bot.cycle import CycleActionRecord, CycleMode, CycleReport, CycleYieldAttribution
+from aero_bot.cycle import (
+    CycleActionRecord,
+    CycleMode,
+    CyclePositionSummary,
+    CyclePositionYield,
+    CycleReport,
+    CycleYieldAttribution,
+)
 from aero_bot.cycle import CycleReconciliation as Reconciliation
 
 
@@ -90,6 +97,46 @@ def calm_report(*, usdc_units: int = 10_000_000, relayer_eth_wei: int = 10**15) 
         pnl_vs_entry_usdc=Decimal("1.25"),
         fee_wei=0,
         input_notes=("fixture note",),
+    )
+
+
+def portfolio_report() -> CycleReport:
+    """Build one two-position portfolio report with per-position attribution."""
+    return calm_report().model_copy(
+        update={
+            "positions": (
+                CyclePositionSummary(
+                    symbol="BBBc",
+                    token_id=101,
+                    committed_usd=Decimal("175"),
+                    value_usdc=Decimal("180"),
+                    unrealized_pnl_usdc=Decimal("5"),
+                    staked=True,
+                    yield_attribution=CyclePositionYield(
+                        symbol="BBBc",
+                        token_id=101,
+                        aero_rewards_usdc=Decimal("0.9"),
+                        fees_earned_usdc=Decimal("0.2"),
+                        stock_mark_to_market_usdc=Decimal("0.1"),
+                    ),
+                ),
+                CyclePositionSummary(
+                    symbol="AAAc",
+                    token_id=102,
+                    committed_usd=Decimal("120"),
+                    value_usdc=Decimal("118"),
+                    unrealized_pnl_usdc=Decimal("-2"),
+                    staked=True,
+                    yield_attribution=CyclePositionYield(
+                        symbol="AAAc",
+                        token_id=102,
+                        aero_rewards_usdc=Decimal("0.4"),
+                        fees_earned_usdc=Decimal("0.1"),
+                        stock_mark_to_market_usdc=Decimal("-0.3"),
+                    ),
+                ),
+            ),
+        }
     )
 
 
@@ -270,6 +317,18 @@ class TestEvaluateAlerts:
 
 class TestComposeCycleEmail:
     """The email composition."""
+
+    def test_the_portfolio_section_lists_positions_and_attributions(self) -> None:
+        """A multi-position book renders one row per name with its slice."""
+        _, body = compose_cycle_email(portfolio_report(), ())
+        assert "--- portfolio " in body
+        bbb = next(line for line in body.splitlines() if line.startswith("  BBBc"))
+        assert "#101" in bbb and "175 committed" in bbb and "staked" in bbb
+        aaa = next(line for line in body.splitlines() if line.startswith("  AAAc"))
+        assert "#102" in aaa and "120 committed" in aaa
+        slice_lines = [line for line in body.splitlines() if "day: aero" in line]
+        assert len(slice_lines) == 2
+        assert "0.9" in slice_lines[0] and "0.4" in slice_lines[1]
 
     def test_calm_subject_and_body_pin_the_readable_layout(self) -> None:
         """A calm email pins its subject and the full one-screen body."""
