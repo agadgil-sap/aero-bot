@@ -16,12 +16,13 @@ The engine never signs, broadcasts, or touches a wallet.
 | Minimum range half width | exactly one tick spacing on each side |
 | Tick grid | spacing 10 on the 500-ppm Slipstream tier |
 | Upside recenter wait | 15 minutes out of range |
+| Out-of-range grace window | 10 minutes (captain's 2026-09-27 correction; configurable in the sealed cycle environment via `AERO_BOT_CYCLE_OUT_OF_RANGE_GRACE_MINUTES`): once elapsed the policy must act - recenter when the economics pass, otherwise exit - because every minute out of range forgoes emissions income |
 | Downside stop | 0.5 percent below the lower range edge |
 | Re-entry cooldown | 15 minutes after stop or dilution exits |
 | Entry threshold | raw AERO emissions APR of at least 150 percent |
-| Position cap | 80 percent of current equity per pool (raised from 20 percent by the captain's 2026-09-09 sizing ruling, inside the unchanged 100/100 USDC hard ceilings) |
+| Position cap | 80 percent of current equity per pool (raised from 20 percent by the captain's 2026-09-09 sizing ruling, inside the 1000/1000 USDC hard ceilings of the 2026-09-27 performance ruling) |
 | Depth hard gate | 1 percent of observed pool depth |
-| Daily loss halt | 5 percent of day-start equity |
+| Daily loss halt | 5 percent of day-start equity, plus the continuous latch from the running equity high-water mark carried across the New York day boundary (captain's 2026-09-27 ruling) |
 | Starting equity | 200 USDC |
 | Reference staleness bound (entries) | 300 seconds |
 | Reference staleness bound (open position) | 900 seconds, then a defensive exit |
@@ -69,8 +70,10 @@ Held stock inventory from a stale-low burn resolves first, then safety exits are
 3. Downside stop: pool price at or below 0.5 percent under the lower range edge burns the position and swaps all inventory back to USDC.
 4. Emissions dilution: while open, the raw emissions APR is re-evaluated at every observation, because other LPs can add sticky staked liquidity that persistently lowers APR per unit of staked liquidity; a fall below the 150 percent threshold exits through the same burn-and-swap path.
 5. Condition-driven flat event: an oracle-stale or registry-pause signal that arrives while a position is open burns and swaps all inventory back to USDC. Scheduled and session-derived event windows no longer force exits since the captain's 2026-09-09 twenty-four-seven ruling (the B20 pools are continuous DeFi markets; nights and weekends are in scope).
-6. Upside recenter: price above the upper edge starts a 15-minute time-based wait; the recenter re-derives the width from the target net daily yield at the current observables and re-mints the range around the current pool price only after the wait elapses and the gas gate allows it.
-7. In-range or below-edge holds keep the position otherwise.
+6. Upside recenter: price above the upper edge starts the out-of-range clock; the recenter re-derives the width from the target net daily yield at the current observables and re-mints the range around the current pool price once the acting window - the earlier of the recenter wait and the out-of-range grace window - elapses and the gas gate allows it.
+Once the grace window itself elapses, a recenter whose economics fail (an empty depth cap, a deferring gas gate) ends the hold as a `range_grace_exit` instead of waiting open-endedly - the income-protection bound of the captain's 2026-09-27 ruling.
+7. In-range or below-edge holds keep the position otherwise, bounded by the same grace window: below the edge (but above the stop) the wait, minimum-displacement, depth, gas, and payback gates all govern the recenter, and once the grace window elapses any gate that still blocks the recenter exits the position - below the range the withdrawn stock routes through inventory convergence, above it the composition is already all USDC.
+Out-of-range holds name the lost-yield basis in their diagnostics: income accrues per unit of time staked in range at the pool's qualifying APR.
 
 Between the 300-second entry bound and the 900-second open-position bound, the reference is too old for dislocation comparisons but fresh enough to keep the position, so the ordinary lifecycle rides on.
 
@@ -79,7 +82,7 @@ Below the range edge but above the stop level, the position holds for recovery.
 Entry gates are evaluated in fixed order while flat: daily loss halt, re-entry cooldown, condition-driven flat events, reference staleness, emissions threshold, the size caps, and finally the gas sense-check gate.
 Scheduled and session-derived event windows no longer gate entries (the same 2026-09-09 ruling); the calendar machinery stays loaded and the decision surfaces report the active window informationally.
 The size is the smaller of 80 percent of current equity (raised from 20 percent by the captain's 2026-09-09 sizing ruling; roughly 72 USDC on the 90-dollar trial book) and 1 percent of observed pool depth, and only then is the range width derived against the target net daily yield.
-The fraction lives inside the LP executor's unchanged hard ceilings - 100 USDC total exposure and 100 USDC per pool - which still refuse anything above them.
+The fraction lives inside the LP executor's hard ceilings - 1000 USDC total exposure and 1000 USDC per pool, raised from the trial's 100/100 by the captain's 2026-09-27 performance ruling because the measured in-range depth (~404k USDC on the AAPLc pool) leaves the one-percent depth gate near 4k USDC per pool - which still refuse anything above them.
 
 ## Underlying dislocation monitor
 
@@ -141,6 +144,15 @@ Re-entry after the cooldown requires the 150 percent threshold to clear again at
 The halt anchors to the America/New_York day-start equity, which resets on the first observation of each new day.
 A marked drawdown of at least 5 percent from that anchor latches the halt for the rest of the day even if equity recovers, and blocks only new entries; every safety exit remains armed while it is active.
 Maintenance of an already-open position (the upside recenter) is not treated as a new entry.
+
+Beside the day-start latch stands the continuous latch (the captain's 2026-09-27 performance ruling): the engine tracks a running equity high-water mark that never resets at the day rollover, and a marked drawdown of at least the same 5 percent from that peak re-arms the same halt machinery on every day it holds - so a swing that runs equity up, gives the run-up back across midnight, and settles against a fresh day-start anchor can no longer slip the latch.
+The peak only ever ratchets upward; the continuous latch releases only when equity recovers to inside the 5 percent band of the peak, while an already-latched day keeps its day-latch semantics for the rest of that day.
+
+## The yield-duration thesis
+
+The strategy is yield duration: real income is the boosted AERO emissions (plus pool fees), a duration-based stream that accrues per unit of time staked in range - never per swap - so the objective is maximizing time-in-range times the pool's qualifying emissions APR, with range placement and pool selection as the optimization variables.
+Every minute out of range forgoes income at that APR, which is why the out-of-range grace window bounds every hold; stock drift and fees ride beside the stream rather than driving it.
+The range-width-versus-volatility tradeoff is a future tuning surface (wider ranges raise time-in-range at a lower per-cell APR), and selector ranking by qualifying APR stays exactly as locked in this lane - whether ranking should blend width-adjusted expected yield is the documented follow-up question, not a changed behavior.
 
 ## Position composition
 

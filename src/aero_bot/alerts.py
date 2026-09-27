@@ -612,9 +612,40 @@ def compose_cycle_email(report: CycleReport, alerts: tuple[str, ...]) -> tuple[s
     else:
         pnl = f"unavailable ({_humanize_numbers(report.pnl_diagnostic)})"
     lines.append(f"  {'pnl vs entry:':<15}{pnl}")
+    if report.day_pnl_usdc is not None:
+        anchor = report.day_start_equity_usd or Decimal("0")
+        peak = report.peak_equity_usd or Decimal("0")
+        lines.append(
+            f"  {'day pnl:':<15}{_format_quantity(report.day_pnl_usdc)} USDC "
+            f"(anchor {_format_quantity(anchor)}, "
+            f"running peak {_format_quantity(peak)})"
+        )
+    if report.unclaimed_aero_units is not None:
+        value_note = (
+            f" worth {_format_quantity(report.unclaimed_aero_value_usdc)} USDC"
+            if report.unclaimed_aero_value_usdc is not None
+            else ""
+        )
+        lines.append(
+            f"  {'unclaimed AERO:':<15}{report.unclaimed_aero_units} raw units{value_note}"
+        )
     lines.append(f"  {'gas spent:':<15}{report.fee_wei} wei")
     if report.halted_reason:
         lines.append(f"  {'halted:':<15}{report.halted_reason}")
+    if report.yield_attribution is not None:
+        attribution = report.yield_attribution
+        lines.extend(["", _section("yield attribution"), ""])
+
+        def component(label: str, value: Decimal | None) -> str:
+            rendered = f"{_format_quantity(value)} USDC" if value is not None else "unmeasured"
+            return f"  {label:<20}{rendered}"
+
+        lines.append(component("aero rewards", attribution.aero_rewards_usdc))
+        lines.append(component("fees (computed)", attribution.fees_earned_usdc))
+        lines.append(component("stock mark-to-mkt", attribution.stock_mark_to_market_usdc))
+        lines.append(component("unattributed", attribution.unattributed_usdc))
+        if attribution.diagnostic:
+            lines.append(f"  note: {_humanize_numbers(attribution.diagnostic)}")
     if report.input_notes:
         lines.extend(["", _section("notes"), ""])
         lines.extend(f"  - {_humanize_numbers(note)}" for note in report.input_notes)

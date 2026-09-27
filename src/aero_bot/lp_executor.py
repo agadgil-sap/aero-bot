@@ -81,7 +81,10 @@ from aero_bot.executor import (
     build_swap_path,
     usdc_units,
 )
+from aero_bot.history import price_usdc_per_stock
 from aero_bot.lp_calldata import (
+    INT24_MAX,
+    INT24_MIN,
     MAX_UINT128,
     LpCollectParams,
     LpDecreaseLiquidityParams,
@@ -105,17 +108,20 @@ from aero_bot.lp_calldata import (
     build_lp_mint_calldata,
     build_lp_positions_read_calldata,
     build_pool_factory_read_calldata,
+    build_pool_fee_growth_global_read_calldata,
     build_pool_gauge_read_calldata,
     build_pool_liquidity_read_calldata,
     build_pool_slot0_read_calldata,
     build_pool_staked_liquidity_read_calldata,
     build_pool_tick_spacing_read_calldata,
+    build_pool_ticks_read_calldata,
     build_pool_token0_read_calldata,
     build_pool_token1_read_calldata,
     build_set_approval_for_all_calldata,
     decode_address_view_result,
     decode_lp_positions_view,
     decode_pool_slot0_view,
+    decode_pool_ticks_view_result,
     decode_uint_view_result,
 )
 from aero_bot.lp_pins import LpPoolPin, LpPoolPinStore, build_pool_pin_from_discovery
@@ -149,7 +155,7 @@ from aero_bot.safe_tx import (
     sign_safe_tx_hash,
 )
 from aero_bot.signing_key import load_signing_key_source
-from aero_bot.venues import BASE_USDC_ADDRESS, PoolDiscoveryStatus
+from aero_bot.venues import AERO_TOKEN_ADDRESS, BASE_USDC_ADDRESS, PoolDiscoveryStatus
 
 # keccak256("ownerOf(uint256)")[0:4], the ERC721 ownership read.
 ERC721_OWNER_OF_SELECTOR = "6352211e"
@@ -197,6 +203,75 @@ EXECUTE_RECEIPT_ENDPOINT_URLS: tuple[str, ...] = (
 )
 # AERO is a standard eighteen-decimal ERC20; the emissions valuation scales by it.
 AERO_DECIMALS = 18
+# The X128 fixed-point shift of the pool's fee-growth accumulators.
+FEE_GROWTH_X128_SHIFT = 128
+# The uint256 modulus the fee-growth accumulators wrap at.
+_FEE_GROWTH_MODULUS = 1 << 256
+
+
+def fee_growth_inside(
+    fee_growth_global: int,
+    tick_current: int,
+    tick_lower: int,
+    tick_upper: int,
+    fee_growth_outside_lower: int,
+    fee_growth_outside_upper: int,
+) -> int:
+    """Compute one side's feeGrowthInside by the exact v3 identity.
+
+    The inside accumulator is the global growth minus the growth below the
+    lower boundary and above the upper boundary, where each boundary's
+    "outside" flips to its complement exactly when the current tick sits on
+    the other side of it: below(lower) is the outside word once the current
+    tick is at or above the lower boundary, and above(upper) is the outside
+    word once the current tick is below the upper boundary - the same
+    inclusive-lower, exclusive-upper semantics the range state uses. Every
+    arithmetic step wraps at the uint256 modulus exactly as the contract's
+    accumulators do.
+
+    Args:
+        fee_growth_global: The pool's live feeGrowthGlobal accumulator.
+        tick_current: The pool's current tick at the same read block.
+        tick_lower: The position's inclusive lower boundary tick.
+        tick_upper: The position's exclusive upper boundary tick.
+        fee_growth_outside_lower: The lower tick's feeGrowthOutside word.
+        fee_growth_outside_upper: The upper tick's feeGrowthOutside word.
+
+    Returns:
+        The position range's inside fee growth, wrapped at two to the 256.
+    """
+    below = (
+        fee_growth_outside_lower
+        if tick_current >= tick_lower
+        else (fee_growth_global - fee_growth_outside_lower) % _FEE_GROWTH_MODULUS
+    )
+    above = (
+        fee_growth_outside_upper
+        if tick_current < tick_upper
+        else (fee_growth_global - fee_growth_outside_upper) % _FEE_GROWTH_MODULUS
+    )
+    return (fee_growth_global - below - above) % _FEE_GROWTH_MODULUS
+
+
+def fees_earned_from_growth(liquidity: int, growth_delta_x128: int) -> int:
+    """Convert one fee-growth delta into raw token units for a liquidity.
+
+    The earned amount is ``liquidity * delta / 2**128`` floored, with the
+    delta taken modulo the uint256 accumulator width first so a wrapped
+    accumulator still measures a positive accrual.
+
+    Args:
+        liquidity: The position's raw liquidity amount.
+        growth_delta_x128: The inside-growth delta since the baseline word.
+
+    Returns:
+        The raw token units earned over the delta.
+    """
+    if liquidity <= 0:
+        return 0
+    return liquidity * (growth_delta_x128 % _FEE_GROWTH_MODULUS) >> FEE_GROWTH_X128_SHIFT
+
+
 # Timing metrics round to whole milliseconds.
 TIMING_PRECISION = Decimal("0.001")
 # CLI exit codes: zero on success, one on failures, two on refusals.
@@ -334,6 +409,13 @@ class LpExecutionRefusalCode(StrEnum):
     EXIT_OUTPUT_ABOVE_POOL_CAP = "exit_output_above_pool_cap"
     # The Safe's held-NFT enumeration could not be read honestly.
     ENUMERATION_UNREADABLE = "enumeration_unreadable"
+    # No live Sugar-verified Slipstream AERO/USDC pool exists for the reward
+    # token conversion.
+    AERO_POOL_NOT_DISCOVERED = "aero_pool_not_discovered"
+    # The Safe holds no AERO balance to convert back to USDC.
+    AERO_BALANCE_ZERO = "aero_balance_zero"
+    # The AERO conversion's quoted USDC output exceeds the per-pool cap.
+    AERO_OUTPUT_ABOVE_POOL_CAP = "aero_output_above_pool_cap"
 
 
 class LpExecutionRole(StrEnum):
@@ -367,6 +449,10 @@ class LpExecutionRole(StrEnum):
     STOCK_ROUTER_ALLOWANCE = "stock_router_allowance"
     # The exact-input stock-to-USDC swap closing one LP exit.
     EXIT_SWAP = "exit_swap"
+    # The exact AERO approval the router's reward conversion pull requires.
+    AERO_ROUTER_ALLOWANCE = "aero_router_allowance"
+    # The exact-input AERO-to-USDC swap converting accumulated emissions.
+    AERO_SWAP = "aero_swap"
 
 
 class LpSafeExecutionPolicy(BaseModel):
@@ -846,6 +932,90 @@ class LpExitSwapDryRunReport(BaseModel):
     diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
 
 
+class LpAeroPoolObservation(BaseModel):
+    """Carry one block-pinned AERO/USDC Slipstream pool snapshot for the swap."""
+
+    # Frozen strict fields keep the conversion on one coherent observation.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The Slipstream pool contract the conversion routes through.
+    pool_address: EvmAddress
+    # The pool's creating factory, allowlisted at discovery.
+    factory_address: EvmAddress
+    # The pool's positive tick spacing, the router path's route flag.
+    tick_spacing: Annotated[int, Field(gt=0)]
+    # The pool's current tick at the snapshot block.
+    current_tick: Annotated[int, Field(ge=INT24_MIN, le=INT24_MAX)]
+    # The pool's current raw sqrtPriceX96 at the snapshot block.
+    sqrt_ratio: Annotated[int, Field(gt=0)]
+    # True when the eighteen-decimal AERO token sorts before USDC.
+    aero_is_token0: bool
+    # The block every field was pinned to.
+    snapshot_block: Annotated[int, Field(ge=0)]
+    # When the snapshot completed, timezone-aware.
+    observed_at: datetime
+
+    @property
+    def price_usdc_per_aero(self) -> Decimal:
+        """Return the snapshot's USDC price of one whole AERO token."""
+        return price_usdc_per_stock(self.sqrt_ratio, self.aero_is_token0, AERO_DECIMALS, 6)
+
+
+class LpAeroSwapDryRunReport(BaseModel):
+    """Report one complete AERO-to-USDC reward conversion build attempt.
+
+    The reward conversion swaps the Safe's ENTIRE AERO balance for USDC
+    through the whitelisted router on the venue's own Slipstream AERO/USDC
+    pool: exact-input AERO, minimum-output USDC, recipient Safe. The quoted
+    output may never exceed the per-pool cap, so an out-of-band reward pile
+    refuses instead of moving.
+    """
+
+    # Frozen strict fields preserve one coherent dry-run outcome.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode marker makes the no-broadcast guarantee auditable.
+    mode: Literal[ExecutionMode.DRY_RUN] = ExecutionMode.DRY_RUN
+    # The Slipstream AERO/USDC pool the conversion routes through.
+    pool_address: EvmAddress
+    # The whitelisted router executing the conversion.
+    router_address: EvmAddress
+    # The AERO token being converted.
+    aero_token_address: EvmAddress
+    # The Sugar snapshot block anchoring the quote.
+    snapshot_block: Annotated[int, Field(ge=0)]
+    # The snapshot's USDC price of one whole AERO token.
+    price_usdc_per_aero: Decimal
+    # The Safe's entire live AERO balance in raw units.
+    aero_balance_units: Annotated[int, Field(ge=0)]
+    # The exact-input AERO units the swap sells.
+    amount_in_units: Annotated[int, Field(ge=0)]
+    # The quoted USDC output at the snapshot price.
+    expected_out_units: Annotated[int, Field(ge=0)]
+    # The minimum accepted USDC output after slippage.
+    amount_out_min_units: Annotated[int, Field(ge=0)]
+    # The live AERO allowance the Safe held for the router at build time.
+    router_aero_allowance_units: Annotated[int, Field(ge=0)]
+    # The Safe every built transaction targets.
+    safe_address: EvmAddress
+    # The public address of the EOA whose key signed the build.
+    relayer_address: EvmAddress
+    # Whether the signing key was generated for this dry run only.
+    ephemeral_key: bool
+    # The Base gas price observed before building.
+    gas_price_wei: Annotated[int, Field(ge=0)]
+    # The Safe ETH balance observed before building.
+    safe_eth_wei: Annotated[int, Field(ge=0)]
+    # Every built transaction in execution order.
+    transactions: Annotated[tuple[BuiltLpTransaction, ...], Field(min_length=1)]
+    # Every cap checked before signing, in enforced order.
+    caps_enforced: Annotated[tuple[str, ...], Field(min_length=1)]
+    # Wall-clock duration of the build phase in milliseconds.
+    build_duration_ms: Decimal
+    # Human-readable evidence lines covering the conversion.
+    diagnostics: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
 class LpActionExecutionReport(BaseModel):
     """Report one complete LP action executed through the broadcast path."""
 
@@ -864,6 +1034,7 @@ class LpActionExecutionReport(BaseModel):
         | LpExitDryRunReport
         | LpCollectDryRunReport
         | LpExitSwapDryRunReport
+        | LpAeroSwapDryRunReport
     )
     # Every broadcast step in execution order, including the halting one.
     steps: Annotated[tuple[LpStepExecutionReport, ...], Field(min_length=0)]
@@ -1041,6 +1212,30 @@ class LpPositionStatusReport(BaseModel):
     # as the composition, the claimable-now evidence the cycle threads into
     # its fee-evidence window; None when a legacy construction carried none.
     fees_owed_usdc: Decimal | None = None
+    # The position range's live token-zero inside fee growth, X128 fixed
+    # point, computed from the pool's global and tick-boundary outside
+    # accumulators; None when the computed measurement was unavailable.
+    fee_growth_inside0_x128: int | None = None
+    # The token-one twin of the inside fee growth above.
+    fee_growth_inside1_x128: int | None = None
+    # The fees earned since the position's last checkpoint, computed from
+    # the inside-growth delta over the position's liquidity, in raw
+    # token-zero units; None when the computed measurement was unavailable.
+    fees_earned_since_checkpoint0_units: int | None = None
+    # The token-one twin of the computed since-checkpoint earnings.
+    fees_earned_since_checkpoint1_units: int | None = None
+    # The computed fees earned since the position's last checkpoint, valued
+    # in USDC at the snapshot price; None when unavailable. This is the
+    # computed measurement that supersedes the checkpointed lower bound.
+    fees_earned_since_checkpoint_usdc: Decimal | None = None
+    # The computed collect-now estimate: the checkpointed tokens owed plus
+    # the computed uncheckpointed growth, valued in USDC; None when
+    # unavailable. This is what a max-uint128 collect would sweep, not the
+    # stale checkpoint the pool exposes between modifications.
+    claimable_fees_computed_usdc: Decimal | None = None
+    # The named method behind the computed fee numbers, carried beside them
+    # so every report labels computed-versus-checkpointed explicitly.
+    fee_method_diagnostic: str = ""
     # The live accrued emissions when staked, else None.
     accrued_aero_earned_units: Annotated[int, Field(ge=0)] | None = None
     # The checkpointed claimable emissions when staked, else None.
@@ -1346,6 +1541,32 @@ class LpExitSwapPlannedPayload(BaseModel):
     amount_out_min_units: Annotated[int, Field(ge=0)]
     # The live stock allowance the Safe held for the router.
     router_stock_allowance_units: Annotated[int, Field(ge=0)]
+
+
+class LpAeroSwapPlannedPayload(BaseModel):
+    """Persist one accepted reward-conversion plan's public numbers."""
+
+    # Frozen strict fields keep the audited plan immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The mode of the attempt this plan belongs to.
+    mode: ExecutionMode
+    # The Slipstream AERO/USDC pool the conversion routes through.
+    pool_address: EvmAddress
+    # The whitelisted router executing the conversion.
+    router_address: EvmAddress
+    # The Sugar snapshot block anchoring the quote.
+    snapshot_block: Annotated[int, Field(ge=0)]
+    # The Safe's entire live AERO balance in raw units.
+    aero_balance_units: Annotated[int, Field(ge=0)]
+    # The snapshot's USDC price of one whole AERO token.
+    price_usdc_per_aero: str
+    # The quoted USDC output in raw units.
+    expected_out_units: Annotated[int, Field(ge=0)]
+    # The minimum accepted USDC output in raw units.
+    amount_out_min_units: Annotated[int, Field(ge=0)]
+    # The live AERO allowance the Safe held for the router.
+    router_aero_allowance_units: Annotated[int, Field(ge=0)]
 
 
 class LpRefusedPayload(BaseModel):
@@ -2385,6 +2606,289 @@ class LpLifecycleExecutor:
             raise
         return LpActionExecutionReport(
             action="exit_swap",
+            build=build,
+            steps=step_reports,
+            completed=halted_reason == "",
+            halted_reason=halted_reason,
+        )
+
+    def _resolve_aero_pool(self) -> tuple[LpAeroPoolObservation, list[str]]:
+        """Resolve the venue's Slipstream AERO/USDC pool with shared gates.
+
+        Args:
+            None; the AERO token is a protocol constant, not a registry symbol.
+
+        Returns:
+            The block-pinned AERO/USDC observation and the cap labels earned.
+
+        Raises:
+            LpExecutionRefusalError: If discovery, snapshot-evidence, or
+                staleness gates refuse.
+        """
+        caps: list[str] = []
+        try:
+            discovery = self._sources.discover_reward_token_pools()
+        except (ExecutionUnavailableError, RuntimeError) as error:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.AERO_POOL_NOT_DISCOVERED,
+                f"the AERO/USDC pool discovery failed: {error}; the reward conversion "
+                "refuses rather than guessing at a venue",
+            ) from error
+        normalized_usdc = BASE_USDC_ADDRESS.lower()
+        normalized_aero = AERO_TOKEN_ADDRESS.lower()
+        matching = [
+            candidate
+            for candidate in discovery.pools
+            if {candidate.token0_address.lower(), candidate.token1_address.lower()}
+            == {normalized_usdc, normalized_aero}
+        ]
+        if not matching or discovery.status is not PoolDiscoveryStatus.VERIFIED:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.AERO_POOL_NOT_DISCOVERED,
+                "no live Sugar-verified Slipstream AERO/USDC pool exists for the reward "
+                f"conversion (discovery status {discovery.status.value}); the swap requires "
+                "a pool from live discovery",
+            )
+        if discovery.observed_at is None or discovery.snapshot_block is None:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.SNAPSHOT_EVIDENCE_MISSING,
+                "the AERO/USDC discovery snapshot carries no observation evidence; "
+                "refusing to plan without a block-pinned snapshot",
+            )
+        observed_at = discovery.observed_at
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=UTC)
+        age_seconds = max(0, int((self._now() - observed_at).total_seconds()))
+        if age_seconds > self._policy.snapshot_max_age_seconds:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.SNAPSHOT_STALE,
+                f"the AERO/USDC pool snapshot is {age_seconds} seconds old, above the "
+                f"{self._policy.snapshot_max_age_seconds}-second staleness bound; re-run "
+                "discovery for a fresh snapshot",
+            )
+        # The deepest pool by USDC reserve wins, ties broken by address, so
+        # the choice is deterministic and best for execution quality.
+        pool = max(
+            matching,
+            key=lambda candidate: (
+                candidate.reserve1
+                if candidate.token0_address.lower() == normalized_usdc
+                else candidate.reserve0,
+                int(candidate.pool_address, 16),
+            ),
+        )
+        caps.append("AERO reward token on the protocol's own Slipstream USDC pair")
+        caps.append(f"pool {pool.pool_address} from live Sugar discovery")
+        caps.append(f"snapshot fresher than {self._policy.snapshot_max_age_seconds} seconds")
+        return (
+            LpAeroPoolObservation(
+                pool_address=pool.pool_address,
+                factory_address=pool.factory_address,
+                tick_spacing=pool.tick_spacing,
+                current_tick=pool.current_tick,
+                sqrt_ratio=pool.sqrt_ratio,
+                aero_is_token0=pool.token0_address.lower() == normalized_aero,
+                snapshot_block=discovery.snapshot_block,
+                observed_at=observed_at,
+            ),
+            caps,
+        )
+
+    def _build_aero_swap_attempt(
+        self,
+        key_bytes: bytes,
+        ephemeral_key: bool,
+        mode: ExecutionMode = ExecutionMode.DRY_RUN,
+    ) -> tuple[LpAeroSwapDryRunReport, tuple[_BuiltLpStep, ...]]:
+        """Build, sign, validate, and estimate the complete reward conversion."""
+        build_started = self._timer()
+        observation, caps = self._resolve_aero_pool()
+        balance_units = self._rpc.fetch_token_balance(AERO_TOKEN_ADDRESS, self._safe_address)
+        if balance_units <= 0:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.AERO_BALANCE_ZERO,
+                "the Safe holds no AERO balance to convert back to USDC; there is "
+                "nothing to reward-swap",
+            )
+        allowance_units = self._rpc.fetch_erc20_allowance(
+            AERO_TOKEN_ADDRESS, self._safe_address, self._policy.router_address
+        )
+        price = observation.price_usdc_per_aero
+        with localcontext() as context:
+            context.prec = 50
+            expected_out_units = int(
+                (
+                    Decimal(balance_units).scaleb(-AERO_DECIMALS)
+                    * price
+                    * Decimal(10) ** QUOTE_TOKEN_DECIMALS
+                ).to_integral_value(ROUND_FLOOR)
+            )
+        tolerance = DEFAULT_MINT_SLIPPAGE_TOLERANCE
+        amount_out_min_units = int(
+            (Decimal(expected_out_units) * (Decimal(1) - tolerance)).to_integral_value(ROUND_FLOOR)
+        )
+        per_pool_cap_units = usdc_units(MAX_POSITION_USDC_PER_POOL)
+        if expected_out_units > per_pool_cap_units:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.AERO_OUTPUT_ABOVE_POOL_CAP,
+                f"the reward conversion's quoted output {expected_out_units} raw USDC "
+                f"exceeds the {MAX_POSITION_USDC_PER_POOL} USDC per-pool cap "
+                f"({per_pool_cap_units} raw units); an out-of-band reward pile is "
+                "moved manually, never through the capped surface",
+            )
+        if amount_out_min_units <= 0:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.AERO_BALANCE_ZERO,
+                f"the Safe's {balance_units} raw AERO balance quotes to a zero USDC "
+                "minimum at the snapshot price; the dust is not worth a swap",
+            )
+        caps.append(
+            f"conversion output at or below the {MAX_POSITION_USDC_PER_POOL} USDC per-pool cap"
+        )
+        caps.append(f"conversion minimum floored at the {tolerance} slippage tolerance")
+        gas_price, safe_eth, live_nonce = self._preflight(caps)
+        deadline = int(self._now().timestamp()) + LP_DEADLINE_SECONDS
+        steps: list[_LpStepSpec] = []
+        if allowance_units < balance_units:
+            steps.append(
+                _LpStepSpec(
+                    role=LpExecutionRole.AERO_ROUTER_ALLOWANCE,
+                    to_address=AERO_TOKEN_ADDRESS,
+                    inner_calldata=build_approval_calldata(
+                        self._policy.router_address, balance_units
+                    ),
+                    description=(
+                        f"approve exactly {balance_units} raw AERO to the whitelisted "
+                        "router for the conversion pull"
+                    ),
+                )
+            )
+        steps.append(
+            _LpStepSpec(
+                role=LpExecutionRole.AERO_SWAP,
+                to_address=self._policy.router_address,
+                inner_calldata=build_swap_calldata(
+                    self._safe_address,
+                    balance_units,
+                    amount_out_min_units,
+                    build_swap_path(
+                        AERO_TOKEN_ADDRESS, BASE_USDC_ADDRESS, observation.tick_spacing
+                    ),
+                    deadline,
+                ),
+                description=(
+                    f"swap the entire {balance_units} raw AERO balance for at least "
+                    f"{amount_out_min_units} raw USDC (quoted {expected_out_units})"
+                ),
+            )
+        )
+        self._record_aero_swap_plan(
+            mode,
+            observation,
+            balance_units,
+            price,
+            expected_out_units,
+            amount_out_min_units,
+            allowance_units,
+        )
+        built_steps = self._build_steps(steps, live_nonce, key_bytes, "aero_swap", mode)
+        report = LpAeroSwapDryRunReport(
+            pool_address=observation.pool_address,
+            router_address=self._policy.router_address,
+            aero_token_address=AERO_TOKEN_ADDRESS,
+            snapshot_block=observation.snapshot_block,
+            price_usdc_per_aero=price,
+            aero_balance_units=balance_units,
+            amount_in_units=balance_units,
+            expected_out_units=expected_out_units,
+            amount_out_min_units=amount_out_min_units,
+            router_aero_allowance_units=allowance_units,
+            safe_address=self._safe_address,
+            relayer_address=normalize_evm_address(Account.from_key(key_bytes).address),
+            ephemeral_key=ephemeral_key,
+            gas_price_wei=gas_price,
+            safe_eth_wei=safe_eth,
+            transactions=tuple(step.report for step in built_steps),
+            caps_enforced=tuple(caps),
+            build_duration_ms=self._milliseconds_since(build_started),
+            diagnostics=(
+                (
+                    f"selling the Safe's entire {balance_units} raw AERO balance at the "
+                    f"snapshot price {price} USDC per AERO on the venue's own Slipstream "
+                    "AERO/USDC pool"
+                ),
+                (
+                    f"quoted {expected_out_units} raw USDC with a {amount_out_min_units} "
+                    f"raw minimum at the {tolerance} tolerance"
+                ),
+            ),
+        )
+        return report, built_steps
+
+    def dry_run_aero_swap(
+        self,
+        key_bytes: bytes,
+        ephemeral_key: bool = False,
+    ) -> LpAeroSwapDryRunReport:
+        """Fully build and validate one reward conversion without broadcasting.
+
+        Args:
+            key_bytes: Exactly 32 raw signing-key bytes used for this build.
+            ephemeral_key: Whether the key was generated for this dry run.
+
+        Returns:
+            The complete dry-run report; nothing was broadcast.
+
+        Raises:
+            LpExecutionRefusalError: If any execution-layer gate refuses.
+        """
+        try:
+            report, _ = self._build_aero_swap_attempt(key_bytes, ephemeral_key)
+            return report
+        except LpExecutionRefusalError as error:
+            self._record_refusal("aero_swap", ExecutionMode.DRY_RUN, error, "AERO")
+            raise
+
+    def execute_aero_swap(
+        self,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Build and broadcast one reward conversion step by step.
+
+        Args:
+            key_bytes: Exactly 32 raw signing-key bytes used for this attempt.
+            confirm_broadcast: The explicit operator confirmation.
+            ephemeral_key: Whether the key was generated for this attempt.
+
+        Returns:
+            The complete execution report with every broadcast step.
+
+        Raises:
+            LpExecutionRefusalError: If any gate, preflight, or per-step check
+                refuses.
+        """
+        if not confirm_broadcast:
+            error = LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING,
+                "the execute command refuses to broadcast without the explicit "
+                "--confirm-broadcast flag; rerun with it to broadcast the built "
+                "sequence",
+            )
+            self._record_refusal("aero_swap", ExecutionMode.EXECUTE, error, "AERO")
+            raise error
+        try:
+            build, steps = self._build_aero_swap_attempt(
+                key_bytes, ephemeral_key, ExecutionMode.EXECUTE
+            )
+            step_reports, halted_reason = self._execute_steps("aero_swap", steps, key_bytes)
+        except LpExecutionRefusalError as error:
+            self._record_refusal("aero_swap", ExecutionMode.EXECUTE, error, "AERO")
+            raise
+        return LpActionExecutionReport(
+            action="aero_swap",
             build=build,
             steps=step_reports,
             completed=halted_reason == "",
@@ -3713,6 +4217,78 @@ class LpLifecycleExecutor:
             build_duration_ms=self._milliseconds_since(build_started),
         )
 
+    def _read_computed_fee_growth(
+        self, observation: LpPoolObservation, position: LpPositionView
+    ) -> tuple[int | None, int | None, str]:
+        """Read the range's live inside fee growth from the pool's own views.
+
+        The measurement is the standard concentrated-liquidity identity over
+        the pool's live state: ``feeGrowthGlobal0/1X128()`` and both range
+        boundaries' ``ticks(int24)`` outside words, combined with the current
+        tick by the v3 inside formula, all read as one consecutive burst of
+        read-only calls. Any failed read leaves the computed measurement
+        absent rather than guessing - the checkpointed lower bound stays the
+        fallback.
+
+        Args:
+            observation: The block-pinned pool observation naming the pool.
+            position: The decoded twelve-word position view with the range.
+
+        Returns:
+            The inside growth words for token zero and token one (or None
+            pairs on a failed read) and the method diagnostic naming how the
+            numbers were computed.
+        """
+        method = (
+            "computed fees: liquidity times the delta of feeGrowthInside, itself "
+            "feeGrowthGlobal minus the range boundaries' feeGrowthOutside words "
+            "at the read block (the v3 identity); pre-share pool-side "
+            "entitlement - any protocol share applies at collect"
+        )
+        pool = observation.pool_address
+        try:
+            _, tick_current = decode_pool_slot0_view(
+                self._rpc.eth_call(pool, build_pool_slot0_read_calldata())
+            )
+            global0 = self._read_word(
+                pool, build_pool_fee_growth_global_read_calldata(0), "feeGrowthGlobal0X128()"
+            )
+            global1 = self._read_word(
+                pool, build_pool_fee_growth_global_read_calldata(1), "feeGrowthGlobal1X128()"
+            )
+            _, _, outside_lower0, outside_lower1 = decode_pool_ticks_view_result(
+                self._rpc.eth_call(pool, build_pool_ticks_read_calldata(position.tick_lower))
+            )
+            _, _, outside_upper0, outside_upper1 = decode_pool_ticks_view_result(
+                self._rpc.eth_call(pool, build_pool_ticks_read_calldata(position.tick_upper))
+            )
+        except (ExecutorRpcRevertError, ExecutionUnavailableError, ValueError) as error:
+            return (
+                None,
+                None,
+                (
+                    f"computed fees unavailable: the pool fee-growth reads failed ({error}); "
+                    "the checkpointed claimable stays the reported lower bound"
+                ),
+            )
+        inside0 = fee_growth_inside(
+            global0,
+            tick_current,
+            position.tick_lower,
+            position.tick_upper,
+            outside_lower0,
+            outside_upper0,
+        )
+        inside1 = fee_growth_inside(
+            global1,
+            tick_current,
+            position.tick_lower,
+            position.tick_upper,
+            outside_lower1,
+            outside_upper1,
+        )
+        return inside0, inside1, method
+
     def _position_status(
         self,
         symbol: str,
@@ -3752,6 +4328,39 @@ class LpLifecycleExecutor:
         fees_owed_usdc = +(
             Decimal(position.tokens_owed0_units) * token0_scale * token0_price
             + Decimal(position.tokens_owed1_units) * token1_scale * token1_price
+        )
+        # The computed fee measurement supersedes the checkpointed lower
+        # bound: the pool's own fee-growth accumulators price the accrual the
+        # checkpoint has not refreshed yet (the captain's 2026-09-27
+        # correction - the flat claimable readings were a measurement
+        # artifact, not zero fees).
+        inside0, inside1, fee_method_diagnostic = self._read_computed_fee_growth(
+            observation, position
+        )
+        fees_since_checkpoint0_units = (
+            fees_earned_from_growth(
+                position.liquidity, inside0 - position.fee_growth_inside0_last_x128
+            )
+            if inside0 is not None
+            else None
+        )
+        fees_since_checkpoint1_units = (
+            fees_earned_from_growth(
+                position.liquidity, inside1 - position.fee_growth_inside1_last_x128
+            )
+            if inside1 is not None
+            else None
+        )
+        fees_since_checkpoint_usdc: Decimal | None = None
+        if fees_since_checkpoint0_units is not None and fees_since_checkpoint1_units is not None:
+            fees_since_checkpoint_usdc = +(
+                Decimal(fees_since_checkpoint0_units) * token0_scale * token0_price
+                + Decimal(fees_since_checkpoint1_units) * token1_scale * token1_price
+            )
+        claimable_fees_computed_usdc = (
+            +(fees_owed_usdc + fees_since_checkpoint_usdc)
+            if fees_since_checkpoint_usdc is not None
+            else None
         )
         accrued_earned: int | None = None
         accrued_checkpoint: int | None = None
@@ -3804,6 +4413,14 @@ class LpLifecycleExecutor:
             f"{position.tokens_owed1_units} raw units worth {fees_owed_usdc} USDC claimable "
             "now; a lower bound the pool refreshes on position modifications"
         )
+        if claimable_fees_computed_usdc is not None:
+            diagnostics.append(
+                f"computed fees earned since the last checkpoint "
+                f"{fees_since_checkpoint_usdc} USDC, so a max-uint128 collect would "
+                f"sweep about {claimable_fees_computed_usdc} USDC ({fee_method_diagnostic})"
+            )
+        else:
+            diagnostics.append(fee_method_diagnostic)
         caps = list(context.caps)
         caps.append("read-only observation; nothing was built or signed")
         self._record_status(
@@ -3834,6 +4451,13 @@ class LpLifecycleExecutor:
             fees_owed0_units=position.tokens_owed0_units,
             fees_owed1_units=position.tokens_owed1_units,
             fees_owed_usdc=fees_owed_usdc,
+            fee_growth_inside0_x128=inside0,
+            fee_growth_inside1_x128=inside1,
+            fees_earned_since_checkpoint0_units=fees_since_checkpoint0_units,
+            fees_earned_since_checkpoint1_units=fees_since_checkpoint1_units,
+            fees_earned_since_checkpoint_usdc=fees_since_checkpoint_usdc,
+            claimable_fees_computed_usdc=claimable_fees_computed_usdc,
+            fee_method_diagnostic=fee_method_diagnostic,
             accrued_aero_earned_units=accrued_earned,
             accrued_aero_checkpoint_units=accrued_checkpoint,
             penalty=penalty,
@@ -5533,6 +6157,35 @@ class LpLifecycleExecutor:
             self._now(),
         )
 
+    def _record_aero_swap_plan(
+        self,
+        mode: ExecutionMode,
+        observation: LpAeroPoolObservation,
+        balance_units: int,
+        price: Decimal,
+        expected_out_units: int,
+        amount_out_min_units: int,
+        allowance_units: int,
+    ) -> None:
+        """Append the reward-conversion plan audit event when a sink exists."""
+        if self._audit_sink is None:
+            return
+        self._audit_sink.append(
+            AuditEventType.LP_AERO_SWAP_PLANNED,
+            LpAeroSwapPlannedPayload(
+                mode=mode,
+                pool_address=observation.pool_address,
+                router_address=self._policy.router_address,
+                snapshot_block=observation.snapshot_block,
+                aero_balance_units=balance_units,
+                price_usdc_per_aero=str(price),
+                expected_out_units=expected_out_units,
+                amount_out_min_units=amount_out_min_units,
+                router_aero_allowance_units=allowance_units,
+            ),
+            self._now(),
+        )
+
     def _record_stake_plan(
         self,
         mode: ExecutionMode,
@@ -6014,6 +6667,24 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
             "report rejection."
         ),
     )
+    dry_run_aero_swap_parser = dry_run_subparsers.add_parser(
+        "aero-swap",
+        help=("Build and validate the AERO-to-USDC reward conversion; nothing is broadcast."),
+    )
+    dry_run_aero_swap_parser.add_argument(
+        "--ephemeral-key",
+        action="store_true",
+        help=(
+            "Sign the dry run with a freshly generated throwaway key instead of "
+            "the configured signing-key source; the signature check will honestly "
+            "report rejection."
+        ),
+    )
+    dry_run_aero_swap_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the complete report as JSON instead of a summary.",
+    )
     execute_parser = subparsers.add_parser(
         "execute",
         help=(
@@ -6058,6 +6729,30 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
             "Explicit operator confirmation to broadcast; without it the "
             "command refuses before building anything."
         ),
+    )
+    execute_aero_swap_parser = execute_subparsers.add_parser(
+        "aero-swap", help="Build and broadcast the AERO-to-USDC reward conversion."
+    )
+    execute_aero_swap_parser.add_argument(
+        "--ephemeral-key",
+        action="store_true",
+        help=(
+            "Sign with a freshly generated throwaway key; the live signature "
+            "check will honestly reject it before anything broadcasts."
+        ),
+    )
+    execute_aero_swap_parser.add_argument(
+        "--confirm-broadcast",
+        action="store_true",
+        help=(
+            "Explicit operator confirmation to broadcast; without it the "
+            "command refuses before building anything."
+        ),
+    )
+    execute_aero_swap_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the complete report as JSON instead of a summary.",
     )
     for lifecycle_parser in (
         execute_mint_parser,
@@ -6122,6 +6817,36 @@ def build_lp_argument_parser() -> argparse.ArgumentParser:
         help="Optional entry cost basis in USDC for the unrealized P&L.",
     )
     return parser
+
+
+def _print_aero_swap_dry_run(report: LpAeroSwapDryRunReport) -> None:
+    """Print one AERO reward-conversion dry-run report's human summary.
+
+    Args:
+        report: The dry-run report being printed.
+    """
+    key_note = "ephemeral" if report.ephemeral_key else "configured source"
+    print(
+        f"AERO/USDC pool {report.pool_address} at block {report.snapshot_block}, "
+        f"token {report.aero_token_address}"
+    )
+    print(
+        f"selling the entire {report.aero_balance_units} raw AERO balance at "
+        f"{report.price_usdc_per_aero} USDC per AERO: quoted "
+        f"{report.expected_out_units} raw USDC, minimum {report.amount_out_min_units}"
+    )
+    print(
+        f"safe {report.safe_address}, relayer {report.relayer_address} ({key_note} key, "
+        "nothing broadcast)"
+    )
+    print(f"gas price {report.gas_price_wei} wei, Safe ETH {report.safe_eth_wei} wei")
+    for cap in report.caps_enforced:
+        print(f"  - {cap}")
+    for transaction in report.transactions:
+        print(
+            f"[{transaction.role}] safeTxHash {transaction.safe_tx_hash} "
+            f"(nonce {transaction.nonce})"
+        )
 
 
 def _print_execution_report(report: LpActionExecutionReport) -> None:
@@ -6681,6 +7406,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 _print_exit_swap_dry_run(exit_swap_report)
             return EXIT_OK
+        if arguments.command == "dry-run" and arguments.lifecycle == "aero-swap":
+            if arguments.ephemeral_key:
+                key_bytes = bytes(Account.create().key)
+                ephemeral = True
+            else:
+                key_bytes = load_signing_key_source().load_signing_key()
+                ephemeral = False
+            aero_swap_report = executor.dry_run_aero_swap(key_bytes, ephemeral_key=ephemeral)
+            if arguments.json:
+                print(aero_swap_report.model_dump_json(indent=2))
+            else:
+                _print_aero_swap_dry_run(aero_swap_report)
+            return EXIT_OK
         if arguments.command == "dry-run" and arguments.lifecycle == "recenter":
             if arguments.token_id < 0:
                 parser.error("--token-id must be non-negative")
@@ -6709,7 +7447,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if arguments.lifecycle == "mint":
                 if arguments.amount <= 0:
                     parser.error("--amount must be positive")
-            elif arguments.lifecycle == "exit-swap":
+            elif arguments.lifecycle in ("exit-swap", "aero-swap"):
                 pass
             else:
                 if arguments.token_id < 0:
@@ -6761,6 +7499,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         execution_report = executor.execute_collect(
                             arguments.symbol,
                             arguments.token_id,
+                            key_bytes,
+                            confirm_broadcast=arguments.confirm_broadcast,
+                            ephemeral_key=ephemeral,
+                        )
+                    elif arguments.lifecycle == "aero-swap":
+                        execution_report = executor.execute_aero_swap(
                             key_bytes,
                             confirm_broadcast=arguments.confirm_broadcast,
                             ephemeral_key=ephemeral,

@@ -76,6 +76,12 @@ GAUGE_MIN_STAKE_TIMES_SELECTOR = "e782453b"
 GAUGE_DEPOSIT_TIMESTAMP_SELECTOR = "4ede8c85"
 # keccak256("slot0()")[0:4], the pool's price-and-tick state view.
 POOL_SLOT0_READ_SELECTOR = "3850c7bd"
+# keccak256("feeGrowthGlobal0X128()")[0:4], the pool's token-zero fee accumulator.
+POOL_FEE_GROWTH_GLOBAL0_READ_SELECTOR = "f3058399"
+# keccak256("feeGrowthGlobal1X128()")[0:4], the pool's token-one fee accumulator.
+POOL_FEE_GROWTH_GLOBAL1_READ_SELECTOR = "46141319"
+# keccak256("ticks(int24)")[0:4], the pool's per-tick state mapping.
+POOL_TICKS_READ_SELECTOR = "f30dba93"
 # keccak256("liquidity()")[0:4], the pool's active in-range liquidity.
 POOL_LIQUIDITY_READ_SELECTOR = "1a686502"
 # keccak256("stakedLiquidity()")[0:4], the pool's gauge-staked liquidity.
@@ -669,6 +675,42 @@ def build_pool_slot0_read_calldata() -> str:
     return f"0x{POOL_SLOT0_READ_SELECTOR}"
 
 
+def build_pool_fee_growth_global_read_calldata(token_index: int) -> str:
+    """ABI-encode one of the pool's global fee-growth accumulator reads.
+
+    Args:
+        token_index: Zero for the token-zero accumulator, one for token-one.
+
+    Returns:
+        Complete 0x-prefixed calldata for the selected feeGrowthGlobal view.
+
+    Raises:
+        ValueError: If the token index is not zero or one.
+    """
+    if token_index == 0:
+        return f"0x{POOL_FEE_GROWTH_GLOBAL0_READ_SELECTOR}"
+    if token_index == 1:
+        return f"0x{POOL_FEE_GROWTH_GLOBAL1_READ_SELECTOR}"
+    raise ValueError("token_index must be zero or one")
+
+
+def build_pool_ticks_read_calldata(tick: int) -> str:
+    """ABI-encode the pool's per-tick state read for one boundary tick.
+
+    The Slipstream ``ticks(int24)`` mapping returns four words - the tick's
+    ``liquidityGross``, its signed ``liquidityNet``, and the tick's
+    ``feeGrowthOutside0X128``/``feeGrowthOutside1X128`` accumulators - which
+    the computed-fee measurement reads at both range boundaries.
+
+    Args:
+        tick: The signed range-boundary tick being read.
+
+    Returns:
+        Complete 0x-prefixed calldata for the ticks view.
+    """
+    return _selector_and_words(POOL_TICKS_READ_SELECTOR, _signed_word(tick))
+
+
 def build_pool_liquidity_read_calldata() -> str:
     """ABI-encode the pool's active in-range liquidity read.
 
@@ -921,6 +963,28 @@ def decode_pool_slot0_view(result: str) -> tuple[int, int]:
     if sqrt_ratio <= 0:
         raise ValueError("slot0 view sqrtPriceX96 must be positive")
     return sqrt_ratio, tick
+
+
+def decode_pool_ticks_view_result(result: str) -> tuple[int, int, int, int]:
+    """Decode one ticks(int24) return into its four raw words.
+
+    Args:
+        result: The 0x-prefixed hex return bytes of the ticks view.
+
+    Returns:
+        The tick's liquidityGross, its signed liquidityNet, and the tick's
+        feeGrowthOutside0X128 and feeGrowthOutside1X128 accumulators.
+
+    Raises:
+        ValueError: If the return is not 0x-prefixed hexadecimal of exactly
+            four whole ABI words.
+    """
+    words = _decode_view_words(result, "ticks view", 4)
+    liquidity_gross = words[0]
+    liquidity_net = int.from_bytes(
+        words[1].to_bytes(WORD_BYTES, "big", signed=False), "big", signed=True
+    )
+    return liquidity_gross, liquidity_net, words[2], words[3]
 
 
 def decode_address_view_result(result: str) -> str:

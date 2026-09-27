@@ -60,13 +60,17 @@ DEFAULT_SWAP_BUFFER_FRACTION = Decimal("0.001")
 QUOTE_TOKEN_DECIMALS = 6
 # One tick spacing per side is the tightest range the planner accepts.
 MIN_HALF_WIDTH_SPACINGS = 1
-# The hard pilot cap on one pool's committed position value, in USDC.
-# Raised from 50 to 100 USDC by the captain's calibration ruling (2026-09-07
-# ~23:45, reconfirmed 2026-09-08): one pool may now commit the whole pilot
-# envelope, while the fleet-wide total below stays 100 USDC.
-MAX_POSITION_USDC_PER_POOL = Decimal("100")
-# The hard pilot cap on the fleet's total committed value, in USDC.
-MAX_TOTAL_PILOT_EXPOSURE_USDC = Decimal("100")
+# The hard cap on one pool's committed position value, in USDC.
+# Raised from 100 to 1000 USDC by the captain's performance ruling
+# (2026-09-27): the measured in-range depth (~404k USDC on the AAPLc pool)
+# leaves the one-percent depth gate - the real protection - at roughly
+# 4k USDC per pool, so the old 100-USDC ceilings sat an order of magnitude
+# below what the venue supports; the depth gate, the sizing fraction, and
+# the gas gate are unchanged and remain the binding protections.
+MAX_POSITION_USDC_PER_POOL = Decimal("1000")
+# The hard cap on the fleet's total committed value, in USDC, raised by the
+# same 2026-09-27 ruling.
+MAX_TOTAL_PILOT_EXPOSURE_USDC = Decimal("1000")
 # A position may commit at most this fraction of the pool's in-range depth.
 MAX_POSITION_FRACTION_OF_POOL_DEPTH = Decimal("0.01")
 # The impact ceiling no balancing swap may reach, as a price-impact fraction.

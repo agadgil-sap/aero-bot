@@ -138,7 +138,7 @@ See [the teacher documentation](docs/teacher.md) for the digest classes, the pro
 
 ## Risk manager command
 
-The `aero-bot-risk-manager` command is the intelligence layer's separation-of-duties seat: a deterministic counterparty desk that replays the corpus's posture snapshots offline and verifies the capital-posture arithmetic (day P&L equal to equity minus the day-start anchor), the halt state (the five-percent latch line and its entry discipline), and exposure against the locked caps (the 100 USDC hard ceiling, the eighty-percent sizing fraction), recording every desk whose accepted brief stayed quiet over a flagged posture.
+The `aero-bot-risk-manager` command is the intelligence layer's separation-of-duties seat: a deterministic counterparty desk that replays the corpus's posture snapshots offline and verifies the capital-posture arithmetic (day P&L equal to equity minus the day-start anchor), the halt state (the five-percent latch line and its entry discipline), and exposure against the locked caps (the 1000 USDC hard ceiling, the eighty-percent sizing fraction), recording every desk whose accepted brief stayed quiet over a flagged posture.
 Its findings feed the upgrade loop's digest as a fourth evidence class, its report lands beside the corpus, and nothing it finds authorizes anything by itself.
 See [the risk-manager documentation](docs/risk-manager.md) for the finding kinds, the contradiction rule, the upgrade wiring, and the daily agent.
 

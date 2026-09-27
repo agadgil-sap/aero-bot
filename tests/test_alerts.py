@@ -37,7 +37,7 @@ from aero_bot.alerts import (
     evaluate_alerts,
     parse_alert_config,
 )
-from aero_bot.cycle import CycleActionRecord, CycleMode, CycleReport
+from aero_bot.cycle import CycleActionRecord, CycleMode, CycleReport, CycleYieldAttribution
 from aero_bot.cycle import CycleReconciliation as Reconciliation
 
 
@@ -645,6 +645,40 @@ class TestCycleWiring:
         subject, body = transport.sent[0]
         assert subject.startswith("[aero-bot] FIXc")
         assert "  gas spent:     0 wei" in body
+
+    def test_yield_attribution_and_peak_ride_the_email(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The day decomposition and running peak render in the outcome section."""
+        for key, value in SMTP_ENV.items():
+            monkeypatch.setenv(key, value)
+        report = calm_report().model_copy(
+            update={
+                "day_pnl_usdc": Decimal("2.5"),
+                "day_start_equity_usd": Decimal("10"),
+                "peak_equity_usd": Decimal("12"),
+                "unclaimed_aero_units": 8 * 10**18,
+                "unclaimed_aero_value_usdc": Decimal("4.8"),
+                "yield_attribution": CycleYieldAttribution(
+                    day_pnl_usdc=Decimal("2.5"),
+                    aero_rewards_usdc=Decimal("3"),
+                    fees_earned_usdc=Decimal("0.25"),
+                    stock_mark_to_market_usdc=Decimal("-0.5"),
+                    unattributed_usdc=Decimal("-0.25"),
+                    method=("the named methods",),
+                ),
+            }
+        )
+        subject, body = compose_cycle_email(report, ())
+        assert "day pnl:" in body
+        assert "running peak 12" in body
+        assert "unclaimed AERO:" in body
+        assert "4.8 USDC" in body
+        assert "yield attribution" in body
+        assert "aero rewards" in body
+        assert "fees (computed)" in body
+        assert "stock mark-to-mkt" in body
+        assert "unattributed" in body
 
 
 def test_quiet_instant_fixture_stays_aware() -> None:

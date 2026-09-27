@@ -2,6 +2,7 @@
 
 The `aero-bot-decide` command runs the complete policy engine - the same locked parameters, event calendar, and decision precedence the rehearsal replays - against one live observation assembled from the same discovery, corrected emissions-APR convention, and depth estimates every executor surface uses.
 It is decision-only by construction: nothing is built, signed, estimated for broadcast, or executed, and the run's single side effect is one `policy_decision` record on the audit chain.
+The strategy itself is yield duration ([docs/policy-engine.md](docs/policy-engine.md), the yield-duration thesis): real income is the boosted AERO emissions, a duration-based stream accruing per unit of time staked in range, so the engine maximizes time-in-range times the qualifying APR with range placement and pool selection as the optimization variables.
 
 ```
 uv run aero-bot-decide [--symbol AAPLc | auto] [--equity-usdc 200] [--reference-price 318.5 | SYM=PRICE,...] [--json]

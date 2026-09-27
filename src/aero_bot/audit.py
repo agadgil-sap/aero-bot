@@ -126,6 +126,8 @@ class AuditEventType(StrEnum):
     CCTP_DELIVERY_PREPARED = "cctp_delivery_prepared"
     # One exit swap converting the Safe's stock inventory back to USDC.
     LP_EXIT_SWAP_PLANNED = "lp_exit_swap_planned"
+    # One reward conversion swapping accumulated AERO emissions to USDC.
+    LP_AERO_SWAP_PLANNED = "lp_aero_swap_planned"
     # System state captures startup, migration, and diagnostic events without secrets.
     SYSTEM_STATE = "system_state"
     # One scheduled cycle's complete reconcile-decide-act summary.

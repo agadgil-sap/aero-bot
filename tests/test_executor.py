@@ -225,6 +225,11 @@ class FakeSources:
         """Return the configured discovery result."""
         return self._discovery
 
+    def discover_reward_token_pools(self) -> PoolDiscoveryResult:
+        """Return one empty AERO/USDC discovery result for the protocol."""
+        fixture = make_discovery(())
+        return fixture.model_copy(update={"diagnostics": ("fixture reward discovery",)})
+
     def read_token_decimals(self, token_address: str) -> int:
         """Return the configured decimal count for one token."""
         return self._decimals[token_address.lower()]

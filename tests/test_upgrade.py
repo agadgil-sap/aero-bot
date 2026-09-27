@@ -1127,7 +1127,7 @@ class TestPostureWiring:
                 equity="120.0",
                 day_start="100.0",
                 day_pnl="-10.0",
-                committed="120.0",
+                committed="1200.0",
                 action="enter",
             ),
             student=student_payload(brief=brief_with(())),

@@ -54,6 +54,8 @@ from aero_bot.lp_executor import (
     LpLifecycleExecutor,
     LpMintDryRunReport,
     LpSafeExecutionPolicy,
+    fee_growth_inside,
+    fees_earned_from_growth,
     main,
 )
 from aero_bot.lp_pins import LpPoolPin, LpPoolPinStore
@@ -140,6 +142,12 @@ PENALTY_RATE_BPS = 10_000
 FIXTURE_AERO_PRICE_USDC = Decimal("1")
 # The scripted canonical USDC/AERO pair: 1 AERO priced at the fixture price.
 AERO_POOL_ADDRESS = "0x" + "ee" * 20
+# The fixture Slipstream AERO/USDC pool the reward conversion routes through,
+# distinct from the classic pricing pair above.
+AERO_SLIPSTREAM_POOL_ADDRESS = "0x" + "ef" * 20
+# The fixture AERO/USDC pool prices one whole AERO at exactly 0.5 USDC: the
+# squared raw ratio is 2e12, and AERO carries twelve more decimals than USDC.
+AERO_POOL_SQRT_RATIO = int((Decimal(2).sqrt() * Decimal(10) ** 6 * (1 << 96)).to_integral_value())
 
 
 def word_hex(value: int) -> str:
@@ -283,6 +291,39 @@ def make_registry(
     )
 
 
+def make_aero_discovery(
+    pools: tuple[PoolCandidate, ...] | None = None,
+) -> PoolDiscoveryResult:
+    """Build one AERO/USDC discovery result for the reward conversion.
+
+    Args:
+        pools: Pool candidates carried by the result; None serves one
+            default AERO/native-USDC Slipstream candidate.
+
+    Returns:
+        A validated discovery result over the reward-token pair.
+    """
+    default = make_candidate(
+        pool_address=AERO_SLIPSTREAM_POOL_ADDRESS,
+        token0_address=BASE_USDC_ADDRESS,
+        token1_address=AERO_TOKEN_ADDRESS,
+        sqrt_ratio=AERO_POOL_SQRT_RATIO,
+        reserve1=500_000 * 10**18,
+        emissions_per_second=0,
+        emissions_token_address=None,
+        gauge_alive=False,
+    )
+    return PoolDiscoveryResult(
+        venue=VenueId.AERODROME,
+        status=PoolDiscoveryStatus.VERIFIED,
+        source="lp-sugar:fixture-aero@block:123",
+        observed_at=BASE_NOW,
+        snapshot_block=123,
+        pools=pools if pools is not None else (default,),
+        diagnostics=("fixture aero summary",),
+    )
+
+
 class FakeSources:
     """Serve the registry, discovery, and decimals one LP run consumes."""
 
@@ -291,6 +332,7 @@ class FakeSources:
         registry: B20RegistryResult | None = None,
         discovery: PoolDiscoveryResult | None = None,
         decimals: dict[str, int] | None = None,
+        reward_discovery: PoolDiscoveryResult | None = None,
     ) -> None:
         """Configure the served sources with verified defaults.
 
@@ -298,9 +340,15 @@ class FakeSources:
             registry: Registry result served to every load_registry call.
             discovery: Discovery result served to every discover_pools call.
             decimals: Decimal counts served per token address.
+            reward_discovery: Discovery result served to every
+                discover_reward_token_pools call; None serves a default
+                AERO/USDC slipstream pair.
         """
         self._registry = registry if registry is not None else make_registry()
         self._discovery = discovery if discovery is not None else make_discovery()
+        self._reward_discovery = (
+            reward_discovery if reward_discovery is not None else make_aero_discovery()
+        )
         self._decimals = decimals if decimals is not None else {B20_ADDRESS: STOCK_DECIMALS}
         # Counting serves proves the fast path never enumerates.
         self.discover_calls = 0
@@ -313,6 +361,10 @@ class FakeSources:
         """Return the configured discovery result, counting every call."""
         self.discover_calls += 1
         return self._discovery
+
+    def discover_reward_token_pools(self) -> PoolDiscoveryResult:
+        """Return the configured AERO/USDC discovery result."""
+        return self._reward_discovery
 
     def read_token_decimals(self, token_address: str) -> int:
         """Return the configured decimal count for one token."""
@@ -375,6 +427,13 @@ class LpRpcScript:
         fast_reward_rate_units: int = 4_494_371_922_759_724,
         fast_token1_address: str | None = None,
         fast_views_revert: bool = False,
+        aero_balance_units: int = 0,
+        aero_router_allowance_units: int = 0,
+        fee_growth_global0_x128: int = 1 << 128,
+        fee_growth_global1_x128: int = 1 << 128,
+        fee_growth_outside0_x128: int = 0,
+        fee_growth_outside1_x128: int = 0,
+        fee_growth_reads_revert: bool = False,
         aero_price_usdc: Decimal | None = Decimal("0.5"),
         post_swap_stock_balance_units: int | None = None,
         post_swap_usdc_balance_units: int | None = None,
@@ -463,6 +522,17 @@ class LpRpcScript:
                 to script a stale pin's identity mismatch.
             fast_views_revert: Every fast-path pool view reverts, scripting an
                 unreadable known pool.
+            aero_balance_units: The Safe's AERO balanceOf answer backing the
+                reward-conversion surface.
+            aero_router_allowance_units: Standing AERO allowance for the
+                router, backing the conversion's approval skip.
+            fee_growth_global0_x128: The pool's token-zero fee-growth
+                accumulator answer for the computed-fee measurement.
+            fee_growth_global1_x128: The token-one accumulator answer.
+            fee_growth_outside0_x128: Every tick's token-zero outside word.
+            fee_growth_outside1_x128: Every tick's token-one outside word.
+            fee_growth_reads_revert: The fee-growth views revert, so the
+                computed measurement fails open to the checkpoint.
             aero_price_usdc: Live USDC/AERO price served to the price read;
                 None makes that read revert so the fail-closed path tests.
             post_swap_stock_balance_units: Optional stock balance applied after
@@ -524,6 +594,13 @@ class LpRpcScript:
         self.fast_reward_rate_units = fast_reward_rate_units
         self.fast_token1_address = fast_token1_address
         self.fast_views_revert = fast_views_revert
+        self.aero_balance_units = aero_balance_units
+        self.aero_router_allowance_units = aero_router_allowance_units
+        self.fee_growth_global0_x128 = fee_growth_global0_x128
+        self.fee_growth_global1_x128 = fee_growth_global1_x128
+        self.fee_growth_outside0_x128 = fee_growth_outside0_x128
+        self.fee_growth_outside1_x128 = fee_growth_outside1_x128
+        self.fee_growth_reads_revert = fee_growth_reads_revert
         self.aero_price_usdc = aero_price_usdc
         self.post_swap_stock_balance_units = post_swap_stock_balance_units
         self.post_swap_usdc_balance_units = post_swap_usdc_balance_units
@@ -627,6 +704,8 @@ class LpRpcScript:
                 and data.startswith(f"0x{ERC20_ALLOWANCE_SELECTOR}")
             ):
                 return word_hex(self.stock_router_allowance_units)
+            elif to_address == AERO_TOKEN_ADDRESS.lower() and spender == AERODROME_ROUTER_ADDRESS:
+                return word_hex(self.aero_router_allowance_units)
             raise AssertionError(f"unexpected allowance read to {to_address} for {spender}")
         if data.startswith(f"0x{ERC20_BALANCE_OF_SELECTOR}"):
             if to_address == usdc_token:
@@ -636,6 +715,8 @@ class LpRpcScript:
                 return word_hex(self.usdc_balance_units)
             if to_address == B20_ADDRESS:
                 return word_hex(self.stock_balance_units)
+            if to_address == AERO_TOKEN_ADDRESS.lower():
+                return word_hex(self.aero_balance_units)
             if to_address == NFPM_ADDRESS:
                 if self.nfpm_balance_hex is not None:
                     return self.nfpm_balance_hex
@@ -716,6 +797,20 @@ class LpRpcScript:
             return word_hex(self.fast_active_liquidity)
         if data.startswith("0x3ab04b20"):
             return word_hex(self.fast_staked_liquidity)
+        if self.fee_growth_reads_revert:
+            raise _ScriptedRevertError("fee growth views unavailable")
+        if data.startswith("0xf3058399"):
+            return word_hex(self.fee_growth_global0_x128)
+        if data.startswith("0x46141319"):
+            return word_hex(self.fee_growth_global1_x128)
+        if data.startswith("0xf30dba93"):
+            return (
+                "0x"
+                + word_hex(1)[2:]
+                + word_hex(0)[2:]
+                + word_hex(self.fee_growth_outside0_x128)[2:]
+                + word_hex(self.fee_growth_outside1_x128)[2:]
+            )
         raise AssertionError(f"unexpected pool view payload {data[:10]}")
 
     def _require_penalty_reads(self) -> None:
@@ -1294,7 +1389,7 @@ def test_known_pool_enforces_every_planner_cap(tmp_path: Path) -> None:
 
     over_budget, _, _ = make_lp_executor(pool_pin_store=store)
     with pytest.raises(LpPlanRefusalError) as pool_cap:
-        over_budget.plan_mint("FIXc", Decimal("100.01"), MINT_WIDTH_SPACINGS)
+        over_budget.plan_mint("FIXc", Decimal("1000.01"), MINT_WIDTH_SPACINGS)
     assert pool_cap.value.code.value == "budget_above_pool_cap"
 
     shallow_pool, _, _ = make_lp_executor(
@@ -1531,6 +1626,154 @@ def test_exit_swap_refuses_output_above_the_per_pool_cap() -> None:
     assert raised.value.code is LpExecutionRefusalCode.EXIT_OUTPUT_ABOVE_POOL_CAP
 
 
+def test_aero_swap_dry_run_builds_approval_and_conversion() -> None:
+    """The reward conversion sells the entire AERO balance through the router."""
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            aero_balance_units=20 * 10**18,
+            aero_router_allowance_units=0,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+    )
+
+    report = executor.dry_run_aero_swap(bytes(Account.create().key))
+
+    assert report.pool_address == AERO_SLIPSTREAM_POOL_ADDRESS
+    assert report.snapshot_block == 123
+    assert report.aero_balance_units == 20 * 10**18
+    price = price_usdc_per_stock(AERO_POOL_SQRT_RATIO, False, 18, 6)
+    assert report.price_usdc_per_aero == price
+    expected_out = int(
+        (Decimal(20 * 10**18).scaleb(-18) * price * Decimal(10) ** 6).to_integral_value(ROUND_FLOOR)
+    )
+    assert report.expected_out_units == expected_out
+    assert report.amount_out_min_units == int(Decimal(expected_out) * Decimal("0.99"))
+    assert [transaction.role for transaction in report.transactions] == [
+        LpExecutionRole.AERO_ROUTER_ALLOWANCE,
+        LpExecutionRole.AERO_SWAP,
+    ]
+    inner_calls = [decode_inner(calldata) for calldata in rpc_script.estimate_requests]
+    assert "0x" + inner_calls[0].hex() == build_approval_calldata(
+        AERODROME_ROUTER_ADDRESS, 20 * 10**18
+    )
+    commands, inputs, deadline = decode(["bytes", "bytes[]", "uint256"], inner_calls[1][4:])
+    recipient, amount_in, minimum, path, _, _ = decode(
+        ["address", "uint256", "uint256", "bytes", "bool", "uint256"], inputs[0]
+    )
+    assert commands == b"\x00"
+    assert deadline == fixture_deadline()
+    assert recipient == SAFE_ADDRESS
+    assert amount_in == 20 * 10**18
+    assert minimum == int(Decimal(expected_out) * Decimal("0.99"))
+    assert path == bytes.fromhex(
+        build_swap_path(AERO_TOKEN_ADDRESS, BASE_USDC_ADDRESS, LP_TICK_SPACING)[2:]
+    )
+
+
+def test_aero_swap_skips_approval_when_allowance_suffices() -> None:
+    """A sufficient standing AERO allowance collapses to the bare swap."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            aero_balance_units=20 * 10**18,
+            aero_router_allowance_units=100 * 10**18,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 2),
+    )
+
+    report = executor.dry_run_aero_swap(bytes(Account.create().key))
+
+    assert [transaction.role for transaction in report.transactions] == [LpExecutionRole.AERO_SWAP]
+    assert report.router_aero_allowance_units == 100 * 10**18
+
+
+def test_aero_swap_refuses_when_no_pool_was_discovered() -> None:
+    """A discovery result without the AERO/USDC pair refuses with its code."""
+    executor, _, _ = make_lp_executor(
+        sources=FakeSources(reward_discovery=make_aero_discovery(pools=()))
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_aero_swap(bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.AERO_POOL_NOT_DISCOVERED
+
+
+def test_aero_swap_refuses_a_zero_aero_balance() -> None:
+    """Nothing to convert refuses before any preflight or build."""
+    executor, _, _ = make_lp_executor(rpc_script=LpRpcScript(aero_balance_units=0))
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_aero_swap(bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.AERO_BALANCE_ZERO
+
+
+def test_aero_swap_refuses_output_above_the_per_pool_cap() -> None:
+    """An out-of-band reward pile quoting past the per-pool cap refuses."""
+    # The fixture pool prices one AERO at exactly 0.5 USDC, so 2500 whole
+    # AERO quotes to 1250 USDC, past the 1000 USDC per-pool cap.
+    executor, _, _ = make_lp_executor(rpc_script=LpRpcScript(aero_balance_units=2500 * 10**18))
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_aero_swap(bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.AERO_OUTPUT_ABOVE_POOL_CAP
+
+
+def test_execute_aero_swap_broadcasts_both_steps(tmp_path: Path) -> None:
+    """A confirmed reward conversion broadcasts approval then swap, audited."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=LpRpcScript(
+            aero_balance_units=20 * 10**18,
+            aero_router_allowance_units=0,
+            allow_broadcasts=True,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 4),
+    )
+
+    report = executor.execute_aero_swap(bytes(Account.create().key), confirm_broadcast=True)
+
+    assert report.completed is True
+    assert [step.role for step in report.steps] == [
+        LpExecutionRole.AERO_ROUTER_ALLOWANCE,
+        LpExecutionRole.AERO_SWAP,
+    ]
+    assert [step.nonce for step in report.steps] == [4, 5]
+    assert len(rpc_script.broadcasts) == 2
+    records = AuditStore(audit_path).read_records(100)
+    assert [record.event_type for record in records] == [
+        AuditEventType.LP_AERO_SWAP_PLANNED,
+        AuditEventType.LP_TRANSACTION_BUILT,
+        AuditEventType.LP_TRANSACTION_BUILT,
+        AuditEventType.LP_EXECUTE_SENT,
+        AuditEventType.LP_EXECUTE_CONFIRMED,
+        AuditEventType.LP_EXECUTE_SENT,
+        AuditEventType.LP_EXECUTE_CONFIRMED,
+    ]
+    planned = json.loads(records[0].payload_json)
+    assert planned["pool_address"] == AERO_SLIPSTREAM_POOL_ADDRESS
+    assert planned["aero_balance_units"] == 20 * 10**18
+
+
+def test_execute_aero_swap_refuses_without_confirmation(tmp_path: Path) -> None:
+    """The reward conversion refuses to broadcast without the explicit flag."""
+    audit_path = tmp_path / "audit.sqlite3"
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=audit_path,
+        rpc_script=LpRpcScript(aero_balance_units=20 * 10**18),
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.execute_aero_swap(bytes(Account.create().key), confirm_broadcast=False)
+
+    assert raised.value.code is LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING
+    records = AuditStore(audit_path).read_records(100)
+    assert [record.event_type for record in records] == [AuditEventType.LP_REFUSED]
+    assert rpc_script.broadcasts == []
+
+
 def test_execute_exit_swap_broadcasts_both_steps(tmp_path: Path) -> None:
     """A confirmed exit swap broadcasts approval then swap, audited."""
     audit_path = tmp_path / "audit.sqlite3"
@@ -1661,7 +1904,7 @@ def test_planner_refusals_surface_with_their_own_codes() -> None:
     executor, _, _ = make_lp_executor()
 
     with pytest.raises(LpPlanRefusalError) as raised:
-        executor.plan_mint("FIXc", Decimal("100.01"), MINT_WIDTH_SPACINGS)
+        executor.plan_mint("FIXc", Decimal("1000.01"), MINT_WIDTH_SPACINGS)
 
     assert "per-pool cap" in str(raised.value)
 
@@ -2332,7 +2575,7 @@ def test_dry_run_recenter_surfaces_planner_cap_refusals() -> None:
 
     with pytest.raises(LpPlanRefusalError) as raised:
         executor.dry_run_recenter(
-            "FIXc", 77, MINT_WIDTH_SPACINGS, Decimal("100.01"), bytes(Account.create().key)
+            "FIXc", 77, MINT_WIDTH_SPACINGS, Decimal("1000.01"), bytes(Account.create().key)
         )
 
     assert raised.value.code.value == "budget_above_pool_cap"
@@ -2341,6 +2584,86 @@ def test_dry_run_recenter_surfaces_planner_cap_refusals() -> None:
 # ---------------------------------------------------------------------------
 # Position status
 # ---------------------------------------------------------------------------
+
+
+def test_fee_growth_inside_matches_the_v3_identity() -> None:
+    """The inside accumulator flips each boundary's outside at its tick."""
+    # With the current tick inside the range both outside words count as-is.
+    assert fee_growth_inside(1_000, -15, -30, -10, 40, 60) == 1_000 - 40 - 60
+    # Below the range the lower boundary's outside complements.
+    assert fee_growth_inside(1_000, -40, -30, -10, 40, 60) == (1_000 - (1_000 - 40) - 60) % (2**256)
+    # At the upper boundary (exclusive) the upper outside complements.
+    assert fee_growth_inside(1_000, -10, -30, -10, 40, 60) == (1_000 - 40 - (1_000 - 60)) % (2**256)
+    # Wrapped accumulators still measure a positive delta modulo 2**256.
+    wrapped = fee_growth_inside(5, -15, -30, -10, 2**256 - 100, 3)
+    assert wrapped == (5 - (2**256 - 100) - 3) % (2**256)
+    assert wrapped == 102
+
+
+def test_fees_earned_from_growth_floors_and_wraps() -> None:
+    """Growth converts to units floored, with wrapped deltas still positive."""
+    assert fees_earned_from_growth(12_345, 1 << 128) == 12_345
+    assert fees_earned_from_growth(12_345, (1 << 128) + 7) == 12_345
+    assert fees_earned_from_growth(0, 1 << 128) == 0
+    # A wrapped accumulator (now below the baseline) still measures forward.
+    assert fees_earned_from_growth(1, (5 << 128) - (2**256)) == 5
+
+
+def test_position_status_computes_fees_from_fee_growth() -> None:
+    """The status prices earned fees from the pool's live accumulators."""
+    executor, rpc_script, safe_script = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            fee_growth_global0_x128=2 << 128,
+            fee_growth_global1_x128=2 << 128,
+        )
+    )
+
+    report = executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC)
+
+    # The fixture position's checkpoint baseline is zero, the current tick
+    # sits inside the range, and both boundary outsides are zero, so each
+    # inside word equals its global accumulator: liquidity 12345 times two
+    # whole growth units floored.
+    assert report.fee_growth_inside0_x128 == 2 << 128
+    assert report.fee_growth_inside1_x128 == 2 << 128
+    assert report.fees_earned_since_checkpoint0_units == 12_345 * 2
+    assert report.fees_earned_since_checkpoint1_units == 12_345 * 2
+    price = price_usdc_per_stock(LP_SQRT_RATIO, False, STOCK_DECIMALS, 6)
+    expected_computed = +(
+        Decimal(12_345 * 2) * Decimal(10) ** -6
+        + Decimal(12_345 * 2) * Decimal(10) ** -STOCK_DECIMALS * price
+    )
+    assert report.fees_earned_since_checkpoint_usdc == expected_computed
+    assert report.fees_owed_usdc is not None
+    assert report.claimable_fees_computed_usdc == +(report.fees_owed_usdc + expected_computed)
+    assert any(
+        "computed fees earned since the last checkpoint" in line and "max-uint128 collect" in line
+        for line in report.diagnostics
+    )
+    assert "feeGrowthInside" in report.fee_method_diagnostic
+    assert "feeGrowthGlobal" in report.fee_method_diagnostic
+
+
+def test_position_status_fee_growth_failure_fails_open_to_the_checkpoint() -> None:
+    """A failed accumulator read leaves the computed measurement absent."""
+    executor, rpc_script, safe_script = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(),
+            fee_growth_reads_revert=True,
+        )
+    )
+
+    report = executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC)
+
+    assert report.fee_growth_inside0_x128 is None
+    assert report.fee_growth_inside1_x128 is None
+    assert report.fees_earned_since_checkpoint_usdc is None
+    assert report.claimable_fees_computed_usdc is None
+    assert "computed fees unavailable" in report.fee_method_diagnostic
+    assert report.fees_owed_usdc is not None
 
 
 def test_position_status_reports_a_staked_position_read_only() -> None:
@@ -2510,7 +2833,7 @@ def test_planner_refusals_audit_their_plan_code(tmp_path: Path) -> None:
     executor, _, _ = make_lp_executor(audit_path=audit_path)
 
     with pytest.raises(LpPlanRefusalError):
-        executor.plan_mint("FIXc", Decimal("100.01"), MINT_WIDTH_SPACINGS)
+        executor.plan_mint("FIXc", Decimal("1000.01"), MINT_WIDTH_SPACINGS)
 
     store = AuditStore(audit_path)
     records = store.read_records(10)
@@ -3748,7 +4071,7 @@ def test_cli_dry_run_exit_swap_prints_the_report(
     assert "selling the entire" in output
 
 
-def test_cli_execute_exit_swap_refuses_without_the_confirmation_flag(
+def test_cli_execute_exit_swap_refuses_without_the_flag(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The execute exit-swap CLI refuses with exit two unless flagged."""
@@ -3765,6 +4088,51 @@ def test_cli_execute_exit_swap_refuses_without_the_confirmation_flag(
 
     assert exit_code == EXIT_REFUSED
     assert "refused [broadcast_confirmation_missing]" in capsys.readouterr().err
+
+
+def test_cli_aero_swap_dry_run_and_execute_round_trip(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The reward conversion's CLI builds dry and broadcasts confirmed."""
+    dry_executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(aero_balance_units=10 * 10**18),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 3),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=dry_executor),
+    ):
+        exit_code = main(["dry-run", "aero-swap", "--ephemeral-key"])
+
+    assert exit_code == EXIT_OK
+    captured = capsys.readouterr()
+    assert "selling the entire 10000000000000000000 raw AERO balance" in captured.out
+    assert "[aero_router_allowance]" in captured.out
+    assert "[aero_swap]" in captured.out
+
+    execute_executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            aero_balance_units=10 * 10**18,
+            allow_broadcasts=True,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4, 4], signature_verdicts=[True] * 8),
+    )
+    with (
+        patch("aero_bot.lp_executor.Settings", return_value=make_cli_settings(tmp_path)),
+        patch("aero_bot.lp_executor.AuditStore"),
+        patch("aero_bot.lp_executor.LiveExecutionSources"),
+        patch("aero_bot.lp_executor.ExecutorRpcBackend"),
+        patch("aero_bot.lp_executor.SafeTransactionRpcBackend"),
+        patch("aero_bot.lp_executor.LpLifecycleExecutor", return_value=execute_executor),
+    ):
+        exit_code = main(["execute", "aero-swap", "--confirm-broadcast", "--ephemeral-key"])
+
+    assert exit_code == EXIT_OK
+    assert "confirmed" in capsys.readouterr().out
 
 
 def test_cli_execute_mint_broadcasts_and_exits_zero(

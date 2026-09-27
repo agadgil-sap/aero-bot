@@ -1061,7 +1061,7 @@ METHODOLOGY_CARD = (
     "cross-board selector: the best-qualifying pool by emissions APR wins, "
     "another pool displaces it only past a 30 percent switch margin with "
     "exit-plus-entry gas economics passing. Position sizing is 80 percent "
-    "of the book inside hard 100/100 USDC caps. Operation is 24/7; market "
+    "of the book inside hard 1000/1000 USDC caps. Operation is 24/7; market "
     "session windows are informational only. Policy assumes zero fee APR - "
     "fees are measured, never assumed. The bot halts on a 5 percent daily "
     "loss against a whole-book equity anchor, waits out-of-range rather "

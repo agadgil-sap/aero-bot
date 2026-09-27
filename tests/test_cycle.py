@@ -25,9 +25,12 @@ from test_lp_executor import (
 
 from aero_bot.audit import AuditEventType, AuditRecord, AuditStore
 from aero_bot.cycle import (
+    CYCLE_AERO_CONVERSION_MIN_ENV,
+    CYCLE_OUT_OF_RANGE_GRACE_ENV,
     CYCLE_REFERENCE_PRICE_ENV,
     CYCLE_SWITCH_MARGIN_ENV,
     CYCLE_SYMBOL_ENV,
+    DEFAULT_AERO_CONVERSION_MIN_USDC,
     CycleMode,
     CycleRunner,
     CycleStateBook,
@@ -35,6 +38,8 @@ from aero_bot.cycle import (
     HeldInventoryRecord,
     ReentryCooldown,
     TrackedPosition,
+    _aero_conversion_min_from_environment,
+    _out_of_range_grace_from_environment,
     _reference_price_from_environment,
     _switch_margin_from_environment,
     _symbol_from_arguments_and_environment,
@@ -51,15 +56,20 @@ from aero_bot.lp_executor import (
     LpSafePositionsSnapshot,
 )
 from aero_bot.policy import (
+    LOCKED_POLICY_PARAMETERS,
     AlignedPriceRange,
     PolicyActionKind,
     PolicyDecision,
     PolicyOutcome,
+    PolicyParameters,
     PolicyReason,
     PolicyState,
 )
 from aero_bot.strategy import BoardListing
-from aero_bot.venues import BASE_USDC_ADDRESS, PoolCandidate
+from aero_bot.venues import AERO_TOKEN_ADDRESS, BASE_USDC_ADDRESS, PoolCandidate
+
+# The fixture stock token contract, aliased for the status view's sides.
+STOCK_TOKEN_ADDRESS = B20_ADDRESS
 
 # 2026-09-08 is a Tuesday; 20:30 UTC is 16:30 New York, past every session
 # window, so decisions run the full gate chain.
@@ -195,12 +205,14 @@ class FakeBalances:
         *,
         usdc_units: int = 10_000_000,
         stock_units: int = 0,
+        aero_units: int = 0,
         relayer_eth_wei: int = 10**15,
         block_number: int = 99_999_999,
     ) -> None:
         """Configure every served balance."""
         self.usdc_units = usdc_units
         self.stock_units = stock_units
+        self.aero_units = aero_units
         self.relayer_eth_wei = relayer_eth_wei
         self.block_number = block_number
         self.receipts: dict[str, dict[str, object]] = {}
@@ -209,6 +221,8 @@ class FakeBalances:
         """Serve the configured per-token balance."""
         if token_address.lower() == BASE_USDC_ADDRESS.lower():
             return self.usdc_units
+        if token_address.lower() == AERO_TOKEN_ADDRESS.lower():
+            return self.aero_units
         return self.stock_units
 
     def fetch_eth_balance(self, account_address: str) -> int:
@@ -246,6 +260,7 @@ class FakeExecutor:
         self.mint_executed_budget: Decimal | None = None
         self.fee_wei_per_step = 90_000
         self.confirmed_block_number = 51_000_000
+        self.collect_aero_units = 0
 
     def _complete(self, action: str, hashes: tuple[str, ...]) -> LpActionExecutionReport:
         """Build one completed execution report over scripted steps."""
@@ -409,6 +424,43 @@ class FakeExecutor:
         self._balances.stock_units = 0
         return self._complete("exit_swap", ("0x" + "d0" * 32,))
 
+    def execute_collect(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Complete one claim, sweeping the scripted emissions to the Safe."""
+        self.calls.append(("collect_rewards", symbol, token_id))
+        if self.refuse_next == "collect_rewards":
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING, "scripted refusal"
+            )
+        self._balances.aero_units += self.collect_aero_units
+        return self._complete("collect", ("0x" + "d1" * 32,))
+
+    def execute_aero_swap(
+        self,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Complete one reward conversion, emptying the Safe's AERO."""
+        self.calls.append(("aero_swap",))
+        if self.refuse_next == "aero_swap":
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING, "scripted refusal"
+            )
+        swapped = self._balances.aero_units
+        self._balances.aero_units = 0
+        self._balances.usdc_units += int(Decimal(swapped).scaleb(-18) * Decimal("0.6") * 10**6)
+        report = self._complete("aero_swap", ("0x" + "d2" * 32,))
+        return report.model_copy(update={"build": SimpleNamespace(aero_balance_units=swapped)})
+
 
 def _empty_book_fields(book: CycleStateBook) -> bool:
     """Return whether one book carries no tracked state (time aside)."""
@@ -457,19 +509,34 @@ def tracked_status(
     pnl: Decimal | None = Decimal("1"),
     fees_usdc: Decimal | None = None,
     observed_at: datetime = QUIET_INSTANT,
+    accrued_aero_units: int | None = None,
+    fee_growth_inside0_x128: int | None = None,
+    fee_growth_inside1_x128: int | None = None,
 ) -> LpPositionStatusReport:
     """Build one minimal tracked-position status via unchecked construction."""
-    view = SimpleNamespace(tick_lower=FIXTURE_RANGE_LOWER, tick_upper=FIXTURE_RANGE_UPPER)
+    view = SimpleNamespace(
+        tick_lower=FIXTURE_RANGE_LOWER,
+        tick_upper=FIXTURE_RANGE_UPPER,
+        token0_address=BASE_USDC_ADDRESS,
+        token1_address=STOCK_TOKEN_ADDRESS,
+        liquidity=12_345,
+    )
     return LpPositionStatusReport.model_construct(
         symbol="FIXc",
         pool_address=POOL_ADDRESS,
+        token_id=TRACKED_TOKEN_ID,
         token_owner_address=owner,
         gauge_address=GAUGE_ADDRESS,
         position=view,
         position_value_usdc=value,
+        token0_value_usdc=+(value / 2),
+        token1_value_usdc=+(value / 2),
         unrealized_pnl_usdc=pnl,
         pnl_diagnostic="" if pnl is not None else "no entry cost",
         fees_owed_usdc=fees_usdc,
+        accrued_aero_earned_units=accrued_aero_units,
+        fee_growth_inside0_x128=fee_growth_inside0_x128,
+        fee_growth_inside1_x128=fee_growth_inside1_x128,
         observed_at=observed_at,
     )
 
@@ -520,6 +587,8 @@ def make_runner(
     now: datetime = QUIET_INSTANT,
     symbol: str | None = "FIXc",
     sleep: Callable[[float], None] | None = None,
+    parameters: PolicyParameters | None = None,
+    aero_conversion_min_usdc: Decimal | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, AuditStore, CycleStateStore]:
     """Assemble one cycle runner over fully scripted boundaries."""
     store_path = tmp_path / "cycle_state.json"
@@ -580,6 +649,12 @@ def make_runner(
         state_store=state_store,
         now=lambda: now,
         sleep=sleep if sleep is not None else (lambda _seconds: None),
+        parameters=parameters if parameters is not None else LOCKED_POLICY_PARAMETERS,
+        aero_conversion_min_usdc=(
+            aero_conversion_min_usdc
+            if aero_conversion_min_usdc is not None
+            else DEFAULT_AERO_CONVERSION_MIN_USDC
+        ),
     )
     return runner, fake_executor, audit, state_store
 
@@ -1074,7 +1149,15 @@ class TestReconciliation:
         # Explicitly put the token1-stock NFT below the fixture's
         # USDC/stock price so this test exercises the upside wait path.
         above_range = tracked_status().model_copy(
-            update={"position": SimpleNamespace(tick_lower=-10, tick_upper=10)}
+            update={
+                "position": SimpleNamespace(
+                    tick_lower=-10,
+                    tick_upper=10,
+                    token0_address=BASE_USDC_ADDRESS,
+                    token1_address=STOCK_TOKEN_ADDRESS,
+                    liquidity=12_345,
+                )
+            }
         )
         reads.set_status(TRACKED_TOKEN_ID, above_range)
         runner, _, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
@@ -1728,6 +1811,350 @@ class TestCycleConfiguration:
             _reference_price_from_environment({CYCLE_REFERENCE_PRICE_ENV: "AAPLc="})
         with pytest.raises(ValueError, match="more than once"):
             _reference_price_from_environment({CYCLE_REFERENCE_PRICE_ENV: "A=1,A=2"})
+
+    def test_out_of_range_grace_defaults_and_overrides(self) -> None:
+        """The grace window defaults to ten minutes and refuses bad values."""
+        assert _out_of_range_grace_from_environment({}) == timedelta(minutes=10)
+        assert _out_of_range_grace_from_environment(
+            {CYCLE_OUT_OF_RANGE_GRACE_ENV: "30"}
+        ) == timedelta(minutes=30)
+        with pytest.raises(ValueError, match="positive"):
+            _out_of_range_grace_from_environment({CYCLE_OUT_OF_RANGE_GRACE_ENV: "0"})
+        with pytest.raises(ValueError, match="positive"):
+            _out_of_range_grace_from_environment({CYCLE_OUT_OF_RANGE_GRACE_ENV: "-5"})
+
+    def test_aero_conversion_min_defaults_and_overrides(self) -> None:
+        """The conversion threshold defaults to five USDC and refuses negatives."""
+        assert _aero_conversion_min_from_environment({}) == Decimal("5")
+        assert _aero_conversion_min_from_environment(
+            {CYCLE_AERO_CONVERSION_MIN_ENV: "12.5"}
+        ) == Decimal("12.5")
+        with pytest.raises(ValueError, match="non-negative"):
+            _aero_conversion_min_from_environment({CYCLE_AERO_CONVERSION_MIN_ENV: "-1"})
+
+
+class TestRewardConversion:
+    """The capped AERO-to-USDC conversion inside the act step."""
+
+    def test_live_cycle_converts_when_unclaimed_aero_exceeds_the_threshold(
+        self, tmp_path: Path
+    ) -> None:
+        """The cadence fires: claim then swap, counted in the book's reconcile."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        staked = tracked_status(owner=GAUGE_ADDRESS, accrued_aero_units=10 * 10**18)
+        reads.set_status(TRACKED_TOKEN_ID, staked)
+        runner, executor, audit, state_store = make_runner(
+            tmp_path, book=tracked_book(), reads=reads
+        )
+        assert executor is not None
+        executor.collect_aero_units = 10 * 10**18
+
+        report = runner.run(
+            CycleMode.LIVE, key_bytes=b"\x01" * 32, reference_price_usdc=FIXTURE_AMM_PRICE
+        )
+
+        assert [action.action for action in report.actions] == ["collect_rewards", "aero_swap"]
+        assert all(action.status == "completed" for action in report.actions)
+        # Ten AERO at the observed 0.6 price converts to six USDC.
+        assert report.unclaimed_aero_units == 10 * 10**18
+        assert report.unclaimed_aero_value_usdc == Decimal("6")
+        assert report.reconciliation.safe_aero_units == 0
+        assert ("aero_swap",) in executor.calls
+        saved = state_store.load()
+        assert saved.day_baseline is not None
+        assert saved.day_baseline.aero_converted_units == 10 * 10**18
+
+    def test_live_cycle_holds_the_rewards_below_the_threshold(self, tmp_path: Path) -> None:
+        """Unclaimed AERO under the threshold never touches the executor."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(
+            TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS, accrued_aero_units=3 * 10**18)
+        )
+        runner, executor, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        report = runner.run(
+            CycleMode.LIVE, key_bytes=b"\x01" * 32, reference_price_usdc=FIXTURE_AMM_PRICE
+        )
+
+        assert report.actions == ()
+        assert executor is not None
+        assert not any(call[0] == "aero_swap" for call in executor.calls)
+        # The measurement still reports the unclaimed pile honestly.
+        assert report.unclaimed_aero_value_usdc == Decimal("1.8")
+
+    def test_dry_run_never_converts(self, tmp_path: Path) -> None:
+        """A dry cycle measures the pile but never claims or swaps."""
+        balances = FakeBalances(aero_units=20 * 10**18)
+        runner, executor, _, _ = make_runner(tmp_path, balances=balances)
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        assert executor is None or not any(
+            call[0] in ("aero_swap", "collect_rewards")
+            for call in (executor.calls if executor else [])
+        )
+        assert report.actions == ()
+        assert report.unclaimed_aero_value_usdc == Decimal("12")
+
+    def test_penalty_window_defers_the_claim(self, tmp_path: Path) -> None:
+        """An open penalty window never claims; only claimed balances convert."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        inside_penalty = tracked_status(
+            owner=GAUGE_ADDRESS, accrued_aero_units=10 * 10**18
+        ).model_copy(
+            update={"penalty": SimpleNamespace(remaining_seconds=120, penalty_rate_bps=10_000)}
+        )
+        reads.set_status(TRACKED_TOKEN_ID, inside_penalty)
+        runner, executor, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        report = runner.run(
+            CycleMode.LIVE, key_bytes=b"\x01" * 32, reference_price_usdc=FIXTURE_AMM_PRICE
+        )
+
+        assert executor is not None
+        assert not any(call[0] == "collect_rewards" for call in executor.calls)
+        assert not any(call[0] == "aero_swap" for call in executor.calls)
+        # The unearned pile is still measured honestly.
+        assert report.unclaimed_aero_value_usdc == Decimal("6")
+
+    def test_a_refused_swap_halts_the_cycle(self, tmp_path: Path) -> None:
+        """A conversion refusal records its code and halts the cycle."""
+        balances = FakeBalances(aero_units=20 * 10**18)
+        runner, executor, _, _ = make_runner(tmp_path, balances=balances)
+        assert executor is not None
+        executor.refuse_next = "aero_swap"
+
+        report = runner.run(
+            CycleMode.LIVE, key_bytes=b"\x01" * 32, reference_price_usdc=FIXTURE_AMM_PRICE
+        )
+
+        assert report.halted_reason.startswith("the aero_swap action refused")
+        assert report.actions[-1].status == "refused"
+        assert report.actions[-1].refusal_code == "broadcast_confirmation_missing"
+
+    def test_idle_aero_counts_in_the_decision_equity(self, tmp_path: Path) -> None:
+        """The equity the halt measures prices the idle AERO pile."""
+        balances = FakeBalances(aero_units=10 * 10**18)
+        runner, _, _, _ = make_runner(tmp_path, balances=balances)
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        # Ten USDC of Safe USDC plus six USDC of AERO at the observed price.
+        assert report.equity_usd == Decimal("16")
+        assert any("unclaimed AERO" in note for note in report.input_notes)
+
+
+class TestYieldAttribution:
+    """The day P&L decomposition into the yield-duration components."""
+
+    def test_two_cycles_decompose_the_day_pnl(self, tmp_path: Path) -> None:
+        """AERO accrual, computed fees, and stock MTM each measure their stream."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        baseline_status = tracked_status(
+            owner=GAUGE_ADDRESS,
+            accrued_aero_units=2 * 10**18,
+            fee_growth_inside0_x128=2 << 128,
+            fee_growth_inside1_x128=2 << 128,
+        )
+        reads.set_status(TRACKED_TOKEN_ID, baseline_status)
+        runner, _, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        first = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+        assert first.yield_attribution is not None
+        assert first.yield_attribution.aero_rewards_usdc == Decimal("0")
+
+        # One more whole growth unit accrued on each side, five more AERO
+        # earned, and a one-percent stock price move.
+        later_status = tracked_status(
+            owner=GAUGE_ADDRESS,
+            accrued_aero_units=7 * 10**18,
+            fee_growth_inside0_x128=3 << 128,
+            fee_growth_inside1_x128=3 << 128,
+        )
+        reads.set_status(TRACKED_TOKEN_ID, later_status)
+        later = runner.run(
+            CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE * Decimal("1.01")
+        )
+
+        attribution = later.yield_attribution
+        assert attribution is not None
+        # Five more AERO at the observed 0.6 price.
+        assert attribution.aero_rewards_usdc == Decimal("3")
+        # 12345 raw USDC-side units plus the stock side at the new price.
+        assert attribution.fees_earned_usdc is not None
+        assert attribution.fees_earned_usdc > 0
+        assert "feeGrowthInside" in " ".join(attribution.method)
+        # Day P&L and the residual reconcile with the components.
+        assert attribution.unattributed_usdc is not None
+        aero_rewards = attribution.aero_rewards_usdc
+        fees_earned = attribution.fees_earned_usdc
+        stock_mtm = attribution.stock_mark_to_market_usdc
+        assert aero_rewards is not None
+        assert fees_earned is not None
+        assert stock_mtm is not None
+        assert attribution.day_pnl_usdc == (
+            aero_rewards + fees_earned + stock_mtm + attribution.unattributed_usdc
+        )
+        saved = state_store.load()
+        assert saved.day_baseline is not None
+        assert saved.day_baseline.aero_units == 2 * 10**18
+
+    def test_position_change_rebaselines_the_fee_words_only(self, tmp_path: Path) -> None:
+        """A recentered token re-snapshots the fee baseline, not the day's AERO."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status(
+                owner=GAUGE_ADDRESS,
+                accrued_aero_units=2 * 10**18,
+                fee_growth_inside0_x128=2 << 128,
+                fee_growth_inside1_x128=2 << 128,
+            ),
+        )
+        runner, _, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
+        runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        # The next cycle tracks a fresh token whose words differ; the day's
+        # AERO baseline must survive the position-scoped reset.
+        fresh_id = TRACKED_TOKEN_ID + 1
+        book = state_store.load()
+        assert book.position is not None
+        state_store.save(
+            book.model_copy(
+                update={"position": book.position.model_copy(update={"token_id": fresh_id})}
+            )
+        )
+        reads.set_inventory(inventory_with(fresh_id))
+        reads.set_status(
+            fresh_id,
+            tracked_status(
+                owner=GAUGE_ADDRESS,
+                accrued_aero_units=4 * 10**18,
+                fee_growth_inside0_x128=5 << 128,
+                fee_growth_inside1_x128=5 << 128,
+            ).model_copy(update={"token_id": fresh_id}),
+        )
+        runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        saved = state_store.load()
+        assert saved.day_baseline is not None
+        assert saved.day_baseline.token_id == fresh_id
+        assert saved.day_baseline.fee_growth_inside0_x128 == 5 << 128
+        assert saved.day_baseline.aero_units == 2 * 10**18
+
+    def test_flat_first_cycle_carries_a_baseline_without_components(self, tmp_path: Path) -> None:
+        """A flat cycle still opens the day's baseline honestly."""
+        runner, _, _, state_store = make_runner(tmp_path)
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        assert report.yield_attribution is not None
+        assert report.yield_attribution.aero_rewards_usdc == Decimal("0")
+        assert report.yield_attribution.fees_earned_usdc is None
+        saved = state_store.load()
+        assert saved.day_baseline is not None
+        assert saved.day_baseline.token_id is None
+
+    def test_audit_record_carries_the_attribution(self, tmp_path: Path) -> None:
+        """The cycle_reported payload persists the decomposition fields."""
+        runner, _, audit, _ = make_runner(tmp_path)
+
+        runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        records = audit.read_records(10)
+        payload = json.loads(records[-1].payload_json)
+        assert payload["yield_aero_rewards_usdc"] is not None
+        assert payload["peak_equity_usdc"] is not None
+
+
+class TestGraceExitMapping:
+    """The range-grace-exit action mapping and the grace configuration."""
+
+    def test_grace_exit_routes_stock_through_inventory_convergence(self, tmp_path: Path) -> None:
+        """A below-range grace exit burns without swapping and holds the stock."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        # Ticks -60..-50 price their lower edge about 0.4 percent above the
+        # fixture price - below the range edge, above the stop, past the
+        # minimum recenter distance.
+        below_edge = tracked_status(owner=GAUGE_ADDRESS, accrued_aero_units=0).model_copy(
+            update={
+                "position": SimpleNamespace(
+                    tick_lower=-60,
+                    tick_upper=-50,
+                    token0_address=BASE_USDC_ADDRESS,
+                    token1_address=STOCK_TOKEN_ADDRESS,
+                    liquidity=12_345,
+                )
+            }
+        )
+        reads.set_status(TRACKED_TOKEN_ID, below_edge)
+        balances = FakeBalances(stock_units=5 * 10**8)
+        expired_book = tracked_book().model_copy(
+            update={
+                "position": TrackedPosition(
+                    symbol="FIXc",
+                    token_id=TRACKED_TOKEN_ID,
+                    pool_address=POOL_ADDRESS,
+                    committed_usd=Decimal("7"),
+                    entered_at=QUIET_INSTANT - timedelta(minutes=30),
+                    out_of_range_since=QUIET_INSTANT - timedelta(minutes=15),
+                    out_of_range_side="below",
+                )
+            }
+        )
+        # An unreachable payback bound forces the recenter economics to fail
+        # at the elapsed grace, so income protection exits instead.
+        parameters = LOCKED_POLICY_PARAMETERS.model_copy(
+            update={"downside_recenter_max_payback_days": Decimal("0.000001")}
+        )
+        runner, executor, _, state_store = make_runner(
+            tmp_path,
+            book=expired_book,
+            reads=reads,
+            balances=balances,
+            parameters=parameters,
+        )
+        assert executor is not None
+
+        report = runner.run(
+            CycleMode.LIVE, key_bytes=b"\x01" * 32, reference_price_usdc=FIXTURE_AMM_PRICE
+        )
+
+        # The policy authorized the grace exit; the cycle unstaked, withdrew,
+        # and held the stock as convergence inventory - never an exit swap.
+        assert report.decision_action == "range_grace_exit"
+        assert [action.action for action in report.actions] == ["unstake", "withdraw"]
+        assert not any(call[0] == "exit_swap" for call in executor.calls)
+        saved = state_store.load()
+        assert saved.position is None
+        assert saved.held_inventory is not None
+        assert saved.held_inventory.origin == "out_of_range_exit"
+
+    def test_configured_grace_window_threads_into_decisions(self, tmp_path: Path) -> None:
+        """The runner's parameter override reaches the engine's decisions."""
+        parameters = LOCKED_POLICY_PARAMETERS.model_copy(
+            update={"out_of_range_grace": timedelta(minutes=45)}
+        )
+        runner, _, _, _ = make_runner(tmp_path, parameters=parameters)
+
+        assert runner._parameters.out_of_range_grace == timedelta(minutes=45)
+
+
+class TestContinuousLatchBook:
+    """The running-peak latch persisted across cycles in the book."""
+
+    def test_peak_equity_survives_cycle_boundaries(self, tmp_path: Path) -> None:
+        """The book carries the running peak forward between scheduled cycles."""
+        runner, _, _, state_store = make_runner(tmp_path)
+
+        first = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+        assert first.peak_equity_usd is not None
+        saved = state_store.load()
+        assert saved.peak_equity_usdc == first.peak_equity_usd
+
+        second = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+        assert second.peak_equity_usd == first.peak_equity_usd
+        assert state_store.load().peak_equity_usdc == first.peak_equity_usd
 
 
 def test_token1_stock_in_range_clears_stale_recenter_anchor(tmp_path: Path) -> None:

@@ -149,6 +149,15 @@ AERO_BOT_BASE_RPC_URL=https://base.publicnode.com
 # qualifying emissions APR by more than this fraction before a switch fires
 # (default 0.30, the captain's 2026-09-09 trial ruling).
 #AERO_BOT_CYCLE_SWITCH_MARGIN_FRACTION=0.30
+# The out-of-range grace window: once a staked position has sat outside its
+# earning range this many minutes, the policy must act - recenter when the
+# economics pass, otherwise exit - because every minute out of range forgoes
+# emissions income (default 10, the captain's 2026-09-27 correction).
+#AERO_BOT_CYCLE_OUT_OF_RANGE_GRACE_MINUTES=10
+# The reward-conversion threshold: unclaimed AERO whose value at the last
+# observed price exceeds this many USDC converts to USDC inside the cycle's
+# act step (default 5, the captain's 2026-09-27 ruling).
+#AERO_BOT_CYCLE_AERO_CONVERSION_MIN_USDC=5
 # Range monitoring is allowed to observe and alert at seconds-level, but the
 # shipped systemd unit is forced into --monitor-only. It cannot trade.
 AERO_BOT_WATCHTOWER_ENABLED=0
