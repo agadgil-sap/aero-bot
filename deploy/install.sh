@@ -258,6 +258,20 @@ EOF
     chown root:"${SERVICE_USER}" "${CONFIG_DIR}/backup.env"
     chmod 0640 "${CONFIG_DIR}/backup.env"
 fi
+if [[ ! -f "${CONFIG_DIR}/dashboard.env" ]]; then
+    cat >"${CONFIG_DIR}/dashboard.env" <<'EOF'
+# Aero Bot dashboard environment - the read-only UI's sealed inputs
+# (mode 0640, root-owned, created by the installer).
+# The production audit chain the dashboard's audit-health endpoint
+# verifies lives under the service state tree; without this line Settings
+# falls back to its platform default and the dashboard opens its own
+# empty store - record_count 0, status empty - instead of the real chain
+# (the gnhf 34 fix).
+AERO_BOT_AUDIT_DATABASE_PATH=/var/lib/aero-bot/audit.sqlite3
+EOF
+    chown root:"${SERVICE_USER}" "${CONFIG_DIR}/dashboard.env"
+    chmod 0640 "${CONFIG_DIR}/dashboard.env"
+fi
 
 # ---------------------------------------------------------------- systemd
 log "installing the systemd units"

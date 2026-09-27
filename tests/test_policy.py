@@ -2102,3 +2102,175 @@ class TestDerivedRangeWidth:
             PolicyEngine().build_aligned_range(Decimal("200"), Decimal("1.5"))
         with pytest.raises(ValueError, match="between zero and one"):
             PolicyEngine().build_aligned_range(Decimal("200"), Decimal("0"))
+
+
+class TestPortfolioEquityLatchBasis:
+    """The day machinery anchors on portfolio equity, never a scaled basis.
+
+    The gnhf 34 fix: the allocator's tranche re-derivations scale the
+    observation's equity to the tranche's sizing basis, and before the
+    ``portfolio_equity_usd`` field existed that scaled equity read as a
+    portfolio drawdown against the day-start anchor - the daily loss halt
+    then refused every fresh entry while the book was healthy.
+    """
+
+    def test_scaled_tranche_observation_does_not_latch_the_halt(self) -> None:
+        """A healthy book's small tranche enters; sizing still uses the basis."""
+        state = PolicyState(
+            day=BASE_OBSERVED_AT.date(),
+            day_start_equity_usd=Decimal("200"),
+            peak_equity_usd=Decimal("200"),
+        )
+        observation = base_observation(
+            equity_usd=Decimal("50"),
+            portfolio_equity_usd=Decimal("200"),
+        )
+        outcome = PolicyEngine().decide(state, observation)
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        # Sizing keeps the scaled basis: the eighty-percent cap of 50.
+        assert outcome.decision.size_usd == Decimal("40")
+
+    def test_scaled_equity_without_the_portfolio_field_still_latches(self) -> None:
+        """The historical failure shape: scaled equity reads as a drawdown."""
+        state = PolicyState(
+            day=BASE_OBSERVED_AT.date(),
+            day_start_equity_usd=Decimal("200"),
+            peak_equity_usd=Decimal("200"),
+        )
+        outcome = PolicyEngine().decide(state, base_observation(equity_usd=Decimal("50")))
+        assert outcome.decision.action is PolicyActionKind.HOLD
+        assert outcome.decision.reason is PolicyReason.DAILY_LOSS_HALT_ACTIVE
+
+    def test_true_book_drawdown_still_latches_at_the_scaled_basis(self) -> None:
+        """Carrying the portfolio equity never weakens the halt protection."""
+        state = PolicyState(
+            day=BASE_OBSERVED_AT.date(),
+            day_start_equity_usd=Decimal("200"),
+            peak_equity_usd=Decimal("200"),
+        )
+        observation = base_observation(
+            equity_usd=Decimal("50"),
+            portfolio_equity_usd=Decimal("150"),
+        )
+        outcome = PolicyEngine().decide(state, observation)
+        assert outcome.decision.action is PolicyActionKind.HOLD
+        assert outcome.decision.reason is PolicyReason.DAILY_LOSS_HALT_ACTIVE
+        # The diagnostic reports the book's number, never the tranche basis.
+        assert "Marked equity 150" in outcome.decision.diagnostics[0]
+
+    def test_continuous_peak_latch_reads_the_portfolio_equity(self) -> None:
+        """The carried peak also judges the whole book at the scaled basis."""
+        state = PolicyState(
+            day=BASE_OBSERVED_AT.date(),
+            day_start_equity_usd=Decimal("50"),
+            peak_equity_usd=Decimal("200"),
+        )
+        observation = base_observation(
+            equity_usd=Decimal("50"),
+            portfolio_equity_usd=Decimal("120"),
+        )
+        outcome = PolicyEngine().decide(state, observation)
+        assert outcome.decision.action is PolicyActionKind.HOLD
+        assert outcome.decision.reason is PolicyReason.DAILY_LOSS_HALT_ACTIVE
+
+    def test_day_rollover_anchor_reads_the_portfolio_equity(self) -> None:
+        """A new day's anchor prices the whole book, not the tranche."""
+        state = PolicyState(day=None)
+        observation = base_observation(
+            equity_usd=Decimal("50"),
+            portfolio_equity_usd=Decimal("200"),
+        )
+        outcome = PolicyEngine().decide(state, observation)
+        assert outcome.next_state.day_start_equity_usd == Decimal("200")
+
+    def test_peak_ratchet_reads_the_portfolio_equity(self) -> None:
+        """A book at a new high ratchets the peak even from a small tranche."""
+        state = PolicyState(
+            day=BASE_OBSERVED_AT.date(),
+            day_start_equity_usd=Decimal("150"),
+            peak_equity_usd=Decimal("100"),
+        )
+        observation = base_observation(
+            equity_usd=Decimal("50"),
+            portfolio_equity_usd=Decimal("200"),
+        )
+        outcome = PolicyEngine().decide(state, observation)
+        assert outcome.next_state.peak_equity_usd == Decimal("200")
+
+
+class TestEntryGateTrace:
+    """The per-gate evidence line every cycle's diagnostics must carry."""
+
+    GATE_ORDER = (
+        "gate daily_loss_halt:",
+        "gate reentry_cooldown:",
+        "gate condition_flat:",
+        "gate reference_freshness:",
+        "gate emissions_floor:",
+        "gate entry_size:",
+        "gate gas_ceiling:",
+        "gate gas_cost_vs_yield:",
+    )
+
+    def test_trace_names_every_ordered_gate_with_verdict_and_bound(self) -> None:
+        """A passing observation traces every gate PASS with its bound."""
+        lines = PolicyEngine().entry_gate_trace(PolicyState(), base_observation())
+        positions = [
+            next((index for index, text in enumerate(lines) if text.startswith(name)), -1)
+            for name in self.GATE_ORDER
+        ]
+        assert all(position != -1 for position in positions)
+        assert positions == sorted(positions)
+        assert all(": PASS" in text or ": FAIL" in text for text in lines)
+        assert all("bound" in text for text in lines)
+
+    def test_trace_marks_the_refusing_gate_fail(self) -> None:
+        """The gate the engine itself refuses on shows FAIL with numbers."""
+        engine = PolicyEngine()
+        lines = engine.entry_gate_trace(
+            PolicyState(), base_observation(emissions_apr=Decimal("1.0"))
+        )
+        emissions_line = next(line for line in lines if line.startswith("gate emissions_floor:"))
+        assert ": FAIL" in emissions_line
+        assert "1.0" in emissions_line
+        assert "1.5" in emissions_line
+
+    def test_trace_halt_fail_carries_the_anchor_and_bound(self) -> None:
+        """A latched halt names the anchor and the five-percent bound."""
+        state = PolicyState(
+            day=BASE_OBSERVED_AT.date(),
+            day_start_equity_usd=Decimal("200"),
+            peak_equity_usd=Decimal("200"),
+        )
+        lines = PolicyEngine().entry_gate_trace(state, base_observation(equity_usd=Decimal("50")))
+        halt_line = next(text for text in lines if text.startswith("gate daily_loss_halt:"))
+        assert ": FAIL" in halt_line
+        assert "200" in halt_line
+        assert "0.05" in halt_line
+
+    def test_trace_agrees_with_the_engine_refusal_at_the_scaled_basis(self) -> None:
+        """The scaled tranche basis traces healthy when the book is healthy."""
+        state = PolicyState(
+            day=BASE_OBSERVED_AT.date(),
+            day_start_equity_usd=Decimal("200"),
+            peak_equity_usd=Decimal("200"),
+        )
+        observation = base_observation(
+            equity_usd=Decimal("50"),
+            portfolio_equity_usd=Decimal("200"),
+        )
+        engine = PolicyEngine()
+        outcome = engine.decide(state, observation)
+        lines = engine.entry_gate_trace(state, observation)
+        halt_line = next(line for line in lines if line.startswith("gate daily_loss_halt:"))
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        assert ": PASS" in halt_line
+
+    def test_gas_cost_gate_traces_cost_against_the_yield_bound(self) -> None:
+        """The yield sense-check line carries cost, bound, and yield."""
+        lines = PolicyEngine().entry_gate_trace(
+            PolicyState(), base_observation(gas_price_gwei=Decimal("0.6"))
+        )
+        ceiling_line = next(line for line in lines if line.startswith("gate gas_ceiling:"))
+        assert ": FAIL" in ceiling_line
+        assert "0.5 gwei" in ceiling_line

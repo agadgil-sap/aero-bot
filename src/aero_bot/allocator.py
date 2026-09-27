@@ -52,6 +52,7 @@ from aero_bot.selector import (
     DEFAULT_SWITCH_MARGIN_FRACTION,
     DEFAULT_SWITCH_MIN_HOLD,
     PoolEntryEvaluation,
+    closest_call_evaluation,
     switch_gas_economics,
 )
 
@@ -183,8 +184,28 @@ class ExcludedPool(BaseModel):
     symbol: str
     # The stable typed reason no tranche was earned.
     reason: PortfolioExclusionReason
-    # One human evidence line carrying the numbers.
+    # The refusing gate's own stable name when this exclusion wraps an
+    # engine refusal (for example ``daily_loss_halt_active`` or
+    # ``gas_gate_deferred``); empty when the allocator's own bounds
+    # decided. The summary line carries it so an operator reads the
+    # refusing gate at a glance, never an opaque typed label.
+    gate: str = ""
+    # One compact cause phrase naming the binding bound and its measured
+    # value (for example ``weighted 15.29 below band floor 34.79``); the
+    # summary line carries it beside the typed reason.
+    cause: str = ""
+    # The excluded pool's qualifying emissions APR when one evaluation
+    # was in hand; None for whole-board exclusions.
+    emissions_apr: NonNegativeDecimal | None = None
+    # One human evidence line carrying the numbers: the refusing gate,
+    # its measured value, its bound, and the income the refusal forgoes
+    # per day at the pool's qualifying APR (the gnhf 34 lost-yield
+    # framing, the same one the out-of-range diagnostics carry).
     detail: str
+    # The approximate daily income the exclusion forgoes at the pool's
+    # qualifying APR on the tranche it would have earned, None when no
+    # sized tranche was ever derived (tier-band and count exclusions).
+    forgone_income_usdc_per_day: Decimal | None = None
 
 
 class HeldPositionFact(BaseModel):
@@ -260,6 +281,18 @@ class PortfolioAllocation(BaseModel):
     # The total committed value the allocation projects across every
     # position once its tranches fund.
     projected_committed_usdc: NonNegativeDecimal = Decimal("0")
+    # The gate-chain evidence's subject symbol (the top-ranked pool the
+    # trace evaluates; empty only when the board enumerated nothing).
+    gate_trace_symbol: str = ""
+    # One header line naming the traced pool and the exact sizing basis
+    # its gates were judged at (the tranche target when the allocator
+    # sized one, else the full-board observation basis).
+    gate_trace_basis: str = ""
+    # The complete per-gate evaluation for the traced pool: every ordered
+    # entry gate with its verdict, measured value, and bound, so a
+    # why-is-it-flat question is answerable from the audit store alone
+    # (the captain's gnhf 34 ruling).
+    gate_trace: tuple[str, ...] = ()
     # One human evidence line summarizing the allocation.
     summary: str
 
@@ -437,13 +470,88 @@ def band_candidates(
     return tuple((evaluation, weight) for evaluation, weight in ranked if weight >= band_floor)
 
 
+def _scaled_entry_observation(
+    engine: PolicyEngine,
+    evaluation: PoolEntryEvaluation,
+    budget_usdc: Decimal,
+) -> PolicyObservation:
+    """Build the tranche-sized observation the engine judges entries at.
+
+    The observation's equity carries the tranche's own sizing basis (so
+    the engine's eighty-percent cap sizes the tranche exactly) beside the
+    full portfolio equity (so the day machinery and its drawdown latches
+    keep judging the whole book, never the tranche's small basis).
+
+    Args:
+        engine: The locked per-pool policy engine naming the equity cap.
+        evaluation: The qualifying evaluation being sized.
+        budget_usdc: The tranche target in USDC.
+
+    Returns:
+        The scaled observation for the entry re-derivation.
+    """
+    scaled_equity = budget_usdc / engine.parameters.max_position_equity_fraction
+    return evaluation.observation.model_copy(
+        update={
+            "equity_usd": scaled_equity,
+            "portfolio_equity_usd": evaluation.observation.equity_usd,
+        }
+    )
+
+
+def _gate_trace_lines(
+    engine: PolicyEngine,
+    base_state: PolicyState,
+    reentry_blocked_until_by_symbol: Mapping[str, datetime],
+    evaluation: PoolEntryEvaluation | None,
+    budget_usdc: Decimal | None,
+) -> tuple[str, str, tuple[str, ...]]:
+    """Trace the complete entry gate chain for one pool at one basis.
+
+    Args:
+        engine: The locked per-pool policy engine.
+        base_state: The threaded session state.
+        reentry_blocked_until_by_symbol: The per-pool re-entry cooldowns.
+        evaluation: The pool being traced; None yields no evidence.
+        budget_usdc: The tranche target the gates judge at, or None to
+            trace at the observation's own full-board basis.
+
+    Returns:
+        The traced symbol, one header line naming the basis, and one
+        line per ordered gate with verdict, measurement, and bound.
+    """
+    if evaluation is None:
+        return "", "", ()
+    if budget_usdc is None:
+        observation = evaluation.observation
+        basis = (
+            f"entry gate chain for {evaluation.symbol} at the full-board basis "
+            f"(portfolio equity {observation.equity_usd} USDC):"
+        )
+    else:
+        observation = _scaled_entry_observation(engine, evaluation, budget_usdc)
+        basis = (
+            f"entry gate chain for {evaluation.symbol} at the {budget_usdc} USDC "
+            f"tranche basis (sized equity {observation.equity_usd} USDC, portfolio "
+            f"equity {observation.portfolio_equity_usd} USDC):"
+        )
+    state = base_state.model_copy(
+        update={
+            "position": None,
+            "held_inventory": None,
+            "reentry_blocked_until": reentry_blocked_until_by_symbol.get(evaluation.symbol),
+        }
+    )
+    return evaluation.symbol, basis, engine.entry_gate_trace(state, observation)
+
+
 def _entry_outcome_at_budget(
     engine: PolicyEngine,
     base_state: PolicyState,
     reentry_blocked_until_by_symbol: Mapping[str, datetime],
     evaluation: PoolEntryEvaluation,
     budget_usdc: Decimal,
-) -> tuple[PolicyOutcome | None, PolicyObservation | None, str]:
+) -> tuple[PolicyOutcome | None, PolicyObservation | None, str, str]:
     """Re-derive one pool's ENTER outcome at exactly the tranche budget.
 
     The engine stays the sole sizing authority: the observation's equity
@@ -452,6 +560,13 @@ def _entry_outcome_at_budget(
     size - the depth cap, the gas sense-check, the cooldown, the halt,
     and reference staleness all judge the tranche honestly, and a
     refusal at the smaller size records the pool as cash.
+
+    The scaled observation carries the full portfolio equity through
+    ``portfolio_equity_usd`` so the engine's day machinery - the
+    day-start anchor and both drawdown latches - keeps judging the whole
+    book, never the tranche's own sizing basis: before the gnhf 34 fix a
+    small tranche's scaled equity read as a portfolio drawdown and the
+    daily loss halt refused every fresh entry while the book was healthy.
 
     Args:
         engine: The locked per-pool policy engine.
@@ -462,14 +577,13 @@ def _entry_outcome_at_budget(
         budget_usdc: The tranche target in USDC.
 
     Returns:
-        The ENTER outcome with its tranche-scaled observation (its size
-        may sit below the target when the pool's depth cap binds), or
-        None, None, and one evidence line when the gate chain refused.
+        A triple of the ENTER outcome with its tranche-scaled observation
+        (its size may sit below the target when the pool's depth cap
+        binds), the refusing gate's stable name when the chain refused,
+        and one evidence line - or None, the gate, and the line when the
+        gate chain refused.
     """
-    scaled_equity = budget_usdc / engine.parameters.max_position_equity_fraction
-    observation: PolicyObservation = evaluation.observation.model_copy(
-        update={"equity_usd": scaled_equity}
-    )
+    observation: PolicyObservation = _scaled_entry_observation(engine, evaluation, budget_usdc)
     state = base_state.model_copy(
         update={
             "position": None,
@@ -480,10 +594,15 @@ def _entry_outcome_at_budget(
     outcome = engine.decide(state, observation)
     decision = outcome.decision
     if decision.action is not PolicyActionKind.ENTER:
-        reason = decision.reason.value
+        gate = decision.reason.value
         diagnostic = decision.diagnostics[0] if decision.diagnostics else ""
-        return None, None, f"the entry gate refused at the tranche size ({reason}): {diagnostic}"
-    return outcome, observation, ""
+        return (
+            None,
+            None,
+            gate,
+            f"the entry gate refused at the tranche size ({gate}): {diagnostic}",
+        )
+    return outcome, observation, "", ""
 
 
 def _build_tranche(
@@ -494,7 +613,7 @@ def _build_tranche(
     weight: Decimal,
     rank: int,
     budget_usdc: Decimal,
-) -> tuple[PortfolioTranche | None, str]:
+) -> tuple[PortfolioTranche | None, str, str]:
     """Derive one candidate's tranche at its budget, engine-judged.
 
     Args:
@@ -507,13 +626,14 @@ def _build_tranche(
         budget_usdc: The committed USDC value the tranche targets.
 
     Returns:
-        The derived tranche, or None and one refusal evidence line.
+        The derived tranche and empty gate and evidence strings, or None
+        with the refusing gate's name and one refusal evidence line.
     """
-    outcome, observation, refusal = _entry_outcome_at_budget(
+    outcome, observation, gate, refusal = _entry_outcome_at_budget(
         engine, base_state, reentry_blocked_until_by_symbol, evaluation, budget_usdc
     )
     if outcome is None or observation is None or outcome.decision.size_usd is None:
-        return None, refusal or "the entry gate carried no positive size"
+        return None, gate, refusal or "the entry gate carried no positive size"
     return (
         PortfolioTranche(
             symbol=evaluation.symbol,
@@ -525,6 +645,7 @@ def _build_tranche(
             observation=observation,
             entry_outcome=outcome,
         ),
+        "",
         "",
     )
 
@@ -583,6 +704,7 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
             ExcludedPool(
                 symbol="*",
                 reason=PortfolioExclusionReason.INVENTORY_UNWIND_PENDING,
+                cause="held inventory pending unwind",
                 detail=(
                     "unsold inventory from a stale-low burn is held; the board "
                     "never enters until the convergence machinery unwinds it"
@@ -596,6 +718,16 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
         for evaluation, weight in rank_qualifying_pools(evaluations, discipline_by_symbol)
         if evaluation.symbol not in held_symbols
     ]
+    # The gate-chain evidence defaults to the best-ranked pool the book
+    # could fund (or the closest call when nothing qualifies), traced at
+    # the full-board basis; the tranche loop below overwrites it with the
+    # tranche basis it actually judged rank one at.
+    trace_evaluation = (
+        ranked_not_held[0][0] if ranked_not_held else closest_call_evaluation(evaluations)
+    )
+    gate_trace_symbol, gate_trace_basis, gate_trace = _gate_trace_lines(
+        engine, base_state, reentry_blocked_until_by_symbol, trace_evaluation, None
+    )
     in_band_symbols = {evaluation.symbol for evaluation, _ in in_band}
     if ranked_not_held:
         band_floor = ranked_not_held[0][1] * resolved.tier_band_fraction
@@ -605,6 +737,12 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                     ExcludedPool(
                         symbol=evaluation.symbol,
                         reason=PortfolioExclusionReason.BELOW_TIER_BAND,
+                        cause=(
+                            f"weighted {weight} below band floor {band_floor} "
+                            f"({resolved.tier_band_fraction} of the top's "
+                            f"{ranked_not_held[0][1]})"
+                        ),
+                        emissions_apr=evaluation.emissions_apr,
                         detail=(
                             f"weighted APR {weight} sits below the tier band floor "
                             f"{band_floor} ({resolved.tier_band_fraction} of the top's "
@@ -625,6 +763,9 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
             deployable_usdc=Decimal("0"),
             cash_residual_usdc=cash_usdc,
             projected_committed_usdc=committed,
+            gate_trace_symbol=gate_trace_symbol,
+            gate_trace_basis=gate_trace_basis,
+            gate_trace=gate_trace,
             summary=(
                 f"allocation holds {len(held)} position(s) committed {committed} USDC; "
                 f"{reason_detail}"
@@ -639,6 +780,11 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                 ExcludedPool(
                     symbol=evaluation.symbol,
                     reason=PortfolioExclusionReason.MAX_POSITIONS_REACHED,
+                    cause=(
+                        f"{len(held)} of {resolved.max_concurrent_positions} slots held; "
+                        "no slot open"
+                    ),
+                    emissions_apr=evaluation.emissions_apr,
                     detail=(
                         f"the book holds {len(held)} of at most "
                         f"{resolved.max_concurrent_positions} positions; no slot is open"
@@ -650,6 +796,9 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
             deployable_usdc=Decimal("0"),
             cash_residual_usdc=cash_usdc,
             projected_committed_usdc=committed,
+            gate_trace_symbol=gate_trace_symbol,
+            gate_trace_basis=gate_trace_basis,
+            gate_trace=gate_trace,
             summary=(
                 f"allocation holds {len(held)} position(s) at the "
                 f"{resolved.max_concurrent_positions}-position count bound; cash "
@@ -661,6 +810,10 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
             ExcludedPool(
                 symbol=evaluation.symbol,
                 reason=PortfolioExclusionReason.MAX_POSITIONS_REACHED,
+                cause=(
+                    f"all {resolved.max_concurrent_positions} slots filled by better-ranked pools"
+                ),
+                emissions_apr=evaluation.emissions_apr,
                 detail=(
                     f"{resolved.max_concurrent_positions} better-ranked pools fill every open slot"
                 ),
@@ -672,6 +825,9 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
             deployable_usdc=deployable,
             cash_residual_usdc=cash_usdc,
             projected_committed_usdc=committed,
+            gate_trace_symbol=gate_trace_symbol,
+            gate_trace_basis=gate_trace_basis,
+            gate_trace=gate_trace,
             summary=(
                 f"allocation holds {len(held)} position(s) committed {committed} USDC; "
                 f"no qualifying pool earned a tranche and {cash_usdc} USDC stays cash"
@@ -679,6 +835,10 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
         )
     total_weight = sum((weight for _, weight in slotted), Decimal("0"))
     concentration_bound = resolved.concentration_cap_fraction * equity_usdc
+    # The lost-yield basis: one day of the pool's qualifying emissions APR
+    # on the tranche it would have earned, the same framing the
+    # out-of-range diagnostics carry (the captain's gnhf 34 ruling).
+    days_per_year = Decimal(365)
     tranches: list[PortfolioTranche] = []
     remaining = deployable
     for rank, (evaluation, weight) in enumerate(slotted, start=1):
@@ -692,19 +852,38 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
         if target > concentration_bound:
             target = concentration_bound
             clamped = True
+        if rank == 1:
+            # The gate-chain evidence names the top-ranked pool at the
+            # exact tranche basis the engine judged it at.
+            gate_trace_symbol, gate_trace_basis, gate_trace = _gate_trace_lines(
+                engine,
+                base_state,
+                reentry_blocked_until_by_symbol,
+                evaluation,
+                target,
+            )
+        forgone_per_day = +(target * evaluation.emissions_apr / days_per_year)
+        forgone_line = (
+            f"income forgone about {forgone_per_day} USDC per day at the qualifying "
+            f"APR {evaluation.emissions_apr}"
+        )
         if target > remaining:
             excluded.append(
                 ExcludedPool(
                     symbol=evaluation.symbol,
                     reason=PortfolioExclusionReason.INSUFFICIENT_CASH,
+                    cause=f"tier target {target} exceeds the {remaining} deployable left",
+                    emissions_apr=evaluation.emissions_apr,
                     detail=(
                         f"the tier target {target} USDC exceeds the {remaining} USDC of "
-                        "deployable budget left by earlier tiers; cash stays cash"
+                        f"deployable budget left by earlier tiers; cash stays cash; "
+                        f"{forgone_line}"
                     ),
+                    forgone_income_usdc_per_day=forgone_per_day,
                 )
             )
             continue
-        tranche, refusal = _build_tranche(
+        tranche, gate, refusal = _build_tranche(
             engine,
             base_state,
             reentry_blocked_until_by_symbol,
@@ -718,19 +897,45 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                 ExcludedPool(
                     symbol=evaluation.symbol,
                     reason=PortfolioExclusionReason.ENTRY_GATE_REFUSED,
-                    detail=refusal,
+                    gate=gate,
+                    cause=gate,
+                    emissions_apr=evaluation.emissions_apr,
+                    detail=f"{refusal}; {forgone_line}",
+                    forgone_income_usdc_per_day=forgone_per_day,
                 )
             )
             continue
         if tranche.budget_usd < resolved.min_position_usdc:
+            bound_line = (
+                f"the tier target clamped to the {concentration_bound} USDC per-name "
+                f"concentration bound ({resolved.concentration_cap_fraction} of equity "
+                f"{equity_usdc}) below the minimum, so the engine sized "
+                f"{tranche.budget_usd} USDC"
+                if clamped
+                else f"the engine's capped size {tranche.budget_usd} USDC sits below "
+                f"the {resolved.min_position_usdc} USDC minimum position size"
+            )
             excluded.append(
                 ExcludedPool(
                     symbol=evaluation.symbol,
                     reason=PortfolioExclusionReason.BELOW_MIN_POSITION_SIZE,
+                    cause=(
+                        f"size {tranche.budget_usd} below the {resolved.min_position_usdc} "
+                        "minimum"
+                        + (
+                            f" after the {concentration_bound} concentration clamp"
+                            if clamped
+                            else ""
+                        )
+                    ),
+                    emissions_apr=evaluation.emissions_apr,
                     detail=(
-                        f"the engine's capped size {tranche.budget_usd} USDC sits below "
-                        f"the {resolved.min_position_usdc} USDC minimum position size; "
-                        "cash stays cash"
+                        f"{bound_line}; cash stays cash; income forgone about "
+                        f"{tranche.budget_usd * evaluation.emissions_apr / days_per_year} "
+                        f"USDC per day at the qualifying APR {evaluation.emissions_apr}"
+                    ),
+                    forgone_income_usdc_per_day=(
+                        +tranche.budget_usd * evaluation.emissions_apr / days_per_year
                     ),
                 )
             )
@@ -742,10 +947,15 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                 ExcludedPool(
                     symbol=evaluation.symbol,
                     reason=PortfolioExclusionReason.CONCENTRATION_CAP_CLAMPED,
+                    cause=(
+                        f"target clamped to {concentration_bound} "
+                        f"({resolved.concentration_cap_fraction} of equity {equity_usdc})"
+                    ),
+                    emissions_apr=evaluation.emissions_apr,
                     detail=(
                         f"the tier target clamped to the {concentration_bound} USDC "
                         f"per-name bound ({resolved.concentration_cap_fraction} of "
-                        f"equity {equity_usdc})"
+                        f"equity {equity_usdc}); the tranche still funds"
                     ),
                 )
             )
@@ -754,7 +964,17 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
     projected = committed + funded
     tier_text = ", ".join(f"{tranche.symbol} {tranche.budget_usd}" for tranche in tranches)
     excluded_text = (
-        "; excluded " + ", ".join(f"{item.symbol} ({item.reason.value})" for item in excluded)
+        "; excluded "
+        + ", ".join(
+            f"{item.symbol} ({item.reason.value}: {item.gate})"
+            if item.gate
+            else (
+                f"{item.symbol} ({item.reason.value}: {item.cause})"
+                if item.cause
+                else f"{item.symbol} ({item.reason.value})"
+            )
+            for item in excluded
+        )
         if excluded
         else ""
     )
@@ -764,6 +984,9 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
         deployable_usdc=deployable,
         cash_residual_usdc=residual,
         projected_committed_usdc=projected,
+        gate_trace_symbol=gate_trace_symbol,
+        gate_trace_basis=gate_trace_basis,
+        gate_trace=gate_trace,
         summary=(
             f"allocation funds {len(tranches)} tranche(s) [{tier_text}] totaling {funded} "
             f"USDC beside {len(held)} held position(s) committed {committed} USDC; "
@@ -849,7 +1072,7 @@ def _reallocation_tranche(
     deployable: Decimal,
     total_weight: Decimal,
     concentration_bound: Decimal,
-) -> tuple[PortfolioTranche | None, str]:
+) -> tuple[PortfolioTranche | None, str, str]:
     """Size one reallocation replacement for the freed capital.
 
     The replacement commits the larger of its tier-weight share of the
@@ -879,7 +1102,7 @@ def _reallocation_tranche(
     weight_share = deployable * weight / total_weight if total_weight > 0 else Decimal("0")
     budget = max(weight_share, held_value)
     budget = min(budget, concentration_bound, cap_after_exit)
-    return _build_tranche(
+    tranche, gate, refusal = _build_tranche(
         engine,
         base_state,
         reentry_blocked_until_by_symbol,
@@ -888,6 +1111,7 @@ def _reallocation_tranche(
         rank,
         budget,
     )
+    return tranche, gate, refusal
 
 
 def plan_portfolio_rebalance(  # noqa: PLR0912, PLR0915 - one fixed precedence
@@ -1071,7 +1295,7 @@ def plan_portfolio_rebalance(  # noqa: PLR0912, PLR0915 - one fixed precedence
             continue
         evaluation, weight = candidates[0]
         cap_after_exit = resolved.total_exposure_cap_usdc - committed + fact.value_usd
-        tranche, refusal = _reallocation_tranche(
+        tranche, _gate, refusal = _reallocation_tranche(
             engine,
             base_state,
             reentry_blocked_until_by_symbol,

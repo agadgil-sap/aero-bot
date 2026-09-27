@@ -30,7 +30,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from aero_bot.allocator import PortfolioRebalancePlan
 from aero_bot.audit import AuditEventType, AuditStore
 from aero_bot.config import Settings
-from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
+from aero_bot.domain import (
+    IMMUTABLE_MODEL_CONFIG,
+    EvmAddress,
+    NonNegativeDecimal,
+    normalize_evm_address,
+)
 from aero_bot.emissions_apr import aerodrome_display_emissions_apr
 from aero_bot.executor import (
     DEFAULT_CANARY_SAFE_ADDRESS,
@@ -134,6 +139,65 @@ class StrategyDecisionReport(BaseModel):
     session_state: PolicyState | None = None
     # One human evidence line summarizing the selector's pass.
     board_summary: str = ""
+    # The header line naming the pool and sizing basis the gate-chain
+    # evidence evaluated (the captain's gnhf 34 ruling), empty when the
+    # board enumerated nothing.
+    gate_trace_basis: str = ""
+    # The complete per-gate evaluation for the top-ranked pool: every
+    # ordered entry gate with its verdict, measured value, and bound.
+    gate_trace: tuple[str, ...] = ()
+    # The idle-book evidence when qualifying pools stayed excluded while
+    # cash sat undeployed; None when the book deployed or nothing ranked
+    # in-band. Carries the episode signature the alert layer rate-limits
+    # on and every exclusion's full lost-yield consequence.
+    idle_cash: "IdleCashState | None" = None
+
+
+class IdleCashExclusion(BaseModel):
+    """Carry one in-band pool the allocator excluded while cash sat idle."""
+
+    # Frozen strict fields keep one exclusion's evidence exactly as derived.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The registry-matched stock symbol excluded while it ranked in-band.
+    symbol: str
+    # The allocator's stable typed exclusion reason.
+    reason: str
+    # The refusing engine gate's stable name when an engine gate refused;
+    # empty when the allocator's own bounds decided.
+    gate: str = ""
+    # One full consequence line: the refusing gate, its measured value,
+    # its bound, and the income the refusal forgoes per day.
+    detail: str
+    # The excluded pool's qualifying emissions APR.
+    emissions_apr: NonNegativeDecimal
+    # The approximate daily income the exclusion forgoes, when a sized
+    # tranche was derived; None for count and tier-band exclusions.
+    forgone_income_usdc_per_day: NonNegativeDecimal | None = None
+
+
+class IdleCashState(BaseModel):
+    """Carry the idle-book evidence one cycle must surface to the operator."""
+
+    # Frozen strict fields keep one idle posture bound to its evidence.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The Safe's live USDC the decision pass priced.
+    cash_usdc: NonNegativeDecimal
+    # The portfolio equity the decision pass priced.
+    equity_usd: Annotated[Decimal, Field(gt=0)]
+    # Cash as a fraction of equity, the alert threshold's measured value.
+    cash_fraction: Annotated[Decimal, Field(ge=0)]
+    # Every in-band pool excluded by a gate or bound, best-ranked first.
+    exclusions: tuple[IdleCashExclusion, ...]
+    # The stable episode signature (the sorted symbol/reason/gate set):
+    # unchanged while the same episode persists, changed when a new cause
+    # begins, absent entirely once the book deploys or the band empties.
+    signature: str
+    # True on the first cycle of an episode or when its cause changed -
+    # the one cycle the alert fires on; False while the same episode
+    # persists so a silent or noisy night never repeats identically.
+    signature_changed: bool
 
 
 class BoardListing(BaseModel):

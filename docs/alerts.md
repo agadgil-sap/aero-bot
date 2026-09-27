@@ -30,9 +30,13 @@ Everything is environment-driven; credentials live only in the sealed environmen
 
 ## Alert semantics
 
-Alerts derive from the cycle report alone, in fixed order: out-of-band first, the halt reason, every refused action with its catalog code, every failed action, then the balance floors (an unknown relayer address - a dry run without `AERO_BOT_RELAYER_ADDRESS` - never alerts, it reports zero honestly instead). Alerting emails carry the `[aero-bot][ALERT]` subject prefix and lead with the first alert; summaries carry `[aero-bot]` and the verdict.
+Alerts derive from the cycle report alone, in fixed order: out-of-band first, the halt reason, every refused action with its catalog code, every failed action, then the balance floors (an unknown relayer address - a dry run without `AERO_BOT_RELAYER_ADDRESS` - never alerts, it reports zero honestly instead), and finally the idle-book alert. Alerting emails carry the `[aero-bot][ALERT]` subject prefix and lead with the first alert; summaries carry `[aero-bot]` and the verdict.
 
 Both floors default above the executor's own hard floors: 0.0005 ETH of relayer headroom over the 0.0002-ETH broadcast floor gives warning before the next cycle refuses, and 5 USDC of Safe working capital suits a pilot funded around twenty - tune both to the deployment through the environment.
+
+### The idle-book alert (captain's ruling, gnhf 34)
+
+A silent idle book must never happen again: the first allocator night sat 113 clean cycles at 97 percent cash while the top pool (qualifying APR 69-81) was excluded every cycle behind an opaque label. The idle-book alert fires when more than the configured fraction of equity sits as cash (default 0.80, `AERO_BOT_ALERT_IDLE_CASH_FRACTION`, a decimal fraction inside (0, 1]) while at least one pool ranks above the tier band but stays excluded by a gate or bound. It fires ONCE PER EPISODE: the cycle book carries the episode signature (the sorted symbol/reason/gate set), and only the first cycle of a changed cause alerts - the same per-cycle rate limit every alert rides, plus episode suppression so a week-long idle posture costs one email, not 2016. The alert line names the pool, the gate, the bound, and the income forgone per day at the pool's qualifying APR; the full per-gate evidence rides every cycle's decision diagnostics and the `cycle_reported` audit record.
 
 ## Wiring
 
