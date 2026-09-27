@@ -709,7 +709,7 @@ def test_plan_mint_entry_refuses_budgets_above_each_cap() -> None:
         plan_mint_entry(
             LpExecutionPolicy(),
             pool_observation(),
-            mint_directive(budget_usdc=Decimal("100.01")),
+            mint_directive(budget_usdc=Decimal("1000.01")),
             safe_inventory(usdc_units=10**9),
         )
     assert pool_cap.value.code is LpPlanRefusalCode.BUDGET_ABOVE_POOL_CAP
@@ -718,7 +718,7 @@ def test_plan_mint_entry_refuses_budgets_above_each_cap() -> None:
             LpExecutionPolicy(),
             pool_observation(),
             mint_directive(budget_usdc=Decimal(7)),
-            safe_inventory(existing_position_value_usdc=Decimal(96)),
+            safe_inventory(existing_position_value_usdc=Decimal("996")),
         )
     assert exposure_cap.value.code is LpPlanRefusalCode.BUDGET_ABOVE_TOTAL_EXPOSURE_CAP
 
@@ -750,8 +750,8 @@ def test_plan_mint_entry_refuses_insufficient_usdc_for_entry() -> None:
 def test_execution_policy_refuses_configuration_above_its_ceilings() -> None:
     """No configuration may raise any pilot cap above its documented ceiling."""
     for overrides in (
-        {"max_position_usdc_per_pool": Decimal("100.01")},
-        {"max_total_pilot_exposure_usdc": Decimal("100.01")},
+        {"max_position_usdc_per_pool": Decimal("1000.01")},
+        {"max_total_pilot_exposure_usdc": Decimal("1000.01")},
         {"max_position_fraction_of_pool_depth": Decimal("0.02")},
         {"swap_impact_ceiling_fraction": Decimal("0.002")},
     ):
@@ -764,15 +764,17 @@ def test_execution_policy_refuses_configuration_above_its_ceilings() -> None:
 
 
 def test_pilot_caps_pin_the_calibrated_bounds() -> None:
-    """The constants and defaults carry the captain-calibrated 100/100 bounds.
+    """The constants and defaults carry the captain-ruled 1000/1000 bounds.
 
-    The captain's calibration ruling (2026-09-07 ~23:45, reconfirmed
-    2026-09-08) raised the per-pool cap from 50 to 100 USDC while the
-    fleet-wide total stayed 100 USDC, so one pool may now commit the whole
-    pilot envelope and no more.
+    The calibration ruling (2026-09-07 ~23:45, reconfirmed 2026-09-08) set
+    the pilot at 50-then-100 USDC per pool with a 100 USDC fleet total; the
+    performance ruling (2026-09-27) raised both ceilings to 1000 USDC
+    because the measured in-range depth (~404k USDC) leaves the
+    one-percent depth gate - the binding protection - near 4k USDC per
+    pool, an order of magnitude above the old ceilings.
     """
-    assert Decimal("100") == MAX_POSITION_USDC_PER_POOL
-    assert Decimal("100") == MAX_TOTAL_PILOT_EXPOSURE_USDC
+    assert Decimal("1000") == MAX_POSITION_USDC_PER_POOL
+    assert Decimal("1000") == MAX_TOTAL_PILOT_EXPOSURE_USDC
     policy = LpExecutionPolicy()
     assert policy.max_position_usdc_per_pool == MAX_POSITION_USDC_PER_POOL
     assert policy.max_total_pilot_exposure_usdc == MAX_TOTAL_PILOT_EXPOSURE_USDC
@@ -780,11 +782,11 @@ def test_pilot_caps_pin_the_calibrated_bounds() -> None:
     plan = plan_mint_entry(
         policy,
         pool_observation(),
-        mint_directive(budget_usdc=Decimal("100")),
-        safe_inventory(usdc_units=200 * ONE_USDC_UNITS),
+        mint_directive(budget_usdc=Decimal("1000")),
+        safe_inventory(usdc_units=2000 * ONE_USDC_UNITS),
     )
-    assert plan.caps_enforced[0] == "budget at or below the 100 USDC per-pool cap"
+    assert plan.caps_enforced[0] == "budget at or below the 1000 USDC per-pool cap"
     assert any(
-        cap == "budget at or below the remaining 100 USDC of the 100 USDC total pilot cap"
+        cap == "budget at or below the remaining 1000 USDC of the 1000 USDC total pilot cap"
         for cap in plan.caps_enforced
     )

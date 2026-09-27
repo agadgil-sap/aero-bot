@@ -106,8 +106,8 @@ Caps are enforced in a fixed order by `plan_mint_entry`, and each evaluation is 
 
 | Cap | Default bound | Refusal code |
 | --- | --- | --- |
-| Per-pool position | 100 USDC | `budget_above_pool_cap` |
-| Total pilot exposure | 100 USDC | `budget_above_total_exposure_cap` |
+| Per-pool position | 1000 USDC | `budget_above_pool_cap` |
+| Total pilot exposure | 1000 USDC | `budget_above_total_exposure_cap` |
 | Share of pool in-range depth | 1 percent | `position_above_pool_depth_fraction` |
 | Snapshot price containment | strictly inside range | `price_outside_range` |
 | Budget funds both raw sides | floors both sides above zero | `budget_too_small_for_both_sides` |
@@ -116,7 +116,7 @@ Caps are enforced in a fixed order by `plan_mint_entry`, and each evaluation is 
 
 The depth base values the pool's active liquidity over one tick spacing per side of the current tick, which is deliberately conservative: the true range-wide depth is always larger.
 The policy model itself refuses construction above any documented ceiling, so no configuration can raise the pilot caps.
-The per-pool bound was raised from 50 to 100 USDC by the captain's calibration ruling (2026-09-07 ~23:45, reconfirmed 2026-09-08), so one pool may now commit the whole pilot envelope; the fleet-wide total stays 100 USDC, and every refusal code and the enforcement order are unchanged.
+The per-pool bound was raised from 50 to 100 USDC by the captain's calibration ruling (2026-09-07 ~23:45, reconfirmed 2026-09-08), then both ceilings were raised to 1000 USDC by the captain's performance ruling (2026-09-27): the measured in-range depth (~404k USDC on the AAPLc pool) leaves the one-percent depth gate - the real protection, unchanged - near 4k USDC per pool, an order of magnitude above the old ceilings; every refusal code and the enforcement order are unchanged.
 The verbatim canary captures further down this page predate the raise and still read the 50 USDC per-pool bound.
 
 ### Balancing swap policy
@@ -144,7 +144,7 @@ balancing swap: 4114602 raw USDC -> ~1284469 raw stock (1 tranche(s), impact 0.0
 
 caps enforced in order:
   - budget at or below the 50 USDC per-pool cap
-  - budget at or below the remaining 100 USDC of the 100 USDC total pilot cap
+  - budget at or below the remaining 1000 USDC of the 1000 USDC total pilot cap
   - half width 10 ticks at or below the 0.003 ceiling (explicit override)
   - snapshot price strictly inside the derived range
   - budget at or below 0.01 of the estimated 404072.1180955263603196782295 USDC in-range depth
@@ -209,7 +209,7 @@ These gates run before anything is signed, in order, and each appends its label 
 | Relayer ETH floor (execute) | 0.0002 ETH plus twice the bounded gas cost | `relayer_eth_insufficient` |
 | Broadcast confirmation (execute) | explicit `--confirm-broadcast` flag | `broadcast_confirmation_missing` |
 | Exit-swap stock balance (exit-swap) | a positive stock balance exists | `stock_balance_zero` |
-| Exit-swap output cap (exit-swap) | quoted output at or below the 100 USDC per-pool pilot cap | `exit_output_above_pool_cap` |
+| Exit-swap output cap (exit-swap) | quoted output at or below the 1000 USDC per-pool cap | `exit_output_above_pool_cap` |
 | Held-NFT enumeration | every balanceOf/tokenOfOwnerByIndex/positions read succeeds | `enumeration_unreadable` |
 | Rebuilt hash pin (execute) | byte-exact against the report | `rebuild_hash_mismatch` |
 | Execute-time signature | live `checkSignatures` accepts again | `signature_rejected` |
@@ -307,17 +307,27 @@ Live verification (2026-09-08, formula from this repo's own Sugar reads vs the f
 The unrealized P&L is reported only against an explicitly supplied `--entry-cost`; without one the diagnostic says the entry cost is unknown rather than implying zero.
 Nothing in the status path builds, signs, estimates, or audits a transaction: the single audit event is `lp_status_reported`, and the read-only proof in tests is that the Safe script's preloaded nonce and signature queues are never consumed.
 
-#### Claimable pool fees (the checkpointed lower bound)
+#### Claimable pool fees (the checkpointed lower bound) and the computed measurement
 
 The status report also values the NFPM's checkpointed owed fees - the `tokensOwed0/1` columns of the `positions` view - as `fees_owed_usdc`, at the same snapshot price as the composition so the two can never disagree.
 The semantics are a lower bound, stated in the report's diagnostic: Slipstream checkpoints `tokensOwed` only on position modifications (mint, increase, decrease, collect), so between modifications the live claimable accrues uncheckpointed and the reported number understates what a `collect` with `MAX_UINT128` would actually sweep.
-The scheduled cycle threads this reading into its fee-evidence window ([docs/cycle.md](docs/cycle.md), fee evidence); policy decisions keep the conservative zero fee APR regardless.
-The honest path to a full fee APR, in ascending fidelity: (1) the current per-cycle claimable deltas across a day, already measured live and bounded below; (2) a `feeGrowthInside` sampling layer over consecutive cycles, which reconstructs accrued-but-uncheckpointed fees between position modifications; (3) the realized split decoded from collect and burn receipts at exit, the only exact accounting.
-Until one of the higher-fidelity layers lands, the measured window is reported with its lower-bound caveat in every diagnostic, never as a decision input.
+The captain's 2026-09-27 correction ruled the flat `claimable = 0` readings a measurement artifact - fees were never zero - so the status now also computes the real accrual from the pool's own state: `feeGrowthInside` by the exact v3 identity (`feeGrowthGlobal` minus both range boundaries' `feeGrowthOutside` words from `ticks(int24)`, at the read block), the earned amount as `liquidity x delta(feeGrowthInside) >> 128` per side.
+The report carries the raw inside words (`fee_growth_inside0/1_x128`), the computed since-checkpoint earnings and their value (`fees_earned_since_checkpoint_usdc`), the computed collect-now estimate (`claimable_fees_computed_usdc` - the checkpointed owed plus the uncheckpointed growth, what a max-uint128 collect would actually sweep), and the named method line (`fee_method_diagnostic`) so every consumer sees computed-versus-checkpointed labeled explicitly.
+A failed accumulator read fails open: the computed fields stay absent and the checkpointed lower bound remains the report.
+Priced pre-share (any protocol share applies at collect), the computed measurement feeds the cycle's fee evidence and yield attribution; policy decisions keep the conservative zero fee APR regardless.
+The remaining path to exact accounting is the realized split decoded from collect and burn receipts at exit.
+
+### The reward conversion (AERO to USDC)
+
+`aero-bot-lp dry-run aero-swap` and `aero-bot-lp execute aero-swap --confirm-broadcast` convert the Safe's ENTIRE AERO balance back to USDC through the same whitelisted router, on the venue's own Slipstream AERO/USDC pool resolved from a dedicated Sugar enumeration scoped to the AERO token (`LiveExecutionSources.discover_reward_token_pools`; the factory allowlist, slipstream-only kind, and exact native-USDC pair scope are enforced, while gauge liveness and emissions - farming gates - are deliberately not required for a swap-only treasury surface).
+When several pools match, the deepest by USDC reserve wins deterministically.
+The sequence is one optional exact AERO approval plus the exact-input swap; the minimum output floors at the locked one-percent tolerance, and the quoted output may never exceed the 1000 USDC per-pool cap (`aero_output_above_pool_cap`) - an out-of-band reward pile refuses instead of moving.
+The full refusal catalog: `aero_pool_not_discovered` (no Sugar-verified Slipstream AERO/USDC pool), `aero_balance_zero` (nothing to convert or dust), `aero_output_above_pool_cap`, plus the shared staleness, gas, ETH-floor, relayer-floor, and broadcast-confirmation gates.
+The scheduled cycle drives this surface inside its act step under the sealed conversion cadence ([docs/cycle.md](docs/cycle.md), the reward conversion); the manual CLI shares every gate.
 
 ### Audit chain and CLI surface
 
-Every plan, built transaction, and refusal appends to the same append-only hash-chained SQLite store as the swap executor, with these event types: `lp_mint_planned`, `lp_stake_planned`, `lp_unstake_planned`, `lp_exit_planned`, `lp_collect_planned`, `lp_recenter_planned`, `lp_status_reported`, `lp_transaction_built`, `lp_refused`, and - on the execute path - `lp_execute_sent`, `lp_execute_confirmed`, and `lp_execute_failed`.
+Every plan, built transaction, and refusal appends to the same append-only hash-chained SQLite store as the swap executor, with these event types: `lp_mint_planned`, `lp_stake_planned`, `lp_unstake_planned`, `lp_exit_planned`, `lp_collect_planned`, `lp_recenter_planned`, `lp_status_reported`, `lp_transaction_built`, `lp_refused`, `lp_aero_swap_planned`, and - on the execute path - `lp_execute_sent`, `lp_execute_confirmed`, and `lp_execute_failed`.
 A recenter appends its inner mint plan as `lp_mint_planned` followed by the `lp_recenter_planned` batch record, so the recycled entry stays inspectable as a first-class plan.
 Refusal records carry the executor catalog code plus the planner's own code when the planner refused, and the action name (`mint`, `stake`, `unstake`, `withdraw`, `collect`, `recenter`, `status`), so both layers' decisions stay inspectable offline.
 The CLI exits zero on success, one on failures, and two on any refusal, with the catalog code printed to stderr as `refused [<code>]`.
@@ -335,6 +345,8 @@ aero-bot-lp execute stake --symbol AAPLc --token-id 0 --confirm-broadcast
 aero-bot-lp execute unstake --symbol AAPLc --token-id 0 --confirm-broadcast
 aero-bot-lp execute withdraw --symbol AAPLc --token-id 0 --confirm-broadcast
 aero-bot-lp execute collect --symbol AAPLc --token-id 0 --confirm-broadcast
+aero-bot-lp dry-run aero-swap
+aero-bot-lp execute aero-swap --confirm-broadcast
 aero-bot-lp status --symbol AAPLc --token-id 0 --aero-price 0.30 [--entry-cost 7]
 ```
 
@@ -349,7 +361,7 @@ The manual LP CLI still exposes recenter as a dry-run-only preflight. Scheduled 
 ### The exit swap (stock to USDC)
 
 `aero-bot-lp execute exit-swap --symbol AAPLc` is the canary campaign's captain-authorized exit swap productized into the lifecycle: it converts the Safe's ENTIRE stock balance back to USDC through the same whitelisted router every balancing swap uses, in the reverse direction (exact-input stock, minimum-output USDC, recipient Safe; the 2026-09-08 live run realized 99.95 percent of quote through exactly this path).
-The sequence is one optional exact stock approval (skipped when the standing router allowance suffices) plus the reverse swap; the quote comes from the block-pinned pool snapshot's sqrt price, the minimum output floors at the locked one-percent tolerance, and the quoted output may never exceed the 100 USDC per-pool pilot cap - a larger inventory refuses as `exit_output_above_pool_cap` instead of moving, so the surface stays inside the pilot envelope whatever the balance.
+The sequence is one optional exact stock approval (skipped when the standing router allowance suffices) plus the reverse swap; the quote comes from the block-pinned pool snapshot's sqrt price, the minimum output floors at the locked one-percent tolerance, and the quoted output may never exceed the 1000 USDC per-pool cap - a larger inventory refuses as `exit_output_above_pool_cap` instead of moving, so the surface stays inside the capped envelope whatever the balance.
 A dry-run form (`dry-run exit-swap`) builds and validates the same sequence without broadcasting.
 
 ### Held-position inventory and the relaxed untracked gate

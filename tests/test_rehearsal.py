@@ -419,7 +419,7 @@ class TestReplayLifecycle:
         assert all(a.action != PolicyActionKind.ENTER for a in ledger.actions[2:])
 
     def test_upside_recenter_after_the_fifteen_minute_wait(self) -> None:
-        """A sustained move above the range recenters once the wait elapses."""
+        """A sustained move above the range recenters once the acting window elapses."""
         prices = [Decimal("100")] + [Decimal("101")] * 16
         ledger = run_rehearsal(prices, high_apr_steps(len(prices)))
 
@@ -428,7 +428,10 @@ class TestReplayLifecycle:
         recenter = ledger.actions[1]
         assert recenter.action == PolicyActionKind.RECENTER
         assert recenter.reason == PolicyReason.RECENTER_WAIT_ELAPSED
-        assert recenter.timestamp == BASE_TIME + timedelta(minutes=16)
+        # The ten-minute out-of-range grace window (the captain's 2026-09-27
+        # correction) pulls the recenter attempt earlier than the locked
+        # fifteen-minute wait, so the first past-grace observation recenters.
+        assert recenter.timestamp == BASE_TIME + timedelta(minutes=11)
         # The recenter re-derives its width from live evidence: the fixture's
         # economics cannot reach the one-percent target, so the solve enters
         # at the one-spacing tightest width rather than widening to hedge.

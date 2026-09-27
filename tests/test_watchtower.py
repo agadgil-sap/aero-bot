@@ -282,6 +282,30 @@ class FakeCloseExecutor:
             "unstake", symbol, token_id, key_bytes, confirm_broadcast=confirm_broadcast
         )
 
+    def execute_collect(
+        self,
+        symbol: str,
+        token_id: int,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Record the claim shape; the watchtower never claims."""
+        return self._run(
+            "collect", symbol, token_id, key_bytes, confirm_broadcast=confirm_broadcast
+        )
+
+    def execute_aero_swap(
+        self,
+        key_bytes: bytes,
+        *,
+        confirm_broadcast: bool,
+        ephemeral_key: bool = False,
+    ) -> LpActionExecutionReport:
+        """Record the reward-conversion shape; the watchtower never converts."""
+        return self._run("aero_swap", key_bytes, confirm_broadcast=confirm_broadcast)
+
     def execute_withdraw(
         self,
         symbol: str,

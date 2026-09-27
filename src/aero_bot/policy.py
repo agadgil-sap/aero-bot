@@ -335,6 +335,15 @@ class PolicyParameters(BaseModel):
     # Any non-urgent out-of-range recenter waits fifteen minutes before the
     # economics are evaluated.
     recenter_wait: timedelta = timedelta(minutes=15)
+    # The out-of-range grace window bounds how long a staked position may
+    # sit outside its earning range at all: once it elapses the policy must
+    # act - recenter when the economics pass, otherwise exit - because every
+    # minute out of range forgoes emissions income (the yield-duration
+    # thesis; captain's 2026-09-27 correction). Default ten minutes,
+    # configurable in the sealed cycle environment; when it is shorter than
+    # the recenter wait it also pulls the recenter attempt earlier, never
+    # later.
+    out_of_range_grace: timedelta = timedelta(minutes=10)
     # A downside recenter is ignored for tiny edge breaches; the pool must be
     # at least 0.10 percent below the lower edge before we pay churn costs.
     downside_recenter_min_distance_fraction: Decimal = Decimal("0.001")
@@ -425,6 +434,8 @@ class PolicyParameters(BaseModel):
             raise ValueError("eth_price_assumption_usd must be positive")
         if self.convergence_timeout <= timedelta(0):
             raise ValueError("convergence_timeout must be positive")
+        if self.out_of_range_grace <= timedelta(0):
+            raise ValueError("out_of_range_grace must be positive")
         if self.reference_open_position_max_age_seconds < self.reference_max_age_seconds:
             raise ValueError(
                 "reference_open_position_max_age_seconds must not be tighter than "
@@ -531,10 +542,15 @@ class HeldInventory(BaseModel):
     stock_quantity: Annotated[Decimal, Field(gt=0)]
     # Held-since anchors the convergence timeout of the hold.
     held_since: datetime
-    # Why inventory is held: stale-low protection, failed entry, or adoption.
-    origin: Literal["stale_low_exit", "failed_entry", "failed_recenter", "adopted_balance"] = (
-        "adopted_balance"
-    )
+    # Why inventory is held: stale-low protection, failed entry, adoption, or
+    # the out-of-range grace exit routing stock through convergence.
+    origin: Literal[
+        "stale_low_exit",
+        "failed_entry",
+        "failed_recenter",
+        "adopted_balance",
+        "out_of_range_exit",
+    ] = "adopted_balance"
 
     @model_validator(mode="after")
     def require_aware_held_since(self) -> Self:
@@ -554,6 +570,11 @@ class PolicyState(BaseModel):
     day: date | None = None
     # Day-start equity anchors the five-percent daily loss halt.
     day_start_equity_usd: Annotated[Decimal, Field(gt=0)] = STARTING_EQUITY_USDC
+    # The running equity high-water mark, carried continuously across the
+    # New York day rollover (captain's 2026-09-27 ruling): the continuous
+    # drawdown latch measures against this peak, so a swing that crosses
+    # midnight can no longer reset the halt. It only ever ratchets upward.
+    peak_equity_usd: Decimal | None = None
     # The day a daily loss halt tripped; entries stay blocked until it changes.
     halted_day: date | None = None
     # The open position, or None while the policy is flat in USDC.
@@ -588,6 +609,12 @@ class PolicyActionKind(StrEnum):
     # Defensive exit burns and swaps all inventory back to USDC when the
     # reference quote went stale beyond the open-position bound.
     DEFENSIVE_EXIT = "defensive_exit"
+    # Range grace exit ends an out-of-range hold once the grace window
+    # elapsed and the recenter economics failed: out of range the position
+    # earns no emissions, so income protection exits it - below the range
+    # the stock routes through inventory convergence, above it the position
+    # is already all USDC (captain's 2026-09-27 performance ruling).
+    RANGE_GRACE_EXIT = "range_grace_exit"
     # Sell inventory swaps held stock tokens back to USDC on convergence,
     # timeout, or a forced flat window.
     SELL_INVENTORY = "sell_inventory"
@@ -627,6 +654,9 @@ class PolicyReason(StrEnum):
     ENTRY_COOLDOWN_ACTIVE = "entry_cooldown_active"
     # The five-percent daily loss halt blocks new entries for the day.
     DAILY_LOSS_HALT_ACTIVE = "daily_loss_halt_active"
+    # The out-of-range grace window elapsed and the recenter economics
+    # failed, so the position exits as income protection.
+    OUT_OF_RANGE_GRACE_EXPIRED = "out_of_range_grace_expired"
     # A condition-driven flat event (a stale oracle observation or a paused
     # registry) requires being flat; scheduled windows no longer gate since
     # the captain's 2026-09-09 twenty-four-seven ruling.
@@ -928,19 +958,31 @@ class PolicyEngine:
         )
 
     def _observe_day(self, state: PolicyState, observation: PolicyObservation) -> PolicyState:
-        """Apply day rollover and the daily loss halt to the threaded state.
+        """Apply day rollover, peak tracking, and both daily loss latches.
+
+        The day-start latch keeps its exact shipped semantics: a marked
+        drawdown of at least the halt fraction from the America/New_York
+        day-start anchor latches the halt for the rest of that day. The
+        continuous latch (captain's 2026-09-27 ruling) rides beside it: the
+        running equity high-water mark persists across the day rollover, so
+        a drawdown of at least the same fraction from that peak re-arms the
+        same halt machinery on the new day - a swing that crosses midnight
+        can no longer reset the latch, and the halt releases only when
+        equity recovers to inside the fraction of the peak.
 
         Args:
             state: Engine state from the previous decision.
             observation: The current injected observation.
 
         Returns:
-            State with the day snapshot rolled over and any halt recorded.
+            State with the day snapshot rolled over, the peak ratcheted, and
+            any halt recorded.
         """
         # The trading day is anchored to the America/New_York session date.
         observation_day = observation.observed_at.astimezone(NEW_YORK).date()
         if state.day != observation_day:
-            # A new day resets both the day-start equity and any prior halt.
+            # A new day resets the day-start anchor and any prior day latch;
+            # the running peak deliberately survives the rollover.
             state = state.model_copy(
                 update={
                     "day": observation_day,
@@ -948,14 +990,27 @@ class PolicyEngine:
                     "halted_day": None,
                 }
             )
+        # The high-water mark only ever ratchets upward, across days.
+        peak = state.peak_equity_usd
+        if peak is None or observation.equity_usd > peak:
+            state = state.model_copy(update={"peak_equity_usd": observation.equity_usd})
+            peak = observation.equity_usd
         if state.halted_day != observation_day:
-            # Marked drawdown from the day-start equity is the halt trigger.
+            # Marked drawdown from the day-start equity is the shipped latch.
             drawdown_fraction = (
                 state.day_start_equity_usd - observation.equity_usd
             ) / state.day_start_equity_usd
             if drawdown_fraction >= self._parameters.daily_loss_halt_fraction:
                 # The halt latches for the day even if equity later recovers.
                 state = state.model_copy(update={"halted_day": observation_day})
+            elif peak is not None:
+                # The continuous latch measures from the running peak and
+                # re-arms the same halt machinery on every day it holds,
+                # including the first observation of a new day whose carried
+                # peak towers above the freshly reset day-start anchor.
+                peak_drawdown_fraction = (peak - observation.equity_usd) / peak
+                if peak_drawdown_fraction >= self._parameters.daily_loss_halt_fraction:
+                    state = state.model_copy(update={"halted_day": observation_day})
         return state
 
     def _flat_reason(self, observation: PolicyObservation) -> str | None:
@@ -1008,6 +1063,105 @@ class PolicyEngine:
                 f"because the current depth cap is {depth_cap} USDC.",
             )
         return size_usd, ()
+
+    def _lost_yield_diagnostics(
+        self,
+        position: PolicyPosition,
+        observation: PolicyObservation,
+    ) -> tuple[str, ...]:
+        """Name the income an out-of-range hold forgoes at the qualifying APR.
+
+        The strategy is yield-duration: income accrues per unit of time staked
+        in range, so every minute outside the range is lost income at the
+        pool's qualifying emissions APR (the captain's 2026-09-27 correction).
+
+        Args:
+            position: The out-of-range open position.
+            observation: The current injected observation.
+
+        Returns:
+            A one-line lost-yield evidence tuple for decision diagnostics.
+        """
+        daily_yield = position.committed_usd * observation.emissions_apr / DAYS_PER_YEAR
+        return (
+            f"Income protection: out of range the staked position earns no emissions, "
+            f"and every minute out of range forgoes yield at the pool's qualifying "
+            f"APR {observation.emissions_apr} - about {daily_yield} USDC per day on the "
+            f"committed {position.committed_usd} USDC.",
+        )
+
+    def _out_of_range_grace_exit(
+        self,
+        state: PolicyState,
+        observation: PolicyObservation,
+        trigger_diagnostics: tuple[str, ...],
+    ) -> PolicyOutcome:
+        """Exit one position whose out-of-range grace window elapsed.
+
+        The grace exit is income protection (captain's 2026-09-27 ruling): the
+        recenter economics failed while the position earns nothing outside its
+        range, so the hold ends. Below the range the withdrawn stock routes
+        through the inventory convergence machinery exactly like a stale-low
+        burn; above the range the composition is already all USDC and the
+        exit completes flat. The re-entry cooldown arms like a stop-out so an
+        immediate re-entry cannot rebuild the position the policy just
+        declined to recenter.
+
+        Args:
+            state: Day-rolled state carrying the open position.
+            observation: The current injected observation.
+            trigger_diagnostics: Evidence naming the failed recenter economics.
+
+        Returns:
+            The grace-exit decision plus the successor state.
+
+        Raises:
+            ValueError: If the state carries no open position.
+        """
+        position = state.position
+        if position is None:  # pragma: no cover - guarded by the caller
+            raise ValueError("out-of-range grace exit requires an open position")
+        stock_quantity = self._stock_quantity(position, observation.amm_price_usdc)
+        gas_units, gas_cost_usd = self._batch_gas(
+            observation, self._parameters.exit_batch_gas_units
+        )
+        updates: dict[str, object] = {
+            "position": None,
+            "reentry_blocked_until": (observation.observed_at + self._parameters.reentry_cooldown),
+        }
+        if stock_quantity > 0:
+            updates["held_inventory"] = HeldInventory(
+                pool_address=position.pool_address,
+                token_address=position.token_address,
+                stock_quantity=stock_quantity,
+                held_since=observation.observed_at,
+                origin="out_of_range_exit",
+            )
+        next_state = state.model_copy(update=updates)
+        route = (
+            "the withdrawn stock routes through the inventory convergence machinery"
+            if stock_quantity > 0
+            else "the position is entirely USDC above its range, so the exit completes flat"
+        )
+        diagnostics = (
+            trigger_diagnostics
+            + (
+                f"The {self._parameters.out_of_range_grace} out-of-range grace window "
+                f"elapsed, so the policy exits the position rather than holding a "
+                f"non-earning stake; {route}.",
+            )
+            + self._gas_diagnostics(gas_units, gas_cost_usd)
+        )
+        return PolicyOutcome(
+            decision=PolicyDecision(
+                action=PolicyActionKind.RANGE_GRACE_EXIT,
+                reason=PolicyReason.OUT_OF_RANGE_GRACE_EXPIRED,
+                diagnostics=diagnostics,
+                estimated_gas_units=gas_units,
+                estimated_gas_cost_usd=gas_cost_usd,
+            ),
+            next_state=next_state,
+        )
 
     def _decide_with_position(
         self,
@@ -1107,109 +1261,136 @@ class PolicyEngine:
                 else observation.observed_at
             )
             waited = observation.observed_at - wait_anchor
-            if waited >= self._parameters.recenter_wait:
-                recenter_size, resize_diagnostics = self._recenter_size(position, observation)
-                if recenter_size <= 0:
-                    waiting_position = position.model_copy(
-                        update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
-                    )
-                    return self._hold(
-                        state.model_copy(update={"position": waiting_position}),
-                        PolicyReason.OPEN_ABOVE_RANGE_WAITING,
-                        (
-                            "The current pool-depth cap leaves no positive safe replacement "
-                            "mint size; holding the existing position until depth recovers.",
-                        ),
-                    )
-                # The gas sense-check gate defers non-urgent recenters.
-                deferred, defer_diagnostics = self._gas_gate_blocks(
-                    observation,
-                    self._parameters.recenter_batch_gas_units,
-                    recenter_size,
-                )
-                if deferred:
-                    # The anchor persists so the elapsed wait stays elapsed and
-                    # the recenter retries on a cheaper observation.
-                    waiting_position = position.model_copy(
-                        update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
-                    )
-                    return self._hold(
-                        state.model_copy(update={"position": waiting_position}),
-                        PolicyReason.GAS_GATE_DEFERRED,
-                        defer_diagnostics,
-                    )
-                # The recenter width is re-derived from the target net daily
-                # yield at the current observables, then the range is rebuilt
-                # around the current pool price.
-                width_solution = self._solve_range_width(observation, recenter_size)
-                new_range = self.build_aligned_range(
-                    observation.amm_price_usdc, width_solution.half_width_fraction
-                )
-                gas_units, gas_cost_usd = self._batch_gas(
-                    observation, self._parameters.recenter_batch_gas_units
-                )
-                # Above the range the burned position is all USDC, so the
-                # re-mint buys roughly half of it back into stock.
-                swap_plan = self._swap_plan(
-                    SwapDirection.BUY_STOCK,
-                    recenter_size / Decimal(2),
-                    observation.pool_depth_usd,
-                )
+            # The out-of-range grace window bounds the whole hold: recenter
+            # attempts open at the earlier of the grace window and the locked
+            # recenter wait, and once the grace elapses the policy must act -
+            # a failed recenter then exits instead of waiting open-endedly.
+            grace = self._parameters.out_of_range_grace
+            attempt_window = min(grace, self._parameters.recenter_wait)
+            must_act = waited >= grace
+            lost_yield = self._lost_yield_diagnostics(position, observation)
+            if waited < attempt_window:
+                # The wait continues and the anchor persists across observations.
                 diagnostics = (
-                    resize_diagnostics
-                    + (
-                        f"Upside out-of-range wait of {waited} elapsed the locked "
-                        f"recenter wait {self._parameters.recenter_wait}.",
-                        f"New range {new_range.lower_price}..{new_range.upper_price} "
-                        f"USDC per stock around pool price {observation.amm_price_usdc}.",
-                        f"Range half width {width_solution.half_width_fraction} "
-                        f"({width_solution.half_width_ticks} ticks per side) derived "
-                        f"against the target net daily yield "
-                        f"{self._parameters.target_net_daily_yield}; solve resolved as "
-                        f"{width_solution.mode.value}.",
-                    )
-                    + width_solution.diagnostics
-                    + self._gas_diagnostics(gas_units, gas_cost_usd)
-                )
+                    f"Pool price {observation.amm_price_usdc} is above the upper range "
+                    f"edge {position.price_range.upper_price}; waited {waited} of the "
+                    f"locked recenter wait {self._parameters.recenter_wait} with the "
+                    f"{grace} out-of-range grace window bounding the hold.",
+                ) + lost_yield
                 next_position = position.model_copy(
-                    update={
-                        "price_range": new_range,
-                        "committed_usd": recenter_size,
-                        "entered_at": observation.observed_at,
-                        "out_of_range_since": None,
-                        "out_of_range_side": None,
-                    }
+                    update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
                 )
                 next_state = state.model_copy(update={"position": next_position})
                 return PolicyOutcome(
                     decision=PolicyDecision(
-                        action=PolicyActionKind.RECENTER,
-                        reason=PolicyReason.RECENTER_WAIT_ELAPSED,
+                        action=PolicyActionKind.HOLD,
+                        reason=PolicyReason.OPEN_ABOVE_RANGE_WAITING,
                         diagnostics=diagnostics,
-                        price_range=new_range,
-                        size_usd=recenter_size,
-                        swap_plan=swap_plan,
-                        estimated_gas_units=gas_units,
-                        estimated_gas_cost_usd=gas_cost_usd,
-                        width_solution=width_solution,
                     ),
                     next_state=next_state,
                 )
-            # The wait continues and the anchor persists across observations.
+            recenter_size, resize_diagnostics = self._recenter_size(position, observation)
+            if recenter_size <= 0:
+                if must_act:
+                    return self._out_of_range_grace_exit(
+                        state,
+                        observation,
+                        (
+                            "The current pool-depth cap leaves no positive safe replacement "
+                            f"mint size after {waited} out of range.",
+                        )
+                        + lost_yield,
+                    )
+                waiting_position = position.model_copy(
+                    update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
+                )
+                return self._hold(
+                    state.model_copy(update={"position": waiting_position}),
+                    PolicyReason.OPEN_ABOVE_RANGE_WAITING,
+                    (
+                        "The current pool-depth cap leaves no positive safe replacement "
+                        "mint size; holding the existing position until depth recovers.",
+                    )
+                    + lost_yield,
+                )
+            # The gas sense-check gate defers non-urgent recenters.
+            deferred, defer_diagnostics = self._gas_gate_blocks(
+                observation,
+                self._parameters.recenter_batch_gas_units,
+                recenter_size,
+            )
+            if deferred:
+                if must_act:
+                    return self._out_of_range_grace_exit(
+                        state,
+                        observation,
+                        defer_diagnostics + lost_yield,
+                    )
+                # The anchor persists so the elapsed wait stays elapsed and
+                # the recenter retries on a cheaper observation.
+                waiting_position = position.model_copy(
+                    update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
+                )
+                return self._hold(
+                    state.model_copy(update={"position": waiting_position}),
+                    PolicyReason.GAS_GATE_DEFERRED,
+                    defer_diagnostics + lost_yield,
+                )
+            # The recenter width is re-derived from the target net daily
+            # yield at the current observables, then the range is rebuilt
+            # around the current pool price.
+            width_solution = self._solve_range_width(observation, recenter_size)
+            new_range = self.build_aligned_range(
+                observation.amm_price_usdc, width_solution.half_width_fraction
+            )
+            gas_units, gas_cost_usd = self._batch_gas(
+                observation, self._parameters.recenter_batch_gas_units
+            )
+            # Above the range the burned position is all USDC, so the
+            # re-mint buys roughly half of it back into stock.
+            swap_plan = self._swap_plan(
+                SwapDirection.BUY_STOCK,
+                recenter_size / Decimal(2),
+                observation.pool_depth_usd,
+            )
             diagnostics = (
-                f"Pool price {observation.amm_price_usdc} is above the upper range "
-                f"edge {position.price_range.upper_price}; waited {waited} of the "
-                f"locked recenter wait {self._parameters.recenter_wait}.",
+                resize_diagnostics
+                + (
+                    f"Upside out-of-range wait of {waited} elapsed the acting window "
+                    f"{attempt_window} (recenter wait {self._parameters.recenter_wait}, "
+                    f"grace {grace}).",
+                    f"New range {new_range.lower_price}..{new_range.upper_price} "
+                    f"USDC per stock around pool price {observation.amm_price_usdc}.",
+                    f"Range half width {width_solution.half_width_fraction} "
+                    f"({width_solution.half_width_ticks} ticks per side) derived "
+                    f"against the target net daily yield "
+                    f"{self._parameters.target_net_daily_yield}; solve resolved as "
+                    f"{width_solution.mode.value}.",
+                )
+                + width_solution.diagnostics
+                + self._gas_diagnostics(gas_units, gas_cost_usd)
             )
             next_position = position.model_copy(
-                update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
+                update={
+                    "price_range": new_range,
+                    "committed_usd": recenter_size,
+                    "entered_at": observation.observed_at,
+                    "out_of_range_since": None,
+                    "out_of_range_side": None,
+                }
             )
             next_state = state.model_copy(update={"position": next_position})
             return PolicyOutcome(
                 decision=PolicyDecision(
-                    action=PolicyActionKind.HOLD,
-                    reason=PolicyReason.OPEN_ABOVE_RANGE_WAITING,
+                    action=PolicyActionKind.RECENTER,
+                    reason=PolicyReason.RECENTER_WAIT_ELAPSED,
                     diagnostics=diagnostics,
+                    price_range=new_range,
+                    size_usd=recenter_size,
+                    swap_plan=swap_plan,
+                    estimated_gas_units=gas_units,
+                    estimated_gas_cost_usd=gas_cost_usd,
+                    width_solution=width_solution,
                 ),
                 next_state=next_state,
             )
@@ -1231,27 +1412,65 @@ class PolicyEngine:
                 update={"out_of_range_since": wait_anchor, "out_of_range_side": "below"}
             )
             waiting_state = state.model_copy(update={"position": waiting_position})
+            # The grace window bounds the whole hold exactly as above: once
+            # waited >= grace the policy must act, and every recenter gate
+            # that would have kept holding - wait, distance, depth, gas,
+            # payback - becomes an exit instead.
+            grace = self._parameters.out_of_range_grace
+            attempt_window = min(grace, self._parameters.recenter_wait)
+            must_act = waited >= grace
+            lost_yield = self._lost_yield_diagnostics(position, observation)
             if (
-                waited < self._parameters.recenter_wait
+                waited < attempt_window
                 or distance_fraction < self._parameters.downside_recenter_min_distance_fraction
-            ):
+            ) and not must_act:
                 diagnostics = (
                     f"Pool price {observation.amm_price_usdc} is below the lower range "
                     f"edge {position.price_range.lower_price} but above the stop level "
                     f"{stop_level}; waited {waited} of {self._parameters.recenter_wait} "
                     f"and is {distance_fraction} below the edge versus the locked "
-                    f"{self._parameters.downside_recenter_min_distance_fraction} minimum.",
-                )
+                    f"{self._parameters.downside_recenter_min_distance_fraction} minimum, "
+                    f"with the {grace} out-of-range grace window bounding the hold.",
+                ) + lost_yield
                 return self._hold(waiting_state, PolicyReason.OPEN_BELOW_EDGE_HOLDING, diagnostics)
+            if waited < attempt_window or distance_fraction < (
+                self._parameters.downside_recenter_min_distance_fraction
+            ):
+                # Only reachable once the grace window elapsed while the
+                # wait or distance gate still blocks the recenter.
+                return self._out_of_range_grace_exit(
+                    state,
+                    observation,
+                    (
+                        f"Pool price {observation.amm_price_usdc} stayed below the lower "
+                        f"range edge {position.price_range.lower_price} for {waited}, "
+                        f"past the {grace} out-of-range grace window, with displacement "
+                        f"{distance_fraction} still under the locked "
+                        f"{self._parameters.downside_recenter_min_distance_fraction} "
+                        "recenter minimum; the recenter economics do not pass.",
+                    )
+                    + lost_yield,
+                )
             recenter_size, resize_diagnostics = self._recenter_size(position, observation)
             if recenter_size <= 0:
+                if must_act:
+                    return self._out_of_range_grace_exit(
+                        state,
+                        observation,
+                        (
+                            "The current pool-depth cap leaves no positive safe replacement "
+                            f"mint size after {waited} out of range.",
+                        )
+                        + lost_yield,
+                    )
                 return self._hold(
                     waiting_state,
                     PolicyReason.OPEN_BELOW_EDGE_HOLDING,
                     (
                         "The current pool-depth cap leaves no positive safe replacement "
                         "mint size; holding the existing position until depth recovers.",
-                    ),
+                    )
+                    + lost_yield,
                 )
             deferred, defer_diagnostics = self._gas_gate_blocks(
                 observation,
@@ -1259,7 +1478,17 @@ class PolicyEngine:
                 recenter_size,
             )
             if deferred:
-                return self._hold(waiting_state, PolicyReason.GAS_GATE_DEFERRED, defer_diagnostics)
+                if must_act:
+                    return self._out_of_range_grace_exit(
+                        state,
+                        observation,
+                        defer_diagnostics + lost_yield,
+                    )
+                return self._hold(
+                    waiting_state,
+                    PolicyReason.GAS_GATE_DEFERRED,
+                    defer_diagnostics + lost_yield,
+                )
             # A downside out-of-range position is stock-heavy. Preserving the
             # withdrawn inventory lets the mint planner sell only the amount
             # needed to rebalance instead of round-tripping the whole position.
@@ -1275,10 +1504,16 @@ class PolicyEngine:
                 observation, recenter_size, swap_plan, gas_cost_usd
             )
             if not economic:
+                if must_act:
+                    return self._out_of_range_grace_exit(
+                        state,
+                        observation,
+                        economics_diagnostics + lost_yield,
+                    )
                 return self._hold(
                     waiting_state,
                     PolicyReason.DOWNSIDE_RECENTER_UNECONOMIC,
-                    economics_diagnostics,
+                    economics_diagnostics + lost_yield,
                 )
             width_solution = self._solve_range_width(observation, recenter_size)
             new_range = self.build_aligned_range(
@@ -1947,6 +2182,18 @@ class PolicyEngine:
         hold_state = state
         # The daily loss halt blocks only new entries; safety exits above stay armed.
         if state.halted_day == state.day:
+            peak = state.peak_equity_usd
+            peak_line = (
+                f" The running equity peak {peak} - carried across the New York "
+                "day boundary, so a boundary-crossing swing cannot reset it - "
+                f"also sits at least {self._parameters.daily_loss_halt_fraction} "
+                "above the marked equity."
+                if peak is not None
+                and peak > observation.equity_usd
+                and (peak - observation.equity_usd) / peak
+                >= self._parameters.daily_loss_halt_fraction
+                else ""
+            )
             return self._hold(
                 hold_state,
                 PolicyReason.DAILY_LOSS_HALT_ACTIVE,
@@ -1954,7 +2201,7 @@ class PolicyEngine:
                     f"Marked equity {observation.equity_usd} fell at least "
                     f"{self._parameters.daily_loss_halt_fraction} below the day-start "
                     f"equity {state.day_start_equity_usd}; no new entries until the "
-                    f"next America/New_York day.",
+                    "next America/New_York day." + peak_line,
                 ),
             )
         # Stop and dilution exits block re-entry through their cooldown.

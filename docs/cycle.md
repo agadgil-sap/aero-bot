@@ -21,7 +21,7 @@ The anti-churn discipline is part of the same ruling:
 - A switch executes as exit-then-enter inside one cycle: the held position runs the full unstake/withdraw/exit-swap sequence first, and any refusal or failure there halts the cycle before anything is minted, so exactly one position is funded at every instant.
 - The existing per-pool re-entry cooldowns apply per pool: a stop-out or dilution exit arms the fifteen-minute cooldown for its own pool only, never blocking another pool's entry, and a voluntary switch arms no cooldown at all.
 - The board never enters while unsold inventory from a stale-low burn is held; the convergence machinery resolves it first, exactly as the per-pool engine orders.
-- Never more than one position: the single-position invariant holds under every path, inside the unchanged hard caps (100 USDC total exposure, 100 USDC per pool, enforced by the LP executor's refusal catalog).
+- Never more than one position: the single-position invariant holds under every path, inside the hard caps (1000 USDC total exposure, 1000 USDC per pool - the captain's 2026-09-27 performance ruling, replacing the trial's 100/100 - enforced by the LP executor's refusal catalog; the one-percent depth gate, the sizing fraction, and the gas gate remain the binding protections).
 
 Selector cycles pay one verified Sugar sweep per run - the whole board comes from one block-pinned snapshot, which is also what makes the cross-pool APR comparison coherent - and every enumerated pool is pinned so later pinned-symbol runs keep the known-pool fast path.
 Expect the sweep's honest per-page progress on the first run and on rate-limited endpoints, and tens of seconds once warm-adjacent; pinned cycles keep their seconds-scale fast path untouched.
@@ -43,10 +43,11 @@ The cycle appends exactly one `cycle_reported` audit record per run beside every
 | `pool_switch` | The held pool's full exit sequence below, then a fresh `execute_mint` -> stake in the winning pool; a failed exit halts before any mint. |
 | `recenter` | The exit sequence below, then a fresh `execute_mint` -> stake at the decision's new range. The burned-out empty NFT remains (the manual recenter batch's burn is not part of the live mapping; a later recenter or manual burn clears residuals). |
 | `stop_out`, `dilution_exit`, `event_exit`, `dislocation_exit`, `defensive_exit` | `execute_unstake` (when staked) -> `execute_withdraw` -> `execute_exit_swap`; the book clears and that pool's re-entry cooldown arms (none for `event_exit`). |
+| `range_grace_exit` | `execute_unstake` (when staked) -> `execute_withdraw`; the stock inventory is recorded with origin `out_of_range_exit` and the convergence machinery unwinds it, exactly like a stale-low burn. When the position sat above its range the composition is already all USDC and the exit completes flat. That pool's re-entry cooldown arms. |
 | `stale_low_burn` | `execute_unstake` (when staked) -> `execute_withdraw`; the returned stock is recorded as held inventory, never swapped below the market. |
 | `sell_inventory` | `execute_exit_swap` alone; the held-inventory record clears. |
 
-The exit swap (`aero-bot-lp execute exit-swap`) is the canary-proven reverse-direction router swap productized into the LP lifecycle: exact-input of the Safe's entire stock balance, minimum output at the locked one-percent tolerance, and a hard refusal when the quoted output exceeds the 100 USDC per-pool pilot cap - an out-of-band inventory never moves.
+The exit swap (`aero-bot-lp execute exit-swap`) is the canary-proven reverse-direction router swap productized into the LP lifecycle: exact-input of the Safe's entire stock balance, minimum output at the locked one-percent tolerance, and a hard refusal when the quoted output exceeds the 1000 USDC per-pool cap - an out-of-band inventory never moves.
 
 ## Day economics: the equity anchor and the day P&L
 
@@ -55,6 +56,19 @@ The engine's own day-rollover reset is authoritative: on rollover it re-anchors 
 The production book exposed exactly that trap on 2026-09-23 - an 80.73 anchor beside a roughly 99 book - which is why the cycle's pre-decision seed matches the composition too: whenever the book carries no anchor yet, the seed is cash plus the tracked LP mark, never cash alone.
 The report and the `cycle_reported` audit record both carry `equity_usdc`, `day_start_equity_usdc`, and `day_pnl_usdc`, so the daily number the captain reads is computed where the decision happened, not reconstructed afterward.
 An out-of-band cycle carries no day economics and says so in `day_diagnostic` rather than publishing a number it cannot stand behind.
+Beside the anchor, the report carries the running equity high-water mark (`peak_equity_usd`) the continuous drawdown latch measures from - the captain's 2026-09-27 ruling: the peak survives the New York rollover, and a drawdown of at least five percent from it re-arms the same halt machinery on every day it holds, so a swing that crosses midnight can no longer reset the latch.
+
+## Yield attribution (the emissions engine, visible daily)
+
+Every cycle report - and therefore the daily report email and the `cycle_reported` audit record - decomposes the day P&L into the strategy's income streams: AERO rewards accrued since the day's baseline (unclaimed units plus anything converted today, valued at the last observed price), fees earned (computed, never the stale checkpoint - see the LP execution fee measurement below), and stock-token mark-to-market on the day's opening quantity, with an explicit unattributed residual absorbing actions, gas, collections, and every marking the components do not price.
+The day's baseline is snapshotted from the first cycle of each New York day - before that cycle's actions, so a reward conversion never reads as lost income - and the position-scoped fee words re-baseline when a recenter changes the tracked token.
+The method lines ride the attribution so every surface names computed-versus-checkpointed explicitly.
+
+## The reward conversion (AERO to USDC)
+
+Unclaimed AERO is income sitting idle, so live cycles convert it inside the act step: once unclaimed AERO - the Safe's balance plus the staked position's `earned` - exceeds the sealed threshold in USDC at the decision's last observed price (default 5 USDC, `AERO_BOT_CYCLE_AERO_CONVERSION_MIN_USDC` or `--aero-conversion-min-usdc`), the cycle first claims through the audited collect surface (never inside the gauge's early-exit penalty window) and then swaps the Safe's entire AERO balance to USDC through the capped executor surface (`aero-bot-lp execute aero-swap` under the hood; [docs/lp_execution.md](docs/lp_execution.md) carries its refusal catalog).
+The conversion is a treasury action of the act step, never a policy verdict and never executed on dry runs; a refusal or failed delivery halts the cycle like any other action.
+Idle AERO counts in the book's reconcile and in the equity the halt measures, so the converted value flows into the next cycle's day economics honestly.
 
 ## Fee evidence (measurement only)
 
@@ -63,6 +77,8 @@ The claimable-now reading is checkpointed truth from the audited position-status
 The first sample reports the claimable balance and opens the window; a second sample closes a measured accrual rate and its annualized fraction of the position's marked value, all riding the cycle report (`fee_evidence`) and the audit record (`claimable_pool_fees_usdc`, `measured_fee_apr`).
 The staked AERO emissions ride beside it as `claimable_aero_units`, the live `earned` reading.
 The caveat is in every diagnostic: the checkpointed claimable is a lower bound the pool refreshes only on position modifications, so a flat window means the checkpoint was not refreshed, not that no fees accrued, and a falling window means a collect or checkpoint refresh landed inside it.
+That limitation is now superseded for reporting by the computed fee measurement ([the LP execution fee measurement](docs/lp_execution.md)): the position status derives earned fees from the pool's own fee-growth accumulators, and the cycle's yield attribution and fee evidence carry that computed number beside the checkpointed one, each labeled with its method.
+The pool keeps its conservative zero fee APR for decisions exactly as locked; both measurements are evidence, never inputs.
 See [the LP execution fee-evidence section](docs/lp_execution.md) for the contract-view derivation and the staged path to a full fee APR.
 
 ## Crash discipline
@@ -99,7 +115,7 @@ See [the LP execution fast-path section](docs/lp_execution.md) for the verified 
 - One template unit per symbol: `systemctl enable --now aero-bot-cycle@AAPLc.timer` for a pinned pool, or `aero-bot-cycle@auto.timer` for the cross-board selector (the sealed `AERO_BOT_CYCLE_SYMBOL` variable in `/etc/aero-bot/cycle.env` reaches the same selector mode; unset, empty, or `auto` selects, an explicit symbol pins).
 - Default cadence `OnCalendar=hourly` with `Persistent=true` (missed ticks catch up) and `RandomizedDelaySec=180`; a `systemctl edit` drop-in changes the cadence.
 - `Type=oneshot`, `Restart=no`: cycles never overlap and never auto-retry - the next tick reconciles.
-- Sealed environment through `/etc/aero-bot/cycle.env` (mode 0600): the symbol's Safe, the relayer address, the key-source selection (chapter 1's sealed variable or 0600 key file under `/etc/aero-bot/`), the optional reference quote (single or per-symbol pairs), the optional symbol pin, and the optional switch margin.
+- Sealed environment through `/etc/aero-bot/cycle.env` (mode 0600): the symbol's Safe, the relayer address, the key-source selection (chapter 1's sealed variable or 0600 key file under `/etc/aero-bot/`), the optional reference quote (single or per-symbol pairs), the optional symbol pin, the optional switch margin, the optional out-of-range grace window (`AERO_BOT_CYCLE_OUT_OF_RANGE_GRACE_MINUTES`, default 10), and the optional reward-conversion threshold (`AERO_BOT_CYCLE_AERO_CONVERSION_MIN_USDC`, default 5).
 - Hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, state under `StateDirectory=aero-bot`.
 - The JSON report lands in the journal: `journalctl -u aero-bot-cycle@AAPLc.service`.
 

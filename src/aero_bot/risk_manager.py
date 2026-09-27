@@ -24,7 +24,7 @@ can recompute by hand:
   latch fraction), and an entry-kind action observed later on the same
   anchor day violates the halt discipline, because the halt blocks new
   entries for the rest of that day.
-- **Exposure versus caps.** Committed exposure above the 100 USDC hard
+- **Exposure versus caps.** Committed exposure above the 1000 USDC hard
   ceiling breaches it, and an entry committing above eighty percent of
   current equity breaches the locked sizing fraction.
 - **Contradictions.** A desk's accepted brief that carried no anomaly
@@ -77,8 +77,10 @@ RISK_MANAGER_REPORT_NAME = "risk_manager_last.json"
 DAILY_LOSS_HALT_FRACTION = Decimal("0.05")
 # The locked sizing fraction at entry (docs/policy-engine.md).
 POSITION_EQUITY_FRACTION = Decimal("0.80")
-# The LP executor's unchanged hard exposure ceilings in USDC.
-EXPOSURE_HARD_CAP_USDC = Decimal("100")
+# The LP executor's hard exposure ceilings in USDC (raised from 100 to
+# 1000 by the captain's 2026-09-27 performance ruling; the one-percent
+# depth gate remains the binding protection).
+EXPOSURE_HARD_CAP_USDC = Decimal("1000")
 # The posture identity's tolerance: one micro-USDC absorbs serialization
 # noise while never excusing a real contradiction.
 POSTURE_TOLERANCE_USDC = Decimal("0.000001")
@@ -100,7 +102,7 @@ RISK_POSTURE_RULES = (
     "within one micro-USDC; a marked drawdown of at least five percent of "
     "the day-start anchor crosses the daily-loss-halt line; an entry-kind "
     "action observed later on the same anchor day violates the halt "
-    "discipline; committed exposure above 100 USDC breaches the hard cap; "
+    "discipline; committed exposure above 1000 USDC breaches the hard cap; "
     "an entry committing above eighty percent of equity breaches the "
     "sizing fraction; and a desk's accepted brief with no anomaly flags "
     "on an episode carrying any finding is a contradiction. Malformed or "
@@ -118,7 +120,7 @@ class RiskFindingKind:
     HALT_THRESHOLD_BREACHED = "halt_threshold_breached"
     # An entry-kind action followed a same-anchor-day halt-line crossing.
     HALT_DISCIPLINE_VIOLATION = "halt_discipline_violation"
-    # Committed exposure sits above the 100 USDC hard ceiling.
+    # Committed exposure sits above the 1000 USDC hard ceiling.
     HARD_CAP_BREACH = "hard_cap_breach"
     # An entry committed above eighty percent of current equity.
     SIZING_CAP_BREACH = "sizing_cap_breach"
@@ -337,7 +339,7 @@ def _posture_findings(
     if committed is not None and committed > EXPOSURE_HARD_CAP_USDC:
         _record(
             RiskFindingKind.HARD_CAP_BREACH,
-            f"committed {facts.committed_usdc} exceeds the 100 USDC hard exposure ceiling",
+            f"committed {facts.committed_usdc} exceeds the 1000 USDC hard exposure ceiling",
         )
     # Exposure versus caps: the eighty-percent sizing bound applies at
     # entry-kind actions, the moments capital commits.

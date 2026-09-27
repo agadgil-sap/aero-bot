@@ -264,15 +264,15 @@ class TestHaltState:
 class TestExposureVersusCaps:
     """The hard ceiling and the sizing fraction read on their own terms."""
 
-    def test_committed_exposure_above_one_hundred_breaches_the_hard_cap(self) -> None:
-        """The 100 USDC ceiling refuses anything above it."""
-        result = audit(episode(T0, facts=facts_picture(committed="100.000001")))
+    def test_committed_exposure_above_one_thousand_breaches_the_hard_cap(self) -> None:
+        """The 1000 USDC ceiling (the captain's 2026-09-27 raise) refuses above it."""
+        result = audit(episode(T0, facts=facts_picture(committed="1000.000001")))
         assert [finding.kind for finding in result.findings] == [RiskFindingKind.HARD_CAP_BREACH]
         assert "hard exposure ceiling" in result.findings[0].detail
 
-    def test_exactly_one_hundred_committed_is_within_the_ceiling(self) -> None:
-        """The cap reads above, not at, one hundred."""
-        assert audit(episode(T0, facts=facts_picture(committed="100.0"))).findings == ()
+    def test_exactly_one_thousand_committed_is_within_the_ceiling(self) -> None:
+        """The cap reads above, not at, one thousand."""
+        assert audit(episode(T0, facts=facts_picture(committed="1000.0"))).findings == ()
 
     def test_an_entry_above_eighty_percent_of_equity_breaches_sizing(self) -> None:
         """The locked sizing fraction binds at the entry moment."""

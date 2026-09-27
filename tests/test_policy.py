@@ -1,7 +1,7 @@
 """Behavior tests for the pure emissions-farming policy decision engine."""
 
 import inspect
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, localcontext
 
 import pytest
@@ -252,6 +252,7 @@ class TestLockedParameters:
         assert parameters.max_range_half_width_fraction == Decimal("0.003")
         assert parameters.tick_spacing == 10
         assert parameters.recenter_wait.total_seconds() == 15 * 60
+        assert parameters.out_of_range_grace.total_seconds() == 10 * 60
         assert parameters.stop_buffer_fraction == Decimal("0.005")
         assert parameters.reentry_cooldown.total_seconds() == 15 * 60
         assert parameters.min_entry_emissions_apr == Decimal("1.5")
@@ -295,6 +296,10 @@ class TestLockedParameters:
             PolicyParameters(daily_loss_halt_fraction=Decimal("0"))
         with pytest.raises(ValidationError):
             PolicyParameters(daily_loss_halt_fraction=Decimal("1"))
+        with pytest.raises(ValidationError):
+            PolicyParameters(out_of_range_grace=timedelta(0))
+        with pytest.raises(ValidationError):
+            PolicyParameters(out_of_range_grace=timedelta(minutes=-5))
         with pytest.raises(ValidationError):
             PolicyParameters(dislocation_threshold_fraction=Decimal("1.5"))
         with pytest.raises(ValidationError):
@@ -570,8 +575,8 @@ class TestPositionLifecycle:
         assert recentred.next_state.position.out_of_range_side is None
         assert any("payback is" in line for line in recentred.decision.diagnostics)
 
-    def test_downside_recenter_does_not_chase_a_tiny_edge_breach(self) -> None:
-        """Even after the wait, a sub-threshold breach holds rather than churns."""
+    def test_downside_recenter_does_not_chase_a_tiny_edge_breach_before_grace(self) -> None:
+        """A sub-threshold breach holds inside the grace window, then exits at its expiry."""
         engine, state = entered_session()
         lower = entered_position_for(state).price_range.lower_price
         below_price = lower * Decimal("0.9995")
@@ -582,20 +587,40 @@ class TestPositionLifecycle:
                 amm_price_usdc=below_price,
             ),
         )
-        held = engine.decide(
+        assert first.decision.action is PolicyActionKind.HOLD
+        assert first.decision.reason is PolicyReason.OPEN_BELOW_EDGE_HOLDING
+        still_inside_grace = engine.decide(
+            first.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 8, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        assert still_inside_grace.decision.action is PolicyActionKind.HOLD
+        assert still_inside_grace.decision.reason is PolicyReason.OPEN_BELOW_EDGE_HOLDING
+        assert any("minimum" in line for line in still_inside_grace.decision.diagnostics)
+        assert any("earns no emissions" in line for line in still_inside_grace.decision.diagnostics)
+        expired = engine.decide(
             first.next_state,
             base_observation(
                 observed_at=datetime(2026, 8, 19, 11, 30, tzinfo=NEW_YORK),
                 amm_price_usdc=below_price,
             ),
         )
-        assert held.decision.action is PolicyActionKind.HOLD
-        assert held.decision.reason is PolicyReason.OPEN_BELOW_EDGE_HOLDING
-        assert any("minimum" in line for line in held.decision.diagnostics)
+        assert expired.decision.action is PolicyActionKind.RANGE_GRACE_EXIT
+        assert expired.decision.reason is PolicyReason.OUT_OF_RANGE_GRACE_EXPIRED
+        assert expired.next_state.position is None
+        assert expired.next_state.held_inventory is not None
+        assert expired.next_state.held_inventory.origin == "out_of_range_exit"
+        assert expired.next_state.reentry_blocked_until is not None
+        assert any("earns no emissions" in line for line in expired.decision.diagnostics)
 
     def test_downside_recenter_holds_when_modeled_payback_is_too_slow(self) -> None:
         """The downside path exposes an explicit economic hold instead of blind recentering."""
-        parameters = PolicyParameters(downside_recenter_max_payback_days=Decimal("0.001"))
+        parameters = PolicyParameters(
+            downside_recenter_max_payback_days=Decimal("0.001"),
+            out_of_range_grace=timedelta(minutes=30),
+        )
         engine = PolicyEngine(parameters=parameters)
         entered = engine.decide(PolicyState(), base_observation())
         assert entered.decision.action is PolicyActionKind.ENTER
@@ -618,6 +643,16 @@ class TestPositionLifecycle:
         assert held.decision.action is PolicyActionKind.HOLD
         assert held.decision.reason is PolicyReason.DOWNSIDE_RECENTER_UNECONOMIC
         assert any("payback is" in line for line in held.decision.diagnostics)
+        expired = engine.decide(
+            first.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 32, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        assert expired.decision.action is PolicyActionKind.RANGE_GRACE_EXIT
+        assert expired.decision.reason is PolicyReason.OUT_OF_RANGE_GRACE_EXPIRED
+        assert any("payback is" in line for line in expired.decision.diagnostics)
 
     def test_downside_stop_exits_and_sets_reentry_cooldown(self) -> None:
         """A price at the stop level burns and swaps back to USDC, then cools down."""
@@ -856,7 +891,7 @@ class TestDailyLossHalt:
         assert next_day.decision.size_usd == Decimal("159.2")
 
     def test_day_rollover_resets_the_day_start_equity(self) -> None:
-        """A new day re-anchors the halt at the current marked equity."""
+        """A new day re-anchors the halt once equity recovers toward the running peak."""
         engine, state = entered_session()
         stopped = engine.decide(
             state,
@@ -866,15 +901,311 @@ class TestDailyLossHalt:
                 equity_usd=Decimal("150"),
             ),
         )
-        next_day = engine.decide(
+        next_day_still_drawn_down = engine.decide(
             stopped.next_state,
             base_observation(
                 observed_at=datetime(2026, 8, 20, 11, 0, tzinfo=NEW_YORK),
                 equity_usd=Decimal("150"),
             ),
         )
-        assert next_day.decision.action is PolicyActionKind.ENTER
-        assert next_day.decision.size_usd == Decimal("120")
+        assert next_day_still_drawn_down.decision.action is PolicyActionKind.HOLD
+        assert next_day_still_drawn_down.decision.reason is PolicyReason.DAILY_LOSS_HALT_ACTIVE
+        assert next_day_still_drawn_down.next_state.peak_equity_usd == Decimal("200")
+        assert any(
+            "running equity peak" in line for line in next_day_still_drawn_down.decision.diagnostics
+        )
+        recovered = engine.decide(
+            stopped.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 20, 11, 0, tzinfo=NEW_YORK),
+                equity_usd=Decimal("195"),
+            ),
+        )
+        assert recovered.decision.action is PolicyActionKind.ENTER
+        assert recovered.decision.size_usd == Decimal("156")
+
+
+class TestContinuousDrawdownLatch:
+    """The running-peak drawdown latch carried across the day boundary."""
+
+    def test_boundary_crossing_swing_latches_the_next_day(self) -> None:
+        """An intraday run-up given back across midnight halts entries on day two."""
+        engine, state = entered_session()
+        # Day one opens at 200, runs up to 212 mid-day, and gives 5.2 percent
+        # of that peak back by late evening - inside the day-anchor's blind spot
+        # because the day P&L stays positive.
+        evening = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 22, 0, tzinfo=NEW_YORK),
+                equity_usd=Decimal("212"),
+            ),
+        )
+        assert evening.next_state.peak_equity_usd == Decimal("212")
+        assert evening.next_state.halted_day is None
+        midnight_side = engine.decide(
+            evening.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 23, 59, tzinfo=NEW_YORK),
+                equity_usd=Decimal("205"),
+            ),
+        )
+        # 205 keeps both latches quiet on day one: the day P&L is up 2.5
+        # percent and the peak drawdown is only 3.3 percent.
+        assert midnight_side.next_state.halted_day is None
+        next_morning = engine.decide(
+            midnight_side.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 20, 9, 0, tzinfo=NEW_YORK),
+                equity_usd=Decimal("199"),
+            ),
+        )
+        # The rollover re-anchors the day at 199, but the peak survived it and
+        # the 6.13 percent peak drawdown - a swing that crossed midnight, blind
+        # to the fresh 199-versus-199 day anchor - re-arms the halt machinery.
+        assert next_morning.next_state.halted_day == date(2026, 8, 20)
+        assert next_morning.next_state.peak_equity_usd == Decimal("212")
+        # Flat on day two, the halt blocks the entry the fresh anchor would
+        # otherwise have allowed (199 versus 199 is a zero-percent day drawdown).
+        stopped = engine.decide(
+            next_morning.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 20, 9, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=stop_level_for(state),
+                equity_usd=Decimal("199"),
+            ),
+        )
+        assert stopped.decision.action is PolicyActionKind.STOP_OUT
+        blocked = engine.decide(
+            stopped.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 20, 9, 6, tzinfo=NEW_YORK),
+                equity_usd=Decimal("199"),
+            ),
+        )
+        assert blocked.decision.reason is PolicyReason.DAILY_LOSS_HALT_ACTIVE
+        assert any("running equity peak" in line for line in blocked.decision.diagnostics)
+
+    def test_peak_ratchets_upward_only(self) -> None:
+        """Equity below a prior peak never lowers the running high-water mark."""
+        engine, state = entered_session()
+        peaked = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 12, 0, tzinfo=NEW_YORK),
+                equity_usd=Decimal("250"),
+            ),
+        )
+        assert peaked.next_state.peak_equity_usd == Decimal("250")
+        drawn = engine.decide(
+            peaked.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 13, 0, tzinfo=NEW_YORK),
+                equity_usd=Decimal("230"),
+            ),
+        )
+        assert drawn.next_state.peak_equity_usd == Decimal("250")
+        # Eight percent off the peak latches even though the day P&L is up.
+        assert drawn.next_state.halted_day == drawn.next_state.day
+
+    def test_latch_releases_on_recovery_toward_the_peak(self) -> None:
+        """Equity recovering inside five percent of the peak reopens entries."""
+        engine, state = entered_session()
+        drawn = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 12, 0, tzinfo=NEW_YORK),
+                equity_usd=Decimal("185"),
+            ),
+        )
+        assert drawn.next_state.halted_day is not None
+        recovered = engine.decide(
+            drawn.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 13, 0, tzinfo=NEW_YORK),
+                equity_usd=Decimal("191"),
+            ),
+        )
+        # A latched day stays latched for that day even after recovery...
+        assert recovered.next_state.halted_day is not None
+        next_day = engine.decide(
+            recovered.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 20, 9, 0, tzinfo=NEW_YORK),
+                equity_usd=Decimal("191"),
+            ),
+        )
+        # ...and the new day opens un-halted because 191 sits inside five
+        # percent of the carried 200 peak.
+        assert next_day.next_state.halted_day is None
+
+    def test_day_start_latch_semantics_are_unchanged(self) -> None:
+        """A plain five percent drop from the day anchor still latches alone."""
+        engine, state = entered_session()
+        dropped = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 12, 0, tzinfo=NEW_YORK),
+                equity_usd=Decimal("190"),
+            ),
+        )
+        assert dropped.next_state.halted_day == dropped.next_state.day
+        assert dropped.next_state.peak_equity_usd == Decimal("200")
+
+
+class TestOutOfRangeGraceWindow:
+    """The bounded out-of-range grace window (captain's 2026-09-27 ruling)."""
+
+    def test_depth_cap_empty_before_grace_holds_the_upside_wait(self) -> None:
+        """A vanished depth cap holds while the grace window still has room."""
+        engine = PolicyEngine(parameters=PolicyParameters(out_of_range_grace=timedelta(minutes=30)))
+        entered = engine.decide(PolicyState(), base_observation())
+        upper = entered_position_for(entered.next_state).price_range.upper_price
+        above_price = upper * Decimal("1.01")
+        waiting = engine.decide(
+            entered.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+            ),
+        )
+        held = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 21, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+                pool_depth_usd=Decimal("0"),
+            ),
+        )
+        assert held.decision.action is PolicyActionKind.HOLD
+        assert held.decision.reason is PolicyReason.OPEN_ABOVE_RANGE_WAITING
+        assert any("depth cap" in line for line in held.decision.diagnostics)
+
+    def test_depth_cap_empty_at_grace_expiry_exits_the_downside_hold(self) -> None:
+        """A vanished depth cap ends the downside hold at grace too."""
+        engine, state = entered_session()
+        lower = entered_position_for(state).price_range.lower_price
+        below_price = lower * Decimal("0.998")
+        waiting = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 1, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+            ),
+        )
+        expired = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 16, tzinfo=NEW_YORK),
+                amm_price_usdc=below_price,
+                pool_depth_usd=Decimal("0"),
+            ),
+        )
+        assert expired.decision.action is PolicyActionKind.RANGE_GRACE_EXIT
+        assert expired.decision.reason is PolicyReason.OUT_OF_RANGE_GRACE_EXPIRED
+        assert expired.next_state.held_inventory is not None
+        assert any("depth cap" in line for line in expired.decision.diagnostics)
+
+    def test_depth_cap_empty_at_grace_expiry_exits_the_upside_hold(self) -> None:
+        """A vanished depth cap ends the upside hold at grace instead of waiting."""
+        engine, state = entered_session()
+        upper = entered_position_for(state).price_range.upper_price
+        above_price = upper * Decimal("1.01")
+        waiting = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+            ),
+        )
+        expired = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 16, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+                pool_depth_usd=Decimal("0"),
+            ),
+        )
+        assert expired.decision.action is PolicyActionKind.RANGE_GRACE_EXIT
+        assert expired.decision.reason is PolicyReason.OUT_OF_RANGE_GRACE_EXPIRED
+        assert expired.next_state.position is None
+        assert any("depth cap" in line for line in expired.decision.diagnostics)
+
+    def test_longer_grace_keeps_the_plain_recenter_wait_behavior(self) -> None:
+        """A configured grace past the recenter wait recenters at the wait as before."""
+        engine = PolicyEngine(parameters=PolicyParameters(out_of_range_grace=timedelta(minutes=30)))
+        entered = engine.decide(PolicyState(), base_observation())
+        upper = entered_position_for(entered.next_state).price_range.upper_price
+        above_price = upper * Decimal("1.01")
+        waiting = engine.decide(
+            entered.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+            ),
+        )
+        recentred = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 21, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+            ),
+        )
+        assert recentred.decision.action is PolicyActionKind.RECENTER
+        assert recentred.decision.reason is PolicyReason.RECENTER_WAIT_ELAPSED
+
+    def test_shorter_grace_pulls_the_recenter_attempt_earlier(self) -> None:
+        """A grace shorter than the wait attempts the recenter at the grace bound."""
+        engine, state = entered_session()
+        upper = entered_position_for(state).price_range.upper_price
+        above_price = upper * Decimal("1.01")
+        waiting = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+            ),
+        )
+        recentred = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 16, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+            ),
+        )
+        assert recentred.decision.action is PolicyActionKind.RECENTER
+        assert any("acting window" in line for line in recentred.decision.diagnostics)
+
+    def test_grace_exit_arms_the_reentry_cooldown(self) -> None:
+        """The grace exit cools re-entry like a stop-out."""
+        engine, state = entered_session()
+        upper = entered_position_for(state).price_range.upper_price
+        above_price = upper * Decimal("1.01")
+        waiting = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+                gas_price_gwei=Decimal("0.5"),
+            ),
+        )
+        exited = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 16, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+                gas_price_gwei=Decimal("0.5"),
+            ),
+        )
+        assert exited.decision.action is PolicyActionKind.RANGE_GRACE_EXIT
+        assert exited.next_state.reentry_blocked_until == datetime(
+            2026, 8, 19, 11, 31, tzinfo=NEW_YORK
+        )
+        cooled = engine.decide(
+            exited.next_state,
+            base_observation(observed_at=datetime(2026, 8, 19, 11, 31, tzinfo=NEW_YORK)),
+        )
+        assert cooled.decision.action is PolicyActionKind.ENTER
 
 
 class TestEnginePurity:
@@ -994,11 +1325,12 @@ class TestGasSenseCheckGate:
 
     def test_recenter_deferred_by_gas_then_fires_on_a_cheap_observation(self) -> None:
         """A gas spike defers the elapsed recenter without resetting its wait."""
-        engine, state = entered_session()
-        upper = entered_position_for(state).price_range.upper_price
+        engine = PolicyEngine(parameters=PolicyParameters(out_of_range_grace=timedelta(minutes=30)))
+        entered = engine.decide(PolicyState(), base_observation())
+        upper = entered_position_for(entered.next_state).price_range.upper_price
         above_price = upper * Decimal("1.01")
         waiting = engine.decide(
-            state,
+            entered.next_state,
             base_observation(
                 observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
                 amm_price_usdc=above_price,
@@ -1026,6 +1358,33 @@ class TestGasSenseCheckGate:
             ),
         )
         assert recentred.decision.action is PolicyActionKind.RECENTER
+
+    def test_recenter_blocked_by_gas_at_grace_expiry_exits_instead(self) -> None:
+        """A gas spike at the default grace expiry ends the hold rather than deferring."""
+        engine, state = entered_session()
+        upper = entered_position_for(state).price_range.upper_price
+        above_price = upper * Decimal("1.01")
+        waiting = engine.decide(
+            state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 5, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+            ),
+        )
+        expired = engine.decide(
+            waiting.next_state,
+            base_observation(
+                observed_at=datetime(2026, 8, 19, 11, 21, tzinfo=NEW_YORK),
+                amm_price_usdc=above_price,
+                gas_price_gwei=Decimal("0.5"),
+            ),
+        )
+        assert expired.decision.action is PolicyActionKind.RANGE_GRACE_EXIT
+        assert expired.decision.reason is PolicyReason.OUT_OF_RANGE_GRACE_EXPIRED
+        assert expired.next_state.position is None
+        assert expired.next_state.held_inventory is None
+        assert expired.next_state.reentry_blocked_until is not None
+        assert any("exceeds" in line for line in expired.decision.diagnostics)
 
     def test_safety_exits_are_never_deferred_by_gas(self) -> None:
         """A downside stop fires at an absurd gas price with its cost attached."""

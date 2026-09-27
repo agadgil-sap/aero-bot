@@ -70,6 +70,9 @@ from aero_bot.venues import (
     AerodromeVenueAdapter,
     PoolDiscoveryResult,
     PoolDiscoveryStatus,
+    PoolKind,
+    VenueId,
+    aerodrome_contract_evidence,
 )
 
 # The Aerodrome universal router of the user's executed reference swap; this
@@ -594,6 +597,10 @@ class ExecutionSources(Protocol):
         """Return the accepted B20/USDC pools in one block-pinned snapshot."""
         ...
 
+    def discover_reward_token_pools(self) -> PoolDiscoveryResult:
+        """Return the Slipstream AERO/USDC pools in one block-pinned snapshot."""
+        ...
+
     def read_token_decimals(self, token_address: str) -> int:
         """Read one ERC20 token's decimal count."""
         ...
@@ -650,6 +657,9 @@ class LiveExecutionSources:
         # the same process reuses that block-pinned batch, mirroring the
         # decimals cache.
         self._discovery_cache: PoolDiscoveryResult | None = None
+        # The reward-token conversion keeps its own single sweep cache over
+        # the AERO/USDC pair, separate from the B20 board cache.
+        self._reward_discovery_cache: PoolDiscoveryResult | None = None
 
     def load_registry(self) -> B20RegistryResult:
         """Return the packaged official B20 registry.
@@ -690,6 +700,67 @@ class LiveExecutionSources:
         )
         result = AerodromeVenueAdapter(backend).discover_pools(b20_addresses)
         self._discovery_cache = result
+        return result
+
+    def discover_reward_token_pools(self) -> PoolDiscoveryResult:
+        """Return the Slipstream AERO/USDC pools in one block-pinned snapshot.
+
+        The reward-token conversion swaps accumulated AERO emissions for
+        USDC on the venue's own Slipstream AERO/USDC pool. Discovery here
+        mirrors the B20 path - one Sugar enumeration, this one scoped to the
+        AERO token - but keeps only factory-allowlisted Slipstream pools of
+        the exact native-USDC pair. Gauge liveness and emissions are not
+        required for a swap-only treasury surface, so those farming gates
+        deliberately stay out of this enumeration while every factory and
+        pair boundary remains enforced.
+
+        Returns:
+            The verified discovery result over the AERO/USDC pair.
+
+        Raises:
+            PoolDiscoveryUnavailableError: If the Sugar enumeration cannot
+                complete with bounded retries.
+        """
+        if self._reward_discovery_cache is not None:
+            return self._reward_discovery_cache
+        backend = LpSugarRpcBackend(
+            rpc_url=self._rpc_url,
+            sugar_address=self._sugar_address,
+            fallback_rpc_urls=self._fallback_rpc_urls,
+            transport=self._transport,
+            sleep=self._sleep,
+            progress=self._progress,
+        )
+        evidence = aerodrome_contract_evidence()
+        allowed_factories = {factory.address.lower() for factory in evidence.pool_factories}
+        normalized_pair = {
+            BASE_USDC_ADDRESS.lower(),
+            AERO_TOKEN_ADDRESS.lower(),
+        }
+        batch = backend.discover(frozenset({AERO_TOKEN_ADDRESS}), evidence.quote_token_address)
+        candidates = tuple(
+            candidate
+            for candidate in batch.candidates
+            if candidate.factory_address.lower() in allowed_factories
+            and candidate.pool_kind == PoolKind.SLIPSTREAM
+            and {candidate.token0_address.lower(), candidate.token1_address.lower()}
+            == normalized_pair
+        )
+        result = PoolDiscoveryResult(
+            venue=VenueId.AERODROME,
+            status=PoolDiscoveryStatus.VERIFIED,
+            source=batch.source,
+            observed_at=batch.observed_at,
+            snapshot_block=batch.snapshot_block,
+            pools=candidates,
+            diagnostics=(
+                f"Accepted {len(candidates)} AERO/native-USDC Slipstream pools from "
+                f"a Sugar enumeration of {batch.enumerated_pool_count} pools; factory "
+                "and pair boundaries enforced, farming gates not required for the "
+                "treasury conversion.",
+            ),
+        )
+        self._reward_discovery_cache = result
         return result
 
     def read_token_decimals(self, token_address: str) -> int:
