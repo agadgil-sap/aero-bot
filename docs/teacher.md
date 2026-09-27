@@ -53,7 +53,7 @@ Every way an answer can be missing is a stable typed reason recorded in the corp
 - `cli_missing` - the seat's CLI binary is not installed.
 - `timeout` - the invocation exceeded the stream's bounded timeout (600 s tactical/daily, 900 s news).
 - `cli_error` - the CLI exited non-zero or answered an error envelope; the bounded detail carries the subtype.
-- `empty_content` / `malformed_json` / `schema_invalid` - the answer was absent, unparseable, or violated the bounded brief schema (the same strict schema the student answers, so every desk's briefs live in one scoreable shape).
+- `empty_content` / `malformed_json` / `schema_invalid` - the answer was absent, unparseable, or violated the bounded brief schema (the same strict schema the student answers, so every desk's briefs live in one scoreable shape - including the position view: when the pulled facts show a tracked position, every seat must state a view, a verdict with a confidence band and a policy-tied reason, or decline one explicitly; never default a missing view to hold).
 - `window_unreachable` - the pull itself failed; no question was asked.
 
 ## The corpus
@@ -102,7 +102,7 @@ Every pulled episode snapshots the window facts at its timestamp, so the realize
 uv run aero-bot-hindsight [--corpus-dir PATH] [--horizon-hours H] [--json]
 ```
 
-Three desks are scored - the `claude` seat, the `codex` seat, and the student whose audited brief rides each episode - on two axes:
+Three desks are scored - the `claude` seat, the `codex` seat, and the student whose audited brief rides each episode - on three axes:
 
 - **Availability**: how many episodes that actually offered the desk a question were answered with a brief, with every typed absence counted by its stable reason.
 A `dark` seat and an unreachable window are unasked, never absent.
@@ -110,8 +110,13 @@ A `dark` seat and an unreachable window are unasked, never absent.
 A bad outcome scores the moment it is observed; a quiet verdict waits until the horizon has fully elapsed, and a brief stays pending until then - never guessed.
 Absences are never scored at all.
 The four counts (flagged-bad, flagged-quiet, unflagged-bad, unflagged-quiet) plus the pending count are the whole judgment - no model grades another model, and every number is recomputable by hand.
+- **View grading (the conviction layer)**: every stated position view - the verdict, band, and reason a desk's brief carried - is graded against the same deterministic later facts, per the report's own self-describing view rule.
+A hold is right when the position stayed tracked through a drained quiet horizon and wrong when a bad outcome followed while it stayed tracked; an exit is right when a bad outcome followed while the position stayed tracked and wrong when a quiet horizon drained with it still tracked; a recenter is right when a recenter action followed while tracked and wrong when a quiet horizon drained with no recenter; an enter is right when an entry followed with no bad outcome inside the window and wrong when any bad outcome fell inside it.
+A view whose position left before its horizon drained is ungradeable, and an unfilled horizon stays pending - never guessed.
+Explicit declines, missing views on positioned episodes, and verdicts incoherent with the facts are counted, never graded.
+The confidence bands are calibrated per desk - high-confidence views must be right more often than low-confidence ones, judged only when both extreme bands hold decided views - and the view-versus-policy counterfactual is computed only where the corpus prices it: an exit view the policy declined is compared against the tracked position's committed-mark path over the same window (first order, blind to emissions, fees, gas, and slippage), a hold view the policy honored is equal, and every comparison whose counterfactual path the store never observed - a hold overridden by an exit, any recenter or enter view the policy declined - is marked uncomputable, never fabricated.
 
-The report is one schema-validated object (`hindsight_report/1`, carrying its own horizon and truth rule) atomically rewritten to `reports/hindsight_last.json` beside the corpus, with the latest equity, day P&L, and bounded sample series for scoreboard context.
+The report is one schema-validated object (`hindsight_report/1`, carrying its own horizon, truth rule, and view rule) atomically rewritten to `reports/hindsight_last.json` beside the corpus, with the latest equity, day P&L, and bounded sample series for scoreboard context and one view-score block per desk.
 The daily launchd agent `com.aero-bot.teacher-hindsight` (09:50, after the 09:30 daily stream's bounded timeout has drained) makes it the daily report; the command exits zero on an honest empty corpus and one only when the report cannot be written.
 
 ## The upgrade loop
@@ -127,14 +132,15 @@ uv run aero-bot-upgrade [--corpus-dir PATH] [--horizon-hours H] [--seat NAME]...
 Exit codes: zero on a clean pass (a gated no-divergence report is honest, not failed), one on configuration, corpus, or write failures.
 
 **Digest first, model second.** Each pass composes a deterministic divergence digest from the corpus and the hindsight verdicts, then asks a question only if the digest is non-empty.
-Three divergence classes exist, and every entry is backed by realized bad truth - only episodes whose hindsight verdict came back True (a negative day P&L or a halt increment followed inside the horizon) may contribute, scoped to the calibrated streams (tactical and daily):
+Five divergence classes exist; the first three draw only from episodes whose hindsight verdict came back True (a negative day P&L or a halt increment followed inside the horizon), scoped to the calibrated streams (tactical and daily):
 
 - **Misses** - a teacher flagged anomalies, the student answered unflagged, and bad followed.
 - **Availability gaps** - a teacher answered a brief the student never gave; the entry carries the student's own recorded outcome, empty when the episode carried no observation at all.
 - **Label divergences** - both flagged, but the teacher named labels the student did not.
 - **Posture misses** - the deterministic risk desk (see [the risk-manager documentation](risk-manager.md)) found a posture problem and the student's accepted brief stayed quiet; backed by the finding itself, realized deterministic truth, never a pending read or a hindsight verdict.
+- **Conviction misses** - the conviction layer's fifth class: a teacher's stated position view graded right against realized outcomes within the horizon while the student's own view was wrong, declined, or missing; backed by the decided view grades alone, so it opens the honest gate without any bad outcome and lets the teachers' proposals cite measured conviction.
 
-Pending and quiet episodes contribute only context counts (grounded, bad, and quiet tallies, plus the hindsight desk scores embedded in the prompt) - never entries.
+Pending and quiet episodes contribute only context counts (grounded, bad, and quiet tallies, plus the hindsight desk scores - now carrying each desk's view grading - embedded in the prompt) - never entries.
 Each class keeps its most recent twenty entries, every brief snippet is whitespace-collapsed and bounded, and each label list is bounded to five, so the digest stays a bounded object.
 
 **Honest gating.** Zero divergences asks no seat anything: the report records the gate and the seats list stays empty, the same fail-closed shape as every sibling surface.

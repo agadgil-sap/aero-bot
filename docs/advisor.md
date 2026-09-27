@@ -51,6 +51,16 @@ Everything in the prompt is deterministic and grounded - the composed facts are 
 3. **Validate fail-closed.** The answer must parse and validate against the strict schema; a reasoning model's separate `reasoning` field is ignored, an error envelope answered under a 200 status is a plane failure (`http_status`), and the token budget must cover thinking plus answer (a length-cutoff plane answering empty content is a typed absence, not a hang).
 4. **Record.** The pass prints a human summary, atomically rewrites `advisor_last_report.json` beside the audit store, and appends one `advisor_reported` audit record carrying the accepted brief or the stable absence reason, the model, the latency, and the window size.
 
+## The position view
+
+The conviction layer (the captain's answer to desks that describe state and defer) extends the shared brief schema backward-compatibly: every desk - the student here, the teacher seats in the harness - may carry a position view beside its prose.
+When the composed facts show a tracked position the view is required: either a verdict (hold, exit, recenter, or enter), a coarse confidence band (low, medium, high), and a one-sentence reason of at most 400 characters tied to the locked policy's own rules or naming the deviation from them - or an explicit `view_declined` saying why no view can be formed.
+A desk that cannot form a view says so; it never defaults a missing view to hold.
+While the book is flat the view is optional (an enter view is the coherent form).
+The fields are optional in the schema itself so every brief already recorded in the audit chain or the teacher corpus keeps parsing; older briefs over a tracked position surface as honest view gaps in the hindsight scorer's measurement, never as parse failures.
+The accepted view rides the `advisor_reported` audit record beside the brief, so the corpus and every offline surface see the same stated conviction.
+Advisory only, like everything here: a view is a measurement input, not an instruction - the locked policy engine keeps every trading decision, and nothing in this layer can authorize, block, or execute anything.
+
 ## The teaching block
 
 The student learns to be taught through one optional sealed file, proposed by the teacher harness's upgrade loop and written by the operator (the checklist lives in [the teacher documentation](teacher.md#the-upgrade-loop)).

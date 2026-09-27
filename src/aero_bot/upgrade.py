@@ -3,11 +3,14 @@
 The intelligence layer's fourth surface turns measured divergence into
 proposed teaching. The hindsight scorer proves where the teacher desks
 outperformed the student - flags that were right while the student stayed
-quiet, answers the student never gave, labels the student never raised -
-and this surface composes that proof into one bounded deterministic
-digest, asks each teacher seat for one schema-validated proposal (a
-replacement teaching block plus its rationale and exemplars), and writes
-the proposals as operator-reviewable artifacts beside the corpus.
+quiet, answers the student never gave, labels the student never raised,
+posture the counterparty desk caught while the student read quiet, and
+stated views that proved right while the student's were wrong, declined,
+or missing - and this surface composes that proof into one bounded
+deterministic digest, asks each teacher seat for one schema-validated
+proposal (a replacement teaching block plus its rationale and exemplars),
+and writes the proposals as operator-reviewable artifacts beside the
+corpus.
 
 Nothing applies itself. A proposal becomes the student's teaching block
 only through the operator's explicit seal - writing one validated file on
@@ -22,8 +25,9 @@ Discipline:
 
 - **Digest first, model second.** The divergence digest is deterministic
   and recomputable by hand; the seats may only propose over it. Every
-  digest entry is backed by realized bad truth (a decided hindsight
-  verdict), never by a pending read.
+  digest entry is backed by realized decided truth (a decided hindsight
+  verdict, a deterministic posture finding, or a decided view grade),
+  never by a pending read.
 - **Honest gating.** Zero scorable divergences means zero questions: the
   report records the gate and no seat is asked, exactly like a dark seat
   is never requested.
@@ -51,8 +55,12 @@ from aero_bot.hindsight import (
     DEFAULT_HINDSIGHT_HORIZON_HOURS,
     HINDSIGHT_HORIZON_BOUNDS,
     HindsightDeskScore,
+    ViewGrade,
+    ViewGrades,
+    ViewState,
     collect_reads,
     episode_verdicts,
+    grade_corpus_views,
     score_corpus,
 )
 from aero_bot.risk_manager import RISK_POSTURE_RULES, PostureAudit, audit_corpus_posture
@@ -188,6 +196,37 @@ class PostureMiss(BaseModel):
     halted_count: Annotated[int, Field(ge=0)] = 0
 
 
+class ConvictionMiss(BaseModel):
+    """Carry one episode a teacher's stated view proved right and the student's did not."""
+
+    # Frozen strict fields keep one miss entry immutable.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # When the episode ran.
+    created_at: datetime
+    # The stream the episode served.
+    stream: str
+    # The teacher seat that stated the right view.
+    seat: str
+    # The teacher seat's model tag.
+    model: str
+    # The teacher's stated verdict.
+    teacher_verdict: str
+    # The teacher's stated confidence band.
+    teacher_confidence: str
+    # The teacher's one-sentence reason, bounded.
+    teacher_reason: str
+    # What the student's brief carried: a view graded wrong, an
+    # explicit decline, or no view at all on a positioned episode.
+    student_state: str
+    # The student's stated verdict when it stated one, else None.
+    student_verdict: str | None = None
+    # The episode's observed day P&L, else None.
+    day_pnl_usdc: str | None = None
+    # The episode's halted-cycle baseline.
+    halted_count: Annotated[int, Field(ge=0)] = 0
+
+
 class UpgradeDivergenceDigest(BaseModel):
     """Carry the deterministic divergence digest the seats propose over."""
 
@@ -221,15 +260,20 @@ class UpgradeDivergenceDigest(BaseModel):
     # answered quiet. Backed by the finding itself - realized
     # deterministic truth, never a pending read.
     posture_misses: tuple[PostureMiss, ...] = ()
+    # A teacher's stated view graded right while the student's view was
+    # wrong, declined, or missing. Backed by the hindsight view grades -
+    # decided realized truth within the horizon, never a pending read.
+    conviction_misses: tuple[ConvictionMiss, ...] = ()
 
     @property
     def total_divergences(self) -> int:
-        """Count every scorable divergence across all four classes."""
+        """Count every scorable divergence across all five classes."""
         return (
             len(self.misses)
             + len(self.availability_gaps)
             + len(self.label_divergences)
             + len(self.posture_misses)
+            + len(self.conviction_misses)
         )
 
 
@@ -324,6 +368,7 @@ def build_divergence_digest(
     *,
     malformed_episode_count: int = 0,
     posture_audit: PostureAudit | None = None,
+    view_grades: ViewGrades | None = None,
 ) -> UpgradeDivergenceDigest:
     """Compose the deterministic divergence digest over decided truth.
 
@@ -335,8 +380,13 @@ def build_divergence_digest(
     fourth class draws from the deterministic risk desk's posture audit
     instead: a posture miss is backed by the finding itself, realized
     deterministic truth at the episode's timestamp, so it needs no
-    hindsight verdict and no stream scoping. Pending and quiet episodes
-    contribute context counts, never entries.
+    hindsight verdict and no stream scoping. The fifth class draws from
+    the hindsight view grades: a conviction miss is a teacher's stated
+    view that graded right against realized outcomes while the
+    student's own view was wrong, declined, or missing - decided truth,
+    never a pending read - so it too needs no verdict-True episode.
+    Pending and quiet episodes contribute context counts, never
+    entries.
 
     Args:
         episodes: The corpus's episodes, oldest first.
@@ -348,6 +398,9 @@ def build_divergence_digest(
         posture_audit: The deterministic risk desk's audit over the same
             episodes, else None to compose the digest without the
             posture class (the live pass always audits).
+        view_grades: The hindsight view grades over the same episodes,
+            else None to compose the digest without the conviction class
+            (the live pass always grades).
 
     Returns:
         The immutable digest, each class bounded to its most recent
@@ -362,6 +415,7 @@ def build_divergence_digest(
     gaps: list[AvailabilityGap] = []
     label_divergences: list[LabelDivergence] = []
     posture_misses: list[PostureMiss] = []
+    conviction_misses: list[ConvictionMiss] = []
     for index, episode in enumerate(episodes):
         if episode.facts is None or episode.stream not in CALIBRATED_STREAMS:
             continue
@@ -463,6 +517,47 @@ def build_divergence_digest(
                     halted_count=episode.facts.halted_count if episode.facts is not None else 0,
                 )
             )
+    if view_grades is not None:
+        for index, episode in enumerate(episodes):
+            if episode.facts is None or episode.stream not in CALIBRATED_STREAMS:
+                continue
+            by_desk = view_grades.by_episode(episode)
+            student_entry = by_desk.get("student")
+            if student_entry is None:
+                continue
+            beaten = student_entry.state in {
+                ViewState.MISSING,
+                ViewState.DECLINED,
+            } or (
+                student_entry.state is ViewState.STATED and student_entry.grade is ViewGrade.WRONG
+            )
+            if not beaten:
+                continue
+            for seat in TeacherSeatName:
+                entry = by_desk.get(seat.value)
+                if entry is None or entry.grade is not ViewGrade.RIGHT:
+                    continue
+                view = entry.view
+                if view is None:
+                    continue
+                read = seat_reads[seat][index]
+                conviction_misses.append(
+                    ConvictionMiss(
+                        created_at=episode.created_at,
+                        stream=episode.stream.value,
+                        seat=seat.value,
+                        model=read.model,
+                        teacher_verdict=view.verdict.value,
+                        teacher_confidence=view.confidence.value,
+                        teacher_reason=_bounded_head(view.reason, UPGRADE_DIGEST_BRIEF_MAX_CHARS),
+                        student_state=student_entry.state.value,
+                        student_verdict=student_entry.view.verdict.value
+                        if student_entry.view is not None
+                        else None,
+                        day_pnl_usdc=episode.facts.day_pnl_usdc,
+                        halted_count=episode.facts.halted_count,
+                    )
+                )
     return UpgradeDivergenceDigest(
         horizon_hours=horizon_hours,
         grounded_episode_count=grounded,
@@ -483,6 +578,11 @@ def build_divergence_digest(
         ),
         posture_misses=tuple(
             sorted(posture_misses, key=lambda entry: entry.created_at)[-UPGRADE_DIGEST_ENTRY_MAX:]
+        ),
+        conviction_misses=tuple(
+            sorted(conviction_misses, key=lambda entry: entry.created_at)[
+                -UPGRADE_DIGEST_ENTRY_MAX:
+            ]
         ),
     )
 
@@ -656,12 +756,17 @@ def run_upgrade_pass(
     # truth and back the digest's fourth evidence class whether or not
     # any teacher ever flagged the posture.
     posture_audit = audit_corpus_posture(episodes)
+    # The conviction layer always grades: decided view truth backs the
+    # digest's fifth evidence class whether or not any anomaly class
+    # contributed.
+    view_grades = grade_corpus_views(episodes, horizon_hours, moment)
     digest = build_divergence_digest(
         episodes,
         verdicts,
         horizon_hours,
         malformed_episode_count=malformed,
         posture_audit=posture_audit,
+        view_grades=view_grades,
     )
     desk_scores = score_corpus(episodes, horizon_hours, moment).desks
     outcomes: list[SeatUpgradeOutcome] = []
@@ -748,7 +853,8 @@ def print_upgrade_report(report: UpgradeReport) -> None:
         f"  divergences: {digest.total_divergences} "
         f"({len(digest.misses)} misses, {len(digest.availability_gaps)} availability gaps, "
         f"{len(digest.label_divergences)} label divergences, "
-        f"{len(digest.posture_misses)} posture misses) over "
+        f"{len(digest.posture_misses)} posture misses, "
+        f"{len(digest.conviction_misses)} conviction misses) over "
         f"{digest.grounded_episode_count} grounded episodes "
         f"({digest.bad_episode_count} bad, {digest.quiet_episode_count} quiet)"
     )
@@ -869,6 +975,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "AvailabilityGap",
+    "ConvictionMiss",
     "DEFAULT_SEAT_MODELS",
     "DivergenceMiss",
     "LabelDivergence",
