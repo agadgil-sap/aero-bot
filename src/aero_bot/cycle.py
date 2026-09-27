@@ -52,6 +52,8 @@ from pydantic import BaseModel, Field, model_validator
 
 from aero_bot.allocator import (
     HeldPositionFact,
+    PortfolioAllocation,
+    PortfolioExclusionReason,
     PortfolioParameters,
     PortfolioRebalancePlan,
     PortfolioStepKind,
@@ -110,6 +112,8 @@ from aero_bot.selector import (
 from aero_bot.strategy import (
     SELECTOR_SYMBOL,
     BoardListing,
+    IdleCashExclusion,
+    IdleCashState,
     StrategyDecisionReport,
     StrategySources,
     assemble_board,
@@ -411,6 +415,12 @@ class CycleStateBook(BaseModel):
     # The current day's yield-attribution baseline, None before the first
     # cycle of a day.
     day_baseline: CycleDayBaseline | None = None
+    # The idle-cash alert episode's signature while it persists: the
+    # sorted symbol/reason/gate set the alert fired on, or None once the
+    # book deploys, the band empties, or no cycle has alerted yet. The
+    # alert fires only on the first cycle of an episode or when its cause
+    # changes (the captain's gnhf 34 ruling).
+    idle_cash_alert_signature: str | None = None
     # When this book was last persisted, timezone-aware.
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -794,6 +804,12 @@ class CycleReport(BaseModel):
     # The day's yield decomposition: AERO rewards, computed fees, stock
     # mark-to-market, and the honest residual.
     yield_attribution: CycleYieldAttribution | None = None
+    # The idle-book evidence when qualifying pools stayed excluded while
+    # cash sat undeployed (the captain's gnhf 34 ruling): the cash
+    # fraction, every in-band exclusion's gate and lost-yield line, and
+    # the episode signature the alert layer rate-limits on. None when
+    # the book deployed or nothing ranked in-band.
+    idle_cash: IdleCashState | None = None
     # Unclaimed AERO at the final reconciliation: the Safe balance plus the
     # staked position's earned, raw units; None when unmeasurable.
     unclaimed_aero_units: Annotated[int, Field(ge=0)] | None = None
@@ -865,6 +881,20 @@ class CycleReportPayload(BaseModel):
     largest_position_share: str | None = None
     # Empty when the cycle completed; otherwise why it halted.
     halted_reason: str = ""
+    # The engine's complete numeric evidence lines, including the
+    # per-gate chain evaluation for the top-ranked pool and every
+    # idle-cash exclusion's consequence line, so any why-is-it-flat
+    # question is answerable from the audit store alone (gnhf 34).
+    decision_diagnostics: tuple[str, ...] = ()
+    # The idle-book episode signature while cash sat undeployed beside
+    # excluded in-band pools, else None.
+    idle_cash_signature: str | None = None
+    # Cash as a fraction of equity while the idle-book episode held,
+    # else None.
+    idle_cash_fraction: str | None = None
+    # Every in-band pool kept out of the book by a gate or bound while
+    # cash sat idle, as compact SYMBOL (reason: gate) tokens.
+    idle_cash_exclusions: tuple[str, ...] = ()
 
 
 class CycleExecutorBoundary(Protocol):
@@ -1149,6 +1179,74 @@ def _cooldown_until(book: CycleStateBook, symbol: str) -> datetime | None:
         if cooldown.symbol.lower() == symbol.lower():
             return cooldown.blocked_until
     return None
+
+
+# The exclusion reasons that mark a book idle while a pool ranked
+# in-band: every bound or gate that kept qualifying capital in cash.
+# Below-band exclusions are lower yield, not idling, and the
+# concentration-cap note rides tranches that funded.
+_IDLE_EXCLUSION_REASONS = frozenset(
+    {
+        PortfolioExclusionReason.ENTRY_GATE_REFUSED,
+        PortfolioExclusionReason.BELOW_MIN_POSITION_SIZE,
+        PortfolioExclusionReason.INSUFFICIENT_CASH,
+        PortfolioExclusionReason.MAX_POSITIONS_REACHED,
+        PortfolioExclusionReason.NO_DEPLOYABLE_BUDGET,
+        PortfolioExclusionReason.INVENTORY_UNWIND_PENDING,
+    }
+)
+
+
+def _idle_cash_state(
+    allocation: PortfolioAllocation,
+    cash_usdc: Decimal,
+    equity_usdc: Decimal,
+    book: CycleStateBook,
+) -> IdleCashState | None:
+    """Build the idle-book evidence when in-band pools stayed excluded.
+
+    The state exists only when at least one pool that ranked in-band was
+    kept out of the book by a gate or bound while cash sat undeployed -
+    the posture the captain rated a horrible mistake when it sat silent
+    all night. The episode signature is the sorted symbol/reason/gate
+    set; it changes exactly when the idle cause changes, so the alert
+    layer fires on the first cycle of an episode and stays quiet while
+    the same cause persists.
+
+    Args:
+        allocation: The allocator's target composition with exclusions.
+        cash_usdc: The Safe's live USDC the decision pass priced.
+        equity_usdc: The portfolio equity the decision pass priced.
+        book: The persisted book carrying the prior episode signature.
+
+    Returns:
+        The idle-book evidence, or None when no in-band pool was excluded.
+    """
+    idle_rows = tuple(
+        item for item in allocation.excluded if item.reason in _IDLE_EXCLUSION_REASONS
+    )
+    if not idle_rows or equity_usdc <= 0:
+        return None
+    exclusions = tuple(
+        IdleCashExclusion(
+            symbol=item.symbol,
+            reason=item.reason.value,
+            gate=item.gate,
+            detail=item.detail,
+            emissions_apr=item.emissions_apr if item.emissions_apr is not None else Decimal("0"),
+            forgone_income_usdc_per_day=item.forgone_income_usdc_per_day,
+        )
+        for item in idle_rows
+    )
+    signature = "; ".join(f"{row.symbol}:{row.reason}:{row.gate}" for row in exclusions)
+    return IdleCashState(
+        cash_usdc=cash_usdc,
+        equity_usd=equity_usdc,
+        cash_fraction=+(cash_usdc / equity_usdc),
+        exclusions=exclusions,
+        signature=signature,
+        signature_changed=signature != book.idle_cash_alert_signature,
+    )
 
 
 def _book_with_cooldowns(
@@ -2426,16 +2524,21 @@ class CycleRunner:
             penalty_blocked_symbols=frozenset(penalty_blocked),
         )
         # The leading outcome: the first planned step when the plan acts,
-        # else a portfolio hold over the session facts.
+        # else a portfolio hold over the session facts. A flat book never
+        # carries a position-scoped reason (the gnhf 34 flat-label fix):
+        # flat with qualifying pools names the awaiting-entry posture and
+        # flat with none names the empty board, exactly like the
+        # pnl_diagnostic layer that already says no tracked position.
         if plan.steps:
             outcome = plan.steps[0].outcome
         else:
             any_qualified = any(evaluation.qualifies for evaluation in evaluations)
-            reason = (
-                PolicyReason.NO_QUALIFYING_POOL
-                if not book.positions and not any_qualified
-                else PolicyReason.OPEN_IN_RANGE
-            )
+            if book.positions:
+                reason = PolicyReason.OPEN_IN_RANGE
+            elif any_qualified:
+                reason = PolicyReason.FLAT_AWAITING_ENTRY
+            else:
+                reason = PolicyReason.NO_QUALIFYING_POOL
             outcome = PolicyOutcome(
                 decision=PolicyDecision(
                     action=PolicyActionKind.HOLD,
@@ -2444,6 +2547,11 @@ class CycleRunner:
                 ),
                 next_state=session_state,
             )
+        # The idle-book evidence: cash undeployed while in-band pools
+        # stayed excluded by gates or bounds, with the episode signature
+        # the alert layer rate-limits on (the captain's gnhf 34 ruling -
+        # a silent idle book must never happen again).
+        idle_cash = _idle_cash_state(allocation, cash_usdc, equity_usdc, book)
         decision_option = self._option_for_plan(plan, options, evaluations)
         window = evaluate_event_window(self._now(), decision_option.token_address, engine.calendar)
         summary = f"portfolio: {allocation.summary}; {plan.summary}; " + board_summary_line(
@@ -2470,6 +2578,9 @@ class CycleRunner:
             held_folds=held_folds,
             session_state=session_state,
             board_summary=summary,
+            gate_trace_basis=allocation.gate_trace_basis,
+            gate_trace=allocation.gate_trace,
+            idle_cash=idle_cash,
         )
 
     def _option_for_plan(
@@ -3500,8 +3611,21 @@ class CycleRunner:
             and decision_report.portfolio_plan is not None
             and decision_report.session_state is not None
         ):
-            return self._rebuild_book_portfolio(
+            rebuilt = self._rebuild_book_portfolio(
                 book, reconciliation, decision_report, decision_report.session_state
+            )
+            # The idle-cash episode stamp rides the rebuilt book: the
+            # signature the alert layer compares against next cycle, or
+            # None once the book deploys or the band empties so a later
+            # episode alerts again from its first cycle.
+            return rebuilt.model_copy(
+                update={
+                    "idle_cash_alert_signature": (
+                        decision_report.idle_cash.signature
+                        if decision_report.idle_cash is not None
+                        else None
+                    )
+                }
             )
         position = book.position
         if (
@@ -4310,6 +4434,22 @@ class CycleRunner:
             decision_action = decision_report.outcome.decision.action.value
             decision_reason = decision_report.outcome.decision.reason.value
             decision_diagnostics = decision_report.outcome.decision.diagnostics
+            # The gate-chain evidence and the idle-exclusion consequence
+            # lines ride every cycle report (the captain's gnhf 34
+            # ruling): any future why-is-it-flat question is answerable
+            # from the report and the audit store alone.
+            if decision_report.gate_trace_basis:
+                decision_diagnostics = decision_diagnostics + (
+                    decision_report.gate_trace_basis,
+                    *decision_report.gate_trace,
+                )
+            if decision_report.idle_cash is not None:
+                for row in decision_report.idle_cash.exclusions:
+                    gate_segment = f": {row.gate}" if row.gate else ""
+                    decision_diagnostics = decision_diagnostics + (
+                        f"idle-cash exclusion {row.symbol} ({row.reason}{gate_segment}): "
+                        f"{row.detail}",
+                    )
             event_window = decision_report.event_window.description
             input_notes = decision_report.input_notes
         else:
@@ -4397,6 +4537,7 @@ class CycleRunner:
             day_diagnostic=day_diagnostic if day_pnl is None else "",
             peak_equity_usd=peak,
             yield_attribution=yield_attribution,
+            idle_cash=decision_report.idle_cash if decision_report is not None else None,
             unclaimed_aero_units=unclaimed_aero_units,
             unclaimed_aero_value_usdc=unclaimed_aero_value_usdc,
             fee_evidence=fee_evidence,
@@ -4485,6 +4626,23 @@ def record_cycle_report(audit_sink: AuditStore, report: CycleReport, created_at:
                 else None
             ),
             halted_reason=report.halted_reason,
+            decision_diagnostics=report.decision_diagnostics,
+            idle_cash_signature=report.idle_cash.signature
+            if report.idle_cash is not None
+            else None,
+            idle_cash_fraction=str(report.idle_cash.cash_fraction)
+            if report.idle_cash is not None
+            else None,
+            idle_cash_exclusions=(
+                tuple(
+                    f"{row.symbol} ({row.reason}: {row.gate})"
+                    if row.gate
+                    else f"{row.symbol} ({row.reason})"
+                    for row in report.idle_cash.exclusions
+                )
+                if report.idle_cash is not None
+                else ()
+            ),
         ),
         created_at,
     )

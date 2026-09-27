@@ -18,6 +18,7 @@ from test_cycle import (
 
 from aero_bot.alerts import (
     ALERT_FROM_ENV,
+    ALERT_IDLE_CASH_FRACTION_ENV,
     ALERT_PROVIDER_ENV,
     ALERT_RESEND_API_KEY_ENV,
     ALERT_SMTP_HOST_ENV,
@@ -46,6 +47,7 @@ from aero_bot.cycle import (
     CycleYieldAttribution,
 )
 from aero_bot.cycle import CycleReconciliation as Reconciliation
+from aero_bot.strategy import IdleCashExclusion, IdleCashState
 
 
 class FakeTransport:
@@ -744,3 +746,86 @@ def test_quiet_instant_fixture_stays_aware() -> None:
     """The shared fixture instant remains timezone-aware for reports."""
     assert QUIET_INSTANT.tzinfo is UTC
     assert mint_receipt(1)["logs"]
+
+
+class TestIdleCashAlert:
+    """The gnhf 34 idle-book alert: a silent idle book must never happen again."""
+
+    def idle_state(
+        self,
+        *,
+        signature_changed: bool = True,
+        cash_fraction: Decimal = Decimal("0.971"),
+    ) -> IdleCashState:
+        """Build the overnight production posture: 97 percent cash, MSTRc excluded."""
+        return IdleCashState(
+            cash_usdc=Decimal("102.263507"),
+            equity_usd=Decimal("105.4951978105427944343744845"),
+            cash_fraction=cash_fraction,
+            exclusions=(
+                IdleCashExclusion(
+                    symbol="MSTRc",
+                    reason="below_min_position_size",
+                    gate="",
+                    detail=(
+                        "the tier target clamped to the 36.92331923368997805203106958 USDC "
+                        "per-name concentration bound (0.35 of equity 105.4951978105427944"
+                        "343744845) below the minimum, so the engine sized 36.92331923368997"
+                        "805203106958 USDC; cash stays cash; income forgone about 7.0397 USDC "
+                        "per day at the qualifying APR 69.59"
+                    ),
+                    emissions_apr=Decimal("69.59"),
+                    forgone_income_usdc_per_day=Decimal("7.0397"),
+                ),
+            ),
+            signature="MSTRc:below_min_position_size:",
+            signature_changed=signature_changed,
+        )
+
+    def test_fires_on_the_first_cycle_of_an_episode_naming_gate_and_bound(self) -> None:
+        """The alert names the pool, the gate, the bound, and the forgone income."""
+        report = calm_report().model_copy(
+            update={"decision_reason": "flat_awaiting_entry", "idle_cash": self.idle_state()}
+        )
+        alerts = evaluate_alerts(report, parse_alert_config({}))
+        assert len(alerts) == 1
+        line = alerts[0]
+        assert line.startswith("idle book:")
+        assert "MSTRc" in line
+        assert "below_min_position_size" in line
+        assert "concentration bound" in line
+        assert "income forgone about" in line
+        assert "0.971" in line
+
+    def test_stays_quiet_while_the_same_episode_persists(self) -> None:
+        """Only the first cycle of a changed signature alerts."""
+        report = calm_report().model_copy(
+            update={
+                "decision_reason": "flat_awaiting_entry",
+                "idle_cash": self.idle_state(signature_changed=False),
+            }
+        )
+        assert evaluate_alerts(report, parse_alert_config({})) == ()
+
+    def test_under_the_threshold_stays_quiet_even_on_a_new_episode(self) -> None:
+        """A book holding half its equity as cash does not alert at eighty percent."""
+        report = calm_report().model_copy(
+            update={
+                "decision_reason": "flat_awaiting_entry",
+                "idle_cash": self.idle_state(cash_fraction=Decimal("0.5")),
+            }
+        )
+        assert evaluate_alerts(report, parse_alert_config({})) == ()
+
+    def test_the_threshold_is_overridable_and_validated(self) -> None:
+        """The fraction parses from the environment and rejects out-of-range values."""
+        config = parse_alert_config({ALERT_IDLE_CASH_FRACTION_ENV: "0.5"})
+        assert config.idle_cash_fraction == Decimal("0.5")
+        with pytest.raises(ValueError, match="inside \\(0, 1\\]"):
+            parse_alert_config({ALERT_IDLE_CASH_FRACTION_ENV: "1.5"})
+        with pytest.raises(ValueError, match="inside \\(0, 1\\]"):
+            parse_alert_config({ALERT_IDLE_CASH_FRACTION_ENV: "0"})
+
+    def test_the_default_threshold_is_eighty_percent(self) -> None:
+        """The shipped default matches the captain's ruling."""
+        assert parse_alert_config({}).idle_cash_fraction == Decimal("0.80")

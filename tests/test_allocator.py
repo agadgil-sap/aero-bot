@@ -672,3 +672,213 @@ class TestRebalanceTriggers:
             and item.reason in tuple(PortfolioExclusionReason)
             for item in plan.deferred
         )
+
+
+class TestEntryGateTransparencyAndScaledLatches:
+    """The gnhf 34 fixes: named refusing gates and unspoofed halt latches.
+
+    The overnight production evidence: 113 clean unhalted cycles sat flat
+    at 102.26 USDC while MSTRc (qualifying APR 69-81) was excluded every
+    cycle with the opaque label ``entry_gate_refused``. The cause: the
+    allocator's tranche re-derivation scaled the observation's equity to
+    the tranche's sizing basis (46.15 for a 36.92 tranche) while the
+    session state anchored the day-start equity at 102.57 - the scaled
+    equity read as a 55 percent drawdown and the daily loss halt refused
+    every fresh entry. These tests pin the fix with the exact production
+    numbers.
+    """
+
+    # The live night's session facts, verbatim from the audit chain.
+    LIVE_DAY_START = Decimal("102.5739724972593502724458080")
+    LIVE_PEAK = Decimal("105.3181507845350552886065412")
+    LIVE_CASH = Decimal("102.263507")
+    LIVE_EQUITY = Decimal("105.4951978105427944343744845")
+    LIVE_MSTRC_APR = Decimal("69.590101247023764134591907279181621479093244490011647158019")
+
+    def live_session(self) -> PolicyState:
+        """Build the live night's session state: same day, healthy anchors."""
+        day = BASE_TIME.astimezone(__import__("zoneinfo").ZoneInfo("America/New_York")).date()
+        return PolicyState(
+            day=day,
+            day_start_equity_usd=self.LIVE_DAY_START,
+            peak_equity_usd=self.LIVE_PEAK,
+            halted_day=None,
+            position=None,
+            held_inventory=None,
+            reentry_blocked_until=None,
+        )
+
+    def live_board(self) -> tuple[PoolBoardOption, ...]:
+        """Build the live night's board: MSTRc atop two out-of-band pools."""
+        return (
+            board_option(
+                "MSTRc",
+                "0x" + "1" * 40,
+                "0x" + "2" * 40,
+                emissions_apr=self.LIVE_MSTRC_APR,
+                equity_usd=self.LIVE_EQUITY,
+            ),
+            board_option(
+                "SNDKc",
+                "0x" + "3" * 40,
+                "0x" + "4" * 40,
+                emissions_apr=Decimal("15.29"),
+                equity_usd=self.LIVE_EQUITY,
+            ),
+            board_option(
+                "METAc",
+                "0x" + "5" * 40,
+                "0x" + "6" * 40,
+                emissions_apr=Decimal("10.59"),
+                equity_usd=self.LIVE_EQUITY,
+            ),
+        )
+
+    def test_the_live_flat_night_names_its_true_cause(self) -> None:
+        """The halt no longer refuses; the min-versus-concentration bound does.
+
+        With the day-start anchor at 102.57 and the tranche's scaled basis
+        at 46.15, the old code latched ``daily_loss_halt_active`` on every
+        tranche. The fix threads the portfolio equity through, the entry
+        chain passes, and the exclusion becomes the honest one: the
+        thirty-five percent concentration bound (36.92) sits below the
+        eighty-USDC minimum - with both bounds named and the forgone
+        income priced.
+        """
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, self.live_session(), self.live_board(), {})
+        assert next(e for e in evaluations if e.symbol == "MSTRc").qualifies
+        allocation = allocate_portfolio(
+            engine,
+            self.live_session(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=self.LIVE_CASH,
+            equity_usdc=self.LIVE_EQUITY,
+        )
+        mstrc = next(item for item in allocation.excluded if item.symbol == "MSTRc")
+        assert mstrc.reason is PortfolioExclusionReason.BELOW_MIN_POSITION_SIZE
+        assert mstrc.gate == ""
+        assert "36.92331923368997805203106958" in mstrc.detail
+        assert "80" in mstrc.detail
+        assert "concentration bound" in mstrc.detail
+        assert "income forgone about" in mstrc.detail
+        assert mstrc.forgone_income_usdc_per_day is not None
+        assert mstrc.forgone_income_usdc_per_day > Decimal("7")
+        assert "MSTRc (below_min_position_size:" in allocation.summary
+
+    def test_a_large_healthy_book_funds_despite_the_anchor_above_the_basis(self) -> None:
+        """The exact old failure shape now funds: anchor 950, tranche 350.
+
+        Before the fix the 350 tranche's scaled basis (437.50) read as a
+        54 percent drawdown against the 950 anchor and the halt refused
+        the entry; the concentration cap alone should bind here.
+        """
+        board = (
+            board_option("MSTRc", AAA_POOL, AAA_TOKEN, emissions_apr=Decimal("69.59")),
+            board_option("SNDKc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("15.29")),
+        )
+        session = PolicyState(
+            day=BASE_TIME.astimezone(__import__("zoneinfo").ZoneInfo("America/New_York")).date(),
+            day_start_equity_usd=Decimal("950"),
+            peak_equity_usd=Decimal("1000"),
+        )
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, session, board, {})
+        allocation = allocate_portfolio(
+            engine,
+            session,
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("1000"),
+            equity_usdc=Decimal("1000"),
+        )
+        assert [tranche.symbol for tranche in allocation.tranches] == ["MSTRc"]
+        assert allocation.tranches[0].budget_usd == Decimal("350")
+
+    def test_a_real_gate_refusal_names_the_gate_and_the_forgone_income(self) -> None:
+        """A tranche-scale gas deferral surfaces the engine gate by name."""
+        board = (
+            board_option(
+                "MSTRc",
+                AAA_POOL,
+                AAA_TOKEN,
+                emissions_apr=Decimal("1.6"),
+                gas_price_gwei=Decimal("0.05"),
+            ),
+        )
+        session = PolicyState(
+            day=BASE_TIME.astimezone(__import__("zoneinfo").ZoneInfo("America/New_York")).date(),
+            day_start_equity_usd=Decimal("1000"),
+            peak_equity_usd=Decimal("1000"),
+        )
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, session, board, {})
+        allocation = allocate_portfolio(
+            engine,
+            session,
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("1000"),
+            equity_usdc=Decimal("1000"),
+        )
+        refused = next(item for item in allocation.excluded if item.symbol == "MSTRc")
+        assert refused.reason is PortfolioExclusionReason.ENTRY_GATE_REFUSED
+        assert refused.gate == "gas_gate_deferred"
+        assert refused.cause == "gas_gate_deferred"
+        assert "Estimated batch cost" in refused.detail
+        assert "income forgone about" in refused.detail
+        assert refused.forgone_income_usdc_per_day is not None
+        assert "MSTRc (entry_gate_refused: gas_gate_deferred)" in allocation.summary
+
+    def test_the_gate_chain_trace_rides_the_allocation(self) -> None:
+        """The trace names the top pool at the tranche basis it was judged at."""
+        board = (
+            board_option("MSTRc", AAA_POOL, AAA_TOKEN, emissions_apr=Decimal("69.59")),
+            board_option("SNDKc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("15.29")),
+        )
+        session = PolicyState(
+            day=BASE_TIME.astimezone(__import__("zoneinfo").ZoneInfo("America/New_York")).date(),
+            day_start_equity_usd=Decimal("1000"),
+        )
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, session, board, {})
+        allocation = allocate_portfolio(
+            engine,
+            session,
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("1000"),
+            equity_usdc=Decimal("1000"),
+        )
+        assert allocation.gate_trace_symbol == "MSTRc"
+        assert allocation.gate_trace_basis.startswith("entry gate chain for MSTRc at the")
+        assert "tranche basis" in allocation.gate_trace_basis
+        assert "portfolio equity 1000" in allocation.gate_trace_basis
+        halt_line = next(
+            text for text in allocation.gate_trace if text.startswith("gate daily_loss_halt:")
+        )
+        assert ": PASS" in halt_line
+
+    def test_the_summary_exclusion_line_names_the_cause_for_every_reason(self) -> None:
+        """Below-band exclusions carry their measured bound in the summary."""
+        options = (
+            board_option("BBBc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("4.0")),
+            board_option("AAAc", AAA_POOL, AAA_TOKEN, emissions_apr=Decimal("2.0")),
+            board_option("CCCc", CCC_POOL, CCC_TOKEN, emissions_apr=Decimal("1.8")),
+        )
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(options),
+            {},
+            held=(),
+            cash_usdc=Decimal("400"),
+            equity_usdc=Decimal("1200"),
+        )
+        assert "CCCc (below_tier_band: weighted" in allocation.summary
+        assert "below band floor" in allocation.summary

@@ -468,6 +468,17 @@ class PolicyObservation(BaseModel):
     pool_depth_usd: NonNegativeDecimal
     # Equity is the caller's current marked total portfolio value in USDC.
     equity_usd: Annotated[Decimal, Field(gt=0)]
+    # The full portfolio equity the day machinery anchors on, when the
+    # observation's equity_usd carries a different sizing basis. The
+    # allocator's tranche re-derivations scale equity_usd down to one
+    # tranche's size basis so the engine's equity cap sizes the tranche
+    # honestly, while the day-start anchor and the continuous drawdown
+    # latches must keep judging the whole book: without this field a
+    # small tranche's scaled equity reads as a portfolio drawdown and
+    # the daily loss halt refuses every fresh entry (the gnhf 34 fix).
+    # None means equity_usd is the portfolio equity, the default every
+    # full-book observation carries.
+    portfolio_equity_usd: Annotated[Decimal, Field(gt=0)] | None = None
     # Reference price is the keyless real-market quote in USDC per stock.
     reference_price_usdc: Annotated[Decimal, Field(gt=0)] | None = None
     # Reference age is seconds since that quote; absence means no live quote.
@@ -643,6 +654,12 @@ class PolicyReason(StrEnum):
     DOWNSIDE_RECENTER_ECONOMIC = "downside_recenter_economic"
     # Entry is eligible because the raw emissions APR threshold is met.
     ENTRY_THRESHOLD_MET = "entry_threshold_met"
+    # Flat with qualifying pools on the board but no tranche funded this
+    # pass: bounds or gates refused every fresh entry while the book
+    # holds only cash. Composed only by the portfolio label layer
+    # (aero_bot.cycle); a flat book never carries a position-scoped
+    # reason (the gnhf 34 flat-label fix).
+    FLAT_AWAITING_ENTRY = "flat_awaiting_entry"
     # A prior mint failed after acquiring stock; retry from that inventory.
     FAILED_ENTRY_RETRY = "failed_entry_retry"
     # A recenter burned the old LP but its replacement mint failed; retry the
@@ -769,6 +786,29 @@ LOCKED_POLICY_PARAMETERS = PolicyParameters()
 EMPTY_EVENT_CALENDAR = EventCalendar()
 
 
+def _latch_equity_of(observation: PolicyObservation) -> Decimal:
+    """Resolve the equity the day machinery anchors on for one observation.
+
+    The day-start anchor, the running peak, and both drawdown latches judge
+    the full portfolio equity. An observation whose ``equity_usd`` carries a
+    scaled sizing basis (the allocator's tranche re-derivations) names the
+    book's own equity through ``portfolio_equity_usd``; every full-book
+    observation leaves that field absent and anchors on ``equity_usd``
+    unchanged.
+
+    Args:
+        observation: The observation whose latch basis is resolved.
+
+    Returns:
+        The portfolio equity the day machinery must anchor on.
+    """
+    return (
+        observation.portfolio_equity_usd
+        if observation.portfolio_equity_usd is not None
+        else observation.equity_usd
+    )
+
+
 class PolicyEngine:
     """Fold injected observations into typed policy decisions without I/O."""
 
@@ -832,6 +872,171 @@ class PolicyEngine:
         if working_state.position is not None:
             return self._decide_with_position(working_state, observation, flat_description)
         return self._decide_flat(working_state, observation, flat_description)
+
+    def entry_gate_trace(
+        self, state: PolicyState, observation: PolicyObservation
+    ) -> tuple[str, ...]:
+        """Trace every ordered entry gate with its verdict, measurement, and bound.
+
+        The trace is evidence only - it decides nothing. Each line names one
+        gate of the flat-posture entry chain in the engine's fixed order,
+        whether it passes or fails at exactly this observation and state, the
+        measured value, and the bound it was judged against, so a why-is-it-
+        flat question is answerable from the decision diagnostics and the
+        audit store alone (the captain's gnhf 34 ruling). The halt verdict is
+        re-derived through the same day machinery the decision itself runs,
+        so the trace can never disagree with the engine's own latch.
+
+        Args:
+            state: The threaded engine state; position and held inventory
+                are stripped because entry qualification is a flat-posture
+                question.
+            observation: The observation whose entry gates are traced, at
+                exactly the sizing basis the caller judged (the allocator
+                passes the tranche-scaled observation with its portfolio
+                equity carried for the latch).
+
+        Returns:
+            One line per ordered gate: verdict, measurement, and bound.
+        """
+        flat_basis = state.model_copy(update={"position": None, "held_inventory": None})
+        working_state = self._observe_day(flat_basis, observation)
+        latch_equity = _latch_equity_of(observation)
+        lines: list[str] = []
+        # Gate 1: the daily loss halt - the latched day, the day-start
+        # drawdown, or the continuous peak drawdown over the bound.
+        halt_fraction = self._parameters.daily_loss_halt_fraction
+        day_drawdown = (
+            working_state.day_start_equity_usd - latch_equity
+        ) / working_state.day_start_equity_usd
+        peak = working_state.peak_equity_usd
+        peak_drawdown = (peak - latch_equity) / peak if peak is not None else None
+        halt_measured = (
+            f"day drawdown {day_drawdown} from anchor "
+            f"{working_state.day_start_equity_usd}"
+            + (
+                f", peak drawdown {peak_drawdown} from running peak {peak}"
+                if peak_drawdown is not None
+                else ""
+            )
+            + (
+                f", halt already latched for {working_state.halted_day}"
+                if working_state.halted_day == working_state.day
+                else ""
+            )
+        )
+        lines.append(
+            f"gate daily_loss_halt: "
+            f"{'FAIL' if working_state.halted_day == working_state.day else 'PASS'} "
+            f"(measured {halt_measured}; bound drawdown < {halt_fraction})"
+        )
+        # Gate 2: the per-pool re-entry cooldown.
+        blocked_until = flat_basis.reentry_blocked_until
+        cooldown_pass = blocked_until is None or observation.observed_at >= blocked_until
+        lines.append(
+            "gate reentry_cooldown: "
+            + ("PASS" if cooldown_pass else "FAIL")
+            + (
+                " (measured none active; bound entries wait out the cooldown)"
+                if blocked_until is None
+                else f" (measured blocked until {blocked_until}, now "
+                f"{observation.observed_at}; bound entries wait out the cooldown)"
+            )
+        )
+        # Gate 3: condition-driven flats (stale oracle, paused registry).
+        condition_flat = self._flat_reason(observation)
+        lines.append(
+            "gate condition_flat: "
+            + ("FAIL" if condition_flat is not None else "PASS")
+            + (
+                f" (measured {condition_flat}; bound oracle fresh and registry active)"
+                if condition_flat is not None
+                else " (measured oracle fresh, registry active; bound no condition flat)"
+            )
+        )
+        # Gate 4: reference quote freshness, fail-closed while enforced.
+        if observation.reference_enforcement_enabled:
+            age = observation.reference_age_seconds
+            reference_pass = (
+                age is not None
+                and observation.reference_price_usdc is not None
+                and age <= self._parameters.reference_max_age_seconds
+            )
+            age_text = "unavailable" if age is None else str(age)
+            lines.append(
+                "gate reference_freshness: "
+                + ("PASS" if reference_pass else "FAIL")
+                + f" (measured age {age_text}s; bound <= "
+                f"{self._parameters.reference_max_age_seconds}s)"
+            )
+        else:
+            lines.append(
+                "gate reference_freshness: PASS (measured not enforced, the resolved "
+                "Aerodrome pool is the trading authority; bound advisory only)"
+            )
+        # Gate 5: the raw emissions floor (the displayed convention).
+        emissions_pass = observation.emissions_apr >= self._parameters.min_entry_emissions_apr
+        lines.append(
+            "gate emissions_floor: "
+            + ("PASS" if emissions_pass else "FAIL")
+            + f" (measured raw APR {observation.emissions_apr}; bound >= "
+            f"{self._parameters.min_entry_emissions_apr})"
+        )
+        # Gate 6: the equity and depth caps leaving a positive size.
+        equity_cap = observation.equity_usd * self._parameters.max_position_equity_fraction
+        depth_cap = observation.pool_depth_usd * self._parameters.max_position_depth_fraction
+        size_usd = min(equity_cap, depth_cap)
+        lines.append(
+            "gate entry_size: "
+            + ("PASS" if size_usd > 0 else "FAIL")
+            + f" (measured min(equity cap {equity_cap}, depth cap {depth_cap}) = "
+            f"{size_usd}; bound size > 0)"
+        )
+        # Gate 7: the gas price ceiling.
+        gas_price = observation.gas_price_gwei
+        ceiling = self._parameters.gas_price_ceiling_gwei
+        if gas_price is None:
+            lines.append(
+                "gate gas_ceiling: FAIL (measured reading unavailable; bound <= "
+                f"{ceiling} gwei, unavailable defers fail-closed)"
+            )
+        else:
+            lines.append(
+                "gate gas_ceiling: "
+                + ("PASS" if gas_price <= ceiling else "FAIL")
+                + f" (measured {gas_price} gwei; bound <= {ceiling} gwei)"
+            )
+        # Gate 8: the batch cost versus the expected daily gross yield at
+        # exactly the sized position (the yield-duration sense-check).
+        total_units = (
+            self._parameters.enter_batch_gas_units + self._parameters.safe_overhead_gas_per_batch
+        )
+        expected_daily_yield = (
+            size_usd * (observation.emissions_apr + observation.fee_apr) / DAYS_PER_YEAR
+        )
+        if gas_price is None:
+            lines.append(
+                "gate gas_cost_vs_yield: FAIL (measured cost unreadable at an "
+                "unavailable gas price; bound cost <= "
+                f"{self._parameters.gas_cost_max_gross_yield_fraction} of the expected "
+                f"daily gross yield {expected_daily_yield} USDC)"
+            )
+        else:
+            cost_usd = (
+                Decimal(total_units)
+                * gas_price
+                / GWEI_PER_ETH
+                * self._parameters.eth_price_assumption_usd
+            )
+            allowed = self._parameters.gas_cost_max_gross_yield_fraction * expected_daily_yield
+            lines.append(
+                "gate gas_cost_vs_yield: "
+                + ("PASS" if cost_usd <= allowed else "FAIL")
+                + f" (measured batch cost {cost_usd} vs allowed {allowed}; bound cost <= "
+                f"{self._parameters.gas_cost_max_gross_yield_fraction} of the expected "
+                f"daily gross yield {expected_daily_yield} USDC)"
+            )
+        return tuple(lines)
 
     def build_aligned_range(
         self,
@@ -980,25 +1185,29 @@ class PolicyEngine:
         """
         # The trading day is anchored to the America/New_York session date.
         observation_day = observation.observed_at.astimezone(NEW_YORK).date()
+        # The day machinery anchors on the full portfolio equity, never a
+        # tranche's scaled sizing basis: a scaled observation carries
+        # portfolio_equity_usd and the latches judge the whole book.
+        latch_equity = _latch_equity_of(observation)
         if state.day != observation_day:
             # A new day resets the day-start anchor and any prior day latch;
             # the running peak deliberately survives the rollover.
             state = state.model_copy(
                 update={
                     "day": observation_day,
-                    "day_start_equity_usd": observation.equity_usd,
+                    "day_start_equity_usd": latch_equity,
                     "halted_day": None,
                 }
             )
         # The high-water mark only ever ratchets upward, across days.
         peak = state.peak_equity_usd
-        if peak is None or observation.equity_usd > peak:
-            state = state.model_copy(update={"peak_equity_usd": observation.equity_usd})
-            peak = observation.equity_usd
+        if peak is None or latch_equity > peak:
+            state = state.model_copy(update={"peak_equity_usd": latch_equity})
+            peak = latch_equity
         if state.halted_day != observation_day:
             # Marked drawdown from the day-start equity is the shipped latch.
             drawdown_fraction = (
-                state.day_start_equity_usd - observation.equity_usd
+                state.day_start_equity_usd - latch_equity
             ) / state.day_start_equity_usd
             if drawdown_fraction >= self._parameters.daily_loss_halt_fraction:
                 # The halt latches for the day even if equity later recovers.
@@ -1008,7 +1217,7 @@ class PolicyEngine:
                 # re-arms the same halt machinery on every day it holds,
                 # including the first observation of a new day whose carried
                 # peak towers above the freshly reset day-start anchor.
-                peak_drawdown_fraction = (peak - observation.equity_usd) / peak
+                peak_drawdown_fraction = (peak - latch_equity) / peak
                 if peak_drawdown_fraction >= self._parameters.daily_loss_halt_fraction:
                     state = state.model_copy(update={"halted_day": observation_day})
         return state
@@ -2181,7 +2390,10 @@ class PolicyEngine:
         # A plain hold carries the day-rolled state forward unchanged.
         hold_state = state
         # The daily loss halt blocks only new entries; safety exits above stay armed.
+        # The latch's equity basis is the full portfolio equity, so a scaled
+        # tranche observation reports the book's number, never its own basis.
         if state.halted_day == state.day:
+            latch_equity = _latch_equity_of(observation)
             peak = state.peak_equity_usd
             peak_line = (
                 f" The running equity peak {peak} - carried across the New York "
@@ -2189,16 +2401,15 @@ class PolicyEngine:
                 f"also sits at least {self._parameters.daily_loss_halt_fraction} "
                 "above the marked equity."
                 if peak is not None
-                and peak > observation.equity_usd
-                and (peak - observation.equity_usd) / peak
-                >= self._parameters.daily_loss_halt_fraction
+                and peak > latch_equity
+                and (peak - latch_equity) / peak >= self._parameters.daily_loss_halt_fraction
                 else ""
             )
             return self._hold(
                 hold_state,
                 PolicyReason.DAILY_LOSS_HALT_ACTIVE,
                 (
-                    f"Marked equity {observation.equity_usd} fell at least "
+                    f"Marked equity {latch_equity} fell at least "
                     f"{self._parameters.daily_loss_halt_fraction} below the day-start "
                     f"equity {state.day_start_equity_usd}; no new entries until the "
                     "next America/New_York day." + peak_line,

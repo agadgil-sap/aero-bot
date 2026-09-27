@@ -3,12 +3,21 @@ Description=Aero Bot loopback-only dashboard
 Documentation=file:/opt/aero-bot/docs/deployment.md
 After=network-online.target
 Wants=network-online.target
+# The sealed environment is mandatory: without the audit-path override
+# inside it, Settings falls back to its platform default and the
+# dashboard opens its own empty store instead of the production chain
+# (the gnhf 34 fix) - a missing seal must fail loudly, not silently.
+ConditionPathExists=/etc/aero-bot/dashboard.env
 
 [Service]
 Type=simple
 # The dedicated unprivileged service user; the dashboard is read-only.
 User=aero-bot
 Group=aero-bot
+# The sealed environment carries the production audit store path so the
+# dashboard's audit-health endpoint verifies the real chain the cycle
+# writes, never an initialized empty store of its own.
+EnvironmentFile=/etc/aero-bot/dashboard.env
 WorkingDirectory=/var/lib/aero-bot
 StateDirectory=aero-bot
 # The installer and the audit store both require the state tree owner-only;

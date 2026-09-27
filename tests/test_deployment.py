@@ -233,6 +233,33 @@ class TestDashboardUnit:
         assert "ProtectSystem=strict" in service
         assert "Restart=on-failure" in service
 
+    def test_the_dashboard_reads_the_sealed_audit_store_path(self) -> None:
+        """The dashboard verifies the production chain, never its own empty store.
+
+        The gnhf 34 fix: without the sealed environment file the service
+        fell back to Settings' platform default and its audit-health
+        endpoint reported an initialized empty store (record_count 0)
+        while the production chain held nineteen thousand records.
+        """
+        service = Path("deploy/systemd/aero-bot-dashboard.service").read_text(encoding="utf-8")
+        assert "EnvironmentFile=/etc/aero-bot/dashboard.env" in service
+        assert "ConditionPathExists=/etc/aero-bot/dashboard.env" in service
+        installer = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "${CONFIG_DIR}/dashboard.env" in installer
+        # The template pins the production store path before any other knob.
+        heredoc = installer.index("${CONFIG_DIR}/dashboard.env")
+        template_start = installer.index("<<'EOF'", heredoc) + len("<<'EOF'")
+        template_end = installer.index("\nEOF\n", template_start)
+        template = installer[template_start:template_end]
+        assert "AERO_BOT_AUDIT_DATABASE_PATH=/var/lib/aero-bot/audit.sqlite3" in template
+
+    def test_the_dashboard_env_template_is_sealed_and_idempotent(self) -> None:
+        """The seal lands root:service 0640 and reinstalls never overwrite it."""
+        installer = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert 'chown root:"${SERVICE_USER}" "${CONFIG_DIR}/dashboard.env"' in installer
+        assert 'chmod 0640 "${CONFIG_DIR}/dashboard.env"' in installer
+        assert '[[ ! -f "${CONFIG_DIR}/dashboard.env" ]]' in installer
+
     def test_every_unit_in_the_kit_installs_under_system(self) -> None:
         """The installer copies exactly the kit's units."""
         units = sorted(path.name for path in Path("deploy/systemd").iterdir())
@@ -338,6 +365,12 @@ class TestDeploymentDoc:
         text = DEPLOYMENT_DOC.read_text(encoding="utf-8")
         assert "ssh -L 8765:127.0.0.1:8765" in text
         assert "deny incoming" in text
+
+    def test_the_dashboard_env_file_is_documented(self) -> None:
+        """The installer-written dashboard seal and its purpose are stated."""
+        text = DEPLOYMENT_DOC.read_text(encoding="utf-8")
+        assert "/etc/aero-bot/dashboard.env" in text
+        assert "audit-health" in text
 
     def test_phase_two_boundaries_are_stated(self) -> None:
         """The captain-dependent steps are named as captain-dependent."""

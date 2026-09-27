@@ -52,6 +52,10 @@ ALERT_SUMMARY_EVERY_CYCLE_ENV = "AERO_BOT_ALERT_SUMMARY_EVERY_CYCLE"
 # Balance-floor alert thresholds, overridable from the environment.
 ALERT_RELAYER_ETH_FLOOR_WEI_ENV = "AERO_BOT_ALERT_RELAYER_ETH_FLOOR_WEI"
 ALERT_SAFE_USDC_FLOOR_UNITS_ENV = "AERO_BOT_ALERT_SAFE_USDC_FLOOR_UNITS"
+# The idle-book alert threshold: the cash fraction of equity (as a
+# decimal fraction, default 0.80) past which an idle book with excluded
+# in-band pools alerts on the first cycle of its episode (gnhf 34).
+ALERT_IDLE_CASH_FRACTION_ENV = "AERO_BOT_ALERT_IDLE_CASH_FRACTION"
 # The default Resend endpoint; any Resend-style API shares the shape.
 DEFAULT_RESEND_URL = "https://api.resend.com/emails"
 # The default SMTP submission port with STARTTLS.
@@ -61,6 +65,10 @@ DEFAULT_SMTP_PORT = 587
 # capital for a pilot funded around twenty.
 DEFAULT_RELAYER_ETH_FLOOR_WEI = 500_000_000_000_000
 DEFAULT_SAFE_USDC_FLOOR_UNITS = 5_000_000
+# The default idle-book threshold: eighty percent of equity as cash while
+# a pool ranks in-band but stays excluded is the posture the captain
+# rated a horrible mistake when it sat silent all night.
+DEFAULT_IDLE_CASH_FRACTION = Decimal("0.80")
 # One email bound: the server gets its seconds, the cycle gets its exit.
 SMTP_TIMEOUT_SECONDS = 30.0
 HTTP_TIMEOUT_SECONDS = 20.0
@@ -241,6 +249,7 @@ class AlertConfig:
         summary_every_cycle: bool,
         relayer_eth_floor_wei: int,
         safe_usdc_floor_units: int,
+        idle_cash_fraction: Decimal = DEFAULT_IDLE_CASH_FRACTION,
         smtp: "SmtpSettings | None" = None,
         resend: "ResendSettings | None" = None,
     ) -> None:
@@ -253,6 +262,9 @@ class AlertConfig:
             summary_every_cycle: Whether calm cycles email their summary.
             relayer_eth_floor_wei: The relayer ETH alert floor in wei.
             safe_usdc_floor_units: The Safe USDC alert floor in raw units.
+            idle_cash_fraction: The cash fraction of equity past which an
+                idle book with excluded in-band pools alerts on the first
+                cycle of its episode.
             smtp: SMTP settings when the provider is smtp.
             resend: Resend settings when the provider is resend.
         """
@@ -262,6 +274,7 @@ class AlertConfig:
         self.summary_every_cycle = summary_every_cycle
         self.relayer_eth_floor_wei = relayer_eth_floor_wei
         self.safe_usdc_floor_units = safe_usdc_floor_units
+        self.idle_cash_fraction = idle_cash_fraction
         self.smtp = smtp
         self.resend = resend
 
@@ -314,6 +327,14 @@ def _non_negative_int(value: str, variable: str) -> int:
     return parsed
 
 
+def _unit_fraction(value: str, variable: str) -> Decimal:
+    """Parse one environment value as a fraction strictly inside (0, 1]."""
+    parsed = Decimal(value)
+    if not Decimal(0) < parsed <= Decimal(1):
+        raise ValueError(f"{variable} must sit inside (0, 1], not {value!r}")
+    return parsed
+
+
 def parse_alert_config(environ: Mapping[str, str] | None = None) -> AlertConfig:
     """Build the alert configuration from the process environment.
 
@@ -342,6 +363,7 @@ def parse_alert_config(environ: Mapping[str, str] | None = None) -> AlertConfig:
         ) from None
     raw_floor_eth = resolved.get(ALERT_RELAYER_ETH_FLOOR_WEI_ENV, "").strip()
     raw_floor_usdc = resolved.get(ALERT_SAFE_USDC_FLOOR_UNITS_ENV, "").strip()
+    raw_idle_fraction = resolved.get(ALERT_IDLE_CASH_FRACTION_ENV, "").strip()
     config = AlertConfig(
         provider=provider,
         sender=resolved.get(ALERT_FROM_ENV, "").strip(),
@@ -363,6 +385,11 @@ def parse_alert_config(environ: Mapping[str, str] | None = None) -> AlertConfig:
             _non_negative_int(raw_floor_usdc, ALERT_SAFE_USDC_FLOOR_UNITS_ENV)
             if raw_floor_usdc
             else DEFAULT_SAFE_USDC_FLOOR_UNITS
+        ),
+        idle_cash_fraction=(
+            _unit_fraction(raw_idle_fraction, ALERT_IDLE_CASH_FRACTION_ENV)
+            if raw_idle_fraction
+            else DEFAULT_IDLE_CASH_FRACTION
         ),
     )
     if provider is AlertProvider.NONE:
@@ -471,6 +498,26 @@ def evaluate_alerts(report: CycleReport, config: AlertConfig) -> tuple[str, ...]
         alerts.append(
             f"Safe USDC {reconciliation.safe_usdc_units} raw units is below the "
             f"{config.safe_usdc_floor_units}-unit alert floor; working capital is low"
+        )
+    # The idle-book alert (the captain's gnhf 34 ruling): a silent idle
+    # book must never happen again. When more than the configured
+    # fraction of equity sits as cash while at least one pool ranks
+    # in-band but stays excluded by a gate, the alert fires once per
+    # episode - only the first cycle of a changed signature alerts - and
+    # names the pool, the gate, the bound, and the income forgone.
+    idle = report.idle_cash
+    if (
+        idle is not None
+        and idle.signature_changed
+        and idle.cash_fraction >= config.idle_cash_fraction
+    ):
+        top = idle.exclusions[0]
+        gate_segment = f": {top.gate}" if top.gate else ""
+        alerts.append(
+            f"idle book: {idle.cash_fraction} of equity ({idle.cash_usdc} of "
+            f"{idle.equity_usd} USDC) sits as cash while {top.symbol} ranks "
+            f"in-band at qualifying APR {top.emissions_apr} but stays excluded "
+            f"({top.reason}{gate_segment}) - {top.detail}"
         )
     return tuple(alerts)
 

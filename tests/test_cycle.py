@@ -2810,3 +2810,114 @@ def test_token1_stock_in_range_clears_stale_recenter_anchor(tmp_path: Path) -> N
     saved = state_store.load()
     assert saved.position is not None
     assert saved.position.out_of_range_since is None
+
+
+class TestFlatLabelAndIdleCashEvidence:
+    """The gnhf 34 label and idle-book fixes, pinned over the thin flat book.
+
+    The flat thin book (ten USDC of cash, qualifying pools on the board,
+    every tranche clamped below the eighty-USDC minimum by the
+    concentration cap) is exactly the posture the production bot sat in
+    all night while its top-level label read ``open_in_range``.
+    """
+
+    def test_flat_unfunded_book_carries_the_flat_label_not_open_in_range(
+        self, tmp_path: Path
+    ) -> None:
+        """A flat book never reports a position-scoped reason."""
+        runner, executor, state_store = selector_runner(
+            tmp_path, sources=SelectorCycleSources(), balances=FakeBalances()
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "hold"
+        assert report.decision_reason == "flat_awaiting_entry"
+        # The tracked-position fields stay explicitly empty while flat,
+        # matching the pnl layer that already says no tracked position.
+        assert report.pnl_diagnostic == "no tracked position"
+        assert report.positions == ()
+        assert report.reconciliation.tracked_token_id is None
+        assert report.reconciliation.tracked_status is None
+
+    def test_the_gate_chain_and_idle_consequences_ride_the_decision_diagnostics(
+        self, tmp_path: Path
+    ) -> None:
+        """Every cycle carries the per-gate evaluation and the consequence lines."""
+        runner, _, _ = selector_runner(
+            tmp_path, sources=SelectorCycleSources(), balances=FakeBalances()
+        )
+        report = runner.run(CycleMode.DRY_RUN)
+        assert any(
+            text.startswith("entry gate chain for BBBc at the")
+            for text in report.decision_diagnostics
+        )
+        assert any(
+            text.startswith("gate daily_loss_halt: ") for text in report.decision_diagnostics
+        )
+        assert any(
+            text.startswith("gate emissions_floor: ") for text in report.decision_diagnostics
+        )
+        assert any(
+            text.startswith("idle-cash exclusion BBBc (below_min_position_size): ")
+            for text in report.decision_diagnostics
+        )
+
+    def test_the_idle_episode_alerts_once_then_stays_quiet(self, tmp_path: Path) -> None:
+        """The signature changes on the first cycle and persists after."""
+        runner, _, state_store = selector_runner(
+            tmp_path, sources=SelectorCycleSources(), balances=FakeBalances()
+        )
+        first = runner.run(CycleMode.DRY_RUN)
+        assert first.idle_cash is not None
+        assert first.idle_cash.signature_changed
+        assert any(
+            row.symbol == "BBBc" and row.forgone_income_usdc_per_day is not None
+            for row in first.idle_cash.exclusions
+        )
+        # The book stamps the episode signature the alert rate-limits on.
+        assert state_store.load().idle_cash_alert_signature == first.idle_cash.signature
+        second = runner.run(CycleMode.DRY_RUN)
+        assert second.idle_cash is not None
+        assert not second.idle_cash.signature_changed
+        assert second.idle_cash.signature == first.idle_cash.signature
+
+    def test_a_deployed_book_carries_no_idle_evidence(self, tmp_path: Path) -> None:
+        """A funding cycle is not idle: no idle state, no episode stamp."""
+        runner, _, state_store = selector_runner(tmp_path)
+        report = runner.run(CycleMode.DRY_RUN)
+        assert report.decision_action == "enter"
+        assert report.idle_cash is None
+        assert state_store.load().idle_cash_alert_signature is None
+
+    def test_the_audit_payload_carries_the_gate_chain_and_idle_evidence(
+        self, tmp_path: Path
+    ) -> None:
+        """The why-is-it-flat question is answerable from the store alone."""
+        from aero_bot.cycle import record_cycle_report
+
+        runner, _, _ = selector_runner(
+            tmp_path, sources=SelectorCycleSources(), balances=FakeBalances()
+        )
+        report = runner.run(CycleMode.DRY_RUN)
+        audit = AuditStore(tmp_path / "chain-audit.sqlite3")
+        record_cycle_report(audit, report, QUIET_INSTANT)
+        record = audit.read_records(limit=1)[0]
+        payload = json.loads(record.payload_json)
+        assert any(
+            text.startswith("gate daily_loss_halt: ") for text in payload["decision_diagnostics"]
+        )
+        assert any(
+            text.startswith("entry gate chain for BBBc") for text in payload["decision_diagnostics"]
+        )
+        assert report.idle_cash is not None
+        assert payload["idle_cash_signature"] == report.idle_cash.signature
+        assert payload["idle_cash_fraction"] is not None
+        assert payload["idle_cash_exclusions"]
+        # The tracked fields stay empty while flat.
+        assert payload["tracked_token_id"] is None
+        assert payload["position_value_usdc"] is None
+        assert payload["position_count"] == 0
