@@ -910,7 +910,7 @@ class TestViewAuditing:
             "facts",
             ScriptedTransport(
                 response=AdvisorHttpResponse(
-                    status_code=200, body=completion_body(json.dumps(viewed_answer("recenter")))
+                    status_code=200, body=chat_body(json.dumps(viewed_answer("recenter")))
                 )
             ),
         )
@@ -925,7 +925,7 @@ class TestViewAuditing:
         CycleStateStore(state).save(tracked_book())
         transport = ScriptedTransport(
             response=AdvisorHttpResponse(
-                status_code=200, body=completion_body(json.dumps(viewed_answer("exit", "low")))
+                status_code=200, body=chat_body(json.dumps(viewed_answer("exit", "low")))
             )
         )
         monitor = AdvisorMonitor(
@@ -957,7 +957,7 @@ class TestViewAuditing:
         transport = ScriptedTransport(
             response=AdvisorHttpResponse(
                 status_code=200,
-                body=completion_body(
+                body=chat_body(
                     json.dumps(
                         {
                             "brief": "a reading",
