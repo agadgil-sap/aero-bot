@@ -1,0 +1,674 @@
+"""Behavior tests for the portfolio allocator."""
+
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
+import pytest
+
+from aero_bot.allocator import (
+    HARD_MAX_CONCURRENT_POSITIONS,
+    PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC,
+    DeferredReallocation,
+    HeldPositionFact,
+    PortfolioExclusionReason,
+    PortfolioParameters,
+    PortfolioRebalancePlan,
+    PortfolioStepKind,
+    allocate_portfolio,
+    band_candidates,
+    plan_portfolio_rebalance,
+    rank_qualifying_pools,
+    weighted_apr_of,
+)
+from aero_bot.domain import normalize_evm_address
+from aero_bot.policy import (
+    PolicyActionKind,
+    PolicyDecision,
+    PolicyEngine,
+    PolicyObservation,
+    PolicyOutcome,
+    PolicyReason,
+    PolicyState,
+)
+from aero_bot.ranging import RangingEvidence
+from aero_bot.selector import PoolBoardOption, PoolEntryEvaluation, evaluate_pool_entries
+
+# Fixture identities: distinct pools and tokens per board symbol.
+AAA_TOKEN = normalize_evm_address("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+BBB_TOKEN = normalize_evm_address("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+CCC_TOKEN = normalize_evm_address("0xcccccccccccccccccccccccccccccccccccccccc")
+AAA_POOL = normalize_evm_address("0x1111111111111111111111111111111111111111")
+BBB_POOL = normalize_evm_address("0x2222222222222222222222222222222222222222")
+CCC_POOL = normalize_evm_address("0x3333333333333333333333333333333333333333")
+# A Saturday noon UTC session, clear of every session window.
+BASE_TIME = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+# The passing entry shape mirrored from the selector tests: emissions
+# over the floor, deep pool, fresh reference, cheap gas.
+RANGING = RangingEvidence.model_validate(
+    {
+        "gauge_liquidity_raw": 80_000_000_000_000,
+        "staked_tvl_usd": Decimal("100000"),
+        "active_liquidity_raw": 80_000_000_000_000,
+        "fee_window_seconds": 86_400,
+        "fee_window_notional_usd": Decimal("1000000"),
+        "pool_fee_ppm": 500,
+        "realized_daily_volatility": Decimal("0.005"),
+        "stock_decimals": 6,
+        "quote_decimals": 6,
+    }
+)
+
+
+def board_option(
+    symbol: str, pool_address: str, token_address: str, **overrides: object
+) -> PoolBoardOption:
+    """Build one board option over a passing entry observation.
+
+    Args:
+        symbol: The registry-matched stock symbol.
+        pool_address: The verified pool contract.
+        token_address: The B20 stock token.
+        **overrides: Observation fields changed for one behavior test.
+
+    Returns:
+        A validated immutable board option.
+    """
+    values: dict[str, object] = {
+        "observed_at": BASE_TIME,
+        "pool_address": pool_address,
+        "token_address": token_address,
+        "amm_price_usdc": Decimal("200"),
+        "emissions_apr": Decimal("2.0"),
+        "fee_apr": Decimal("0.5"),
+        "pool_depth_usd": Decimal("50000"),
+        "equity_usd": Decimal("1000"),
+        "reference_price_usdc": Decimal("200"),
+        "reference_age_seconds": 10,
+        "gas_price_gwei": Decimal("0.002"),
+        "ranging": RANGING,
+    }
+    values.update(overrides)
+    return PoolBoardOption(
+        symbol=symbol,
+        pool_address=pool_address,
+        token_address=token_address,
+        observation=PolicyObservation.model_validate(values),
+    )
+
+
+def qualified_board() -> tuple[PoolBoardOption, ...]:
+    """Build the three-pool scripted universe: BBBc best, CCCc sub-band."""
+    return (
+        board_option("AAAc", AAA_POOL, AAA_TOKEN, emissions_apr=Decimal("2.0")),
+        board_option("BBBc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("3.0")),
+        board_option("CCCc", CCC_POOL, CCC_TOKEN, emissions_apr=Decimal("1.2")),
+    )
+
+
+def board_evaluations(
+    options: tuple[PoolBoardOption, ...] | None = None,
+    cooldowns: dict[str, datetime] | None = None,
+) -> tuple[PoolEntryEvaluation, ...]:
+    """Run the selector's entry-gate chain over the scripted board."""
+    return evaluate_pool_entries(
+        PolicyEngine(), PolicyState(), options or qualified_board(), cooldowns or {}
+    )
+
+
+def held_fact(
+    symbol: str = "AAAc",
+    *,
+    token_id: int = 77,
+    committed: Decimal = Decimal("100"),
+    marked: Decimal | None = Decimal("100"),
+    entered_hours_ago: float = 2.0,
+    apr: Decimal = Decimal("1.2"),
+) -> HeldPositionFact:
+    """Build one held position fact two hours into its hold."""
+    return HeldPositionFact(
+        symbol=symbol,
+        token_id=token_id,
+        committed_usd=committed,
+        marked_usd=marked,
+        entered_at=BASE_TIME - timedelta(hours=entered_hours_ago),
+        emissions_apr=apr,
+    )
+
+
+def hold_outcome() -> PolicyOutcome:
+    """Build one in-range hold outcome for a held fold."""
+    return PolicyOutcome(
+        decision=PolicyDecision(
+            action=PolicyActionKind.HOLD,
+            reason=PolicyReason.OPEN_IN_RANGE,
+            diagnostics=("fixture: the position holds in range",),
+        ),
+        next_state=PolicyState(),
+    )
+
+
+def action_outcome(action: PolicyActionKind, reason: PolicyReason) -> PolicyOutcome:
+    """Build one typed action outcome for a held fold."""
+    return PolicyOutcome(
+        decision=PolicyDecision(
+            action=action,
+            reason=reason,
+            diagnostics=(f"fixture: the engine ordered {action.value}",),
+        ),
+        next_state=PolicyState(),
+    )
+
+
+class TestParameterCeilings:
+    """The locked bounds reject any sealed configuration above them."""
+
+    def test_count_cap_hard_ceiling_is_ten(self) -> None:
+        """No configuration may exceed the captain's ten positions."""
+        with pytest.raises(ValueError, match="hard.*ceiling of 10"):
+            PortfolioParameters(max_concurrent_positions=11)
+        assert HARD_MAX_CONCURRENT_POSITIONS == 10
+        PortfolioParameters(max_concurrent_positions=10)
+
+    def test_min_size_stays_inside_the_total_cap(self) -> None:
+        """A minimum above the total cap can never fund anything."""
+        with pytest.raises(ValueError, match="exceeds the hard"):
+            PortfolioParameters(min_position_usdc=Decimal("1500"))
+
+    def test_fractions_stay_in_their_intervals(self) -> None:
+        """The concentration and band fractions cap at one."""
+        with pytest.raises(ValueError, match="concentration"):
+            PortfolioParameters(concentration_cap_fraction=Decimal("1.5"))
+        with pytest.raises(ValueError, match="tier_band"):
+            PortfolioParameters(tier_band_fraction=Decimal("1.5"))
+        with pytest.raises(ValueError, match="non-negative"):
+            PortfolioParameters(switch_margin_fraction=Decimal("-0.1"))
+
+    def test_total_cap_never_exceeds_the_pilot_ceiling(self) -> None:
+        """The portfolio cap mirrors the executor's 1000 USDC ceiling."""
+        with pytest.raises(ValueError, match="hard ceiling"):
+            PortfolioParameters(total_exposure_cap_usdc=Decimal("2000"))
+        assert Decimal("1000") == PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC
+
+
+class TestTierConstruction:
+    """Tiered allocation across sparse and rich boards."""
+
+    def test_rich_board_funds_weight_proportional_tiers(self) -> None:
+        """The top APR earns the largest tranche; shares follow weights."""
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(),
+            {},
+            held=(),
+            cash_usdc=Decimal("400"),
+            equity_usdc=Decimal("1200"),
+        )
+        symbols = [tranche.symbol for tranche in allocation.tranches]
+        assert symbols == ["BBBc", "AAAc"]  # ranked, CCCc cut by the band
+        top, second = allocation.tranches
+        assert top.budget_usd == Decimal("240")  # 3.0/5.0 of 400
+        assert second.budget_usd == Decimal("160")  # 2.0/5.0 of 400
+        assert top.tier_rank == 1 and second.tier_rank == 2
+        assert allocation.cash_residual_usdc == Decimal("0")
+        assert allocation.projected_committed_usdc == Decimal("400")
+
+    def test_sparse_board_funds_one_tranche_with_cash_residual(self) -> None:
+        """One qualifying pool deploys alone and the rest stays cash."""
+        options = (board_option("BBBc", BBB_POOL, BBB_TOKEN),)
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(options),
+            {},
+            held=(),
+            cash_usdc=Decimal("500"),
+            equity_usdc=Decimal("2000"),
+        )
+        assert len(allocation.tranches) == 1
+        assert allocation.tranches[0].symbol == "BBBc"
+        assert allocation.tranches[0].budget_usd == Decimal("500")
+        assert allocation.cash_residual_usdc == Decimal("0")
+
+    def test_below_band_pool_is_excluded_with_typed_reason(self) -> None:
+        """A qualifying pool under half the top's APR earns no tranche."""
+        options = (
+            board_option("BBBc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("4.0")),
+            board_option("AAAc", AAA_POOL, AAA_TOKEN, emissions_apr=Decimal("2.0")),
+            board_option("CCCc", CCC_POOL, CCC_TOKEN, emissions_apr=Decimal("1.8")),
+        )
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(options),
+            {},
+            held=(),
+            cash_usdc=Decimal("400"),
+            equity_usdc=Decimal("1200"),
+        )
+        excluded = {item.symbol: item.reason for item in allocation.excluded}
+        assert excluded["CCCc"] is PortfolioExclusionReason.BELOW_TIER_BAND
+        assert "CCCc" not in [tranche.symbol for tranche in allocation.tranches]
+        details = {item.symbol: item.detail for item in allocation.excluded}
+        assert "tier band floor 2.00" in details["CCCc"]
+
+    def test_concentration_cap_clamps_the_top_tier(self) -> None:
+        """No tranche exceeds thirty-five percent of book equity."""
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(),
+            {},
+            held=(),
+            cash_usdc=Decimal("400"),
+            equity_usdc=Decimal("400"),
+        )
+        top, second = allocation.tranches
+        assert top.budget_usd == Decimal("140")  # 0.35 * 400
+        assert second.budget_usd == Decimal("140")  # also clamped
+        assert allocation.cash_residual_usdc == Decimal("120")
+        clamped = {item.symbol for item in allocation.excluded}
+        assert clamped == {"BBBc", "AAAc"}
+        reasons = {item.symbol: item.reason for item in allocation.excluded}
+        assert reasons["BBBc"] is PortfolioExclusionReason.CONCENTRATION_CAP_CLAMPED
+
+    def test_ties_break_on_the_symbol(self) -> None:
+        """Equal weighted APRs rank lexicographically."""
+        options = (
+            board_option("BBBc", BBB_POOL, BBB_TOKEN),
+            board_option("AAAc", AAA_POOL, AAA_TOKEN),
+        )
+        ranked = rank_qualifying_pools(board_evaluations(options))
+        assert [evaluation.symbol for evaluation, _ in ranked] == ["AAAc", "BBBc"]
+
+
+class TestCountAsOutput:
+    """The deployed count emerges under the bounds."""
+
+    def test_held_slots_consume_the_count_bound(self) -> None:
+        """Held positions come off the ceiling before new tiers fund."""
+        parameters = PortfolioParameters(max_concurrent_positions=2)
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(),
+            {},
+            held=(held_fact("DDDc", token_id=1, apr=Decimal("1.6")),),
+            cash_usdc=Decimal("400"),
+            equity_usdc=Decimal("1200"),
+            parameters=parameters,
+        )
+        assert [tranche.symbol for tranche in allocation.tranches] == ["BBBc"]
+        excluded = {item.symbol: item.reason for item in allocation.excluded}
+        assert excluded["AAAc"] is PortfolioExclusionReason.MAX_POSITIONS_REACHED
+
+    def test_full_book_deploys_nothing(self) -> None:
+        """A book at the count bound keeps every candidate as cash."""
+        parameters = PortfolioParameters(max_concurrent_positions=1)
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(),
+            {},
+            held=(held_fact("DDDc", token_id=1, apr=Decimal("1.6")),),
+            cash_usdc=Decimal("400"),
+            equity_usdc=Decimal("1200"),
+            parameters=parameters,
+        )
+        assert allocation.tranches == ()
+        assert allocation.cash_residual_usdc == Decimal("400")
+        assert "count bound" in allocation.summary
+
+    def test_below_minimum_target_stays_cash(self) -> None:
+        """A tier target under eighty USDC never deploys."""
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(),
+            {},
+            held=(),
+            cash_usdc=Decimal("150"),
+            equity_usdc=Decimal("1500"),
+        )
+        # Weights 3/5 and 2/5 of 150: 90 funds the top; the second share
+        # floors to 80 but only 60 remains, so it stays cash.
+        assert [tranche.symbol for tranche in allocation.tranches] == ["BBBc"]
+        assert allocation.tranches[0].budget_usd == Decimal("90")
+        excluded = {item.symbol: item.reason for item in allocation.excluded}
+        assert excluded["AAAc"] is PortfolioExclusionReason.INSUFFICIENT_CASH
+        assert allocation.cash_residual_usdc == Decimal("60")
+
+    def test_cash_never_deploys_past_the_budget(self) -> None:
+        """A later tier cannot spend cash an earlier tier consumed."""
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(),
+            {},
+            held=(),
+            cash_usdc=Decimal("250"),
+            equity_usdc=Decimal("1500"),
+        )
+        # 3/5 of 250 = 150 funds; 2/5 = 100 also fits, so both deploy.
+        assert len(allocation.tranches) == 2
+        tight = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(),
+            {},
+            held=(),
+            cash_usdc=Decimal("180"),
+            equity_usdc=Decimal("1500"),
+        )
+        # 3/5 of 180 = 108 funds; the second share floors to 80 but only
+        # 72 remains, so it stays cash rather than deploying a stub.
+        assert [tranche.symbol for tranche in tight.tranches] == ["BBBc"]
+        assert tight.cash_residual_usdc == Decimal("72")
+
+    def test_total_cap_headroom_bounds_deployment(self) -> None:
+        """Committed capital comes off the deployable budget first."""
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(),
+            {},
+            held=(held_fact("DDDc", token_id=1, committed=Decimal("900"), marked=Decimal("900")),),
+            cash_usdc=Decimal("500"),
+            equity_usdc=Decimal("1400"),
+        )
+        # Headroom is 100 USDC; the top tier takes its minimum-sized
+        # share of it and the second share no longer fits.
+        assert [tranche.symbol for tranche in allocation.tranches] == ["BBBc"]
+        assert allocation.tranches[0].budget_usd == Decimal("80")
+        assert allocation.deployable_usdc == Decimal("100")
+        assert allocation.projected_committed_usdc == Decimal("980")
+
+    def test_halted_book_funds_no_entries(self) -> None:
+        """The daily loss halt blocks every tranche, engine-judged."""
+        halted = PolicyState(day=BASE_TIME.date(), halted_day=BASE_TIME.date())
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            halted,
+            board_evaluations(),
+            {},
+            held=(),
+            cash_usdc=Decimal("400"),
+            equity_usdc=Decimal("1200"),
+        )
+        assert allocation.tranches == ()
+        reasons = {item.symbol: item.reason for item in allocation.excluded}
+        assert reasons["BBBc"] is PortfolioExclusionReason.ENTRY_GATE_REFUSED
+        details = {item.symbol: item.detail for item in allocation.excluded}
+        assert "daily_loss_halt_active" in details["BBBc"]
+
+    def test_pending_inventory_blocks_entries(self) -> None:
+        """Unsold stock keeps the whole board in cash."""
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(),
+            {},
+            held=(),
+            cash_usdc=Decimal("400"),
+            equity_usdc=Decimal("1200"),
+            inventory_pending=True,
+        )
+        assert allocation.tranches == ()
+        assert allocation.cash_residual_usdc == Decimal("400")
+        reasons = [item.reason for item in allocation.excluded]
+        assert PortfolioExclusionReason.INVENTORY_UNWIND_PENDING in reasons
+
+
+class TestDisciplineWeighting:
+    """Measured in-range discipline weights the tier ranking."""
+
+    def test_weight_reorders_the_tiers(self) -> None:
+        """A disciplined second-best pool outranks the raw APR leader."""
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(),
+            {},
+            held=(),
+            cash_usdc=Decimal("400"),
+            equity_usdc=Decimal("1200"),
+            discipline_by_symbol={"AAAc": Decimal("1.0"), "BBBc": Decimal("0.5")},
+        )
+        # Weighted: AAAc 2.0, BBBc 1.5, CCCc 1.2 - the band reshapes.
+        assert [tranche.symbol for tranche in allocation.tranches] == ["AAAc", "BBBc"]
+
+    def test_weight_out_of_bounds_refuses(self) -> None:
+        """A discipline weight outside [0, 1] never ranks anything."""
+        with pytest.raises(ValueError, match="must sit in \\[0, 1\\]"):
+            rank_qualifying_pools(board_evaluations(), {"AAAc": Decimal("1.5")})
+        with pytest.raises(ValueError, match="must sit in \\[0, 1\\]"):
+            weighted_apr_of(Decimal("2"), {"AAAc": Decimal("-0.1")}, "AAAc")
+
+    def test_unmeasured_names_rank_on_raw_apr(self) -> None:
+        """Names without a measurement keep the selector ranking."""
+        assert weighted_apr_of(Decimal("2.0"), {}, "AAAc") == Decimal("2.0")
+
+    def test_band_candidates_cut_held_symbols(self) -> None:
+        """Held symbols never compete for fresh tiers."""
+        candidates = band_candidates(board_evaluations(), {"BBBc"}, PortfolioParameters())
+        assert [evaluation.symbol for evaluation, _ in candidates] == ["AAAc"]
+
+
+class TestRebalanceTriggers:
+    """Portfolio reallocation under the generalized switch margin."""
+
+    def _plan(
+        self,
+        held: tuple[HeldPositionFact, ...],
+        held_outcomes: dict[str, PolicyOutcome],
+        *,
+        cash: Decimal = Decimal("0"),
+        equity: Decimal = Decimal("1000"),
+        parameters: PortfolioParameters | None = None,
+        evaluations: tuple[PoolEntryEvaluation, ...] | None = None,
+        base_state: PolicyState | None = None,
+        inventory_symbol: str | None = None,
+        inventory_outcome: PolicyOutcome | None = None,
+        now: datetime | None = BASE_TIME,
+    ) -> "PortfolioRebalancePlan":
+        """Allocate and plan over the scripted board in one pass."""
+        engine = PolicyEngine()
+        resolved_evaluations = evaluations if evaluations is not None else board_evaluations()
+        resolved_state = base_state or PolicyState()
+        allocation = allocate_portfolio(
+            engine,
+            resolved_state,
+            resolved_evaluations,
+            {},
+            held=held,
+            cash_usdc=cash,
+            equity_usdc=equity,
+            parameters=parameters,
+        )
+        return plan_portfolio_rebalance(
+            engine,
+            allocation,
+            resolved_evaluations,
+            resolved_state,
+            {},
+            held,
+            held_outcomes,
+            cash,
+            equity,
+            inventory_symbol=inventory_symbol,
+            inventory_outcome=inventory_outcome,
+            parameters=parameters,
+            now=now,
+        )
+
+    def test_decayed_pool_reallocates_to_the_better_candidate(self) -> None:
+        """A held APR decayed past the margin swaps into the candidate."""
+        held = (held_fact("AAAc", apr=Decimal("1.2")),)
+        plan = self._plan(held, {"AAAc": hold_outcome()})
+        assert len(plan.steps) == 1
+        step = plan.steps[0]
+        assert step.kind is PortfolioStepKind.REALLOCATE
+        assert step.symbol == "AAAc" and step.to_symbol == "BBBc"
+        assert step.outcome.decision.action is PolicyActionKind.POOL_SWITCH
+        assert step.outcome.decision.size_usd == Decimal("100")  # the freed scale
+        assert plan.projected_committed_usdc == Decimal("100")
+        assert plan.projected_position_count == 1
+
+    def test_margin_not_met_keeps_the_held_pool(self) -> None:
+        """A candidate inside the margin never churns a funded position."""
+        held = (held_fact("AAAc", apr=Decimal("2.6")),)
+        plan = self._plan(held, {"AAAc": hold_outcome()})
+        assert plan.steps == ()
+        assert plan.projected_position_count == 1
+
+    def test_minimum_hold_window_defers_reallocation(self) -> None:
+        """A fresh position runs its hour before any voluntary swap."""
+        held = (held_fact("AAAc", apr=Decimal("1.2"), entered_hours_ago=0.2),)
+        plan = self._plan(held, {"AAAc": hold_outcome()})
+        assert plan.steps == ()
+        assert plan.deferred[0].reason is PortfolioExclusionReason.REALLOCATION_MIN_HOLD_ACTIVE
+
+    def test_sub_minimum_freed_capital_keeps_the_held_pool(self) -> None:
+        """Freed capital under the minimum never churns into a stub."""
+        held = (
+            held_fact("AAAc", apr=Decimal("1.2"), committed=Decimal("40"), marked=Decimal("40")),
+        )
+        parameters = PortfolioParameters()
+        plan = self._plan(held, {"AAAc": hold_outcome()}, parameters=parameters)
+        assert plan.steps == ()
+        assert plan.deferred[0].reason is PortfolioExclusionReason.REALLOCATION_TOO_SMALL
+
+    def test_safety_exit_precedes_entries_and_reallocation(self) -> None:
+        """Exits order first; entries fund from the freed capital."""
+        held = (
+            held_fact("AAAc", apr=Decimal("1.2")),
+            held_fact("ZZZc", token_id=78, apr=Decimal("2.9")),
+        )
+        outcomes = {
+            "AAAc": hold_outcome(),
+            "ZZZc": action_outcome(PolicyActionKind.STOP_OUT, PolicyReason.DOWNSIDE_STOP_TRIGGERED),
+        }
+        plan = self._plan(held, outcomes, cash=Decimal("300"), equity=Decimal("1300"))
+        kinds = [step.kind for step in plan.steps]
+        # The stop-out frees ZZZc first; the reallocation swaps AAAc into
+        # BBBc; the entry funds CCCc-adjacent leftovers from cash.
+        assert kinds[0] is PortfolioStepKind.POSITION_ACTION
+        assert plan.steps[0].symbol == "ZZZc"
+        assert plan.steps[0].outcome.decision.action is PolicyActionKind.STOP_OUT
+        assert any(step.kind is PortfolioStepKind.REALLOCATE for step in plan.steps)
+        assert kinds[-1] is PortfolioStepKind.ENTER or all(
+            step.kind is not PortfolioStepKind.ENTER for step in plan.steps
+        )
+        # The invariant: committed never projects above the total cap.
+        assert plan.projected_committed_usdc <= PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC
+
+    def test_recenter_step_plans_as_position_action(self) -> None:
+        """A held fold's recenter rides the plan as its own step."""
+        held = (held_fact("AAAc", apr=Decimal("3.0")),)
+        outcomes = {
+            "AAAc": action_outcome(PolicyActionKind.RECENTER, PolicyReason.RECENTER_WAIT_ELAPSED)
+        }
+        plan = self._plan(held, outcomes, cash=Decimal("300"))
+        step = plan.steps[0]
+        assert step.kind is PortfolioStepKind.POSITION_ACTION
+        assert step.symbol == "AAAc" and step.token_id == 77
+        assert step.outcome.decision.action is PolicyActionKind.RECENTER
+
+    def test_inventory_resolution_orders_before_maintenance(self) -> None:
+        """The held-inventory fold's action rides right after safety exits."""
+        held = (held_fact("AAAc", apr=Decimal("3.0")),)
+        sell = action_outcome(
+            PolicyActionKind.SELL_INVENTORY, PolicyReason.INVENTORY_FLAT_WINDOW_SELL
+        )
+        plan = self._plan(
+            held,
+            {"AAAc": hold_outcome()},
+            inventory_symbol="QQQc",
+            inventory_outcome=sell,
+        )
+        assert plan.steps[0].kind is PortfolioStepKind.INVENTORY_ACTION
+        assert plan.steps[0].symbol == "QQQc"
+
+    def test_reallocation_claims_its_target(self) -> None:
+        """No fresh entry double-funds a reallocation's target."""
+        held = (held_fact("AAAc", apr=Decimal("1.2")),)
+        plan = self._plan(
+            held, {"AAAc": hold_outcome()}, cash=Decimal("400"), equity=Decimal("1200")
+        )
+        targets = {
+            step.to_symbol for step in plan.steps if step.kind is PortfolioStepKind.REALLOCATE
+        }
+        entered = {step.symbol for step in plan.steps if step.kind is PortfolioStepKind.ENTER}
+        assert targets and not (targets & entered)
+
+    def test_full_book_still_rotates_decayed_names(self) -> None:
+        """A book at the count bound swaps one-for-one, cap intact."""
+        held = tuple(
+            held_fact(symbol, token_id=index, apr=Decimal("1.2"), committed=Decimal("90"))
+            for index, symbol in enumerate(("AAAc", "DDDc", "EEEc"), start=1)
+        )
+        parameters = PortfolioParameters(max_concurrent_positions=3)
+        plan = self._plan(
+            held,
+            {fact.symbol: hold_outcome() for fact in held},
+            parameters=parameters,
+        )
+        reallocations = [step for step in plan.steps if step.kind is PortfolioStepKind.REALLOCATE]
+        assert len(reallocations) == 1
+        assert plan.projected_position_count == 3
+        assert plan.projected_committed_usdc <= PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC
+
+    def test_missing_fold_refuses(self) -> None:
+        """A held position without its engine fold is a plan bug."""
+        held = (held_fact("AAAc"),)
+        with pytest.raises(ValueError, match="carries no engine fold"):
+            self._plan(held, {})
+
+    def test_over_cap_projection_refuses(self) -> None:
+        """The projection guard refuses a plan above the total cap."""
+        engine = PolicyEngine()
+        evaluations = board_evaluations()
+        tranche_allocation = allocate_portfolio(
+            engine,
+            PolicyState(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("400"),
+            equity_usdc=Decimal("1200"),
+        )
+        assert tranche_allocation.tranches
+        # Forge an allocation whose tranches sum past a tightened cap;
+        # the planner's invariant must refuse to sequence it.
+        inflated = tranche_allocation.model_copy(
+            update={
+                "tranches": (
+                    tranche_allocation.tranches[0].model_copy(
+                        update={"budget_usd": Decimal("200")}
+                    ),
+                )
+            }
+        )
+        with pytest.raises(ValueError, match="USDC total cap"):
+            plan_portfolio_rebalance(
+                engine,
+                inflated,
+                evaluations,
+                PolicyState(),
+                {},
+                held=(),
+                held_outcomes={},
+                cash_usdc=Decimal("400"),
+                equity_usdc=Decimal("1200"),
+                parameters=PortfolioParameters(total_exposure_cap_usdc=Decimal("150")),
+            )
+
+    def test_deferred_reallocation_is_typed(self) -> None:
+        """Every considered-and-refused swap carries its catalog reason."""
+        held = (held_fact("AAAc", apr=Decimal("1.2"), entered_hours_ago=0.1),)
+        plan = self._plan(held, {"AAAc": hold_outcome()})
+        assert all(
+            isinstance(item, DeferredReallocation)
+            and item.reason in tuple(PortfolioExclusionReason)
+            for item in plan.deferred
+        )

@@ -48,6 +48,8 @@ def facts_picture(
     committed: str | None = None,
     action: str | None = None,
     halted: int = 0,
+    position_count: int = 0,
+    largest_position_share: str | None = None,
 ) -> AdvisorWindowFacts:
     """Build one grounded window snapshot with the given posture fields."""
     return AdvisorWindowFacts(
@@ -59,6 +61,8 @@ def facts_picture(
         day_pnl_usdc=day_pnl,
         halted_count=halted,
         latest_action=action,
+        position_count=position_count,
+        largest_position_share=largest_position_share,
     )
 
 
@@ -259,6 +263,63 @@ class TestHaltState:
             ),
         )
         assert [f for f in result.findings if f.kind == RiskFindingKind.HALT_DISCIPLINE_VIOLATION]
+
+
+class TestPortfolioPosture:
+    """The allocator ruling's concentration and count bounds audit offline."""
+
+    def test_a_largest_position_above_thirty_five_percent_breaches(self) -> None:
+        """One name above the concentration cap of equity is flagged."""
+        result = audit(
+            episode(
+                T0,
+                facts=facts_picture(
+                    equity="100.0",
+                    committed="40.0",
+                    largest_position_share="0.40",
+                ),
+            )
+        )
+        kinds = [finding.kind for finding in result.findings]
+        assert RiskFindingKind.CONCENTRATION_CAP_BREACH in kinds
+        detail = next(
+            finding.detail
+            for finding in result.findings
+            if finding.kind is RiskFindingKind.CONCENTRATION_CAP_BREACH
+        )
+        assert "concentration cap" in detail
+
+    def test_thirty_five_percent_exactly_stays_within_the_cap(self) -> None:
+        """The cap reads above, not at, the bound."""
+        result = audit(
+            episode(
+                T0,
+                facts=facts_picture(
+                    equity="100.0",
+                    committed="35.0",
+                    largest_position_share="0.35",
+                ),
+            )
+        )
+        assert RiskFindingKind.CONCENTRATION_CAP_BREACH not in [
+            finding.kind for finding in result.findings
+        ]
+
+    def test_an_absent_share_is_an_absence_never_a_guess(self) -> None:
+        """A corpus without portfolio facts skips the concentration check."""
+        result = audit(episode(T0, facts=facts_picture(equity="100.0", committed="40.0")))
+        assert RiskFindingKind.CONCENTRATION_CAP_BREACH not in [
+            finding.kind for finding in result.findings
+        ]
+
+    def test_more_than_ten_tracked_positions_breach_the_count_ceiling(self) -> None:
+        """The ten-position hard ceiling is a posture fact the audit reads."""
+        result = audit(episode(T0, facts=facts_picture(position_count=11)))
+        assert [finding.kind for finding in result.findings] == [RiskFindingKind.COUNT_CAP_BREACH]
+
+    def test_ten_positions_exactly_stay_within_the_ceiling(self) -> None:
+        """The ceiling reads above, not at, ten."""
+        assert audit(episode(T0, facts=facts_picture(position_count=10))).findings == ()
 
 
 class TestExposureVersusCaps:

@@ -158,6 +158,16 @@ AERO_BOT_BASE_RPC_URL=https://base.publicnode.com
 # observed price exceeds this many USDC converts to USDC inside the cycle's
 # act step (default 5, the captain's 2026-09-27 ruling).
 #AERO_BOT_CYCLE_AERO_CONVERSION_MIN_USDC=5
+# The allocator's portfolio bounds (the captain's gnhf 33 ruling): every
+# default is locked and every override stays under the hard ceilings -
+# at most ten concurrent positions, a positive minimum position size
+# inside the total cap, and fractions inside (0, 1]. The deployed count
+# stays an output of qualification under the bounds; cash is never
+# force-deployed.
+#AERO_BOT_CYCLE_TIER_BAND_FRACTION=0.50
+#AERO_BOT_CYCLE_MAX_POSITIONS=10
+#AERO_BOT_CYCLE_MIN_POSITION_USDC=80
+#AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION=0.35
 # Range monitoring is allowed to observe and alert at seconds-level, but the
 # shipped systemd unit is forced into --monitor-only. It cannot trade.
 AERO_BOT_WATCHTOWER_ENABLED=0

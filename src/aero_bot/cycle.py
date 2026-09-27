@@ -17,10 +17,12 @@ decides when cycles happen. One cycle, in fixed order:
    observation assembled exactly like ``aero-bot-decide``, threading the
    reconciled policy state (open position, held inventory, cooldowns, the
    daily-loss anchor). Selector mode evaluates every verified B20 pool
-   through the complete entry gate chain and selects the best-qualifying
-   pool by qualifying emissions APR under the captain's 2026-09-09
-   cross-board ruling; market windows no longer gate entries since the
-   same date's twenty-four-seven ruling.
+   through the complete entry gate chain and hands the ranked qualifying
+   board to the portfolio allocator (the captain's gnhf 33 ruling): tiered
+   positions with the deployed count as an output of qualification, cash
+   as dry powder, and per-position lifecycle folds for safety and
+   maintenance; market windows no longer gate entries since the
+   2026-09-09 twenty-four-seven ruling.
 3. **Act.** Only when the policy authorizes an action does the cycle execute
    it, and only through the proven audited executor surfaces (mint, stake,
    unstake, withdraw, exit swap) inside the existing caps and refusal
@@ -48,6 +50,14 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, model_validator
 
+from aero_bot.allocator import (
+    HeldPositionFact,
+    PortfolioParameters,
+    PortfolioRebalancePlan,
+    PortfolioStepKind,
+    allocate_portfolio,
+    plan_portfolio_rebalance,
+)
 from aero_bot.audit import AuditEventType, AuditRecord, AuditStore
 from aero_bot.config import Settings
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
@@ -78,21 +88,24 @@ from aero_bot.policy import (
     AlignedPriceRange,
     HeldInventory,
     PolicyActionKind,
+    PolicyDecision,
     PolicyEngine,
     PolicyOutcome,
     PolicyParameters,
     PolicyPosition,
+    PolicyReason,
     PolicyState,
     evaluate_event_window,
     load_event_calendar,
 )
 from aero_bot.selector import (
     DEFAULT_SWITCH_MARGIN_FRACTION,
-    BoardSelection,
     PoolBoardOption,
+    PoolEntryEvaluation,
     SwitchDirective,
+    board_summary_line,
     closest_call_evaluation,
-    select_board,
+    evaluate_pool_entries,
 )
 from aero_bot.strategy import (
     SELECTOR_SYMBOL,
@@ -128,6 +141,13 @@ CYCLE_OUT_OF_RANGE_GRACE_ENV = "AERO_BOT_CYCLE_OUT_OF_RANGE_GRACE_MINUTES"
 # accumulated unclaimed AERO converts to USDC inside the cycle's act step
 # once its value at the last observed price exceeds it (default 5).
 CYCLE_AERO_CONVERSION_MIN_ENV = "AERO_BOT_CYCLE_AERO_CONVERSION_MIN_USDC"
+# Environment variables carrying the allocator's portfolio bounds (the
+# captain's gnhf 33 ruling): every default is locked and every override
+# stays under the hard ceilings PortfolioParameters enforces.
+CYCLE_TIER_BAND_ENV = "AERO_BOT_CYCLE_TIER_BAND_FRACTION"
+CYCLE_MAX_POSITIONS_ENV = "AERO_BOT_CYCLE_MAX_POSITIONS"
+CYCLE_MIN_POSITION_USDC_ENV = "AERO_BOT_CYCLE_MIN_POSITION_USDC"
+CYCLE_CONCENTRATION_CAP_ENV = "AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION"
 # The default reward-conversion threshold in USDC.
 DEFAULT_AERO_CONVERSION_MIN_USDC = Decimal("5")
 # Dynamic selector sizing keeps ten percent of the observed in-range depth cap
@@ -243,15 +263,43 @@ class CycleFeeSampleRecord(BaseModel):
     position_value_usdc: Annotated[Decimal, Field(ge=0)]
 
 
+class CyclePositionBaseline(BaseModel):
+    """Carry one position's day-start observables for its attribution."""
+
+    # Frozen strict fields keep one row coherent.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The registry-matched stock symbol the position lives in; empty on a
+    # legacy single-position baseline folded up from the scalar fields.
+    symbol: str = ""
+    # The position NFT the fee words belong to; None while flat.
+    token_id: Annotated[int, Field(ge=0)] | None = None
+    # The position's liquidity at the baseline.
+    liquidity_units: Annotated[int, Field(ge=0)] | None = None
+    # The position's token-zero inside fee growth at the baseline.
+    fee_growth_inside0_x128: int | None = None
+    # The token-one twin of the inside fee growth.
+    fee_growth_inside1_x128: int | None = None
+    # The position's staked AERO earned at the baseline, raw units.
+    aero_earned_units: Annotated[int, Field(ge=0)] = 0
+    # The whole-token stock quantity at the baseline: Safe inventory plus
+    # the position's stock side for this symbol.
+    stock_quantity: Annotated[Decimal, Field(ge=0)] | None = None
+    # The pool's stock price at the baseline, USDC per stock.
+    stock_price_usdc: Annotated[Decimal, Field(gt=0)] | None = None
+
+
 class CycleDayBaseline(BaseModel):
     """Carry the day-start observables the yield attribution measures from.
 
     The baseline snapshots one America/New_York day's first cycle - the
-    unclaimed-AERO units, the stock quantity and price, and the tracked
-    position's live fee-growth words - so every later cycle can decompose the
+    unclaimed-AERO units and, per position, the stock quantity and price
+    and the live fee-growth words - so every later cycle can decompose the
     day's P&L into AERO rewards accrued, fees earned (computed from the
     pool's fee-growth accumulators), and stock mark-to-market, with the
-    residual named honestly as unattributed.
+    residual named honestly as unattributed. One row per funded position
+    (the allocator ruling); legacy single-position baselines fold into
+    their one row.
     """
 
     # Frozen strict fields keep one day's baseline coherent.
@@ -259,32 +307,89 @@ class CycleDayBaseline(BaseModel):
 
     # The New York day this baseline belongs to.
     day: date
-    # The tracked position NFT the fee words belong to; None while flat.
-    token_id: Annotated[int, Field(ge=0)] | None = None
-    # The tracked position's liquidity at the baseline.
-    liquidity_units: Annotated[int, Field(ge=0)] | None = None
-    # The tracked position's token-zero inside fee growth at the baseline.
-    fee_growth_inside0_x128: int | None = None
-    # The token-one twin of the inside fee growth.
-    fee_growth_inside1_x128: int | None = None
+    # One row per funded position; the scalar legacy fields below fold
+    # into the first row on load.
+    positions: tuple[CyclePositionBaseline, ...] = ()
     # Unclaimed AERO at the baseline: the Safe balance plus staked earned,
     # raw units.
     aero_units: Annotated[int, Field(ge=0)] = 0
     # AERO converted to USDC since the baseline, raw units, so a conversion
     # never reads as lost rewards.
     aero_converted_units: Annotated[int, Field(ge=0)] = 0
-    # The whole-token stock quantity at the baseline: Safe inventory plus the
-    # tracked position's stock side.
-    stock_quantity: Annotated[Decimal, Field(ge=0)] | None = None
-    # The pool's stock price at the baseline, USDC per stock.
-    stock_price_usdc: Annotated[Decimal, Field(gt=0)] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def fold_legacy_scalars(cls, data: object) -> object:
+        """Fold a legacy single-position baseline into its one row.
+
+        Baselines persisted before the allocator ruling carried scalar
+        position fields; the upgrade wraps them into the first row so old
+        books keep their day's measurement.
+
+        Args:
+            data: Raw model input mapping or value.
+
+        Returns:
+            Input with the legacy scalars folded into ``positions``.
+        """
+        if not isinstance(data, dict) or "positions" in data:
+            return data
+        row_fields = (
+            "token_id",
+            "liquidity_units",
+            "fee_growth_inside0_x128",
+            "fee_growth_inside1_x128",
+            "stock_quantity",
+            "stock_price_usdc",
+        )
+        if any(data.get(field) is not None for field in row_fields):
+            row = {field: data.get(field) for field in row_fields}
+            data = {key: value for key, value in data.items() if key not in row_fields}
+            data["positions"] = [row]
+        return data
+
+    @property
+    def token_id(self) -> int | None:
+        """The first row's token id, for single-position readers."""
+        return self.positions[0].token_id if self.positions else None
+
+    @property
+    def liquidity_units(self) -> int | None:
+        """The first row's liquidity, for single-position readers."""
+        return self.positions[0].liquidity_units if self.positions else None
+
+    @property
+    def fee_growth_inside0_x128(self) -> int | None:
+        """The first row's token-zero fee growth, for single-position readers."""
+        return self.positions[0].fee_growth_inside0_x128 if self.positions else None
+
+    @property
+    def fee_growth_inside1_x128(self) -> int | None:
+        """The first row's token-one fee growth, for single-position readers."""
+        return self.positions[0].fee_growth_inside1_x128 if self.positions else None
+
+    @property
+    def stock_quantity(self) -> Decimal | None:
+        """The first row's stock quantity, for single-position readers."""
+        return self.positions[0].stock_quantity if self.positions else None
+
+    @property
+    def stock_price_usdc(self) -> Decimal | None:
+        """The first row's stock price, for single-position readers."""
+        return self.positions[0].stock_price_usdc if self.positions else None
 
 
 class CycleStateBook(BaseModel):
-    """Carry every engine-owned fact the next cycle must thread forward."""
+    """Carry every engine-owned fact the next cycle must thread forward.
 
-    # The tracked open position, or None while flat.
-    position: TrackedPosition | None = None
+    The book tracks the portfolio's positions - one tuple entry per funded
+    position (the captain's allocator ruling) - beside the session facts
+    every fold shares: the day anchors, the halt latch, and the per-pool
+    re-entry cooldowns.
+    """
+
+    # Every tracked open position, one per funded pool; empty while flat.
+    positions: tuple[TrackedPosition, ...] = ()
     # Stock held unsold after a stale-low burn, or None.
     held_inventory: HeldInventoryRecord | None = None
     # Re-entry cooldowns, one per pool: an exit from one pool never blocks
@@ -309,29 +414,46 @@ class CycleStateBook(BaseModel):
     # When this book was last persisted, timezone-aware.
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
+    @property
+    def position(self) -> TrackedPosition | None:
+        """Return the one tracked position, or None while flat or plural.
+
+        Pinned-symbol surfaces and legacy readers consume the single
+        position; portfolio surfaces iterate ``positions`` directly.
+        """
+        return self.positions[0] if len(self.positions) == 1 else None
+
     @model_validator(mode="before")
     @classmethod
-    def fold_legacy_cooldown(cls, data: object) -> object:
-        """Fold a legacy single-pool cooldown field into the per-pool map.
+    def fold_legacy_fields(cls, data: object) -> object:
+        """Fold legacy single-position fields into the portfolio shapes.
 
-        Books persisted before the cross-board ruling carried one global
-        ``reentry_blocked_until``; the upgrade applies it to the tracked
-        position's pool when one exists and drops it otherwise.
+        Books persisted before the allocator ruling carried one
+        ``position`` (and, older still, one global
+        ``reentry_blocked_until``); the upgrade folds the position into
+        the ``positions`` tuple and applies the legacy cooldown to the
+        tracked pool when one exists.
 
         Args:
             data: Raw model input mapping or value.
 
         Returns:
-            Input with the legacy field folded into ``reentry_cooldowns``.
+            Input with the legacy fields folded into the portfolio shapes.
         """
-        if not isinstance(data, dict) or "reentry_cooldowns" in data:
+        if not isinstance(data, dict):
             return data
-        legacy = data.get("reentry_blocked_until")
-        tracked = data.get("position")
-        symbol = tracked.get("symbol") if isinstance(tracked, dict) else None
-        if legacy is not None and isinstance(symbol, str):
-            data = {key: value for key, value in data.items() if key != "reentry_blocked_until"}
-            data["reentry_cooldowns"] = [{"symbol": symbol, "blocked_until": legacy}]
+        if "positions" not in data:
+            legacy_position = data.get("position")
+            if legacy_position is not None:
+                data = {key: value for key, value in data.items() if key != "position"}
+                data["positions"] = [legacy_position]
+        if "reentry_cooldowns" not in data:
+            legacy = data.get("reentry_blocked_until")
+            tracked = data.get("position") or next(iter(data.get("positions") or []), None)
+            symbol = tracked.get("symbol") if isinstance(tracked, dict) else None
+            if legacy is not None and isinstance(symbol, str):
+                data = {key: value for key, value in data.items() if key != "reentry_blocked_until"}
+                data["reentry_cooldowns"] = [{"symbol": symbol, "blocked_until": legacy}]
         return data
 
 
@@ -433,6 +555,26 @@ class CycleActionRecord(BaseModel):
     diagnostic: str = ""
 
 
+class PositionStatusRecord(BaseModel):
+    """Carry one tracked position's live reconciliation record."""
+
+    # Frozen strict fields keep one record coherent.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The registry-matched stock symbol the position lives in.
+    symbol: str
+    # The position NFT id on the pool's NFPM.
+    token_id: Annotated[int, Field(ge=0)]
+    # The pool the position was minted in.
+    pool_address: EvmAddress
+    # The committed USDC value at entry, the P&L basis.
+    committed_usd: Annotated[Decimal, Field(gt=0)]
+    # Whether the position is staked in its gauge.
+    staked: bool
+    # The position's live status read.
+    status: LpPositionStatusReport
+
+
 class CycleReconciliation(BaseModel):
     """Carry one coherent on-chain reconciliation snapshot."""
 
@@ -455,7 +597,11 @@ class CycleReconciliation(BaseModel):
     inventory_live_token_ids: Annotated[tuple[int, ...], Field(min_length=0)]
     # How many held NFTs are empty residuals carrying no exposure.
     inventory_empty_count: Annotated[int, Field(ge=0)]
-    # The tracked position's live status, None while flat.
+    # Every tracked position's live status, one record per funded pool
+    # (the allocator ruling); empty while flat.
+    position_statuses: tuple[PositionStatusRecord, ...] = ()
+    # The tracked position's live status, None while flat; the primary
+    # (first) position for pinned surfaces and legacy readers.
     tracked_status: LpPositionStatusReport | None = None
     # The tracked position id after reconciliation (adoptions included).
     tracked_token_id: Annotated[int, Field(ge=0)] | None = None
@@ -509,6 +655,52 @@ class CycleFeeEvidence(BaseModel):
     diagnostic: str = ""
 
 
+class CyclePositionYield(BaseModel):
+    """Carry one position's slice of the day's yield attribution."""
+
+    # Frozen strict fields keep one row coherent.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The registry-matched stock symbol the position lives in.
+    symbol: str
+    # The position NFT the attribution covers.
+    token_id: Annotated[int, Field(ge=0)] | None = None
+    # The position's AERO rewards accrued since its baseline (its staked
+    # earned delta), valued at the last observed price, None when
+    # unmeasurable.
+    aero_rewards_usdc: Decimal | None = None
+    # The position's fees earned since its baseline, computed from fee
+    # growth, None when unmeasurable.
+    fees_earned_usdc: Decimal | None = None
+    # The position's stock mark-to-market at its own pool's price, None
+    # when unmeasurable.
+    stock_mark_to_market_usdc: Decimal | None = None
+    # Why any component is absent, empty when everything computed.
+    diagnostic: str = ""
+
+
+class CyclePositionSummary(BaseModel):
+    """Carry one tracked position's headline summary for the report."""
+
+    # Frozen strict fields keep one row coherent.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The registry-matched stock symbol the position lives in.
+    symbol: str
+    # The position NFT id.
+    token_id: Annotated[int, Field(ge=0)]
+    # The committed USDC value at entry, the P&L basis.
+    committed_usd: Annotated[Decimal, Field(gt=0)]
+    # The live marked USDC value, None when unvalued.
+    value_usdc: Decimal | None = None
+    # The unrealized P&L vs entry, None when uncomputed.
+    unrealized_pnl_usdc: Decimal | None = None
+    # Whether the position is staked in its gauge.
+    staked: bool
+    # The position's slice of the day's yield attribution, when one runs.
+    yield_attribution: CyclePositionYield | None = None
+
+
 class CycleYieldAttribution(BaseModel):
     """Decompose one day's P&L into its yield-duration components.
 
@@ -519,7 +711,9 @@ class CycleYieldAttribution(BaseModel):
     stock-token mark-to-market on the day's opening quantity. Everything
     else - actions, gas, collections, marking flows - lands in the named
     unattributed residual so the three components never masquerade as a
-    complete ledger (the captain's 2026-09-27 corrections).
+    complete ledger (the captain's 2026-09-27 corrections). The
+    decomposition runs per position (the allocator ruling) and rolls up:
+    the tier decisions are judged by measured income daily, name by name.
     """
 
     # Frozen strict fields keep one attribution coherent.
@@ -539,6 +733,9 @@ class CycleYieldAttribution(BaseModel):
     # The residual: day P&L minus the three components, None when either
     # side is unmeasurable.
     unattributed_usdc: Decimal | None = None
+    # One row per funded position: its own AERO, fee, and mark-to-market
+    # slices at its own pool's price.
+    positions: tuple[CyclePositionYield, ...] = ()
     # The named methods behind each component, for the report and audit.
     method: Annotated[tuple[str, ...], Field(min_length=1)]
     # Why any component is absent, empty when everything computed.
@@ -579,6 +776,9 @@ class CycleReport(BaseModel):
     pnl_vs_entry_usdc: Decimal | None = None
     # Why P&L is absent, empty when computed.
     pnl_diagnostic: str = ""
+    # One summary row per tracked position (the allocator ruling): symbol,
+    # committed and marked value, P&L, custody, and its attribution slice.
+    positions: tuple[CyclePositionSummary, ...] = ()
     # The portfolio equity the engine acted on - Safe USDC, held stock, and
     # the tracked LP mark - None when the cycle refused out-of-band.
     equity_usd: Decimal | None = None
@@ -657,6 +857,12 @@ class CycleReportPayload(BaseModel):
     fee_wei: Annotated[int, Field(ge=0)] = 0
     # The number of actions attempted this cycle.
     action_count: Annotated[int, Field(ge=0)] = 0
+    # How many positions the book tracked at the report (the allocator).
+    position_count: Annotated[int, Field(ge=0)] = 0
+    # The total committed value across every tracked position, else None.
+    total_committed_usdc: str | None = None
+    # The largest position's share of book equity as a fraction, else None.
+    largest_position_share: str | None = None
     # Empty when the cycle completed; otherwise why it halted.
     halted_reason: str = ""
 
@@ -672,6 +878,7 @@ class CycleExecutorBoundary(Protocol):
         budget_usdc: Decimal | None,
         key_bytes: bytes,
         ephemeral_key: bool = False,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> object:
         """Preflight one same-pool recenter without broadcasting."""
         ...
@@ -685,6 +892,7 @@ class CycleExecutorBoundary(Protocol):
         budget_usdc: Decimal,
         key_bytes: bytes,
         ephemeral_key: bool = False,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> object:
         """Preflight a cross-pool replacement without broadcasting."""
         ...
@@ -698,6 +906,7 @@ class CycleExecutorBoundary(Protocol):
         *,
         confirm_broadcast: bool,
         ephemeral_key: bool = False,
+        portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
     ) -> LpActionExecutionReport:
         """Broadcast one capped mint and stake sequence through the executor."""
         ...
@@ -968,6 +1177,68 @@ def _book_with_cooldowns(
     return book.model_copy(update={"reentry_cooldowns": kept + fresh})
 
 
+def _book_with_position_added(book: CycleStateBook, tracked: TrackedPosition) -> CycleStateBook:
+    """Return the book carrying one freshly entered tracked position.
+
+    A position replaces any prior tracked slot on the same pool - one
+    position per pool is the book's shape - so a recenter or reallocation
+    successor lands in place.
+
+    Args:
+        book: The book being updated.
+        tracked: The freshly minted and staked position.
+
+    Returns:
+        The book carrying the added (or replaced) position.
+    """
+    kept = tuple(
+        position for position in book.positions if position.symbol.lower() != tracked.symbol.lower()
+    )
+    return book.model_copy(update={"positions": (*kept, tracked)})
+
+
+def _book_with_position_replaced(
+    book: CycleStateBook, token_id: int, tracked: TrackedPosition
+) -> CycleStateBook:
+    """Return the book with one position replaced by its successor.
+
+    Args:
+        book: The book being updated.
+        token_id: The NFT id being replaced (a recenter or reallocation).
+        tracked: The successor position.
+
+    Returns:
+        The book carrying the replacement at the same slot order.
+    """
+    return book.model_copy(
+        update={
+            "positions": tuple(
+                tracked if position.token_id == token_id else position
+                for position in book.positions
+            )
+        }
+    )
+
+
+def _book_with_position_removed(book: CycleStateBook, token_id: int) -> CycleStateBook:
+    """Return the book with one exited position removed.
+
+    Args:
+        book: The book being updated.
+        token_id: The NFT id being removed.
+
+    Returns:
+        The book without the exited position.
+    """
+    return book.model_copy(
+        update={
+            "positions": tuple(
+                position for position in book.positions if position.token_id != token_id
+            )
+        }
+    )
+
+
 class CycleRunner:
     """Run one complete reconcile-decide-act cycle."""
 
@@ -988,6 +1259,7 @@ class CycleRunner:
         switch_margin_fraction: Decimal = DEFAULT_SWITCH_MARGIN_FRACTION,
         parameters: PolicyParameters = LOCKED_POLICY_PARAMETERS,
         aero_conversion_min_usdc: Decimal = DEFAULT_AERO_CONVERSION_MIN_USDC,
+        portfolio_parameters: PortfolioParameters | None = None,
     ) -> None:
         """Configure one cycle runner over every injectable boundary.
 
@@ -1014,6 +1286,9 @@ class CycleRunner:
                 out-of-range grace override applied.
             aero_conversion_min_usdc: The unclaimed-AERO value threshold that
                 triggers the reward conversion inside the act step.
+            portfolio_parameters: The portfolio allocation parameter set
+                (the allocator ruling); None builds the locked defaults
+                carrying this runner's switch margin.
         """
         self._symbol = symbol.strip() if symbol is not None else None
         self._safe_address = normalize_evm_address(safe_address)
@@ -1030,6 +1305,7 @@ class CycleRunner:
         self._switch_margin_fraction = switch_margin_fraction
         self._parameters = parameters
         self._aero_conversion_min_usdc = aero_conversion_min_usdc
+        self._portfolio_parameters_value = portfolio_parameters
         self._last_reconciliation: CycleReconciliation | None = None
         # One cycle process enumerates the board at most once; reconcile and
         # decide share the cached listing and its snapshot block.
@@ -1040,6 +1316,17 @@ class CycleRunner:
     def selector_mode(self) -> bool:
         """Return whether this runner selects across the whole B20 board."""
         return self._symbol is None
+
+    def _portfolio_parameters(self) -> PortfolioParameters:
+        """Resolve the portfolio parameter set the allocator runs under.
+
+        Returns:
+            The configured parameter set, or the locked defaults carrying
+            this runner's switch margin as the reallocation margin.
+        """
+        if self._portfolio_parameters_value is None:
+            return PortfolioParameters(switch_margin_fraction=self._switch_margin_fraction)
+        return self._portfolio_parameters_value
 
     def _ensure_board(self) -> None:
         """Enumerate the verified board once per runner unless cached.
@@ -1122,11 +1409,15 @@ class CycleRunner:
                 reference_prices_by_symbol or {},
             )
             outcome = decision_report.outcome
+            portfolio_plan = decision_report.portfolio_plan
+            any_unstaked = bool(book.positions) and any(
+                not record.staked for record in reconciliation.position_statuses
+            )
             if (
                 mode is CycleMode.LIVE
                 and outcome.decision.action is PolicyActionKind.HOLD
-                and book.position is not None
-                and not reconciliation.tracked_staked
+                and not (portfolio_plan is not None and portfolio_plan.steps)
+                and any_unstaked
             ):
                 if self._executor is None or key_bytes is None:
                     raise ValueError("a live cycle requires its signing key and executor")
@@ -1138,6 +1429,19 @@ class CycleRunner:
                     )
                     halted_reason = (
                         "post-action stake recovery is unverified because the primary RPC "
+                        f"did not reach confirmed block {target} within the bounded wait"
+                    )
+            elif mode is CycleMode.LIVE and portfolio_plan is not None and portfolio_plan.steps:
+                if self._executor is None or key_bytes is None:
+                    raise ValueError("a live cycle requires its signing key and executor")
+                actions, halted_reason, book = self._act_portfolio(book, portfolio_plan, key_bytes)
+                final_reconciliation_verified = self._await_post_action_visibility(tuple(actions))
+                if not final_reconciliation_verified and not halted_reason:
+                    target = max(
+                        (action.confirmed_block_number or 0 for action in actions), default=0
+                    )
+                    halted_reason = (
+                        "post-action reconciliation is unverified because the primary RPC "
                         f"did not reach confirmed block {target} within the bounded wait"
                     )
             elif mode is CycleMode.LIVE and outcome.decision.action is not PolicyActionKind.HOLD:
@@ -1211,6 +1515,7 @@ class CycleRunner:
                     decision_report.outcome.next_state,
                     decision_report.symbol,
                     decision_report.outcome.decision.action,
+                    decision_report,
                 )
             elif not halted_reason:
                 halted_reason = final_reconciliation.out_of_band
@@ -1263,8 +1568,8 @@ class CycleRunner:
         """
         if self._symbol is not None:
             return self._symbol
-        if book.position is not None:
-            return book.position.symbol
+        if book.positions:
+            return book.positions[0].symbol
         if book.held_inventory is not None:
             return book.held_inventory.symbol
         listings = self._board_listings()
@@ -1306,39 +1611,55 @@ class CycleRunner:
         tracked_token_id: int | None = None
         tracked_staked = False
         out_of_band = ""
-        tracked = book.position
-        if tracked is not None:
-            tracked_status = self._reads.position_status(
+        position_statuses: list[PositionStatusRecord] = []
+        tracked_ids: set[int] = set()
+        for tracked in book.positions:
+            status = self._reads.position_status(
                 tracked.symbol, tracked.token_id, entry_cost_usdc=tracked.committed_usd
             )
-            owner = normalize_evm_address(tracked_status.token_owner_address)
-            gauge = normalize_evm_address(tracked_status.gauge_address)
+            owner = normalize_evm_address(status.token_owner_address)
+            gauge = normalize_evm_address(status.gauge_address)
             if owner != self._safe_address and owner != gauge:
                 out_of_band = (
                     f"tracked position {tracked.token_id} is owned by {owner}, which is "
                     "neither the Safe nor the pool's gauge; refusing the cycle"
                 )
-            else:
-                tracked_token_id = tracked.token_id
-                tracked_staked = owner == gauge
-                diagnostics.append(
-                    f"tracked position {tracked.token_id} "
-                    f"({'staked' if tracked_staked else 'in the Safe'}) valued "
-                    f"{tracked_status.position_value_usdc} USDC against "
-                    f"{tracked.committed_usd} committed"
+                break
+            staked = owner == gauge
+            tracked_ids.add(tracked.token_id)
+            position_statuses.append(
+                PositionStatusRecord(
+                    symbol=tracked.symbol,
+                    token_id=tracked.token_id,
+                    pool_address=tracked.pool_address,
+                    committed_usd=tracked.committed_usd,
+                    staked=staked,
+                    status=status,
                 )
-                if not tracked_staked:
-                    diagnostics.append(
-                        f"tracked position {tracked.token_id} is unstaked in the Safe; "
-                        "a live HOLD cycle will attempt bounded stake recovery before returning"
-                    )
-            untracked_live = tuple(token for token in live_ids if token != tracked.token_id)
-            if untracked_live and not out_of_band:
+            )
+            diagnostics.append(
+                f"tracked position {tracked.token_id} on {tracked.symbol} "
+                f"({'staked' if staked else 'in the Safe'}) valued "
+                f"{status.position_value_usdc} USDC against "
+                f"{tracked.committed_usd} committed"
+            )
+            if not staked:
+                diagnostics.append(
+                    f"tracked position {tracked.token_id} is unstaked in the Safe; "
+                    "a live HOLD cycle will attempt bounded stake recovery before returning"
+                )
+        if position_statuses and not out_of_band:
+            primary = position_statuses[0]
+            tracked_status = primary.status
+            tracked_token_id = primary.token_id
+            tracked_staked = primary.staked
+            untracked_live = tuple(token for token in live_ids if token not in tracked_ids)
+            if untracked_live:
                 out_of_band = (
                     f"live untracked position NFT(s) {untracked_live} sit beside the "
-                    "tracked position; refusing the cycle until reconciled"
+                    "tracked positions; refusing the cycle until reconciled"
                 )
-        elif live_ids:
+        elif live_ids and not book.positions:
             adopted = self._adoption_evidence(live_ids)
             if adopted is None:
                 out_of_band = (
@@ -1366,7 +1687,7 @@ class CycleRunner:
             held_symbol = book.held_inventory.symbol
             if held_quantity == 0 and tracked_token_id is None:
                 diagnostics.append("recorded held inventory no longer exists on-chain; clearing")
-        elif self.selector_mode and book.position is None:
+        elif self.selector_mode and not book.positions:
             for listing in self._board_listings():
                 token = self._stock_token_of_pool(listing.pool)
                 units = self._balances.fetch_token_balance(token, self._safe_address)
@@ -1425,6 +1746,7 @@ class CycleRunner:
             safe_aero_units=safe_aero,
             inventory_live_token_ids=live_ids,
             inventory_empty_count=empty_count,
+            position_statuses=tuple(position_statuses),
             tracked_status=tracked_status,
             tracked_token_id=tracked_token_id,
             tracked_staked=tracked_staked,
@@ -1568,7 +1890,7 @@ class CycleRunner:
         """Fold reconciliation adoptions into the book before deciding."""
         updates: dict[str, object] = {}
         if (
-            book.position is None
+            not book.positions
             and reconciliation.tracked_token_id is not None
             and not reconciliation.out_of_band
         ):
@@ -1585,12 +1907,14 @@ class CycleRunner:
                 else self._pool_for_symbol(adopted_symbol).pool_address
             )
             if committed is not None:
-                updates["position"] = TrackedPosition(
-                    symbol=adopted_symbol,
-                    token_id=reconciliation.tracked_token_id,
-                    pool_address=pool,
-                    committed_usd=committed,
-                    entered_at=self._now(),
+                updates["positions"] = (
+                    TrackedPosition(
+                        symbol=adopted_symbol,
+                        token_id=reconciliation.tracked_token_id,
+                        pool_address=pool,
+                        committed_usd=committed,
+                        entered_at=self._now(),
+                    ),
                 )
         if (
             book.held_inventory is None
@@ -1632,43 +1956,109 @@ class CycleRunner:
     # Decision
     # ------------------------------------------------------------------
 
-    def _policy_state(
+    def _policy_position_of(
+        self, tracked: TrackedPosition, status: LpPositionStatusReport
+    ) -> PolicyPosition:
+        """Reconstruct one tracked position's engine shape from live custody.
+
+        Args:
+            tracked: The book's record of the position.
+            status: The position's live status read.
+
+        Returns:
+            The engine's typed position for one funded pool.
+        """
+        stock_address = self._stock_token_address_for(tracked.symbol)
+        pool = self._pool_for_symbol(tracked.symbol)
+        stock_decimals = self._sources.token_decimals(stock_address)
+        stock_is_token0 = normalize_evm_address(pool.token0_address) == normalize_evm_address(
+            stock_address
+        )
+        first_edge_price = _price_at_tick(
+            status.position.tick_lower,
+            stock_is_token0=stock_is_token0,
+            stock_decimals=stock_decimals,
+        )
+        second_edge_price = _price_at_tick(
+            status.position.tick_upper,
+            stock_is_token0=stock_is_token0,
+            stock_decimals=stock_decimals,
+        )
+        return PolicyPosition(
+            pool_address=status.pool_address,
+            token_address=stock_address,
+            price_range=AlignedPriceRange(
+                lower_tick=status.position.tick_lower,
+                upper_tick=status.position.tick_upper,
+                lower_price=min(first_edge_price, second_edge_price),
+                upper_price=max(first_edge_price, second_edge_price),
+            ),
+            committed_usd=tracked.committed_usd,
+            entered_at=tracked.entered_at,
+            out_of_range_since=tracked.out_of_range_since,
+            out_of_range_side=tracked.out_of_range_side,
+        )
+
+    def _policy_states(
+        self, book: CycleStateBook, reconciliation: CycleReconciliation
+    ) -> tuple[tuple[TrackedPosition, PolicyState], ...]:
+        """Reconstruct one engine state per tracked position.
+
+        Each fold judges exactly its own position over the shared session
+        facts - the day anchors, the halt latch, and the portfolio equity
+        seed - so per-position lifecycle discipline (safety exits,
+        recenters, the out-of-range grace) survives the portfolio shape.
+
+        Args:
+            book: The persisted book whose positions reconcile.
+            reconciliation: The reconciliation whose status reads carry
+                each position's live custody.
+
+        Returns:
+            One (tracked position, engine state) pair per funded pool, in
+            book order.
+        """
+        statuses = {record.token_id: record.status for record in reconciliation.position_statuses}
+        # Each position's fold judges exactly its own lifecycle: no held
+        # inventory (that resolves in its own lane) and no sibling blur.
+        session = self._session_state(book, reconciliation).model_copy(
+            update={"held_inventory": None}
+        )
+        states: list[tuple[TrackedPosition, PolicyState]] = []
+        for tracked in book.positions:
+            status = statuses.get(tracked.token_id)
+            if status is None:
+                continue
+            states.append(
+                (
+                    tracked,
+                    session.model_copy(
+                        update={
+                            "position": self._policy_position_of(tracked, status),
+                            "reentry_blocked_until": _cooldown_until(book, tracked.symbol),
+                        }
+                    ),
+                )
+            )
+        return tuple(states)
+
+    def _session_state(
         self, book: CycleStateBook, reconciliation: CycleReconciliation
     ) -> PolicyState:
-        """Reconstruct the engine state from the book and live custody."""
-        position: PolicyPosition | None = None
-        if book.position is not None and reconciliation.tracked_status is not None:
-            status = reconciliation.tracked_status
-            stock_address = self._stock_token_address_for(book.position.symbol)
-            pool = self._pool_for_symbol(book.position.symbol)
-            stock_decimals = self._sources.token_decimals(stock_address)
-            stock_is_token0 = normalize_evm_address(pool.token0_address) == normalize_evm_address(
-                stock_address
-            )
-            first_edge_price = _price_at_tick(
-                status.position.tick_lower,
-                stock_is_token0=stock_is_token0,
-                stock_decimals=stock_decimals,
-            )
-            second_edge_price = _price_at_tick(
-                status.position.tick_upper,
-                stock_is_token0=stock_is_token0,
-                stock_decimals=stock_decimals,
-            )
-            position = PolicyPosition(
-                pool_address=status.pool_address,
-                token_address=stock_address,
-                price_range=AlignedPriceRange(
-                    lower_tick=status.position.tick_lower,
-                    upper_tick=status.position.tick_upper,
-                    lower_price=min(first_edge_price, second_edge_price),
-                    upper_price=max(first_edge_price, second_edge_price),
-                ),
-                committed_usd=book.position.committed_usd,
-                entered_at=book.position.entered_at,
-                out_of_range_since=book.position.out_of_range_since,
-                out_of_range_side=book.position.out_of_range_side,
-            )
+        """Reconstruct the shared session state every fold threads.
+
+        The day anchors, the continuous-latch peak, and any halt latch are
+        portfolio-level facts: the equity seed prices cash plus every
+        tracked LP mark, so a deployed book never reads as a drawdown
+        against a cash-only anchor.
+
+        Args:
+            book: The persisted book whose day facts carry forward.
+            reconciliation: The reconciliation whose balances seed equity.
+
+        Returns:
+            The flat session state (no position, no inventory).
+        """
         held: HeldInventory | None = None
         if book.held_inventory is not None:
             held = HeldInventory(
@@ -1685,21 +2075,47 @@ class CycleRunner:
             # The engine's day rollover is the authoritative anchor reset -
             # it prices the fully composed observation including held stock.
             # This seed only shapes the pre-decision state, so it carries the
-            # same cash-plus-LP composition to keep a deployed position from
+            # same cash-plus-LP composition to keep deployed positions from
             # ever reading as a drawdown against a cash-only seed.
             day_start = Decimal(reconciliation.safe_usdc_units).scaleb(-6)
-            tracked_status = reconciliation.tracked_status
-            if tracked_status is not None and tracked_status.position_value_usdc is not None:
-                day_start += tracked_status.position_value_usdc
+            for record in reconciliation.position_statuses:
+                value = record.status.position_value_usdc
+                if value is not None:
+                    day_start += value
         return PolicyState(
             day=day if same_day else None,
             day_start_equity_usd=day_start,
             peak_equity_usd=book.peak_equity_usdc,
             halted_day=book.halted_day if same_day else None,
-            position=position,
+            position=None,
             held_inventory=held,
             reentry_blocked_until=None,
         )
+
+    def _policy_state(
+        self, book: CycleStateBook, reconciliation: CycleReconciliation
+    ) -> PolicyState:
+        """Reconstruct the single-position engine state from the book.
+
+        The pinned-symbol path keeps its exact single-fold semantics: the
+        first tracked position (there is at most one) over the shared
+        session facts.
+
+        Args:
+            book: The persisted book whose position reconciles.
+            reconciliation: The reconciliation whose status read carries
+                the position's live custody.
+
+        Returns:
+            The engine state carrying the tracked position and any held
+            inventory.
+        """
+        session = self._session_state(book, reconciliation)
+        pairs = self._policy_states(book, reconciliation)
+        if not pairs:
+            return session
+        _, state = pairs[0]
+        return state
 
     def _cooldown_map(self, book: CycleStateBook) -> dict[str, datetime]:
         """Read the book's per-pool re-entry cooldowns as a mapping.
@@ -1871,14 +2287,21 @@ class CycleRunner:
         notes = notes + (
             "selector sizing reserves 10% headroom below each observed pool-depth cap",
         )
-        # Selector observations start from loose Safe balances. When an LP is
-        # already tracked, add its live marked value to every board option
-        # before policy evaluation so the daily-loss guard sees total managed
-        # portfolio equity rather than falsely treating deployed LP capital as
-        # a drawdown.
-        tracked_status = self._last_reconciliation.tracked_status
-        if tracked_status is not None and tracked_status.position_value_usdc is not None:
-            lp_value = tracked_status.position_value_usdc
+        # Selector observations start from loose Safe balances. When LPs are
+        # already tracked, add every position's live marked value to each
+        # board option before policy evaluation so the daily-loss guard
+        # sees total managed portfolio equity rather than falsely treating
+        # deployed LP capital as a drawdown.
+        statuses = self._last_reconciliation.position_statuses
+        lp_value = sum(
+            (
+                record.status.position_value_usdc
+                for record in statuses
+                if record.status.position_value_usdc is not None
+            ),
+            Decimal("0"),
+        )
+        if lp_value > 0:
             options = tuple(
                 option.model_copy(
                     update={
@@ -1889,7 +2312,10 @@ class CycleRunner:
                 )
                 for option in options
             )
-            notes = notes + (f"selector equity includes tracked LP marked value {lp_value} USDC",)
+            notes = notes + (
+                f"selector equity includes {lp_value} USDC of tracked LP marked value across "
+                f"{len(statuses)} position(s)",
+            )
         aero_units = self._balances.fetch_token_balance(AERO_TOKEN_ADDRESS, self._safe_address)
         if aero_units > 0 and aero_price is not None:
             aero_value = +(Decimal(aero_units).scaleb(-AERO_DECIMALS) * aero_price)
@@ -1912,39 +2338,117 @@ class CycleRunner:
             "resolved Aerodrome pool's on-chain price and state",
         )
         engine = PolicyEngine(self._parameters, load_event_calendar())
-        policy_state = self._policy_state(book, self._last_reconciliation)
-        selection = select_board(
+        session_state = self._session_state(book, self._last_reconciliation)
+        cooldowns = self._cooldown_map(book)
+        options_by_symbol = {option.symbol: option for option in options}
+        # One fold per held position: each position's own lifecycle - its
+        # safety exits, its recenters, its out-of-range grace - is judged by
+        # the per-pool engine over exactly its own position, never blurred
+        # across the portfolio.
+        held_folds: dict[str, PolicyOutcome] = {}
+        held_facts: list[HeldPositionFact] = []
+        penalty_blocked: set[str] = set()
+        for tracked, state in self._policy_states(book, self._last_reconciliation):
+            option = options_by_symbol.get(tracked.symbol)
+            if option is None:
+                raise ValueError(
+                    f"the tracked position's pool for {tracked.symbol} is not on the "
+                    "enumerated board"
+                )
+            fold = engine.decide(state, option.observation)
+            held_folds[tracked.symbol] = fold
+            status = next(
+                (record.status for record in statuses if record.token_id == tracked.token_id),
+                None,
+            )
+            penalty = getattr(status, "penalty", None)
+            if penalty is not None and penalty.remaining_seconds > 0:
+                penalty_blocked.add(tracked.symbol)
+            held_facts.append(
+                HeldPositionFact(
+                    symbol=tracked.symbol,
+                    token_id=tracked.token_id,
+                    committed_usd=tracked.committed_usd,
+                    marked_usd=(
+                        status.position_value_usdc
+                        if status is not None and status.position_value_usdc is not None
+                        else None
+                    ),
+                    entered_at=tracked.entered_at,
+                    emissions_apr=option.observation.emissions_apr,
+                )
+            )
+        # The held-inventory fold resolves its own lane: convergence or the
+        # timeout sell, judged without any position so a stale-low burn never
+        # blocks another position's safety exits.
+        inventory_symbol: str | None = None
+        inventory_outcome: PolicyOutcome | None = None
+        if book.held_inventory is not None:
+            inventory_symbol = book.held_inventory.symbol
+            inventory_option = options_by_symbol.get(inventory_symbol)
+            if inventory_option is None:
+                raise ValueError(
+                    f"the held inventory's pool for {inventory_symbol} is not on the "
+                    "enumerated board"
+                )
+            inventory_outcome = engine.decide(session_state, inventory_option.observation)
+        # The board evaluation stays exactly the selector's: the complete
+        # entry gate chain per pool over the flat session posture.
+        evaluations = evaluate_pool_entries(engine, session_state, options, cooldowns)
+        cash_usdc = Decimal(self._last_reconciliation.safe_usdc_units).scaleb(-6)
+        equity_usdc = options[0].observation.equity_usd if options else cash_usdc + lp_value
+        portfolio_parameters = self._portfolio_parameters()
+        allocation = allocate_portfolio(
             engine,
-            policy_state,
-            options,
-            self._cooldown_map(book),
-            self._switch_margin_fraction,
+            session_state,
+            evaluations,
+            cooldowns,
+            held=held_facts,
+            cash_usdc=cash_usdc,
+            equity_usdc=equity_usdc,
+            parameters=portfolio_parameters,
+            inventory_pending=book.held_inventory is not None,
         )
-        penalty = getattr(tracked_status, "penalty", None)
-        if (
-            selection.switch is not None
-            and penalty is not None
-            and penalty.remaining_seconds > 0
-            and book.position is not None
-        ):
-            held_option = next(
-                option for option in options if option.symbol == book.position.symbol
+        plan = plan_portfolio_rebalance(
+            engine,
+            allocation,
+            evaluations,
+            session_state,
+            cooldowns,
+            held_facts,
+            held_folds,
+            cash_usdc,
+            equity_usdc,
+            inventory_symbol=inventory_symbol,
+            inventory_outcome=inventory_outcome,
+            parameters=portfolio_parameters,
+            now=self._now(),
+            penalty_blocked_symbols=frozenset(penalty_blocked),
+        )
+        # The leading outcome: the first planned step when the plan acts,
+        # else a portfolio hold over the session facts.
+        if plan.steps:
+            outcome = plan.steps[0].outcome
+        else:
+            any_qualified = any(evaluation.qualifies for evaluation in evaluations)
+            reason = (
+                PolicyReason.NO_QUALIFYING_POOL
+                if not book.positions and not any_qualified
+                else PolicyReason.OPEN_IN_RANGE
             )
-            held_outcome = engine.decide(policy_state, held_option.observation)
-            selection = BoardSelection(
-                outcome=held_outcome,
-                evaluations=selection.evaluations,
-                selected_symbol=book.position.symbol,
-                switch=None,
-                summary=(
-                    f"holding {book.position.symbol}: cross-pool switch deferred for "
-                    f"{penalty.remaining_seconds}s until the active minimum-stake penalty "
-                    "window clears; " + selection.summary
+            outcome = PolicyOutcome(
+                decision=PolicyDecision(
+                    action=PolicyActionKind.HOLD,
+                    reason=reason,
+                    diagnostics=(allocation.summary, plan.summary),
                 ),
+                next_state=session_state,
             )
-        decision_option = self._option_for_selection(selection, options)
+        decision_option = self._option_for_plan(plan, options, evaluations)
         window = evaluate_event_window(self._now(), decision_option.token_address, engine.calendar)
-        switch = selection.switch
+        summary = f"portfolio: {allocation.summary}; {plan.summary}; " + board_summary_line(
+            evaluations, decision_option.symbol
+        )
         return StrategyDecisionReport(
             symbol=decision_option.symbol,
             pool_address=decision_option.pool_address,
@@ -1958,40 +2462,40 @@ class CycleRunner:
             gas_price_gwei=gas_price,
             reference_price_usdc=reference_prices_by_symbol.get(decision_option.symbol),
             event_window=window,
-            outcome=selection.outcome,
-            input_notes=notes + (selection.summary,),
+            outcome=outcome,
+            input_notes=notes + (summary,),
             selector_mode=True,
-            board=selection.evaluations,
-            switch=switch,
-            board_summary=selection.summary,
+            board=evaluations,
+            portfolio_plan=plan,
+            held_folds=held_folds,
+            session_state=session_state,
+            board_summary=summary,
         )
 
-    def _option_for_selection(
-        self, selection: "BoardSelection", options: tuple[PoolBoardOption, ...]
+    def _option_for_plan(
+        self,
+        plan: PortfolioRebalancePlan,
+        options: tuple[PoolBoardOption, ...],
+        evaluations: tuple[PoolEntryEvaluation, ...],
     ) -> PoolBoardOption:
-        """Resolve the board option the selection's decision covers.
+        """Resolve the board option the plan's leading step acts on.
 
         Args:
-            selection: The selector's complete verdict.
+            plan: The portfolio rebalance plan.
             options: The assembled board options in listing order.
+            evaluations: The board's complete entry-gate evaluations.
 
         Returns:
-            The held, selected, or closest-call option; the report names its
-            pool, mirroring the decide surface's fallback.
+            The option the leading step enters, exits, or reallocates
+            into; the closest-call pool when the plan holds.
         """
-        symbol = selection.selected_symbol
-        if symbol is not None:
+        if plan.steps:
+            leading = plan.steps[0]
+            symbol = leading.to_symbol or leading.symbol
             for option in options:
                 if option.symbol == symbol:
                     return option
-        if selection.switch is not None:
-            for option in options:
-                if option.pool_address == selection.switch.to_pool_address:
-                    return option
-        # Nothing qualified: name the closest-call pool - the highest
-        # emissions APR on the board, ties lexicographic - so both surfaces
-        # report the same pool for the same board.
-        closest = closest_call_evaluation(selection.evaluations)
+        closest = closest_call_evaluation(evaluations)
         if closest is not None:
             for option in options:
                 if option.symbol == closest.symbol:
@@ -2007,67 +2511,73 @@ class CycleRunner:
         book: CycleStateBook,
         key_bytes: bytes,
     ) -> tuple[list[CycleActionRecord], str]:
-        """Restake a valid tracked NFT left in the Safe after a partial prior cycle.
+        """Restake valid tracked NFTs left in the Safe after a partial cycle.
 
-        This recovery is intentionally narrow: reconciliation already proved the
-        tracked token is owned by the Safe (not a stranger), the policy verdict is
-        HOLD, and no normal policy action needs the NFT unstaked.  The existing
-        audited stake executor remains the only broadcast surface.
+        This recovery is intentionally narrow: reconciliation already proved
+        every tracked token is owned by the Safe (not a stranger), the
+        policy verdict is HOLD, and no normal policy action needs the NFT
+        unstaked. The existing audited stake executor remains the only
+        broadcast surface; one position's recovery failure stops the pass
+        exactly like any other action.
         """
         executor = self._executor
         assert executor is not None  # noqa: S101 - live run validated the boundary
-        tracked = book.position
-        if tracked is None:
-            return [], "stake recovery requested while no position is tracked"
-        try:
-            report = executor.execute_stake(
-                tracked.symbol,
-                tracked.token_id,
-                key_bytes,
-                confirm_broadcast=True,
-            )
-        except (LpExecutionRefusalError, LpPlanRefusalError) as error:
-            code = str(getattr(error, "code", "plan_refused"))
-            completed_steps = tuple(getattr(error, "completed_steps", ()))
-            hashes = tuple(step.transaction_hash for step in completed_steps)
-            fees = sum(step.fee_wei or 0 for step in completed_steps)
-            blocks = tuple(
-                int(step.block_number)
-                for step in completed_steps
-                if step.status == "confirmed" and getattr(step, "block_number", None) is not None
-            )
-            return [
+        records: list[CycleActionRecord] = []
+        for tracked in book.positions:
+            try:
+                report = executor.execute_stake(
+                    tracked.symbol,
+                    tracked.token_id,
+                    key_bytes,
+                    confirm_broadcast=True,
+                )
+            except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+                code = str(getattr(error, "code", "plan_refused"))
+                completed_steps = tuple(getattr(error, "completed_steps", ()))
+                hashes = tuple(step.transaction_hash for step in completed_steps)
+                fees = sum(step.fee_wei or 0 for step in completed_steps)
+                blocks = tuple(
+                    int(step.block_number)
+                    for step in completed_steps
+                    if step.status == "confirmed"
+                    and getattr(step, "block_number", None) is not None
+                )
+                records.append(
+                    CycleActionRecord(
+                        action="stake_recovery",
+                        status="refused",
+                        transaction_hashes=hashes,
+                        fee_wei=fees,
+                        confirmed_block_number=max(blocks) if blocks else None,
+                        refusal_code=code,
+                        diagnostic=str(error),
+                    )
+                )
+                return records, f"the stake recovery action refused [{code}]"
+            except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
+                records.append(
+                    CycleActionRecord(
+                        action="stake_recovery",
+                        status="failed",
+                        diagnostic=str(error),
+                    )
+                )
+                return records, f"the stake recovery action failed: {error}"
+            hashes, fees, confirmed_block = _action_hashes_fees_and_block(report)
+            completed = _action_completed(report)
+            records.append(
                 CycleActionRecord(
                     action="stake_recovery",
-                    status="refused",
+                    status="completed" if completed else "failed",
                     transaction_hashes=hashes,
                     fee_wei=fees,
-                    confirmed_block_number=max(blocks) if blocks else None,
-                    refusal_code=code,
-                    diagnostic=str(error),
+                    confirmed_block_number=confirmed_block,
+                    diagnostic=report.halted_reason,
                 )
-            ], f"the stake recovery action refused [{code}]"
-        except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
-            return [
-                CycleActionRecord(
-                    action="stake_recovery",
-                    status="failed",
-                    diagnostic=str(error),
-                )
-            ], f"the stake recovery action failed: {error}"
-        hashes, fees, confirmed_block = _action_hashes_fees_and_block(report)
-        completed = _action_completed(report)
-        record = CycleActionRecord(
-            action="stake_recovery",
-            status="completed" if completed else "failed",
-            transaction_hashes=hashes,
-            fee_wei=fees,
-            confirmed_block_number=confirmed_block,
-            diagnostic=report.halted_reason,
-        )
-        if not completed:
-            return [record], f"the stake recovery action halted: {report.halted_reason}"
-        return [record], ""
+            )
+            if not completed:
+                return records, f"the stake recovery action halted: {report.halted_reason}"
+        return records, ""
 
     def _act(  # noqa: PLR0915, PLR0912 - one fixed policy mapping, explicit branches
         self,
@@ -2265,9 +2775,12 @@ class CycleRunner:
                 )
                 halted = f"the switch preflight failed: {error}"
                 return records, halted, book
-            if not self._exit_position(executor, book, key_bytes, run):
+            if book.position is None:
+                halted = "the engine authorized a switch while flat"
                 return records, halted, book
-            switched_book = book.model_copy(update={"position": None, "held_inventory": None})
+            if not self._exit_position(executor, book.position, key_bytes, run):
+                return records, halted, book
+            switched_book = book.model_copy(update={"positions": (), "held_inventory": None})
             if not run(
                 "mint",
                 lambda: executor.execute_mint(
@@ -2367,9 +2880,9 @@ class CycleRunner:
                     return records, halted, book
 
             exit_ok = (
-                self._burn_without_swap(executor, book, key_bytes, run)
+                self._burn_without_swap(executor, book.position, key_bytes, run)
                 if action in (PolicyActionKind.RECENTER, PolicyActionKind.RANGE_GRACE_EXIT)
-                else self._exit_position(executor, book, key_bytes, run)
+                else self._exit_position(executor, book.position, key_bytes, run)
             )
             if not exit_ok:
                 return records, halted, book
@@ -2386,20 +2899,22 @@ class CycleRunner:
                     return (
                         records,
                         halted,
-                        book.model_copy(
-                            update={
-                                "position": None,
-                                "held_inventory": HeldInventoryRecord(
-                                    symbol=tracked_symbol,
-                                    token_address=self._stock_token_address_for(tracked_symbol),
-                                    stock_quantity=held_quantity,
-                                    held_since=self._now(),
-                                    origin="out_of_range_exit",
-                                ),
-                            }
+                        _book_with_position_removed(
+                            book.model_copy(
+                                update={
+                                    "held_inventory": HeldInventoryRecord(
+                                        symbol=tracked_symbol,
+                                        token_address=self._stock_token_address_for(tracked_symbol),
+                                        stock_quantity=held_quantity,
+                                        held_since=self._now(),
+                                        origin="out_of_range_exit",
+                                    )
+                                }
+                            ),
+                            book.position.token_id,
                         ),
                     )
-                return records, halted, book.model_copy(update={"position": None})
+                return records, halted, _book_with_position_removed(book, book.position.token_id)
             if action is PolicyActionKind.RECENTER:
                 size = decision.size_usd
                 width = self._width_from_range(decision.price_range, tracked_symbol)
@@ -2408,7 +2923,7 @@ class CycleRunner:
                     return (
                         records,
                         halted,
-                        book.model_copy(update={"position": None, "held_inventory": None}),
+                        book.model_copy(update={"positions": (), "held_inventory": None}),
                     )
                 recenter_budget: Decimal = size
                 recenter_width: int = width
@@ -2423,7 +2938,7 @@ class CycleRunner:
                     ),
                 ):
                     held_quantity = self._live_stock_quantity(tracked_symbol)
-                    failed_book = book.model_copy(update={"position": None, "held_inventory": None})
+                    failed_book = book.model_copy(update={"positions": (), "held_inventory": None})
                     if held_quantity > 0:
                         failed_book = failed_book.model_copy(
                             update={
@@ -2443,7 +2958,7 @@ class CycleRunner:
                     return (
                         records,
                         halted,
-                        book.model_copy(update={"position": None, "held_inventory": None}),
+                        book.model_copy(update={"positions": (), "held_inventory": None}),
                     )
                 if not run(
                     "stake",
@@ -2454,7 +2969,7 @@ class CycleRunner:
                     return (
                         records,
                         halted,
-                        book.model_copy(update={"position": None, "held_inventory": None}),
+                        book.model_copy(update={"positions": (), "held_inventory": None}),
                     )
                 return (
                     records,
@@ -2469,33 +2984,35 @@ class CycleRunner:
             return (
                 records,
                 halted,
-                book.model_copy(update={"position": None, "held_inventory": None}),
+                book.model_copy(update={"positions": (), "held_inventory": None}),
             )
 
         if action is PolicyActionKind.STALE_LOW_BURN:
             if book.position is None or tracked_symbol is None:
                 halted = "the engine authorized a stale-low burn while flat"
                 return records, halted, book
-            if not self._burn_without_swap(executor, book, key_bytes, run):
+            if not self._burn_without_swap(executor, book.position, key_bytes, run):
                 return records, halted, book
             held_quantity = self._live_stock_quantity(tracked_symbol)
             if held_quantity <= 0:
                 halted = "the stale-low burn left no stock balance to hold"
-                return records, halted, book.model_copy(update={"position": None})
+                return records, halted, _book_with_position_removed(book, book.position.token_id)
             return (
                 records,
                 halted,
-                book.model_copy(
-                    update={
-                        "position": None,
-                        "held_inventory": HeldInventoryRecord(
-                            symbol=tracked_symbol,
-                            token_address=self._stock_token_address_for(tracked_symbol),
-                            stock_quantity=held_quantity,
-                            held_since=self._now(),
-                            origin="stale_low_exit",
-                        ),
-                    }
+                _book_with_position_removed(
+                    book.model_copy(
+                        update={
+                            "held_inventory": HeldInventoryRecord(
+                                symbol=tracked_symbol,
+                                token_address=self._stock_token_address_for(tracked_symbol),
+                                stock_quantity=held_quantity,
+                                held_since=self._now(),
+                                origin="stale_low_exit",
+                            )
+                        }
+                    ),
+                    book.position.token_id,
                 ),
             )
 
@@ -2514,36 +3031,379 @@ class CycleRunner:
         halted = f"the cycle has no live mapping for action {action.value}"
         return records, halted, book
 
+    def _act_portfolio(  # noqa: PLR0912, PLR0915 - one fixed step mapping
+        self,
+        book: CycleStateBook,
+        plan: PortfolioRebalancePlan,
+        key_bytes: bytes,
+    ) -> tuple[list[CycleActionRecord], str, CycleStateBook]:
+        """Execute the portfolio plan's ordered steps through audited surfaces.
+
+        The steps run in the plan's fixed order - safety exits, the
+        inventory resolution, recenters, reallocations, then entries - so
+        every exit lands before the entry it funds and the total cap is
+        never breached even transiently. Any refusal or failure halts the
+        cycle exactly like the pinned path: a completed prefix is chain
+        truth the next cycle reconciles.
+
+        Args:
+            book: The reconciled book the steps mutate.
+            plan: The allocator's ordered rebalance plan.
+            key_bytes: The signing key for live broadcasts.
+
+        Returns:
+            The action records, a halted reason (empty on success), and the
+            mutated book.
+        """
+        executor = self._executor
+        assert executor is not None  # noqa: S101 - the caller verified liveness
+        records: list[CycleActionRecord] = []
+        halted = ""
+
+        def run(name: str, call: Callable[[], LpActionExecutionReport]) -> bool:
+            """Run one audited action, recording its outcome."""
+            nonlocal halted
+            try:
+                report = call()
+            except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+                code = str(getattr(error, "code", "plan_refused"))
+                completed_steps = tuple(getattr(error, "completed_steps", ()))
+                hashes = tuple(step.transaction_hash for step in completed_steps)
+                fees = sum(step.fee_wei or 0 for step in completed_steps)
+                blocks = tuple(
+                    int(step.block_number)
+                    for step in completed_steps
+                    if step.status == "confirmed"
+                    and getattr(step, "block_number", None) is not None
+                )
+                records.append(
+                    CycleActionRecord(
+                        action=name,
+                        status="refused",
+                        transaction_hashes=hashes,
+                        fee_wei=fees,
+                        confirmed_block_number=max(blocks) if blocks else None,
+                        refusal_code=code,
+                        diagnostic=str(error),
+                    )
+                )
+                halted = f"the {name} action refused [{code}]"
+                return False
+            except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
+                records.append(
+                    CycleActionRecord(action=name, status="failed", diagnostic=str(error))
+                )
+                halted = f"the {name} action failed: {error}"
+                return False
+            hashes, fees, confirmed_block = _action_hashes_fees_and_block(report)
+            mint_plan = getattr(report.build, "plan", None) if name == "mint" else None
+            executed_budget = (
+                getattr(mint_plan, "budget_usdc", None) if mint_plan is not None else None
+            )
+            records.append(
+                CycleActionRecord(
+                    action=name,
+                    status="completed" if _action_completed(report) else "failed",
+                    transaction_hashes=hashes,
+                    fee_wei=fees,
+                    confirmed_block_number=confirmed_block,
+                    executed_budget_usdc=executed_budget,
+                    diagnostic=report.halted_reason,
+                )
+            )
+            if not _action_completed(report):
+                halted = f"the {name} action halted: {report.halted_reason}"
+                return False
+            return True
+
+        def mint_and_stake(
+            working: CycleStateBook, symbol: str, budget: Decimal, width: int
+        ) -> CycleStateBook | None:
+            """Mint and stake one position, returning the mutated book."""
+            nonlocal halted
+            # The executor's total-cap gate sees the book's other tracked
+            # positions as expected exposure, never as strangers.
+            live_positions = tuple(
+                (position.token_id, position.committed_usd) for position in working.positions
+            )
+            if not run(
+                "mint",
+                lambda: executor.execute_mint(
+                    symbol,
+                    budget,
+                    width,
+                    key_bytes,
+                    confirm_broadcast=True,
+                    portfolio_live_positions=live_positions,
+                ),
+            ):
+                held_quantity = self._live_stock_quantity(symbol)
+                failed_book = working
+                if held_quantity > 0:
+                    existing_retry = (
+                        working.held_inventory
+                        if working.held_inventory is not None
+                        and working.held_inventory.symbol == symbol
+                        and working.held_inventory.origin in ("failed_entry", "failed_recenter")
+                        else None
+                    )
+                    failed_book = working.model_copy(
+                        update={
+                            "held_inventory": HeldInventoryRecord(
+                                symbol=symbol,
+                                token_address=self._stock_token_address_for(symbol),
+                                stock_quantity=held_quantity,
+                                held_since=(
+                                    existing_retry.held_since
+                                    if existing_retry is not None
+                                    else self._now()
+                                ),
+                                origin=(
+                                    existing_retry.origin
+                                    if existing_retry is not None
+                                    else "failed_entry"
+                                ),
+                            )
+                        }
+                    )
+                return failed_book
+            token_id = self._decode_mint_token_id(records[-1])
+            if token_id is None:
+                halted = "the minted position id could not be decoded from the receipt"
+                return working
+            minted_id: int = token_id
+            if not run(
+                "stake",
+                lambda: executor.execute_stake(
+                    symbol, minted_id, key_bytes, confirm_broadcast=True
+                ),
+            ):
+                return working
+            committed = records[-2].executed_budget_usdc or budget
+            return self._book_with_position(working, symbol, minted_id, committed)
+
+        for step in plan.steps:
+            if halted:
+                break
+            tracked = next(
+                (position for position in book.positions if position.token_id == step.token_id),
+                None,
+            )
+            decision = step.outcome.decision
+            if step.kind is PortfolioStepKind.POSITION_ACTION:
+                if tracked is None:
+                    halted = (
+                        f"the plan's {step.symbol} step names token {step.token_id} the "
+                        "book does not track"
+                    )
+                    break
+                action = decision.action
+                if action is PolicyActionKind.RECENTER:
+                    size = decision.size_usd
+                    width = self._width_from_range(decision.price_range, step.symbol)
+                    if size is None or size <= 0 or width is None:
+                        halted = "the recenter decision carried no complete fresh entry"
+                        break
+                    try:
+                        executor.dry_run_recenter(
+                            step.symbol,
+                            tracked.token_id,
+                            width,
+                            size,
+                            key_bytes,
+                            portfolio_live_positions=tuple(
+                                (position.token_id, position.committed_usd)
+                                for position in book.positions
+                            ),
+                        )
+                    except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+                        code = str(getattr(error, "code", "plan_refused"))
+                        records.append(
+                            CycleActionRecord(
+                                action="recenter_preflight",
+                                status="refused",
+                                refusal_code=code,
+                                diagnostic=str(error),
+                            )
+                        )
+                        halted = f"the recenter preflight refused [{code}]"
+                        break
+                    except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
+                        records.append(
+                            CycleActionRecord(
+                                action="recenter_preflight",
+                                status="failed",
+                                diagnostic=str(error),
+                            )
+                        )
+                        halted = f"the recenter preflight failed: {error}"
+                        break
+                    if not self._burn_without_swap(executor, tracked, key_bytes, run):
+                        break
+                    after_burn = _book_with_position_removed(book, tracked.token_id)
+                    reborn = mint_and_stake(after_burn, step.symbol, size, width)
+                    if reborn is not None:
+                        book = reborn
+                    if halted:
+                        break
+                    continue
+                # Every other position action fully unwinds the position.
+                burn_only = action is PolicyActionKind.RANGE_GRACE_EXIT or (
+                    action is PolicyActionKind.STALE_LOW_BURN
+                )
+                exit_ok = (
+                    self._burn_without_swap(executor, tracked, key_bytes, run)
+                    if burn_only
+                    else self._exit_position(executor, tracked, key_bytes, run)
+                )
+                if not exit_ok:
+                    break
+                book = _book_with_position_removed(book, tracked.token_id)
+                if burn_only:
+                    held_quantity = self._live_stock_quantity(step.symbol)
+                    if held_quantity > 0:
+                        book = book.model_copy(
+                            update={
+                                "held_inventory": HeldInventoryRecord(
+                                    symbol=step.symbol,
+                                    token_address=self._stock_token_address_for(step.symbol),
+                                    stock_quantity=held_quantity,
+                                    held_since=self._now(),
+                                    origin=(
+                                        "out_of_range_exit"
+                                        if action is PolicyActionKind.RANGE_GRACE_EXIT
+                                        else "stale_low_exit"
+                                    ),
+                                )
+                            }
+                        )
+                continue
+            if step.kind is PortfolioStepKind.INVENTORY_ACTION:
+                if book.held_inventory is None:
+                    halted = "the plan authorized an inventory sale with nothing held"
+                    break
+                inventory_symbol = step.symbol
+
+                def _exit_inventory(
+                    bound_symbol: str = inventory_symbol,
+                ) -> LpActionExecutionReport:
+                    return executor.execute_exit_swap(
+                        bound_symbol, key_bytes, confirm_broadcast=True
+                    )
+
+                if not run("exit_swap", _exit_inventory):
+                    break
+                book = book.model_copy(update={"held_inventory": None})
+                continue
+            if step.kind is PortfolioStepKind.REALLOCATE:
+                if tracked is None or step.to_symbol is None:
+                    halted = "the reallocation step carried no complete pair"
+                    break
+                size = decision.size_usd
+                width = self._width_from_range(decision.price_range, step.to_symbol)
+                if size is None or size <= 0 or width is None:
+                    halted = "the reallocation decision carried no complete fresh entry"
+                    break
+                try:
+                    executor.dry_run_switch(
+                        step.symbol,
+                        tracked.token_id,
+                        step.to_symbol,
+                        width,
+                        size,
+                        key_bytes,
+                        portfolio_live_positions=tuple(
+                            (position.token_id, position.committed_usd)
+                            for position in book.positions
+                        ),
+                    )
+                except (LpExecutionRefusalError, LpPlanRefusalError) as error:
+                    code = str(getattr(error, "code", "plan_refused"))
+                    records.append(
+                        CycleActionRecord(
+                            action="switch_preflight",
+                            status="refused",
+                            refusal_code=code,
+                            diagnostic=str(error),
+                        )
+                    )
+                    halted = f"the switch preflight refused [{code}]"
+                    break
+                except (ExecutionUnavailableError, ValueError, RuntimeError) as error:
+                    records.append(
+                        CycleActionRecord(
+                            action="switch_preflight",
+                            status="failed",
+                            diagnostic=str(error),
+                        )
+                    )
+                    halted = f"the switch preflight failed: {error}"
+                    break
+                if not self._exit_position(executor, tracked, key_bytes, run):
+                    break
+                after_exit = _book_with_position_removed(book, tracked.token_id)
+                reborn = mint_and_stake(after_exit, step.to_symbol, size, width)
+                if reborn is not None:
+                    book = reborn
+                if halted:
+                    break
+                continue
+            if step.kind is PortfolioStepKind.ENTER:
+                size = decision.size_usd
+                width = self._width_from_range(decision.price_range, step.symbol)
+                if size is None or size <= 0 or width is None:
+                    halted = "the enter decision carried no positive size or width"
+                    break
+                entered = mint_and_stake(book, step.symbol, size, width)
+                if entered is not None:
+                    book = entered
+                if halted:
+                    break
+                continue
+            halted = f"the portfolio plan carried an unmapped step kind {step.kind.value}"
+            break
+        return records, halted, book
+
     def _book_with_position(
         self, book: CycleStateBook, symbol: str, token_id: int, committed: Decimal
     ) -> CycleStateBook:
         """Return the book carrying one freshly entered tracked position."""
-        return book.model_copy(
-            update={
-                "position": TrackedPosition(
-                    symbol=symbol,
-                    token_id=token_id,
-                    pool_address=self._pool_for_symbol(symbol).pool_address,
-                    committed_usd=committed,
-                    entered_at=self._now(),
-                ),
-                "held_inventory": None,
-            }
+        tracked = TrackedPosition(
+            symbol=symbol,
+            token_id=token_id,
+            pool_address=self._pool_for_symbol(symbol).pool_address,
+            committed_usd=committed,
+            entered_at=self._now(),
+        )
+        return _book_with_position_added(book.model_copy(update={"held_inventory": None}), tracked)
+
+    def _position_staked(self, token_id: int) -> bool:
+        """Read one position's staked custody from the decision reconciliation.
+
+        Args:
+            token_id: The position NFT id being looked up.
+
+        Returns:
+            True when the reconciliation saw the NFT in its gauge.
+        """
+        assert self._last_reconciliation is not None  # noqa: S101 - set by run()
+        for record in self._last_reconciliation.position_statuses:
+            if record.token_id == token_id:
+                return record.staked
+        return self._last_reconciliation.tracked_staked and (
+            self._last_reconciliation.tracked_token_id == token_id
         )
 
     def _exit_position(
         self,
         executor: CycleExecutorBoundary,
-        book: CycleStateBook,
+        tracked: TrackedPosition,
         key_bytes: bytes,
         run: Callable[[str, Callable[[], LpActionExecutionReport]], bool],
     ) -> bool:
         """Unstake, withdraw, and swap one tracked position fully to USDC."""
-        tracked = book.position
-        assert tracked is not None  # noqa: S101 - the caller verified a tracked position
         symbol = tracked.symbol
-        assert self._last_reconciliation is not None  # noqa: S101 - set by run()
-        if self._last_reconciliation.tracked_staked and not run(
+        if self._position_staked(tracked.token_id) and not run(
             "unstake",
             lambda: executor.execute_unstake(
                 symbol, tracked.token_id, key_bytes, confirm_broadcast=True
@@ -2565,16 +3425,13 @@ class CycleRunner:
     def _burn_without_swap(
         self,
         executor: CycleExecutorBoundary,
-        book: CycleStateBook,
+        tracked: TrackedPosition,
         key_bytes: bytes,
         run: Callable[[str, Callable[[], LpActionExecutionReport]], bool],
     ) -> bool:
         """Unstake and withdraw while holding the stock unsold."""
-        tracked = book.position
-        assert tracked is not None  # noqa: S101 - the caller verified a tracked position
         symbol = tracked.symbol
-        assert self._last_reconciliation is not None  # noqa: S101 - set by run()
-        if self._last_reconciliation.tracked_staked and not run(
+        if self._position_staked(tracked.token_id) and not run(
             "unstake",
             lambda: executor.execute_unstake(
                 symbol, tracked.token_id, key_bytes, confirm_broadcast=True
@@ -2629,8 +3486,23 @@ class CycleRunner:
         next_state: PolicyState,
         decision_symbol: str | None = None,
         decision_action: PolicyActionKind = PolicyActionKind.HOLD,
+        decision_report: StrategyDecisionReport | None = None,
     ) -> CycleStateBook:
-        """Rebuild the book from post-action chain truth plus engine state."""
+        """Rebuild the book from post-action chain truth plus engine state.
+
+        A portfolio decision report (selector mode under the allocator)
+        rebuilds per position: the folds' successor states thread each
+        position's out-of-range anchors and each exit's cooldown, and the
+        session state threads the day anchors and the halt latch once.
+        """
+        if (
+            decision_report is not None
+            and decision_report.portfolio_plan is not None
+            and decision_report.session_state is not None
+        ):
+            return self._rebuild_book_portfolio(
+                book, reconciliation, decision_report, decision_report.session_state
+            )
         position = book.position
         if (
             position is not None
@@ -2675,12 +3547,90 @@ class CycleRunner:
         )
         return rebuilt.model_copy(
             update={
-                "position": position,
+                "positions": (position,) if position is not None else (),
                 "held_inventory": held,
                 "day": next_state.day,
                 "day_start_equity_usd": next_state.day_start_equity_usd,
                 "peak_equity_usdc": next_state.peak_equity_usd,
                 "halted_day": next_state.halted_day,
+                "updated_at": self._now(),
+            }
+        )
+
+    def _rebuild_book_portfolio(
+        self,
+        book: CycleStateBook,
+        reconciliation: CycleReconciliation,
+        decision_report: StrategyDecisionReport,
+        session_state: PolicyState,
+    ) -> CycleStateBook:
+        """Rebuild the book after one portfolio decision, per position.
+
+        Args:
+            book: The post-action book the act layer threaded.
+            reconciliation: The final on-chain reconciliation.
+            decision_report: The portfolio decision carrying the folds.
+            session_state: The post-fold session facts.
+
+        Returns:
+            The rebuilt book.
+        """
+        statuses = {record.token_id: record.status for record in reconciliation.position_statuses}
+        folds = decision_report.held_folds
+        positions: list[TrackedPosition] = []
+        cooldown_updates: dict[str, datetime | None] = {}
+        for tracked in book.positions:
+            updated = tracked
+            status = statuses.get(tracked.token_id)
+            if status is not None and status.token_id != tracked.token_id:
+                updated = updated.model_copy(update={"token_id": status.token_id})
+            fold = folds.get(updated.symbol)
+            successor = fold.next_state.position if fold is not None else None
+            if successor is not None and fold is not None:
+                if fold.decision.action is PolicyActionKind.HOLD:
+                    updated = updated.model_copy(
+                        update={
+                            "out_of_range_since": successor.out_of_range_since,
+                            "out_of_range_side": successor.out_of_range_side,
+                        }
+                    )
+                elif fold.decision.action in (
+                    PolicyActionKind.STOP_OUT,
+                    PolicyActionKind.DILUTION_EXIT,
+                ):
+                    cooldown_updates[updated.symbol] = fold.next_state.reentry_blocked_until
+            positions.append(updated)
+        # Reallocation and grace exits arm their own pools' cooldowns when
+        # the engine's successor names one; voluntary switches arm none.
+        plan = decision_report.portfolio_plan
+        if plan is not None:
+            for step in plan.steps:
+                if step.kind is PortfolioStepKind.POSITION_ACTION and step.token_id is not None:
+                    action = step.outcome.decision.action
+                    if (
+                        action
+                        in (
+                            PolicyActionKind.STOP_OUT,
+                            PolicyActionKind.DILUTION_EXIT,
+                            PolicyActionKind.RANGE_GRACE_EXIT,
+                        )
+                        and step.outcome.next_state.reentry_blocked_until is not None
+                    ):
+                        cooldown_updates[step.symbol] = (
+                            step.outcome.next_state.reentry_blocked_until
+                        )
+        held = book.held_inventory
+        if held is not None and reconciliation.held_stock_quantity == 0:
+            held = None
+        rebuilt = _book_with_cooldowns(book, cooldown_updates)
+        return rebuilt.model_copy(
+            update={
+                "positions": tuple(positions),
+                "held_inventory": held,
+                "day": session_state.day,
+                "day_start_equity_usd": session_state.day_start_equity_usd,
+                "peak_equity_usdc": session_state.peak_equity_usd,
+                "halted_day": session_state.halted_day,
                 "updated_at": self._now(),
             }
         )
@@ -2771,23 +3721,24 @@ class CycleRunner:
             The book carrying the latest sample for the tracked token,
             bounded to the eight most recent token ids.
         """
-        status = reconciliation.tracked_status
-        token_id = reconciliation.tracked_token_id
-        if (
-            status is None
-            or token_id is None
-            or status.fees_owed_usdc is None
-            or status.position_value_usdc is None
-        ):
+        samples: list[CycleFeeSampleRecord] = []
+        for record in reconciliation.position_statuses:
+            status = record.status
+            if status.fees_owed_usdc is None or status.position_value_usdc is None:
+                continue
+            samples.append(
+                CycleFeeSampleRecord(
+                    token_id=record.token_id,
+                    observed_at=status.observed_at,
+                    claimable_pool_fees_usdc=status.fees_owed_usdc,
+                    position_value_usdc=status.position_value_usdc,
+                )
+            )
+        if not samples:
             return book
-        sample = CycleFeeSampleRecord(
-            token_id=token_id,
-            observed_at=status.observed_at,
-            claimable_pool_fees_usdc=status.fees_owed_usdc,
-            position_value_usdc=status.position_value_usdc,
-        )
-        kept = tuple(item for item in book.fee_samples if item.token_id != token_id)
-        return book.model_copy(update={"fee_samples": (*kept, sample)[-8:]})
+        fresh_ids = {sample.token_id for sample in samples}
+        kept = tuple(item for item in book.fee_samples if item.token_id not in fresh_ids)
+        return book.model_copy(update={"fee_samples": (*kept, *samples)[-40:]})
 
     # ------------------------------------------------------------------
     # Reward conversion and yield attribution
@@ -2809,11 +3760,12 @@ class CycleRunner:
             their value at the last observed price; either side None when its
             input is absent.
         """
-        status = reconciliation.tracked_status
-        earned = (
-            status.accrued_aero_earned_units
-            if status is not None and status.accrued_aero_earned_units is not None
-            else 0
+        earned = sum(
+            (
+                record.status.accrued_aero_earned_units or 0
+                for record in reconciliation.position_statuses
+            ),
+            0,
         )
         units = reconciliation.safe_aero_units + earned
         aero_price = decision_report.aero_price_usdc if decision_report is not None else None
@@ -2859,18 +3811,25 @@ class CycleRunner:
         halted = ""
         safe_units = self._balances.fetch_token_balance(AERO_TOKEN_ADDRESS, self._safe_address)
         earned_units = 0
-        penalty_clear = True
-        tracked = book.position
-        if tracked is not None:
+        # One collect candidate per staked position: every position's earned
+        # counts, and every position's penalty window is respected on its own.
+        collect_targets: list[tuple[TrackedPosition, int]] = []
+        for tracked in book.positions:
             try:
                 status = self._reads.position_status(tracked.symbol, tracked.token_id)
             except (LpExecutionRefusalError, ExecutionUnavailableError, ValueError, RuntimeError):
-                status = None
+                continue
             if status is not None and status.accrued_aero_earned_units is not None:
-                earned_units = status.accrued_aero_earned_units
-            if status is not None and status.penalty is not None:
-                penalty = status.penalty
-                penalty_clear = penalty.remaining_seconds <= 0 or penalty.penalty_rate_bps <= 0
+                earned_units += status.accrued_aero_earned_units
+                if status.accrued_aero_earned_units > 0:
+                    penalty = status.penalty
+                    penalty_clear = (
+                        penalty is None
+                        or penalty.remaining_seconds <= 0
+                        or penalty.penalty_rate_bps <= 0
+                    )
+                    if penalty_clear:
+                        collect_targets.append((tracked, status.accrued_aero_earned_units))
         unclaimed_units = safe_units + earned_units
         value_usdc = +(Decimal(unclaimed_units).scaleb(-AERO_DECIMALS) * aero_price)
         if value_usdc < self._aero_conversion_min_usdc:
@@ -2930,20 +3889,18 @@ class CycleRunner:
             return report
 
         converted_units = 0
-        if tracked is not None and earned_units > 0 and penalty_clear:
-            if (
-                run(
-                    "collect_rewards",
-                    lambda: executor.execute_collect(
-                        tracked.symbol, tracked.token_id, key_bytes, confirm_broadcast=True
-                    ),
+        for collect_target, _target_units in collect_targets:
+
+            def _collect(bound: TrackedPosition = collect_target) -> LpActionExecutionReport:
+                return executor.execute_collect(
+                    bound.symbol, bound.token_id, key_bytes, confirm_broadcast=True
                 )
-                is None
-            ):
+
+            if run("collect_rewards", _collect) is None:
                 return records, halted, book, 0
-        elif tracked is not None and earned_units > 0 and not penalty_clear:
+        if earned_units > sum(units for _, units in collect_targets):
             _cycle_progress(
-                "reward claim deferred: the penalty window is still open; converting only "
+                "reward claim deferred: a penalty window is still open; converting only "
                 "the already-claimed Safe balance"
             )
         safe_units = self._balances.fetch_token_balance(AERO_TOKEN_ADDRESS, self._safe_address)
@@ -2961,48 +3918,127 @@ class CycleRunner:
         )
         return records, halted, book, converted_units
 
-    def _stock_quantity_snapshot(
+    def _price_map(self, decision_report: StrategyDecisionReport | None) -> dict[str, Decimal]:
+        """Map every board symbol to its observed pool price.
+
+        Args:
+            decision_report: The decision whose board observations carry
+                each pool's AMM price.
+
+        Returns:
+            The symbol-to-price map; the decision's own symbol rides the
+            board evaluations or its reported price.
+        """
+        prices: dict[str, Decimal] = {}
+        if decision_report is None:
+            return prices
+        for evaluation in decision_report.board:
+            prices[evaluation.symbol] = evaluation.observation.amm_price_usdc
+        if decision_report.symbol not in prices:
+            prices[decision_report.symbol] = decision_report.amm_price_usdc
+        return prices
+
+    def _stock_quantities_by_symbol(
         self,
         reconciliation: CycleReconciliation,
-        price: Decimal | None,
-    ) -> Decimal | None:
-        """Measure the whole-token stock quantity: Safe inventory plus LP side.
+        prices: Mapping[str, Decimal],
+    ) -> dict[str, Decimal]:
+        """Measure each symbol's whole-token stock quantity.
+
+        Per symbol: the tracked positions' stock sides valued at their own
+        pool's price, plus the Safe's stock balance when the reconciliation
+        attributes it to that symbol.
 
         Args:
             reconciliation: The reconciliation whose balances are measured.
-            price: The pool price valuing the position's stock side; None
-                leaves the snapshot absent.
+            prices: The symbol-to-price map valuing stock sides.
 
         Returns:
-            The whole-token stock quantity, or None when unmeasurable.
+            The per-symbol whole-token quantities; symbols without a price
+            are absent.
         """
-        if price is None or price <= 0:
-            return None
-        quantity = Decimal("0")
-        status = reconciliation.tracked_status
-        measured = False
-        if status is not None:
+        quantities: dict[str, Decimal] = {}
+        for record in reconciliation.position_statuses:
+            status = record.status
+            price = prices.get(record.symbol)
+            if price is None or price <= 0:
+                continue
             token0_is_usdc = (
                 normalize_evm_address(status.position.token0_address) == BASE_USDC_ADDRESS
             )
             stock_side_value = (
                 status.token1_value_usdc if token0_is_usdc else status.token0_value_usdc
             )
-            quantity += stock_side_value / price
-            measured = True
-        symbol = reconciliation.held_symbol or (
-            reconciliation.symbol if reconciliation.symbol != SELECTOR_SYMBOL else None
-        )
-        if symbol is not None and reconciliation.safe_stock_units > 0:
+            quantities[record.symbol] = (
+                quantities.get(record.symbol, Decimal("0")) + stock_side_value / price
+            )
+        held_symbol = reconciliation.held_symbol
+        if (
+            held_symbol is not None
+            and reconciliation.safe_stock_units > 0
+            and held_symbol in prices
+        ):
             try:
-                token = self._stock_token_address_for(symbol)
-                quantity += Decimal(reconciliation.safe_stock_units).scaleb(
-                    -self._sources.token_decimals(token)
-                )
-                measured = True
+                token = self._stock_token_address_for(held_symbol)
+                quantities[held_symbol] = quantities.get(held_symbol, Decimal("0")) + Decimal(
+                    reconciliation.safe_stock_units
+                ).scaleb(-self._sources.token_decimals(token))
             except ValueError:
                 pass
-        return +quantity if measured else None
+        return {symbol: +value for symbol, value in quantities.items() if value > 0}
+
+    def _baseline_rows(
+        self,
+        reconciliation: CycleReconciliation,
+        prices: Mapping[str, Decimal],
+    ) -> tuple[CyclePositionBaseline, ...]:
+        """Build the day-start baseline rows from one reconciliation.
+
+        Args:
+            reconciliation: The pre-action reconciliation being snapshotted.
+            prices: The symbol-to-price map valuing stock sides.
+
+        Returns:
+            One row per funded position, plus one inventory-only row when
+            unsold stock exists without a position on its symbol.
+        """
+        quantities = self._stock_quantities_by_symbol(reconciliation, prices)
+        rows: list[CyclePositionBaseline] = []
+        for record in reconciliation.position_statuses:
+            status = record.status
+            # The live status read names the chain's token id; a recentered
+            # NFT rebaselines even when the book's record lags it.
+            token_id = getattr(status, "token_id", record.token_id)
+            rows.append(
+                CyclePositionBaseline(
+                    symbol=record.symbol,
+                    token_id=token_id,
+                    liquidity_units=status.position.liquidity,
+                    fee_growth_inside0_x128=status.fee_growth_inside0_x128,
+                    fee_growth_inside1_x128=status.fee_growth_inside1_x128,
+                    aero_earned_units=(
+                        status.accrued_aero_earned_units
+                        if status.accrued_aero_earned_units is not None
+                        else 0
+                    ),
+                    stock_quantity=quantities.get(record.symbol),
+                    stock_price_usdc=prices.get(record.symbol),
+                )
+            )
+        held_symbol = reconciliation.held_symbol
+        if (
+            held_symbol is not None
+            and held_symbol not in {row.symbol for row in rows}
+            and held_symbol in quantities
+        ):
+            rows.append(
+                CyclePositionBaseline(
+                    symbol=held_symbol,
+                    stock_quantity=quantities[held_symbol],
+                    stock_price_usdc=prices[held_symbol],
+                )
+            )
+        return tuple(rows)
 
     def _book_with_day_baseline(
         self,
@@ -3015,9 +4051,9 @@ class CycleRunner:
 
         The baseline snapshots the first cycle of each New York day - before
         that cycle's actions, so a conversion never reads as lost rewards -
-        and re-snapshots only the position-scoped fee words when the tracked
-        token changes mid-day; the day-scoped AERO and stock observations
-        keep their day-start values.
+        and re-snapshots only the position-scoped fee words when a tracked
+        token changes mid-day; the day-scoped AERO observations keep their
+        day-start values.
 
         Args:
             book: The book carrying (or lacking) the baseline.
@@ -3029,46 +4065,42 @@ class CycleRunner:
             The book carrying the updated baseline.
         """
         today = self._now().astimezone(POLICY_TIMEZONE).date()
-        status = reconciliation.tracked_status
         existing = book.day_baseline
-        price = decision_report.amm_price_usdc if decision_report is not None else None
+        prices = self._price_map(decision_report)
         if existing is None or existing.day != today:
-            earned = (
-                status.accrued_aero_earned_units
-                if status is not None and status.accrued_aero_earned_units is not None
-                else 0
+            earned = sum(
+                (
+                    record.status.accrued_aero_earned_units or 0
+                    for record in reconciliation.position_statuses
+                ),
+                0,
             )
             baseline = CycleDayBaseline(
                 day=today,
-                token_id=status.token_id if status is not None else None,
-                liquidity_units=(status.position.liquidity if status is not None else None),
-                fee_growth_inside0_x128=(
-                    status.fee_growth_inside0_x128 if status is not None else None
-                ),
-                fee_growth_inside1_x128=(
-                    status.fee_growth_inside1_x128 if status is not None else None
-                ),
+                positions=self._baseline_rows(reconciliation, prices),
                 aero_units=reconciliation.safe_aero_units + earned,
                 aero_converted_units=converted_units,
-                stock_quantity=self._stock_quantity_snapshot(reconciliation, price),
-                stock_price_usdc=price,
             )
             return book.model_copy(update={"day_baseline": baseline})
         updates: dict[str, object] = {}
-        current_token = status.token_id if status is not None else None
-        if existing.token_id != current_token:
-            updates.update(
-                {
-                    "token_id": current_token,
-                    "liquidity_units": (status.position.liquidity if status is not None else None),
-                    "fee_growth_inside0_x128": (
-                        status.fee_growth_inside0_x128 if status is not None else None
-                    ),
-                    "fee_growth_inside1_x128": (
-                        status.fee_growth_inside1_x128 if status is not None else None
-                    ),
-                }
-            )
+        rows = self._baseline_rows(reconciliation, prices)
+        existing_by_token = {row.token_id: row for row in existing.positions if row.token_id}
+        # The day-start rows survive untouched while their tokens live; a
+        # token change (a recenter or reallocation) or a new position
+        # re-snapshots its row at adoption, and departed tokens drop.
+        merged: list[CyclePositionBaseline] = []
+        changed = False
+        for row in rows:
+            prior = existing_by_token.get(row.token_id) if row.token_id is not None else None
+            if prior is not None:
+                merged.append(prior)
+            else:
+                merged.append(row)
+                changed = True
+        if len(merged) != len(existing.positions):
+            changed = True
+        if changed:
+            updates["positions"] = tuple(merged)
         if converted_units:
             updates["aero_converted_units"] = existing.aero_converted_units + converted_units
         if not updates:
@@ -3082,7 +4114,7 @@ class CycleRunner:
         decision_report: StrategyDecisionReport | None,
         day_pnl_usdc: Decimal | None = None,
     ) -> CycleYieldAttribution | None:
-        """Decompose the day's P&L into its yield-duration components.
+        """Decompose the day's P&L into its per-position yield components.
 
         Args:
             book: The book carrying the day's baseline.
@@ -3091,20 +4123,120 @@ class CycleRunner:
             day_pnl_usdc: The day P&L the decomposition explains.
 
         Returns:
-            The attribution, or None when no baseline exists yet.
+            The attribution with its per-position rows and the portfolio
+            rollup, or None when no baseline exists yet.
         """
         baseline = book.day_baseline
         if baseline is None:
             return None
-        status = reconciliation.tracked_status
-        price_now = decision_report.amm_price_usdc if decision_report is not None else None
+        prices = self._price_map(decision_report)
         aero_price = decision_report.aero_price_usdc if decision_report is not None else None
         diagnostics: list[str] = []
+        statuses = {record.token_id: record for record in reconciliation.position_statuses}
+        row_by_token = {row.token_id: row for row in baseline.positions if row.token_id}
+        position_rows: list[CyclePositionYield] = []
+        fees_total: Decimal | None = None
+        mtm_total: Decimal | None = None
+        for record in reconciliation.position_statuses:
+            status = record.status
+            row = row_by_token.get(record.token_id)
+            row_diagnostic = ""
+            row_fees: Decimal | None = None
+            price_now = prices.get(record.symbol)
+            if (
+                row is not None
+                and row.liquidity_units is not None
+                and row.fee_growth_inside0_x128 is not None
+                and row.fee_growth_inside1_x128 is not None
+                and status.fee_growth_inside0_x128 is not None
+                and status.fee_growth_inside1_x128 is not None
+                and price_now is not None
+            ):
+                earned0 = fees_earned_from_growth(
+                    row.liquidity_units,
+                    status.fee_growth_inside0_x128 - row.fee_growth_inside0_x128,
+                )
+                earned1 = fees_earned_from_growth(
+                    row.liquidity_units,
+                    status.fee_growth_inside1_x128 - row.fee_growth_inside1_x128,
+                )
+                token0_is_usdc = (
+                    normalize_evm_address(status.position.token0_address) == BASE_USDC_ADDRESS
+                )
+                usdc_side = Decimal(earned0 if token0_is_usdc else earned1).scaleb(-6)
+                stock_side = Decimal(earned1 if token0_is_usdc else earned0).scaleb(
+                    -self._sources.token_decimals(
+                        status.position.token1_address
+                        if token0_is_usdc
+                        else status.position.token0_address
+                    )
+                )
+                row_fees = +(usdc_side + stock_side * price_now)
+            elif row is None:
+                row_diagnostic = (
+                    "no baseline row: the position entered after the day started "
+                    "(its fee baseline re-snapshots at adoption)"
+                )
+            else:
+                row_diagnostic = "fee words unmeasured this cycle"
+            row_mtm: Decimal | None = None
+            if (
+                row is not None
+                and row.stock_quantity is not None
+                and row.stock_price_usdc is not None
+                and price_now is not None
+            ):
+                row_mtm = +(row.stock_quantity * (price_now - row.stock_price_usdc))
+            elif row is not None:
+                row_diagnostic = (
+                    row_diagnostic + "; " if row_diagnostic else ""
+                ) + "stock mark-to-market unmeasured: no baseline price or quote"
+            row_aero: Decimal | None = None
+            earned_now = status.accrued_aero_earned_units or 0
+            if row is not None and aero_price is not None:
+                row_aero = +(
+                    Decimal(earned_now - row.aero_earned_units).scaleb(-AERO_DECIMALS) * aero_price
+                )
+            if row_fees is not None:
+                fees_total = (fees_total or Decimal("0")) + row_fees
+            if row_mtm is not None:
+                mtm_total = (mtm_total or Decimal("0")) + row_mtm
+            position_rows.append(
+                CyclePositionYield(
+                    symbol=record.symbol,
+                    token_id=record.token_id,
+                    aero_rewards_usdc=row_aero,
+                    fees_earned_usdc=row_fees,
+                    stock_mark_to_market_usdc=row_mtm,
+                    diagnostic=row_diagnostic,
+                )
+            )
+        # Inventory-only rows still mark their stock to market.
+        for row in baseline.positions:
+            if row.token_id is not None or row.symbol in {
+                record.symbol for record in reconciliation.position_statuses
+            }:
+                continue
+            price_now = prices.get(row.symbol)
+            if (
+                row.stock_quantity is not None
+                and row.stock_price_usdc is not None
+                and price_now is not None
+            ):
+                row_mtm = +(row.stock_quantity * (price_now - row.stock_price_usdc))
+                mtm_total = (mtm_total or Decimal("0")) + row_mtm
+                position_rows.append(
+                    CyclePositionYield(
+                        symbol=row.symbol,
+                        aero_rewards_usdc=Decimal("0"),
+                        stock_mark_to_market_usdc=row_mtm,
+                        diagnostic="held-inventory row: convergence income lands in the residual",
+                    )
+                )
         aero_rewards: Decimal | None = None
-        earned = (
-            status.accrued_aero_earned_units
-            if status is not None and status.accrued_aero_earned_units is not None
-            else 0
+        earned = sum(
+            (record.status.accrued_aero_earned_units or 0 for record in statuses.values()),
+            0,
         )
         unclaimed_now = reconciliation.safe_aero_units + earned
         if aero_price is not None:
@@ -3112,65 +4244,28 @@ class CycleRunner:
             aero_rewards = +(Decimal(delta_units).scaleb(-AERO_DECIMALS) * aero_price)
         else:
             diagnostics.append("AERO rewards unmeasured: no AERO price was observed")
-        fees_earned: Decimal | None = None
-        if (
-            status is not None
-            and baseline.token_id == status.token_id
-            and baseline.liquidity_units is not None
-            and baseline.fee_growth_inside0_x128 is not None
-            and baseline.fee_growth_inside1_x128 is not None
-            and status.fee_growth_inside0_x128 is not None
-            and status.fee_growth_inside1_x128 is not None
-            and price_now is not None
-        ):
-            earned0 = fees_earned_from_growth(
-                baseline.liquidity_units,
-                status.fee_growth_inside0_x128 - baseline.fee_growth_inside0_x128,
-            )
-            earned1 = fees_earned_from_growth(
-                baseline.liquidity_units,
-                status.fee_growth_inside1_x128 - baseline.fee_growth_inside1_x128,
-            )
-            token0_is_usdc = (
-                normalize_evm_address(status.position.token0_address) == BASE_USDC_ADDRESS
-            )
-            usdc_side = Decimal(earned0 if token0_is_usdc else earned1).scaleb(-6)
-            stock_side = Decimal(earned1 if token0_is_usdc else earned0).scaleb(
-                -self._sources.token_decimals(
-                    status.position.token1_address
-                    if token0_is_usdc
-                    else status.position.token0_address
-                )
-            )
-            fees_earned = +(usdc_side + stock_side * price_now)
-        else:
+        if fees_total is None:
             diagnostics.append(
                 "fees earned unmeasured: no tracked position spans the baseline and now "
                 "(a position change resets its fee baseline at adoption)"
             )
-        stock_mtm: Decimal | None = None
-        if (
-            baseline.stock_quantity is not None
-            and baseline.stock_price_usdc is not None
-            and price_now is not None
-        ):
-            stock_mtm = +(baseline.stock_quantity * (price_now - baseline.stock_price_usdc))
-        else:
+        if mtm_total is None:
             diagnostics.append("stock mark-to-market unmeasured: no baseline price or quote")
         unattributed: Decimal | None = None
         if (
             day_pnl_usdc is not None
             and aero_rewards is not None
-            and fees_earned is not None
-            and stock_mtm is not None
+            and fees_total is not None
+            and mtm_total is not None
         ):
-            unattributed = +(day_pnl_usdc - aero_rewards - fees_earned - stock_mtm)
+            unattributed = +(day_pnl_usdc - aero_rewards - fees_total - mtm_total)
         return CycleYieldAttribution(
             day_pnl_usdc=day_pnl_usdc,
             aero_rewards_usdc=aero_rewards,
-            fees_earned_usdc=fees_earned,
-            stock_mark_to_market_usdc=stock_mtm,
+            fees_earned_usdc=fees_total,
+            stock_mark_to_market_usdc=mtm_total,
             unattributed_usdc=unattributed,
+            positions=tuple(position_rows),
             method=(
                 "AERO rewards: unclaimed units (Safe balance plus staked earned, plus any "
                 "converted today) minus the day-start baseline, valued at the last "
@@ -3178,10 +4273,12 @@ class CycleRunner:
                 "Fees earned: liquidity times the delta of the pool's feeGrowthInside "
                 "accumulators since the day-start (or position-adoption) baseline - "
                 "computed, never the stale checkpoint; pre-share pool-side entitlement.",
-                "Stock mark-to-market: the day's opening stock quantity times the change "
-                "in pool price; quantity flows from actions land in the residual.",
+                "Stock mark-to-market: each row's day-opening stock quantity times the "
+                "change in its own pool's price; quantity flows land in the residual.",
                 "Unattributed: the day P&L minus the three components - actions, gas, "
                 "collections, and every marking the components do not price.",
+                "Per position: one row per funded name at its own pool's price, so the "
+                "allocator's tier decisions are judged by measured income daily.",
             ),
             diagnostic="; ".join(diagnostics),
         )
@@ -3263,11 +4360,28 @@ class CycleRunner:
                     - yield_attribution.stock_mark_to_market_usdc
                 )
             yield_attribution = yield_attribution.model_copy(update=components)
+        attribution_rows = {
+            row.symbol: row
+            for row in (yield_attribution.positions if yield_attribution is not None else ())
+        }
+        positions = tuple(
+            CyclePositionSummary(
+                symbol=record.symbol,
+                token_id=record.token_id,
+                committed_usd=record.committed_usd,
+                value_usdc=record.status.position_value_usdc,
+                unrealized_pnl_usdc=record.status.unrealized_pnl_usdc,
+                staked=record.staked,
+                yield_attribution=attribution_rows.get(record.symbol),
+            )
+            for record in reconciliation.position_statuses
+        )
         return CycleReport(
             started_at=started_at,
             mode=mode,
             symbol=report_symbol,
             reconciliation=reconciliation,
+            positions=positions,
             decision_reconciliation=decision_reconciliation,
             final_reconciliation_verified=final_reconciliation_verified,
             decision_action=decision_action,
@@ -3359,6 +4473,17 @@ def record_cycle_report(audit_sink: AuditStore, report: CycleReport, created_at:
             else None,
             fee_wei=report.fee_wei,
             action_count=len(report.actions),
+            position_count=len(report.positions),
+            total_committed_usdc=(
+                str(sum((row.committed_usd for row in report.positions), Decimal("0")))
+                if report.positions
+                else None
+            ),
+            largest_position_share=(
+                str(max(row.committed_usd for row in report.positions) / report.equity_usd)
+                if report.positions and report.equity_usd
+                else None
+            ),
             halted_reason=report.halted_reason,
         ),
         created_at,
@@ -3389,6 +4514,21 @@ def _print_report(report: CycleReport) -> None:
         print(f"  action {action.action}: {action.status}{suffix} ({action.fee_wei} wei, {hashes})")
         if action.diagnostic:
             print(f"    - {action.diagnostic}")
+    if report.positions:
+        print(f"portfolio: {len(report.positions)} tracked position(s)")
+        for row in report.positions:
+            custody = "staked" if row.staked else "unstaked"
+            pnl = f", pnl {row.unrealized_pnl_usdc}" if row.unrealized_pnl_usdc is not None else ""
+            print(
+                f"  {row.symbol} #{row.token_id}: {row.committed_usd} committed, "
+                f"value {row.value_usdc} {custody}{pnl}"
+            )
+            if row.yield_attribution is not None:
+                slice_ = row.yield_attribution
+                print(
+                    f"    attribution: aero {slice_.aero_rewards_usdc}, fees "
+                    f"{slice_.fees_earned_usdc}, mtm {slice_.stock_mark_to_market_usdc}"
+                )
     if report.pnl_vs_entry_usdc is not None:
         print(f"pnl vs entry: {report.pnl_vs_entry_usdc} USDC")
     elif report.pnl_diagnostic:
@@ -3535,6 +4675,59 @@ def _aero_conversion_min_from_environment(environ: Mapping[str, str]) -> Decimal
     return value
 
 
+def _portfolio_parameters_from_environment(
+    environ: Mapping[str, str],
+    switch_margin_fraction: Decimal,
+) -> PortfolioParameters:
+    """Read the allocator's portfolio bounds from the sealed environment.
+
+    Args:
+        environ: The environment mapping carrying the optional bounds.
+        switch_margin_fraction: The switch margin the reallocation margin
+            generalizes.
+
+    Returns:
+        The portfolio parameter set, with the locked defaults for every
+        unset variable.
+
+    Raises:
+        ValueError: If any configured bound is malformed or breaches its
+            hard ceiling.
+    """
+
+    def _decimal(name: str, default: Decimal) -> Decimal:
+        raw = environ.get(name, "").strip()
+        if not raw:
+            return default
+        value = Decimal(raw)
+        if value <= 0:
+            raise ValueError(f"{name} must be positive, not {raw!r}")
+        return value
+
+    def _int(name: str, default: int) -> int:
+        raw = environ.get(name, "").strip()
+        if not raw:
+            return default
+        value = int(raw)
+        if value < 1:
+            raise ValueError(f"{name} must be at least one, not {raw!r}")
+        return value
+
+    return PortfolioParameters(
+        tier_band_fraction=_decimal(CYCLE_TIER_BAND_ENV, PortfolioParameters().tier_band_fraction),
+        max_concurrent_positions=_int(
+            CYCLE_MAX_POSITIONS_ENV, PortfolioParameters().max_concurrent_positions
+        ),
+        min_position_usdc=_decimal(
+            CYCLE_MIN_POSITION_USDC_ENV, PortfolioParameters().min_position_usdc
+        ),
+        concentration_cap_fraction=_decimal(
+            CYCLE_CONCENTRATION_CAP_ENV, PortfolioParameters().concentration_cap_fraction
+        ),
+        switch_margin_fraction=switch_margin_fraction,
+    )
+
+
 def build_cycle_runner(
     settings: Settings,
     symbol: str | None,
@@ -3543,6 +4736,7 @@ def build_cycle_runner(
     switch_margin_fraction: Decimal = DEFAULT_SWITCH_MARGIN_FRACTION,
     parameters: PolicyParameters = LOCKED_POLICY_PARAMETERS,
     aero_conversion_min_usdc: Decimal = DEFAULT_AERO_CONVERSION_MIN_USDC,
+    portfolio_parameters: PortfolioParameters | None = None,
 ) -> CycleRunner:
     """Assemble the live cycle runner from the application settings.
 
@@ -3557,6 +4751,8 @@ def build_cycle_runner(
         parameters: The policy parameters decisions run under.
         aero_conversion_min_usdc: The unclaimed-AERO value threshold that
             triggers the reward conversion inside the act step.
+        portfolio_parameters: The allocator's portfolio bounds; None keeps
+            the locked defaults carrying the switch margin.
 
     Returns:
         The fully wired runner; nothing has been read yet.
@@ -3630,6 +4826,7 @@ def build_cycle_runner(
         switch_margin_fraction=switch_margin_fraction,
         parameters=parameters,
         aero_conversion_min_usdc=aero_conversion_min_usdc,
+        portfolio_parameters=portfolio_parameters,
     )
 
 
@@ -3713,6 +4910,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--tier-band",
+        type=Decimal,
+        default=None,
+        help=(
+            "Pools whose qualifying APR sits at or above this fraction of "
+            "the top's share the tiers (default 0.50; the sealed "
+            "AERO_BOT_CYCLE_TIER_BAND_FRACTION variable supplies the same "
+            "value when the flag is absent)."
+        ),
+    )
+    parser.add_argument(
+        "--max-positions",
+        type=int,
+        default=None,
+        help=(
+            "The maximum concurrent deployed positions, an output of "
+            "qualification under the bounds (default 10, the hard ceiling; "
+            "the sealed AERO_BOT_CYCLE_MAX_POSITIONS variable supplies the "
+            "same value when the flag is absent)."
+        ),
+    )
+    parser.add_argument(
+        "--min-position-usdc",
+        type=Decimal,
+        default=None,
+        help=(
+            "The minimum position size in USDC; below it cash stays cash "
+            "(default 80; the sealed AERO_BOT_CYCLE_MIN_POSITION_USDC "
+            "variable supplies the same value when the flag is absent)."
+        ),
+    )
+    parser.add_argument(
+        "--concentration-cap",
+        type=Decimal,
+        default=None,
+        help=(
+            "The per-name concentration cap as a fraction of book equity "
+            "(default 0.35; the sealed "
+            "AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION variable supplies "
+            "the same value when the flag is absent)."
+        ),
+    )
+    parser.add_argument(
         "--aero-conversion-min-usdc",
         type=Decimal,
         default=None,
@@ -3740,6 +4980,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--out-of-range-grace-minutes must be positive")
     if arguments.aero_conversion_min_usdc is not None and arguments.aero_conversion_min_usdc < 0:
         parser.error("--aero-conversion-min-usdc must be non-negative")
+    for flag, value in (
+        ("--tier-band", arguments.tier_band),
+        ("--min-position-usdc", arguments.min_position_usdc),
+        ("--concentration-cap", arguments.concentration_cap),
+    ):
+        if value is not None and value <= 0:
+            parser.error(f"{flag} must be positive")
+    if arguments.max_positions is not None and arguments.max_positions < 1:
+        parser.error("--max-positions must be at least one")
     symbol = _symbol_from_arguments_and_environment(arguments.symbol, os.environ)
     try:
         switch_margin = (
@@ -3760,6 +5009,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             if arguments.aero_conversion_min_usdc is not None
             else _aero_conversion_min_from_environment(os.environ)
         )
+        portfolio_parameters = _portfolio_parameters_from_environment(os.environ, switch_margin)
+        if arguments.tier_band is not None:
+            portfolio_parameters = portfolio_parameters.model_copy(
+                update={"tier_band_fraction": arguments.tier_band}
+            )
+        if arguments.max_positions is not None:
+            portfolio_parameters = portfolio_parameters.model_copy(
+                update={"max_concurrent_positions": arguments.max_positions}
+            )
+        if arguments.min_position_usdc is not None:
+            portfolio_parameters = portfolio_parameters.model_copy(
+                update={"min_position_usdc": arguments.min_position_usdc}
+            )
+        if arguments.concentration_cap is not None:
+            portfolio_parameters = portfolio_parameters.model_copy(
+                update={"concentration_cap_fraction": arguments.concentration_cap}
+            )
         configured_reference = (
             parse_reference_quotes(arguments.reference_price)
             if arguments.reference_price is not None
@@ -3817,6 +5083,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             switch_margin,
             parameters,
             aero_conversion_min,
+            portfolio_parameters,
         )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"the cycle runner is unavailable: {error}", file=sys.stderr)

@@ -1467,6 +1467,57 @@ def test_mint_refuses_live_untracked_positions() -> None:
     assert "900" in str(raised.value) and "901" in str(raised.value)
 
 
+def test_mint_counts_tracked_portfolio_positions_toward_the_total_cap() -> None:
+    """The cycle book's tracked NFTs are expected exposure the cap spans."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            nfpm_held_positions=2,
+            held_token_ids=[900, 901],
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+            router_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_usdc_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+            nfpm_stock_allowance_units=SATISFIED_ALLOWANCE_UNITS,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 5),
+    )
+    tracked_book = [(900, Decimal("600")), (901, Decimal("350"))]
+
+    # The 950 USDC tracked book leaves 50 USDC of the total cap; a mint
+    # above that headroom refuses on the total-exposure cap, not on the
+    # untracked-positions gate.
+    with pytest.raises(LpPlanRefusalError) as raised:
+        executor.plan_mint(
+            "FIXc",
+            Decimal("150"),
+            MINT_WIDTH_SPACINGS,
+            portfolio_live_positions=tracked_book,
+        )
+    assert raised.value.code.value == "budget_above_total_exposure_cap"
+    assert "remaining pilot exposure" in str(raised.value)
+
+
+def test_mint_still_refuses_strangers_beside_the_tracked_book() -> None:
+    """A live NFT beyond the tracked set still refuses fail-closed."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            nfpm_held_positions=2,
+            held_token_ids=[900, 901],
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+        )
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.plan_mint(
+            "FIXc",
+            MINT_BUDGET_USDC,
+            MINT_WIDTH_SPACINGS,
+            portfolio_live_positions=[(900, Decimal("100"))],
+        )
+
+    assert raised.value.code is LpExecutionRefusalCode.UNTRACKED_EXISTING_POSITIONS
+    assert "901" in str(raised.value)
+
+
 def test_mint_allows_empty_residual_nfts() -> None:
     """Empty residual NFTs carry no exposure and no longer block entry."""
     executor, _, _ = make_lp_executor(

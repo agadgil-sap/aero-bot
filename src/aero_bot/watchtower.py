@@ -541,18 +541,52 @@ class RangeWatchtower:
             self._sleep(self._config.poll_interval_seconds)
 
     def poll_once(self) -> WatchtowerPollOutcome:
-        """Run exactly one poll: read, compare, and maybe fire.
+        """Run exactly one poll over every tracked position.
+
+        The portfolio's positions are each watched on their own pool's tick
+        (the allocator ruling); one defensive close ends the poll - the
+        book it mutates belongs to the next pass - and otherwise the most
+        severe per-position outcome reports.
 
         Returns:
             The structured outcome of one poll.
         """
         book = self._state_store.load()
-        tracked = book.position
         latch = self._latch_store.load()
-        if tracked is None:
+        if not book.positions:
             if latch.tripped:
                 self._save_latch(tripped=False, note="unlatched: no tracked position remains")
             return WatchtowerPollOutcome(state=WatchtowerPollState.FLAT)
+        severity = (
+            WatchtowerPollState.FIRED,
+            WatchtowerPollState.READ_FAILED,
+            WatchtowerPollState.STOOD_DOWN,
+            WatchtowerPollState.COOLDOWN,
+            WatchtowerPollState.IN_RANGE,
+        )
+        worst: WatchtowerPollOutcome | None = None
+        for tracked in book.positions:
+            outcome = self._poll_position(book, tracked)
+            if outcome.state is WatchtowerPollState.FIRED:
+                return outcome
+            if worst is None or severity.index(outcome.state) < severity.index(worst.state):
+                worst = outcome
+        assert worst is not None  # noqa: S101 - the book carried a position
+        return worst
+
+    def _poll_position(
+        self, book: CycleStateBook, tracked: TrackedPosition
+    ) -> WatchtowerPollOutcome:
+        """Run one poll for one tracked position: read, compare, maybe fire.
+
+        Args:
+            book: The cycle book carrying the tracked position.
+            tracked: The position being watched this pass.
+
+        Returns:
+            The structured outcome of this position's poll.
+        """
+        latch = self._latch_store.load()
         bounds = self._bounds_for(tracked)
         if bounds is None:
             return self._unreadable(
@@ -773,8 +807,20 @@ class RangeWatchtower:
         ):
             return finish(actions, halted, status)
         # The close completed: reconcile the book exactly like the cycle's
-        # exit completion and reset the latch through that success.
-        self._state_store.save(book.model_copy(update={"position": None, "held_inventory": None}))
+        # exit completion - removing only the closed position's slot - and
+        # reset the latch through that success.
+        self._state_store.save(
+            book.model_copy(
+                update={
+                    "positions": tuple(
+                        position
+                        for position in book.positions
+                        if position.token_id != tracked.token_id
+                    ),
+                    "held_inventory": None,
+                }
+            )
+        )
         self._save_latch(tripped=False, note="unlatched: the defensive close completed")
         return finish(actions, "", status)
 
