@@ -81,12 +81,22 @@ class TestInstallScript:
         assert '[[ ! -f "${CONFIG_DIR}/backup.env" ]]' in text
 
     def test_advisor_env_template_stays_dark_until_sealed(self) -> None:
-        """The advisor template ships commented plane values and thinking knobs."""
+        """The advisor template ships commented plane values and hardening knobs."""
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
-        assert "#AERO_BOT_ADVISOR_URL=" in text
+        assert "#AERO_BOT_ADVISOR_URL=http://100.106.111.37:11435" in text
+        assert "#AERO_BOT_ADVISOR_FALLBACK_URL=http://100.106.111.37:11434" in text
         assert "#AERO_BOT_ADVISOR_MODEL=" in text
-        assert "#AERO_BOT_ADVISOR_TIMEOUT_SECONDS=120" in text
-        assert "#AERO_BOT_ADVISOR_DISABLE_THINKING=0" in text
+        assert "#AERO_BOT_ADVISOR_TIMEOUT_SECONDS=90" in text
+        assert "#AERO_BOT_ADVISOR_DISABLE_THINKING=1" in text
+        assert "#AERO_BOT_ADVISOR_JSON_MODE=1" in text
+
+    def test_advisor_env_template_documents_the_hardened_posture(self) -> None:
+        """The template's comments state the pin, the fallback, and the budget."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "OLLAMA_KEEP_ALIVE=-1" in text
+        assert "measured warm brief latency" in text
+        assert "availability outranks deliberation" in text
+        assert "eliminated at the source" in text
 
     def test_advisor_env_template_names_the_teaching_seal(self) -> None:
         """The upgrade loop's seal ships commented with its bounds stated."""
@@ -338,6 +348,7 @@ class TestDeploymentDoc:
 
 MAC_INSTALL_SCRIPT = Path("deploy/launchd/install-mac.sh")
 MAC_RUN_SCRIPT = Path("deploy/launchd/teacher-run.sh")
+MAC_STUDENT_OLLAMA_SCRIPT = Path("deploy/launchd/student-ollama.sh")
 
 
 class TestMacTeacherKit:
@@ -386,6 +397,41 @@ class TestMacTeacherKit:
             "teacher-risk-manager",
         ):
             assert f"com.aero-bot.{label}" in text, label
+
+    def test_the_student_plane_wrapper_pins_the_model_resident(self) -> None:
+        """The dedicated plane's wrapper carries the keep-alive pin and one slot."""
+        text = MAC_STUDENT_OLLAMA_SCRIPT.read_text(encoding="utf-8")
+        assert "export OLLAMA_KEEP_ALIVE=-1" in text
+        assert "export OLLAMA_NUM_PARALLEL=1" in text
+        # The bind defaults to the Mac's tailnet address with a distinct
+        # port, overridable by the generated agent.
+        assert "AERO_BOT_STUDENT_OLLAMA_HOST:-100.106.111.37:11435" in text
+        # The binary prefers the app bundle: older Homebrew builds break
+        # JSON mode with thinking off (verified live, 0.32.15 versus 0.34.3).
+        assert '"/Applications/Ollama.app/Contents/Resources/ollama"' in text
+        assert text.index("/Applications/Ollama.app") < text.index("command -v ollama")
+
+    def test_the_student_plane_is_generated_as_an_always_alive_server(self) -> None:
+        """The plane starts at login and launchd keeps it alive, unlike the passes."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "com.aero-bot.student-ollama.plist" in text
+        assert "<key>RunAtLoad</key>" in text
+        assert "<key>KeepAlive</key>" in text
+        # The bind is stamped into the agent so a reboot restores the plane
+        # without the GUI instance's fragile runtime OLLAMA_HOST state.
+        assert "<key>AERO_BOT_STUDENT_OLLAMA_HOST</key>" in text
+        assert "<string>${STUDENT_OLLAMA_BIND}</string>" in text
+
+    def test_the_student_plane_wrapper_is_copied_beside_the_teacher_wrapper(self) -> None:
+        """The installer ships the plane's wrapper into the state directory."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert 'cp "$STUDENT_OLLAMA_SRC" "$STATE_STUDENT_OLLAMA"' in text
+
+    def test_the_student_plane_arm_hint_names_both_seal_variables(self) -> None:
+        """The printed instructions wire the VM seat to the dedicated plane."""
+        text = MAC_INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "AERO_BOT_ADVISOR_URL=http://$STUDENT_OLLAMA_HOST" in text
+        assert "AERO_BOT_ADVISOR_FALLBACK_URL=http://100.106.111.37:11434" in text
 
     def test_the_cadences_are_thirty_minutes_daily_and_morning_news(self) -> None:
         """Tactical runs each half hour; daily and news ride calendar times."""
