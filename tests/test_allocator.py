@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 
 from aero_bot.allocator import (
+    DEFAULT_MIN_POSITION_FLOOR_USDC,
     HARD_MAX_CONCURRENT_POSITIONS,
     PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC,
     DeferredReallocation,
@@ -175,6 +176,18 @@ class TestParameterCeilings:
         with pytest.raises(ValueError, match="exceeds the hard"):
             PortfolioParameters(min_position_usdc=Decimal("1500"))
 
+    def test_the_floor_stays_positive_and_under_the_configured_minimum(self) -> None:
+        """A floor above the configured minimum would raise the bound."""
+        with pytest.raises(ValueError, match="greater than 0"):
+            PortfolioParameters(min_position_floor_usdc=Decimal("0"))
+        with pytest.raises(ValueError, match="never raises the minimum"):
+            PortfolioParameters(min_position_floor_usdc=Decimal("90"))
+        # The floor may equal the minimum: the coherence rule degenerates
+        # to the old behavior, which is coherent at every equity.
+        PortfolioParameters(min_position_floor_usdc=Decimal("80"))
+        assert PortfolioParameters().min_position_floor_usdc == DEFAULT_MIN_POSITION_FLOOR_USDC
+        assert Decimal("30") == DEFAULT_MIN_POSITION_FLOOR_USDC  # the shipped default
+
     def test_fractions_stay_in_their_intervals(self) -> None:
         """The concentration and band fractions cap at one."""
         with pytest.raises(ValueError, match="concentration"):
@@ -189,6 +202,159 @@ class TestParameterCeilings:
         with pytest.raises(ValueError, match="hard ceiling"):
             PortfolioParameters(total_exposure_cap_usdc=Decimal("2000"))
         assert Decimal("1000") == PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC
+
+
+class TestParameterCoherence:
+    """The gnhf 36 rule: the minimum and the concentration cap cohere.
+
+    The two bounds were mutually unsatisfiable below 80 / 0.35 = 228.57
+    USDC equity: the clamp forced every tranche under the minimum, so a
+    book at the captain's trial scale could never deploy. The effective
+    minimum is max(floor, min(configured minimum, concentration clamp))
+    with a hard gas-efficiency floor (default 30 USDC). These tests pin
+    the three regimes, the exact boundary crossings, and the allocation
+    behavior at each boundary size.
+    """
+
+    # The defaults: 80 minimum, 0.35 concentration fraction, 30 floor.
+    PARAMETERS = PortfolioParameters()
+    # The equity where the clamp crosses the configured minimum:
+    # 80 / 0.35 = 228.571428... USDC.
+    MINIMUM_CROSSING_EQUITY = Decimal("1600") / Decimal("7")
+    # The equity where the clamp crosses the hard floor:
+    # 30 / 0.35 = 85.714285... USDC.
+    FLOOR_CROSSING_EQUITY = Decimal("600") / Decimal("7")
+
+    def test_the_three_regimes_of_the_effective_minimum(self) -> None:
+        """The configured minimum, the clamp, and the floor each govern."""
+        parameters = self.PARAMETERS
+        # A rich book: the clamp (350) sits above 80, so 80 governs.
+        assert parameters.effective_minimum_position_usdc(Decimal("1000")) == Decimal("80")
+        assert "the configured minimum governs" in parameters.describe_effective_minimum(
+            Decimal("1000")
+        )
+        # The captain's trial scale: the clamp (36.75) governs over 30.
+        assert parameters.effective_minimum_position_usdc(Decimal("105")) == Decimal("36.75")
+        assert "the concentration clamp governs" in parameters.describe_effective_minimum(
+            Decimal("105")
+        )
+        # A tiny book: the clamp (29.75) sits below the 30 floor, so the
+        # floor holds the minimum - and the allocation stays cash at it.
+        assert parameters.effective_minimum_position_usdc(Decimal("85")) == Decimal("30")
+        assert "the hard floor governs" in parameters.describe_effective_minimum(Decimal("85"))
+        # The derivation names every bound and the arithmetic.
+        assert parameters.describe_effective_minimum(Decimal("105")) == (
+            "effective minimum min(80 configured, 36.75 concentration clamp on "
+            "equity 105) floored at 30 = 36.75; the concentration clamp governs "
+            "under the configured minimum"
+        )
+
+    def test_the_exact_boundary_crossings(self) -> None:
+        """The clamp crosses the minimum at 228.57 and the floor at 85.71."""
+        parameters = self.PARAMETERS
+        at_crossing = parameters.effective_minimum_position_usdc(self.MINIMUM_CROSSING_EQUITY)
+        assert at_crossing == Decimal("80")
+        below_crossing = parameters.effective_minimum_position_usdc(
+            self.MINIMUM_CROSSING_EQUITY - Decimal("0.01")
+        )
+        assert below_crossing < Decimal("80")  # the clamp governs just below
+        assert parameters.effective_minimum_position_usdc(self.FLOOR_CROSSING_EQUITY) == Decimal(
+            "30"
+        )
+        just_under = parameters.effective_minimum_position_usdc(
+            self.FLOOR_CROSSING_EQUITY - Decimal("0.01")
+        )
+        assert just_under == Decimal("30")  # the floor holds the boundary
+        assert just_under > Decimal("30") - Decimal("0.01")
+
+    def test_the_boundary_sizes_fund_at_the_binding_bound(self) -> None:
+        """A single-pool book funds at the clamp just under the crossing.
+
+        At equity 228 (clamp 79.80, under the 80 minimum) the tranche
+        funds at 79.80 - the exact size the old bound pair refused; at
+        equity 230 (clamp 80.50, above the minimum) the configured 80 is
+        the effective minimum and the tranche funds at the 80.50 target.
+        """
+        board = (board_option("BBBc", BBB_POOL, BBB_TOKEN),)
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, PolicyState(), board, {})
+        below = allocate_portfolio(
+            engine,
+            PolicyState(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("228"),
+            equity_usdc=Decimal("228"),
+        )
+        assert [tranche.symbol for tranche in below.tranches] == ["BBBc"]
+        assert below.tranches[0].budget_usd == Decimal("79.80")
+        assert self.PARAMETERS.effective_minimum_position_usdc(Decimal("228")) == Decimal("79.80")
+        above = allocate_portfolio(
+            engine,
+            PolicyState(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("230"),
+            equity_usdc=Decimal("230"),
+        )
+        assert [tranche.symbol for tranche in above.tranches] == ["BBBc"]
+        assert above.tranches[0].budget_usd == Decimal("80.50")
+        assert self.PARAMETERS.effective_minimum_position_usdc(Decimal("230")) == Decimal("80")
+
+    def test_a_lower_floor_lets_a_tiny_book_deploy_at_its_clamp(self) -> None:
+        """The floor is sealed-env configurable: floor 10 funds 29.75."""
+        parameters = PortfolioParameters(min_position_floor_usdc=Decimal("10"))
+        assert parameters.effective_minimum_position_usdc(Decimal("85")) == Decimal("29.75")
+        board = (board_option("BBBc", BBB_POOL, BBB_TOKEN),)
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, PolicyState(), board, {})
+        allocation = allocate_portfolio(
+            engine,
+            PolicyState(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("85"),
+            equity_usdc=Decimal("85"),
+            parameters=parameters,
+        )
+        assert [tranche.symbol for tranche in allocation.tranches] == ["BBBc"]
+        assert allocation.tranches[0].budget_usd == Decimal("29.75")
+
+    def test_sub_effective_minimum_freed_capital_names_the_derivation(self) -> None:
+        """A reallocation below the effective minimum states it fully."""
+        held = (
+            held_fact("AAAc", apr=Decimal("1.2"), committed=Decimal("40"), marked=Decimal("40")),
+        )
+        plan = plan_portfolio_rebalance(
+            PolicyEngine(),
+            allocate_portfolio(
+                PolicyEngine(),
+                PolicyState(),
+                board_evaluations(),
+                {},
+                held=held,
+                cash_usdc=Decimal("0"),
+                equity_usdc=Decimal("1000"),
+            ),
+            board_evaluations(),
+            PolicyState(),
+            {},
+            held,
+            {"AAAc": hold_outcome()},
+            Decimal("0"),
+            Decimal("1000"),
+        )
+        deferred = next(
+            item
+            for item in plan.deferred
+            if item.reason is PortfolioExclusionReason.REALLOCATION_TOO_SMALL
+        )
+        assert "below the effective minimum 80 USDC" in deferred.detail
+        assert "floored at 30 = 80" in deferred.detail
+        assert "the configured minimum governs" in deferred.detail
 
 
 class TestTierConstruction:
@@ -735,16 +901,18 @@ class TestEntryGateTransparencyAndScaledLatches:
             ),
         )
 
-    def test_the_live_flat_night_names_its_true_cause(self) -> None:
-        """The halt no longer refuses; the min-versus-concentration bound does.
+    def test_the_live_flat_night_now_funds_at_the_coherent_minimum(self) -> None:
+        """The gnhf 36 flip: the exact night that sat flat now deploys.
 
         With the day-start anchor at 102.57 and the tranche's scaled basis
         at 46.15, the old code latched ``daily_loss_halt_active`` on every
-        tranche. The fix threads the portfolio equity through, the entry
-        chain passes, and the exclusion becomes the honest one: the
-        thirty-five percent concentration bound (36.92) sits below the
-        eighty-USDC minimum - with both bounds named and the forgone
-        income priced.
+        tranche (gnhf 34 fixed that), and the book then sat flat on the
+        honest bound conflict - the thirty-five percent concentration
+        bound (36.92) below the eighty-USDC minimum (the state gnhf 35
+        pinned). The coherence rule resolves it: the effective minimum
+        at this equity IS the concentration clamp (36.92), so MSTRc
+        funds at exactly the locked per-name bound and the residual
+        stays cash.
         """
         engine = PolicyEngine()
         evaluations = evaluate_pool_entries(engine, self.live_session(), self.live_board(), {})
@@ -758,16 +926,23 @@ class TestEntryGateTransparencyAndScaledLatches:
             cash_usdc=self.LIVE_CASH,
             equity_usdc=self.LIVE_EQUITY,
         )
-        mstrc = next(item for item in allocation.excluded if item.symbol == "MSTRc")
-        assert mstrc.reason is PortfolioExclusionReason.BELOW_MIN_POSITION_SIZE
-        assert mstrc.gate == ""
-        assert "36.92331923368997805203106958" in mstrc.detail
-        assert "80" in mstrc.detail
-        assert "concentration bound" in mstrc.detail
-        assert "income forgone about" in mstrc.detail
-        assert mstrc.forgone_income_usdc_per_day is not None
-        assert mstrc.forgone_income_usdc_per_day > Decimal("7")
-        assert "MSTRc (below_min_position_size:" in allocation.summary
+        assert [tranche.symbol for tranche in allocation.tranches] == ["MSTRc"]
+        tranche = allocation.tranches[0]
+        # The concentration bound equals the effective minimum here.
+        assert tranche.budget_usd == Decimal("36.92331923368997805203106958")
+        assert tranche.budget_usd >= PortfolioParameters().effective_minimum_position_usdc(
+            self.LIVE_EQUITY
+        )
+        assert allocation.cash_residual_usdc == Decimal("65.34018776631002194796893042")
+        # The clamp note still rides: the tier target was clamped, and
+        # the funded size names the per-name bound it clamped to.
+        clamped = next(
+            item
+            for item in allocation.excluded
+            if item.reason is PortfolioExclusionReason.CONCENTRATION_CAP_CLAMPED
+        )
+        assert clamped.symbol == "MSTRc"
+        assert "the tranche still funds" in clamped.detail
 
     def test_a_large_healthy_book_funds_despite_the_anchor_above_the_basis(self) -> None:
         """The exact old failure shape now funds: anchor 950, tranche 350.
@@ -886,7 +1061,7 @@ class TestEntryGateTransparencyAndScaledLatches:
 
 
 class TestLiveSndkcNight:
-    """The gnhf 35 live reproduction: the 2026-09-28 SNDKc flat book.
+    """The gnhf 35 live reproduction, flipped by the gnhf 36 coherence rule.
 
     The second production evidence pass, verbatim from the VM cycle at
     2026-09-28T05:30Z and the on-chain decomposition at block 51893582:
@@ -896,9 +1071,10 @@ class TestLiveSndkcNight:
     current-cell staked value) collapsed overnight while the reward
     stream held. Every protective gate PASSED; the book stayed flat on
     the honest bound conflict - the 35-percent concentration bound
-    (36.86 USDC of a 105.30 book) sits below the 80-USDC minimum - and
-    these tests pin that the operator reads gate, bound, measured value,
-    percent, and the full chain.
+    (36.86 USDC of a 105.30 book) below the 80-USDC minimum. The gnhf 36
+    coherence rule makes those bounds satisfiable: the effective minimum
+    at this equity IS the clamp, so the same morning's board funds its
+    top name at the locked per-name bound.
     """
 
     LIVE_CASH = Decimal("102.263507")
@@ -948,38 +1124,73 @@ class TestLiveSndkcNight:
             equity_usdc=self.LIVE_EQUITY,
         )
 
-    def test_the_summary_names_the_bound_conflict_with_both_bounds(self) -> None:
-        """The excluded line carries reason, size, minimum, and clamp bound."""
+    def test_the_morning_funds_at_the_effective_minimum(self) -> None:
+        """The deployment unblock: the funded tranche clears the coherent bound.
+
+        The gnhf 36 verification the captain's brief demanded: a fixture
+        decision at the exact 105-equity production basis showing the
+        funded tranche sitting at the effective minimum (36.86, the
+        clamp) rather than refused against the unsatisfiable 80.
+        """
         allocation = self.allocation()
+        assert [tranche.symbol for tranche in allocation.tranches] == ["SNDKc"]
+        tranche = allocation.tranches[0]
+        assert tranche.budget_usd == self.LIVE_CONCENTRATION_BOUND
+        effective = PortfolioParameters().effective_minimum_position_usdc(self.LIVE_EQUITY)
+        assert effective == self.LIVE_CONCENTRATION_BOUND
+        assert tranche.budget_usd >= effective
+        assert allocation.cash_residual_usdc == Decimal("65.40757342234538052883903646")
+        # MSTRc stays below the band; nothing is force-deployed past it.
+        mstrc = next(item for item in allocation.excluded if item.symbol == "MSTRc")
+        assert mstrc.reason is PortfolioExclusionReason.BELOW_TIER_BAND
+        assert (
+            f"allocation funds 1 tranche(s) [SNDKc {self.LIVE_CONCENTRATION_BOUND}]"
+            in allocation.summary
+        )
+
+    def test_the_degenerate_book_stays_cash_below_the_floor(self) -> None:
+        """A book whose clamp sits under the hard floor never breaches the cap.
+
+        The chosen degenerate behavior, stated explicitly: when the
+        concentration clamp (29.75 at equity 85) sits below the 30-USDC
+        floor, the effective minimum holds at the floor and the book
+        stays cash - the floor bounds the coherence rule from below, it
+        never licenses breaching the locked per-name concentration cap.
+        The exclusion carries the full derivation and the percent-
+        annotated forgone income (the gnhf 34-35 evidence style).
+        """
+        equity = Decimal("85")
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, self.session(), self.board(), {})
+        allocation = allocate_portfolio(
+            engine,
+            self.session(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=equity,
+            equity_usdc=equity,
+        )
         assert allocation.tranches == ()
         sndkc = next(item for item in allocation.excluded if item.symbol == "SNDKc")
         assert sndkc.reason is PortfolioExclusionReason.BELOW_MIN_POSITION_SIZE
         assert (
-            f"SNDKc (below_min_position_size: size {self.LIVE_CONCENTRATION_BOUND} "
-            "below the 80 minimum after the "
-            f"{self.LIVE_CONCENTRATION_BOUND} concentration clamp)" in allocation.summary
+            "SNDKc (below_min_position_size: size 29.750000 below the effective minimum "
+            "30 after the 29.75 concentration clamp)" in allocation.summary
         )
-
-    def test_the_detail_line_reads_the_apr_in_percent(self) -> None:
-        """The forgone-income line renders both APR scales.
-
-        The live line read ``at the qualifying APR 347.907...`` and every
-        operator read it as 347.9 percent; the annotation prevents the
-        one-hundred-x misread.
-        """
-        allocation = self.allocation()
-        sndkc = next(item for item in allocation.excluded if item.symbol == "SNDKc")
-        assert sndkc.detail is not None
-        assert "income forgone about 35.13003557266472636969790386 USDC per day" in sndkc.detail
-        assert "347.907697331990933767452574132184551184787645543487960275680" in sndkc.detail
+        assert "that locked bound sits below the effective minimum 30 USDC" in sndkc.detail
+        assert "the book stays cash rather than breach the concentration cap" in sndkc.detail
+        assert "floored at 30 = 30; the hard floor governs" in sndkc.detail
+        assert "income forgone about" in sndkc.detail
         assert "(about 34,791 percent)" in sndkc.detail
 
     def test_the_full_gate_chain_rides_the_allocation_all_pass(self) -> None:
         """The eight-gate chain shows every protective gate passing.
 
         The determination the escalation asked for: no gate refuses on bad
-        data - the flat book is the sizing bound conflict alone, and the
-        trace proves it cycle over cycle.
+        data - the flat book was the sizing bound conflict alone, and the
+        trace proves it cycle over cycle at the exact tranche basis that
+        now funds.
         """
         allocation = self.allocation()
         assert allocation.gate_trace_symbol == "SNDKc"

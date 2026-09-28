@@ -152,6 +152,12 @@ CYCLE_TIER_BAND_ENV = "AERO_BOT_CYCLE_TIER_BAND_FRACTION"
 CYCLE_MAX_POSITIONS_ENV = "AERO_BOT_CYCLE_MAX_POSITIONS"
 CYCLE_MIN_POSITION_USDC_ENV = "AERO_BOT_CYCLE_MIN_POSITION_USDC"
 CYCLE_CONCENTRATION_CAP_ENV = "AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION"
+# Environment variable carrying the hard floor under the effective
+# minimum position size in USDC (the gnhf 36 parameter-coherence
+# ruling, default 30): the effective minimum lowers to the per-name
+# concentration clamp whenever the clamp governs, never below this
+# gas-efficiency floor.
+CYCLE_MIN_POSITION_FLOOR_USDC_ENV = "AERO_BOT_CYCLE_MIN_POSITION_FLOOR_USDC"
 # The default reward-conversion threshold in USDC.
 DEFAULT_AERO_CONVERSION_MIN_USDC = Decimal("5")
 # Dynamic selector sizing keeps ten percent of the observed in-range depth cap
@@ -4879,6 +4885,9 @@ def _portfolio_parameters_from_environment(
         min_position_usdc=_decimal(
             CYCLE_MIN_POSITION_USDC_ENV, PortfolioParameters().min_position_usdc
         ),
+        min_position_floor_usdc=_decimal(
+            CYCLE_MIN_POSITION_FLOOR_USDC_ENV, PortfolioParameters().min_position_floor_usdc
+        ),
         concentration_cap_fraction=_decimal(
             CYCLE_CONCENTRATION_CAP_ENV, PortfolioParameters().concentration_cap_fraction
         ),
@@ -5094,9 +5103,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Decimal,
         default=None,
         help=(
-            "The minimum position size in USDC; below it cash stays cash "
-            "(default 80; the sealed AERO_BOT_CYCLE_MIN_POSITION_USDC "
-            "variable supplies the same value when the flag is absent)."
+            "The configured minimum position size in USDC; below the EFFECTIVE "
+            "minimum cash stays cash (default 80; the sealed "
+            "AERO_BOT_CYCLE_MIN_POSITION_USDC variable supplies the same value "
+            "when the flag is absent)."
+        ),
+    )
+    parser.add_argument(
+        "--min-position-floor-usdc",
+        type=Decimal,
+        default=None,
+        help=(
+            "The hard floor in USDC under the effective minimum position size: "
+            "the effective minimum is max(this floor, min(the configured "
+            "minimum, the per-name concentration clamp at the live equity)), "
+            "so a small book deploys at the clamp instead of refusing forever "
+            "(default 30; the sealed "
+            "AERO_BOT_CYCLE_MIN_POSITION_FLOOR_USDC variable supplies the same "
+            "value when the flag is absent)."
         ),
     )
     parser.add_argument(
@@ -5141,10 +5165,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     for flag, value in (
         ("--tier-band", arguments.tier_band),
         ("--min-position-usdc", arguments.min_position_usdc),
+        ("--min-position-floor-usdc", arguments.min_position_floor_usdc),
         ("--concentration-cap", arguments.concentration_cap),
     ):
         if value is not None and value <= 0:
             parser.error(f"{flag} must be positive")
+    # The floor bounds the coherence rule from below only: a floor above
+    # the minimum it floors would raise the effective minimum above the
+    # configured bound (model_copy bypasses the model validator, so the
+    # CLI boundary checks the pair explicitly).
+    raw_minimum = os.environ.get(CYCLE_MIN_POSITION_USDC_ENV, "").strip()
+    resolved_min_position = (
+        arguments.min_position_usdc
+        if arguments.min_position_usdc is not None
+        else (Decimal(raw_minimum) if raw_minimum else PortfolioParameters().min_position_usdc)
+    )
+    if (
+        arguments.min_position_floor_usdc is not None
+        and arguments.min_position_floor_usdc > resolved_min_position
+    ):
+        parser.error(
+            "--min-position-floor-usdc must not exceed the minimum position size "
+            f"({resolved_min_position} USDC); the floor bounds the coherence rule, "
+            "it never raises the minimum"
+        )
     if arguments.max_positions is not None and arguments.max_positions < 1:
         parser.error("--max-positions must be at least one")
     symbol = _symbol_from_arguments_and_environment(arguments.symbol, os.environ)
@@ -5179,6 +5223,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.min_position_usdc is not None:
             portfolio_parameters = portfolio_parameters.model_copy(
                 update={"min_position_usdc": arguments.min_position_usdc}
+            )
+        if arguments.min_position_floor_usdc is not None:
+            portfolio_parameters = portfolio_parameters.model_copy(
+                update={"min_position_floor_usdc": arguments.min_position_floor_usdc}
             )
         if arguments.concentration_cap is not None:
             portfolio_parameters = portfolio_parameters.model_copy(

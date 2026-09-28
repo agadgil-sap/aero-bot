@@ -168,6 +168,13 @@ AERO_BOT_BASE_RPC_URL=https://base.publicnode.com
 #AERO_BOT_CYCLE_MAX_POSITIONS=10
 #AERO_BOT_CYCLE_MIN_POSITION_USDC=80
 #AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION=0.35
+# The hard floor under the effective minimum position size (gnhf 36
+# parameter coherence): the effective minimum is
+# max(this floor, min(the minimum above, the per-name concentration
+# clamp at the live equity)) - a small book deploys at the clamp, never
+# below this floor, and a book whose clamp sits under the floor stays
+# cash. The floor must stay at or under the configured minimum.
+#AERO_BOT_CYCLE_MIN_POSITION_FLOOR_USDC=30
 # Range monitoring is allowed to observe and alert at seconds-level, but the
 # shipped systemd unit is forced into --monitor-only. It cannot trade.
 AERO_BOT_WATCHTOWER_ENABLED=0

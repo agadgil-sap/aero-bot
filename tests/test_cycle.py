@@ -29,6 +29,7 @@ from aero_bot.cycle import (
     CYCLE_AERO_CONVERSION_MIN_ENV,
     CYCLE_CONCENTRATION_CAP_ENV,
     CYCLE_MAX_POSITIONS_ENV,
+    CYCLE_MIN_POSITION_FLOOR_USDC_ENV,
     CYCLE_MIN_POSITION_USDC_ENV,
     CYCLE_OUT_OF_RANGE_GRACE_ENV,
     CYCLE_REFERENCE_PRICE_ENV,
@@ -1949,6 +1950,8 @@ class TestCycleConfiguration:
                 "6",
                 "--min-position-usdc",
                 "95",
+                "--min-position-floor-usdc",
+                "25",
                 "--concentration-cap",
                 "0.3",
             ]
@@ -1958,7 +1961,58 @@ class TestCycleConfiguration:
         assert portfolio.tier_band_fraction == Decimal("0.7")  # the flag wins
         assert portfolio.max_concurrent_positions == 6
         assert portfolio.min_position_usdc == Decimal("95")
+        assert portfolio.min_position_floor_usdc == Decimal("25")
         assert portfolio.concentration_cap_fraction == Decimal("0.3")
+
+    def test_the_floor_flag_never_exceeds_the_minimum(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A floor above the minimum refuses at the CLI boundary."""
+        from aero_bot import cycle as cycle_module
+
+        monkeypatch.setattr(
+            cycle_module,
+            "build_cycle_runner",
+            lambda *args, **kwargs: pytest.fail("the runner must not build"),
+        )
+        for argv in (
+            ["--dry-run", "--min-position-floor-usdc", "95"],  # above the default min
+            [
+                "--dry-run",
+                "--min-position-usdc",
+                "60",
+                "--min-position-floor-usdc",
+                "70",
+            ],  # the pair checked against each other
+            ["--dry-run", "--min-position-floor-usdc", "-5"],
+        ):
+            with pytest.raises(SystemExit) as raised:
+                cycle_module.main(argv)
+            assert raised.value.code == 2
+
+        # A floor at the minimum stays coherent (the rule degenerates to
+        # the old bound) and parses cleanly past the boundary check.
+        class StubRunner:
+            def run(self, mode: CycleMode, **kwargs: object) -> object:
+                raise RuntimeError("selector reached runner")
+
+        monkeypatch.setattr(
+            cycle_module,
+            "build_cycle_runner",
+            lambda *args, **kwargs: StubRunner(),
+        )
+        assert cycle_module.main(["--dry-run", "--min-position-floor-usdc", "80"]) == 1
+
+    def test_the_floor_env_pair_refuses_incoherent_values(self) -> None:
+        """The env floor above the env minimum refuses at construction."""
+        with pytest.raises(ValueError, match="never raises the minimum"):
+            _portfolio_parameters_from_environment(
+                {
+                    CYCLE_MIN_POSITION_FLOOR_USDC_ENV: "95",
+                    CYCLE_MIN_POSITION_USDC_ENV: "90",
+                },
+                Decimal("0.3"),
+            )
 
     def test_the_allocator_flags_refuse_nonpositive_values(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2022,8 +2076,10 @@ class TestCycleConfiguration:
         assert defaults.tier_band_fraction == Decimal("0.50")
         assert defaults.max_concurrent_positions == 10
         assert defaults.min_position_usdc == Decimal("80")
+        assert defaults.min_position_floor_usdc == Decimal("30")
         assert defaults.concentration_cap_fraction == Decimal("0.35")
         assert defaults.switch_margin_fraction == Decimal("0.30")
+        assert defaults.effective_minimum_position_usdc(Decimal("105")) == Decimal("36.75")
         tuned = _portfolio_parameters_from_environment(
             {
                 CYCLE_TIER_BAND_ENV: "0.6",
@@ -2038,6 +2094,24 @@ class TestCycleConfiguration:
         assert tuned.min_position_usdc == Decimal("90")
         assert tuned.concentration_cap_fraction == Decimal("0.25")
         assert tuned.switch_margin_fraction == Decimal("0.5")
+        floored = _portfolio_parameters_from_environment(
+            {
+                CYCLE_MIN_POSITION_FLOOR_USDC_ENV: "10",
+                CYCLE_MIN_POSITION_USDC_ENV: "90",
+            },
+            Decimal("0.3"),
+        )
+        assert floored.min_position_floor_usdc == Decimal("10")
+        # The floor is sealed-env configurable under the hard rule: a
+        # floor above the configured minimum raises rather than bounds.
+        with pytest.raises(ValueError, match="never raises the minimum"):
+            _portfolio_parameters_from_environment(
+                {
+                    CYCLE_MIN_POSITION_FLOOR_USDC_ENV: "95",
+                    CYCLE_MIN_POSITION_USDC_ENV: "90",
+                },
+                Decimal("0.3"),
+            )
         with pytest.raises(ValueError, match="positive"):
             _portfolio_parameters_from_environment({CYCLE_TIER_BAND_ENV: "0"}, Decimal("0.3"))
         with pytest.raises(ValueError, match="at least one"):
