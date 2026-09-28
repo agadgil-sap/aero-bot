@@ -738,3 +738,72 @@ async def test_corrupt_audit_chain_degrades_health_and_dashboard(tmp_path: Path)
     assert policy_response.status_code == 503
     assert "Policy decision blocked" in policy_response.json()["detail"]
     assert audit_store.verify_chain().record_count == 1
+
+
+@pytest.mark.anyio
+async def test_latest_cycle_apr_reads_the_primary_venue_convention(tmp_path: Path) -> None:
+    """The primary APR surface reads the engine's venue-convention evidence.
+
+    The captain's 2026-09-28 display ruling: the engine qualifying
+    emissions APR (the venue's own convention) is the primary number, the
+    external DefiLlama screen stays clearly secondary.
+    """
+    from aero_bot.cycle import CycleReportPayload
+
+    audit_store = AuditStore(tmp_path / "apr-audit" / "audit.sqlite3")
+    audit_store.append(
+        AuditEventType.CYCLE_REPORTED,
+        CycleReportPayload(
+            mode="live",
+            symbol="METAc",
+            action="enter",
+            reason="entry_threshold_met",
+            decision_diagnostics=(
+                "board [METAc: qualified at APR 237.18 (about 23,719 percent)]; ",
+                "conservative income basis: METAc expected-yield surfaces read "
+                "3 (about 300 percent), the trailing 6-cycle median",
+            ),
+        ),
+        datetime.now(UTC),
+    )
+    settings = Settings()
+    transport = httpx.ASGITransport(app=create_app(settings, audit_store=audit_store))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/cycle/latest-apr")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is True
+    assert payload["symbol"] == "METAc"
+    assert payload["action"] == "enter"
+    assert any("qualified at APR 237.18" in line for line in payload["decision_diagnostics"])
+
+
+@pytest.mark.anyio
+async def test_latest_cycle_apr_reports_absent_history() -> None:
+    """An empty chain reports unavailable rather than implying a reading."""
+    settings = Settings()
+    transport = httpx.ASGITransport(app=create_app(settings))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/cycle/latest-apr")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is False
+    assert payload["symbol"] is None
+    assert payload["decision_diagnostics"] == []
+
+
+@pytest.mark.anyio
+async def test_dashboard_carries_the_primary_and_secondary_yield_labels() -> None:
+    """The dashboard names the venue convention primary and DefiLlama secondary."""
+    settings = Settings()
+    transport = httpx.ASGITransport(app=create_app(settings))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "Engine qualifying emissions APR - the venue convention (primary)" in html
+    assert "External yield screen - DefiLlama haircut convention (secondary reference)" in html
+    assert "Secondary external reference only" in html

@@ -93,7 +93,27 @@
       <article class="card screen-card" aria-live="polite">
         <div class="screen-head">
           <div>
-            <p class="label">Live Aerodrome B20 yield screen</p>
+            <p class="label">Engine qualifying emissions APR - the venue convention (primary)</p>
+            <p id="engine-apr-status" class="value pending">Loading the latest cycle</p>
+          </div>
+          <button id="engine-apr-refresh" class="refresh" type="button">Refresh</button>
+        </div>
+        <p id="engine-apr-diagnostic" class="detail">The engine's own qualifying emissions APR exactly as Aerodrome's venue displays it: the gauge's annualized reward stream over the current cell's staked value. This is the primary yield reference - high readings are real.</p>
+        <div id="engine-apr-lines" class="table-wrap" hidden>
+          <table>
+            <thead>
+              <tr>
+                <th>Latest cycle evidence</th>
+              </tr>
+            </thead>
+            <tbody id="engine-apr-rows"></tbody>
+          </table>
+        </div>
+      </article>
+      <article class="card screen-card" aria-live="polite">
+        <div class="screen-head">
+          <div>
+            <p class="label">External yield screen - DefiLlama haircut convention (secondary reference)</p>
             <p id="yield-status" class="value pending">Loading read-only data</p>
           </div>
           <button id="yield-refresh" class="refresh" type="button">Refresh</button>
@@ -115,7 +135,7 @@
           </table>
         </div>
         <p id="yield-empty" class="empty-screen" hidden></p>
-        <p class="source-note">The daily figure adds fee APY to haircut AERO APY because a staked in-range position earns both streams. It still excludes IL, adverse selection, slippage, gas, and exit risk.</p>
+        <p class="source-note">Secondary external reference only: DefiLlama applies its own haircut convention over a different denominator, so its numbers read far below the venue's own display. The engine's venue-convention APR above is the trading reference.</p>
       </article>
     </section>
     <div class="notice">
@@ -124,6 +144,10 @@
     </div>
   </main>
   <script>
+    const engineAprStatus = document.querySelector("#engine-apr-status");
+    const engineAprRefresh = document.querySelector("#engine-apr-refresh");
+    const engineAprLines = document.querySelector("#engine-apr-lines");
+    const engineAprRows = document.querySelector("#engine-apr-rows");
     const yieldStatus = document.querySelector("#yield-status");
     const yieldDiagnostic = document.querySelector("#yield-diagnostic");
     const yieldRefresh = document.querySelector("#yield-refresh");
@@ -169,6 +193,43 @@
       appendCell(row, `${observation.sample_count} samples`);
       yieldRows.appendChild(row);
     }
+
+    function appendRow(tbody, text) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.textContent = text;
+      row.appendChild(cell);
+      tbody.appendChild(row);
+    }
+
+    async function refreshEngineApr() {
+      engineAprRefresh.disabled = true;
+      engineAprStatus.className = "value pending";
+      engineAprStatus.textContent = "Loading the latest cycle";
+      engineAprLines.hidden = true;
+      engineAprRows.replaceChildren();
+      try {
+        const response = await fetch("/api/cycle/latest-apr", { cache: "no-store" });
+        if (!response.ok) throw new Error(`Local API returned ${response.status}`);
+        const result = await response.json();
+        if (!result.available) {
+          engineAprStatus.textContent = "No cycle recorded yet";
+          return;
+        }
+        engineAprStatus.className = "value good";
+        engineAprStatus.textContent = `${result.symbol} - ${result.action}`;
+        result.decision_diagnostics.forEach((line) => appendRow(engineAprRows, line));
+        engineAprLines.hidden = false;
+      } catch (error) {
+        engineAprStatus.className = "value danger";
+        engineAprStatus.textContent = "Latest cycle unavailable";
+      } finally {
+        engineAprRefresh.disabled = false;
+      }
+    }
+
+    engineAprRefresh.addEventListener("click", refreshEngineApr);
+    refreshEngineApr();
 
     async function refreshYieldScreen() {
       yieldRefresh.disabled = true;

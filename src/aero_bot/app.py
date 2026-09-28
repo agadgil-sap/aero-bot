@@ -1,5 +1,6 @@
 """FastAPI application factory and wallet-free dashboard routes."""
 
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from html import escape
@@ -13,6 +14,7 @@ from pydantic import BaseModel
 from aero_bot.audit import (
     AuditEventType,
     AuditIntegrityError,
+    AuditRecord,
     AuditStore,
     AuditVerification,
     AuditVerificationStatus,
@@ -65,6 +67,21 @@ APP_VERSION = "0.1.0"
 ENABLED_VENUE: Literal["aerodrome"] = "aerodrome"
 # The Base mainnet chain identifier prevents ambiguity about the target network.
 BASE_CHAIN_ID = 8453
+
+
+class LatestCycleAprResponse(BaseModel):
+    """Carry the latest cycle's engine APR evidence for the dashboard."""
+
+    # True when one cycle_reported record exists in the chain.
+    available: bool
+    # The registry-matched symbol the latest cycle decided on.
+    symbol: str | None = None
+    # The latest cycle's action and reason, machine-readable.
+    action: str | None = None
+    # The latest cycle's decision diagnostics - the board summary names
+    # every pool's engine qualifying emissions APR in the venue's own
+    # displayed convention, the PRIMARY yield reference.
+    decision_diagnostics: tuple[str, ...] = ()
 
 
 class HealthResponse(BaseModel):
@@ -268,6 +285,35 @@ def create_app(
     def aerodrome_yield_screen() -> YieldScreenResult:
         """Fetch a live read-only B20/native-USDC secondary-source yield screen."""
         return resolved_yield_scanner.scan(resolved_registry)
+
+    @application.get("/api/cycle/latest-apr", response_model=LatestCycleAprResponse)
+    def latest_cycle_apr() -> LatestCycleAprResponse:
+        """Read the latest cycle's engine APR evidence from the audit chain.
+
+        The captain's 2026-09-28 display ruling: the engine's qualifying
+        emissions APR - the venue's own displayed convention - is the
+        PRIMARY yield reference, and the external screen stays clearly
+        secondary beside it.
+        """
+        latest: AuditRecord | None = None
+        offset = 0
+        while True:
+            page = resolved_audit_store.read_records(1_000, offset=offset)
+            if not page:
+                break
+            for record in page:
+                if record.event_type is AuditEventType.CYCLE_REPORTED:
+                    latest = record
+            offset += len(page)
+        if latest is None:
+            return LatestCycleAprResponse(available=False)
+        payload = json.loads(latest.payload_json)
+        return LatestCycleAprResponse(
+            available=True,
+            symbol=payload.get("symbol"),
+            action=payload.get("action"),
+            decision_diagnostics=tuple(payload.get("decision_diagnostics") or ()),
+        )
 
     @application.get("/api/transactions/capabilities", response_model=TransactionCapabilities)
     def transaction_capabilities() -> TransactionCapabilities:

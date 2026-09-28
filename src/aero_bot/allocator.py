@@ -24,17 +24,20 @@ at most ten concurrent positions, no tranche below the per-name minimum
 position size, and no name above the thirty-five percent concentration
 cap of book equity.
 
-The minimum is COHERENT with the concentration cap (the gnhf 36
-deployment unblock): the effective per-name minimum is
-``max(floor, min(configured minimum, concentration clamp at the live
-equity))`` - at the captain's trial scale (a 105-USDC book) the
-thirty-five percent clamp (36.84) governs under the configured
-eighty, so the book deploys at the clamp instead of refusing forever,
-while at 300-plus USDC equity the configured eighty governs naturally.
-The hard floor (default thirty USDC) bounds how far the coherence rule
-may lower the minimum - a gas-efficiency floor, never a license to
-breach the concentration cap: when the clamp itself sits below the
-floor the book stays cash, because the cap is the locked safety bound. Rebalancing generalizes the
+The minimum and the concentration cap are coherent under the captain's
+2026-09-28 activation ruling, which supersedes the gnhf 36 interplay:
+the per-name concentration bound applies only at or above a locked
+activation equity (default 1000 USDC, the funded scale the trial book
+grows toward); below it the cap does not bind at all and sizing follows
+the tier logic under the configured eighty-USDC minimum - so a
+105-USDC book runs the proven single-position ~80-105 shape plus
+residual cash instead of starving behind a clamp that was never meant
+for the trial scale. The gnhf 36 coherence machinery stays for the
+sealed early-activation override: engaged books compute the effective
+minimum as ``max(floor, min(configured minimum, concentration clamp))``
+with the hard gas-efficiency floor (default thirty USDC) bounding how
+far the rule may lower the bound - never a license to breach the cap.
+Rebalancing generalizes the
 selector's thirty percent switch margin from switch-to-switch to
 portfolio reallocation: a held pool whose weighted APR decayed below the
 margin versus the next qualifying candidate inside the band is exited
@@ -44,7 +47,7 @@ breached even transiently and exactly one position is funded per step.
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from enum import StrEnum
 from typing import Annotated, Self
 
@@ -91,10 +94,24 @@ DEFAULT_MIN_POSITION_FLOOR_USDC = Decimal("30")
 # The default per-name concentration cap as a fraction of book equity
 # (locked parameter; the measured-edge baseline's MSTRc argument).
 DEFAULT_CONCENTRATION_CAP_FRACTION = Decimal("0.35")
+# The default book equity at or above which the per-name concentration
+# cap engages (the captain's 2026-09-28 ruling): below it the cap does
+# not bind at all - the trial-scale book funds toward the 1000-USDC
+# total cap running the proven ~100-per-position shape - and at or
+# above it the thirty-five-percent bound governs every name (sealed-env
+# configurable through AERO_BOT_CYCLE_CONCENTRATION_CAP_ACTIVATION_USDC;
+# the hard ceiling is the same 1000 USDC total cap, so a sealed override
+# can only engage the cap sooner, never later than the funded scale).
+DEFAULT_CONCENTRATION_CAP_ACTIVATION_USDC = Decimal("1000")
 # The total exposure ceiling the portfolio spans, aligned with the LP
 # executor's hard pilot cap (raised to 1000/1000 USDC by the captain's
 # 2026-09-27 performance ruling).
 PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC = Decimal("1000")
+# The money grid every tier share quantizes down to: USDC's own six
+# decimal places, so the engine's scaled-basis sizing round-trips a
+# share exactly and a share can never read above the budget that funded
+# it through intermediate rounding.
+TIER_SHARE_QUANTUM = Decimal("0.000001")
 
 
 class PortfolioParameters(BaseModel):
@@ -127,6 +144,16 @@ class PortfolioParameters(BaseModel):
     min_position_floor_usdc: Annotated[Decimal, Field(gt=0)] = DEFAULT_MIN_POSITION_FLOOR_USDC
     # The per-name concentration cap as a fraction of book equity.
     concentration_cap_fraction: Annotated[Decimal, Field(gt=0)] = DEFAULT_CONCENTRATION_CAP_FRACTION
+    # The book equity at or above which the per-name concentration cap
+    # engages (the captain's 2026-09-28 ruling): below the activation
+    # equity the cap does not bind at all and sizing follows the tier
+    # logic under the configured minimum, so the trial-scale book runs
+    # the proven ~100-per-position shape while it funds toward the cap.
+    # The hard ceiling is the total exposure cap itself, so a sealed
+    # override can only engage the cap sooner, never later.
+    concentration_cap_activation_equity_usdc: Annotated[Decimal, Field(gt=0)] = (
+        DEFAULT_CONCENTRATION_CAP_ACTIVATION_USDC
+    )
     # The tier band: qualifying APR at or above this fraction of the
     # top's shares the tiers; below it the pool sits out as cash.
     tier_band_fraction: Annotated[Decimal, Field(gt=0)] = DEFAULT_TIER_BAND_FRACTION
@@ -164,6 +191,13 @@ class PortfolioParameters(BaseModel):
             )
         if self.concentration_cap_fraction > Decimal(1):
             raise ValueError("concentration_cap_fraction must not exceed one")
+        if self.concentration_cap_activation_equity_usdc > PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC:
+            raise ValueError(
+                f"concentration_cap_activation_equity_usdc "
+                f"{self.concentration_cap_activation_equity_usdc} exceeds the hard "
+                f"{PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC} USDC total cap; the activation "
+                "equity may only engage the concentration cap sooner, never later"
+            )
         if self.tier_band_fraction > Decimal(1):
             raise ValueError("tier_band_fraction must not exceed one")
         if self.switch_margin_fraction < 0:
@@ -175,16 +209,42 @@ class PortfolioParameters(BaseModel):
             )
         return self
 
+    def concentration_bound_usdc(self, equity_usdc: Decimal) -> Decimal | None:
+        """Return the per-name concentration bound, or None below activation.
+
+        The captain's 2026-09-28 ruling: the per-name concentration bound
+        applies only when the book has reached the activation equity
+        (default 1000 USDC, the funded scale the trial book grows toward);
+        below it the cap does not bind at all, so the trial-scale book runs
+        the proven ~100-per-position shape with the configured minimum
+        governing sizing and the residual as cash.
+
+        Args:
+            equity_usdc: The portfolio equity the bound is judged against.
+
+        Returns:
+            The per-name concentration bound in USDC, or None when the cap
+            is not engaged.
+        """
+        if equity_usdc < self.concentration_cap_activation_equity_usdc:
+            return None
+        return self.concentration_cap_fraction * equity_usdc
+
     def effective_minimum_position_usdc(self, equity_usdc: Decimal) -> Decimal:
         """Return the coherent per-name entry minimum at one book equity.
 
-        The gnhf 36 parameter-coherence rule: the configured minimum and
-        the per-name concentration clamp are mutually unsatisfiable
-        below an equity of ``min_position_usdc / concentration_cap_fraction``
-        (80 / 0.35 = 228.57 USDC at the defaults), so the EFFECTIVE
-        minimum takes whichever of the two binds - and the hard floor
-        bounds how far that coherence may lower it:
-        ``max(floor, min(configured minimum, concentration clamp))``.
+        The gnhf 36 parameter-coherence rule, as superseded by the
+        captain's 2026-09-28 activation ruling: below the activation
+        equity the concentration cap does not bind at all, so the
+        configured minimum governs unchanged (the hard floor can never
+        raise it - the validator keeps the floor at or under the
+        configured minimum). At or above the activation equity the clamp
+        engages at thirty-five percent of a book that is already at the
+        thousand-USDC scale, so the configured eighty governs there too
+        at the defaults; the coherence rule still protects the sealed
+        early-activation override, where ``max(floor, min(configured
+        minimum, concentration clamp))`` keeps the two bounds
+        satisfiable without ever breaching the cap to reach the floor.
 
         Args:
             equity_usdc: The portfolio equity pricing the concentration
@@ -193,7 +253,9 @@ class PortfolioParameters(BaseModel):
         Returns:
             The per-name minimum a tranche must meet to fund.
         """
-        concentration_bound = self.concentration_cap_fraction * equity_usdc
+        concentration_bound = self.concentration_bound_usdc(equity_usdc)
+        if concentration_bound is None:
+            return self.min_position_usdc
         return max(
             self.min_position_floor_usdc,
             min(self.min_position_usdc, concentration_bound),
@@ -213,6 +275,13 @@ class PortfolioParameters(BaseModel):
         Returns:
             One phrase stating the full derivation and its governing term.
         """
+        if self.concentration_bound_usdc(equity_usdc) is None:
+            return (
+                f"the concentration cap is not engaged below the "
+                f"{self.concentration_cap_activation_equity_usdc} USDC activation equity "
+                f"(book equity {equity_usdc}); the configured minimum "
+                f"{self.min_position_usdc} governs"
+            )
         concentration_bound = self.concentration_cap_fraction * equity_usdc
         if concentration_bound < self.min_position_floor_usdc:
             governing = "the hard floor governs"
@@ -922,12 +991,28 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                 f"no qualifying pool earned a tranche and {cash_usdc} USDC stays cash"
             ),
         )
+    # The tier shares quantize DOWN to USDC's own six-decimal grid: the
+    # engine re-derives each tranche at its scaled basis with a divide-by-
+    # then-multiply-by the equity fraction, and that round-trip is exact
+    # only when the target sits on a finite money grid. Unquantized shares
+    # carry dozens of repeating digits, so an intermediate rounding can
+    # land the engine's size - or the next tier's share - one ulp ABOVE
+    # the deployable budget and wrongly refuse the book's entries as
+    # insufficient cash, a defect the activation ruling exposed once the
+    # clamp stopped masking every target under the bound. Rounding down
+    # also guarantees a single-pool board's share never exceeds its
+    # deployable budget.
     total_weight = sum((weight for _, weight in slotted), Decimal("0"))
-    concentration_bound = resolved.concentration_cap_fraction * equity_usdc
-    # The coherent per-name entry minimum (the gnhf 36 rule): whichever
-    # of the configured minimum and the concentration clamp binds, over
-    # the hard floor - the two bounds can never again be mutually
-    # unsatisfiable the way 80-versus-36.84 starved the 105-USDC book.
+    # The per-name concentration bound, None while the book sits below the
+    # activation equity (the captain's 2026-09-28 ruling): the trial-scale
+    # book funds toward the cap running the proven ~100-per-position shape
+    # with no per-name clamp at all.
+    concentration_bound = resolved.concentration_bound_usdc(equity_usdc)
+    # The coherent per-name entry minimum (the gnhf 36 rule over the
+    # activated cap): whichever of the configured minimum and the engaged
+    # concentration clamp binds, over the hard floor - the two bounds can
+    # never again be mutually unsatisfiable the way 80-versus-36.84 starved
+    # the 105-USDC book.
     effective_minimum = resolved.effective_minimum_position_usdc(equity_usdc)
     # The lost-yield basis: one day of the pool's qualifying emissions APR
     # on the tranche it would have earned, the same framing the
@@ -936,7 +1021,9 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
     tranches: list[PortfolioTranche] = []
     remaining = deployable
     for rank, (evaluation, weight) in enumerate(slotted, start=1):
-        target = deployable * weight / total_weight
+        target = (deployable * weight / total_weight).quantize(
+            TIER_SHARE_QUANTUM, rounding=ROUND_DOWN
+        )
         # The effective minimum position size floors the tranche - a
         # position near the proven per-position scale - so a thin budget
         # deploys to the top names first instead of being split into
@@ -944,7 +1031,7 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
         if target < effective_minimum:
             target = effective_minimum
         clamped = False
-        if target > concentration_bound:
+        if concentration_bound is not None and target > concentration_bound:
             target = concentration_bound
             clamped = True
         if rank == 1:
@@ -957,10 +1044,10 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                 evaluation,
                 target,
             )
-        forgone_per_day = +(target * evaluation.emissions_apr / days_per_year)
+        forgone_per_day = +(target * evaluation.observation.income_expectation_apr / days_per_year)
         forgone_line = (
-            f"income forgone about {forgone_per_day} USDC per day at the qualifying "
-            f"APR {format_apr_percent(evaluation.emissions_apr)}"
+            f"income forgone about {forgone_per_day} USDC per day at the conservative "
+            f"income APR {format_apr_percent(evaluation.observation.income_expectation_apr)}"
         )
         if target > remaining:
             excluded.append(
@@ -1002,7 +1089,7 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
             continue
         if tranche.budget_usd < effective_minimum:
             derivation = resolved.describe_effective_minimum(equity_usdc)
-            if clamped:
+            if clamped and concentration_bound is not None:
                 bound_line = (
                     f"the tier target clamped to the {concentration_bound} USDC per-name "
                     f"concentration bound ({resolved.concentration_cap_fraction} of "
@@ -1025,26 +1112,32 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                         f"{effective_minimum}"
                         + (
                             f" after the {concentration_bound} concentration clamp"
-                            if clamped
+                            if clamped and concentration_bound is not None
                             else ""
                         )
                     ),
                     emissions_apr=evaluation.emissions_apr,
                     detail=(
                         f"{bound_line}; cash stays cash; income forgone about "
-                        f"{tranche.budget_usd * evaluation.emissions_apr / days_per_year} "
-                        f"USDC per day at the qualifying APR "
-                        f"{format_apr_percent(evaluation.emissions_apr)}"
+                        f"{
+                            tranche.budget_usd
+                            * evaluation.observation.income_expectation_apr
+                            / days_per_year
+                        } "
+                        f"USDC per day at the conservative income APR "
+                        f"{format_apr_percent(evaluation.observation.income_expectation_apr)}"
                     ),
                     forgone_income_usdc_per_day=(
-                        +tranche.budget_usd * evaluation.emissions_apr / days_per_year
+                        +tranche.budget_usd
+                        * evaluation.observation.income_expectation_apr
+                        / days_per_year
                     ),
                 )
             )
             continue
         remaining -= tranche.budget_usd
         tranches.append(tranche)
-        if clamped:
+        if clamped and concentration_bound is not None:
             excluded.append(
                 ExcludedPool(
                     symbol=evaluation.symbol,
@@ -1174,7 +1267,7 @@ def _reallocation_tranche(
     cap_after_exit: Decimal,
     deployable: Decimal,
     total_weight: Decimal,
-    concentration_bound: Decimal,
+    concentration_bound: Decimal | None,
 ) -> tuple[PortfolioTranche | None, str, str]:
     """Size one reallocation replacement for the freed capital.
 
@@ -1197,14 +1290,28 @@ def _reallocation_tranche(
             held value.
         deployable: The pass's deployable budget for weight shares.
         total_weight: The band's total weight.
-        concentration_bound: The per-name concentration bound in USDC.
+        concentration_bound: The per-name concentration bound in USDC, or
+            None while the book sits below the activation equity (the
+            captain's 2026-09-28 ruling: the trial-scale book reallocates
+            at the proven per-position scale with no per-name clamp).
 
     Returns:
         The sized replacement tranche, or None and one evidence line.
     """
-    weight_share = deployable * weight / total_weight if total_weight > 0 else Decimal("0")
+    # The share quantizes down to USDC's six-decimal grid for the same
+    # reason the tier targets do: the engine's scaled-basis round-trip is
+    # exact only on a finite money grid, and rounding down never pushes a
+    # freed-capital replacement past its bound.
+    if total_weight > 0:
+        weight_share = (deployable * weight / total_weight).quantize(
+            TIER_SHARE_QUANTUM, rounding=ROUND_DOWN
+        )
+    else:
+        weight_share = Decimal("0")
     budget = max(weight_share, held_value)
-    budget = min(budget, concentration_bound, cap_after_exit)
+    if concentration_bound is not None:
+        budget = min(budget, concentration_bound)
+    budget = min(budget, cap_after_exit)
     tranche, gate, refusal = _build_tranche(
         engine,
         base_state,
@@ -1355,7 +1462,10 @@ def plan_portfolio_rebalance(  # noqa: PLR0912, PLR0915 - one fixed precedence
     claimed_targets: set[str] = set()
     deployable = allocation.deployable_usdc
     total_weight = sum((weight for _, weight in in_band), Decimal("0"))
-    concentration_bound = resolved.concentration_cap_fraction * equity_usdc
+    # The per-name concentration bound, None below the activation equity
+    # (the captain's 2026-09-28 ruling): the trial-scale book rotates its
+    # decayed names at the proven per-position scale with no clamp.
+    concentration_bound = resolved.concentration_bound_usdc(equity_usdc)
     # The same coherent per-name minimum governs replacements: a freed
     # tranche must meet the effective minimum, never the unsatisfiable
     # configured-versus-clamp pair that starved the small book.

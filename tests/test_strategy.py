@@ -224,16 +224,28 @@ class SelectorStrategySources(FakeStrategySources):
         """Configure the scripted board and shared reads."""
         super().__init__()
         second_token = "0xbb0000000000000000000078ee7ce2fe4908108c"  # noqa: S105
+        # The staked liquidity is sized for sane qualifying APRs (about
+        # 250 and 500 percent) in the venue convention's ordinary regime
+        # plausibility bound, so the ordinary selection tests exercise
+        # the selector, not the anomaly exclusion.
         self._second_pool = make_candidate(
             pool_address="0x2222222222222222222222222222222222222222",
             token1_address=second_token,
             emissions_per_second=2 * 4_494_371_922_759_724,
+            # One USDC more staked than AAAc keeps BBBc clear of the band
+            # floor by a real margin instead of an exact 2:1 ratio that
+            # one ulp of division rounding can flip.
+            staked0=15_601 * 10**6,
+            staked1=100 * 10**6,
         )
 
     def enumerate_pools(self) -> tuple[tuple[BoardListing, ...], int]:
         """Return the two-pool board ordered by symbol."""
         return (
-            BoardListing(symbol="AAAc", pool=make_candidate()),
+            BoardListing(
+                symbol="AAAc",
+                pool=make_candidate(staked0=15_600 * 10**6, staked1=100 * 10**6),
+            ),
             BoardListing(symbol="BBBc", pool=self._second_pool),
         ), 123
 

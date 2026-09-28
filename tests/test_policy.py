@@ -2291,3 +2291,134 @@ class TestEntryGateTrace:
         ceiling_line = next(line for line in lines if line.startswith("gate gas_ceiling:"))
         assert ": FAIL" in ceiling_line
         assert "0.5 gwei" in ceiling_line
+
+
+class TestConservativeIncomeBasis:
+    """The captain's 2026-09-28 correction inside the engine.
+
+    The venue's displayed convention is the reference and its high
+    readings are real, so the qualifying gates (the emissions floor) keep
+    reading the raw APR - but every surface that ASSUMES an expected
+    daily yield reads the conservative basis when one is carried: the
+    range-width solve, the gas cost-versus-yield gate, and the
+    lost-yield evidence. A transient spike never sizes or justifies a
+    position.
+    """
+
+    def test_the_property_floors_at_the_basis_never_inflates(self) -> None:
+        """min(raw, basis) in both directions; raw when no basis is carried."""
+        raw = base_observation(emissions_apr=Decimal("300"))
+        assert raw.income_expectation_apr == Decimal("300")  # no basis carried
+        floored = base_observation(
+            emissions_apr=Decimal("300"), conservative_income_apr=Decimal("3")
+        )
+        assert floored.income_expectation_apr == Decimal("3")
+        collapsed = base_observation(
+            emissions_apr=Decimal("1.2"), conservative_income_apr=Decimal("3")
+        )
+        assert collapsed.income_expectation_apr == Decimal("1.2")
+
+    def test_a_spiked_reading_still_qualifies_on_the_raw_floor(self) -> None:
+        """The boosted-yield thesis: a high reading enters, never excluded."""
+        outcome = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("300"),
+                conservative_income_apr=Decimal("2"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        assert outcome.decision.action is PolicyActionKind.ENTER
+        assert outcome.decision.reason is PolicyReason.ENTRY_THRESHOLD_MET
+
+    def test_the_width_solve_sizes_on_the_basis_not_the_spike(self) -> None:
+        """A conservative basis honestly re-derives the range's yield math.
+
+        The raw 4000 reading solves the target at the tightest width; the
+        same reading with a conservative basis cannot reach the target
+        there (the solve reports it unreachable and enters at the
+        tightest candidate anyway, its evidence naming the basis) - the
+        range's yield derivation is never carried by the spike.
+        """
+        spiked = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(emissions_apr=Decimal("4000"), ranging=ranging_evidence()),
+        )
+        floored = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("4000"),
+                conservative_income_apr=Decimal("2"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        spiked_solution = spiked.decision.width_solution
+        floored_solution = floored.decision.width_solution
+        assert spiked_solution is not None and floored_solution is not None
+        assert spiked_solution.mode is WidthSolveMode.SOLVED
+        assert floored_solution.mode is WidthSolveMode.TARGET_UNREACHABLE
+        # The solve's own evidence names the basis it read, never the spike.
+        assert any("Raw emissions APR 2 " in line for line in floored_solution.diagnostics)
+        assert any("Raw emissions APR 4000" in line for line in spiked_solution.diagnostics)
+        joined = "\n".join(floored.decision.diagnostics)
+        assert "cannot reach the target" in joined
+
+    def test_the_gas_gate_judges_the_basis_not_the_spike(self) -> None:
+        """A spike must not justify a batch cost the basis cannot carry.
+
+        At the fixture's size, expensive gas (0.05 gwei) against the
+        conservative basis (2.0) cannot pass the locked five-percent
+        cost-share bound, so the EXISTING gas sense-check defers the
+        entry - the gate judging honest yield, never an exclusion of the
+        reading itself (the raw 4000 reading passes the same gate).
+        """
+        outcome = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("4000"),
+                conservative_income_apr=Decimal("2"),
+                gas_price_gwei=Decimal("0.05"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        assert outcome.decision.action is PolicyActionKind.HOLD
+        assert outcome.decision.reason is PolicyReason.GAS_GATE_DEFERRED
+        passed = PolicyEngine().decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("4000"),
+                gas_price_gwei=Decimal("0.05"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        assert passed.decision.action is PolicyActionKind.ENTER
+
+    def test_the_lost_yield_line_quotes_the_basis(self) -> None:
+        """The out-of-range forgone-yield evidence reads the basis."""
+        engine = PolicyEngine()
+        entry = engine.decide(
+            PolicyState(),
+            base_observation(
+                emissions_apr=Decimal("4000"),
+                conservative_income_apr=Decimal("2"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        assert entry.decision.action is PolicyActionKind.ENTER
+        state = entry.next_state
+        assert state.position is not None
+        upper = state.position.price_range.upper_price
+        above = engine.decide(
+            state,
+            base_observation(
+                observed_at=base_observation().observed_at + timedelta(minutes=1),
+                amm_price_usdc=upper * Decimal("1.01"),
+                emissions_apr=Decimal("4000"),
+                conservative_income_apr=Decimal("2"),
+                ranging=ranging_evidence(),
+            ),
+        )
+        joined = "\n".join(above.decision.diagnostics)
+        assert "Income protection" in joined
+        assert "2 (about 200 percent)" in joined
+        assert "4000 (about 400,000 percent)" not in joined

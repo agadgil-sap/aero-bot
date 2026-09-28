@@ -36,7 +36,7 @@ from aero_bot.domain import (
     NonNegativeDecimal,
     normalize_evm_address,
 )
-from aero_bot.emissions_apr import aerodrome_display_emissions_apr
+from aero_bot.emissions_apr import AprReadingSample, aerodrome_display_emissions_apr
 from aero_bot.executor import (
     DEFAULT_CANARY_SAFE_ADDRESS,
     SAFE_ADDRESS_ENV,
@@ -151,6 +151,14 @@ class StrategyDecisionReport(BaseModel):
     # in-band. Carries the episode signature the alert layer rate-limits
     # on and every exclusion's full lost-yield consequence.
     idle_cash: "IdleCashState | None" = None
+    # The conservative income window's successor readings (the captain's
+    # 2026-09-28 correction): the trailing per-symbol qualifying APRs the
+    # book threads so the next cycle floors its income expectations at
+    # their median. Empty when no cycle history is in hand.
+    apr_history: tuple[AprReadingSample, ...] = ()
+    # One human evidence line per pool whose income expectation was
+    # floored by the trailing median (information, never exclusion).
+    income_basis_evidence: tuple[str, ...] = ()
 
 
 class IdleCashExclusion(BaseModel):

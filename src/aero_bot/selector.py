@@ -23,6 +23,7 @@ scheduled cycle composes the tiered portfolio over the same entry-gate
 evaluations through `aero_bot.allocator` (the captain's gnhf 33 ruling), so
 the ranked board this module produces is the allocator's input, never a
 competitor to it.
+
 """
 
 from collections.abc import Mapping, Sequence
@@ -354,9 +355,12 @@ def switch_gas_economics(
     combined_cost_usd = (
         Decimal(combined_units) * gas_price / GWEI_PER_ETH * parameters.eth_price_assumption_usd
     )
+    # The income expectation reads the conservative basis when the caller
+    # carries one (the captain's 2026-09-28 correction): the switch's
+    # economics are never justified by a transient reading.
     expected_daily_gross_yield = (
         entry_size_usd
-        * (candidate_observation.emissions_apr + candidate_observation.fee_apr)
+        * (candidate_observation.income_expectation_apr + candidate_observation.fee_apr)
         / DAYS_PER_YEAR
     )
     bound_usd = parameters.gas_cost_max_gross_yield_fraction * expected_daily_gross_yield
@@ -576,7 +580,6 @@ def select_board(
             on the board, or the switch margin is negative.
     """
     evaluations = evaluate_pool_entries(engine, state, options, reentry_blocked_until_by_symbol)
-
     if state.held_inventory is not None:
         # Unsold stock resolves before any new exposure; the engine never
         # holds inventory and a position at once, and neither does the board.

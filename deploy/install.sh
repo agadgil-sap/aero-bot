@@ -175,6 +175,23 @@ AERO_BOT_BASE_RPC_URL=https://base.publicnode.com
 # below this floor, and a book whose clamp sits under the floor stays
 # cash. The floor must stay at or under the configured minimum.
 #AERO_BOT_CYCLE_MIN_POSITION_FLOOR_USDC=30
+# The book equity at or above which the per-name concentration cap
+# engages (the captain's 2026-09-28 ruling): below it the cap does not
+# bind at all and the book funds toward the cap running the proven
+# ~100-per-position shape under the configured minimum. The hard
+# ceiling is the 1000-USDC total cap itself, so an override can only
+# engage the cap sooner, never later.
+#AERO_BOT_CYCLE_CONCENTRATION_CAP_ACTIVATION_USDC=1000
+# The trailing window of cycle readings the conservative income
+# expectation floors itself at (the captain's 2026-09-28 correction,
+# default 6 cycles = half an hour at the five-minute cadence): every
+# surface that assumes an expected daily yield - the range-width solve,
+# the gas cost-versus-yield checks, the income-forgone accounting -
+# reads min(current, median(window)) so a transient spike never sizes
+# or justifies a position. Information, never exclusion: the qualifying
+# gates and the ranking keep the raw venue-convention APR, and high
+# readings still deploy (the boosted yield thesis).
+#AERO_BOT_CYCLE_INCOME_HISTORY_CYCLES=6
 # Range monitoring is allowed to observe and alert at seconds-level, but the
 # shipped systemd unit is forced into --monitor-only. It cannot trade.
 AERO_BOT_WATCHTOWER_ENABLED=0

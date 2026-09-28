@@ -51,6 +51,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field, model_validator
 
 from aero_bot.allocator import (
+    PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC,
     HeldPositionFact,
     PortfolioAllocation,
     PortfolioExclusionReason,
@@ -63,6 +64,11 @@ from aero_bot.allocator import (
 from aero_bot.audit import AuditEventType, AuditRecord, AuditStore
 from aero_bot.config import Settings
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
+from aero_bot.emissions_apr import (
+    AprReadingSample,
+    conservative_income_apr,
+    format_apr_percent,
+)
 from aero_bot.execution_lock import ExecutionLockUnavailableError, exclusive_execution_lock
 from aero_bot.executor import (
     DEFAULT_CANARY_SAFE_ADDRESS,
@@ -158,6 +164,25 @@ CYCLE_CONCENTRATION_CAP_ENV = "AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION"
 # concentration clamp whenever the clamp governs, never below this
 # gas-efficiency floor.
 CYCLE_MIN_POSITION_FLOOR_USDC_ENV = "AERO_BOT_CYCLE_MIN_POSITION_FLOOR_USDC"
+# Environment variable carrying the book equity at or above which the
+# per-name concentration cap engages (the captain's 2026-09-28 ruling,
+# default 1000 USDC): below the activation equity the cap does not bind
+# at all, so the trial-scale book funds toward the cap running the
+# proven ~100-per-position shape under the configured minimum.
+CYCLE_CONCENTRATION_CAP_ACTIVATION_USDC_ENV = "AERO_BOT_CYCLE_CONCENTRATION_CAP_ACTIVATION_USDC"
+# Environment variable carrying the trailing window of cycle readings the
+# conservative income expectation floors itself at (the captain's
+# 2026-09-28 correction, default 6 cycles = half an hour at the five-minute
+# cadence): every surface that assumes an expected daily yield reads
+# min(current, median(window)) so a transient spike never sizes or
+# justifies a position. Information, never exclusion - the qualifying
+# gates and the ranking keep the raw venue-convention APR.
+CYCLE_INCOME_HISTORY_CYCLES_ENV = "AERO_BOT_CYCLE_INCOME_HISTORY_CYCLES"
+# The default trailing window in cycles.
+DEFAULT_INCOME_HISTORY_CYCLES = 6
+# The hard ceiling on the window: a sealed override may lengthen the
+# memory, never shorten it below the single-cycle minimum.
+HARD_MAX_INCOME_HISTORY_CYCLES = 48
 # The default reward-conversion threshold in USDC.
 DEFAULT_AERO_CONVERSION_MIN_USDC = Decimal("5")
 # Dynamic selector sizing keeps ten percent of the observed in-range depth cap
@@ -427,6 +452,12 @@ class CycleStateBook(BaseModel):
     # alert fires only on the first cycle of an episode or when its cause
     # changes (the captain's gnhf 34 ruling).
     idle_cash_alert_signature: str | None = None
+    # The trailing per-symbol qualifying-APR readings (the captain's
+    # 2026-09-28 correction): the conservative income expectation floors
+    # itself at the median of each pool's trailing window, so no position
+    # is ever sized or justified by a transient reading. Bounded to the
+    # window per symbol.
+    apr_history: tuple[AprReadingSample, ...] = ()
     # When this book was last persisted, timezone-aware.
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -1364,6 +1395,7 @@ class CycleRunner:
         parameters: PolicyParameters = LOCKED_POLICY_PARAMETERS,
         aero_conversion_min_usdc: Decimal = DEFAULT_AERO_CONVERSION_MIN_USDC,
         portfolio_parameters: PortfolioParameters | None = None,
+        income_history_cycles: int | None = None,
     ) -> None:
         """Configure one cycle runner over every injectable boundary.
 
@@ -1393,6 +1425,10 @@ class CycleRunner:
             portfolio_parameters: The portfolio allocation parameter set
                 (the allocator ruling); None builds the locked defaults
                 carrying this runner's switch margin.
+            income_history_cycles: The trailing window of cycle readings
+                the conservative income expectation floors itself at (the
+                captain's 2026-09-28 correction); None uses the sealed
+                default.
         """
         self._symbol = symbol.strip() if symbol is not None else None
         self._safe_address = normalize_evm_address(safe_address)
@@ -1410,6 +1446,7 @@ class CycleRunner:
         self._parameters = parameters
         self._aero_conversion_min_usdc = aero_conversion_min_usdc
         self._portfolio_parameters_value = portfolio_parameters
+        self._income_history_cycles_value = income_history_cycles
         self._last_reconciliation: CycleReconciliation | None = None
         # One cycle process enumerates the board at most once; reconcile and
         # decide share the cached listing and its snapshot block.
@@ -1431,6 +1468,70 @@ class CycleRunner:
         if self._portfolio_parameters_value is None:
             return PortfolioParameters(switch_margin_fraction=self._switch_margin_fraction)
         return self._portfolio_parameters_value
+
+    def _income_history_cycles(self) -> int:
+        """Resolve the conservative income window in cycles.
+
+        Returns:
+            The configured window, or the sealed default.
+        """
+        if self._income_history_cycles_value is not None:
+            return self._income_history_cycles_value
+        return _income_history_cycles_from_environment()
+
+    def _income_basis_stamping(
+        self, options: tuple[PoolBoardOption, ...], book: CycleStateBook
+    ) -> tuple[tuple[PoolBoardOption, ...], tuple[AprReadingSample, ...], tuple[str, ...]]:
+        """Stamp each option's conservative income basis from the book's window.
+
+        The captain's 2026-09-28 correction: the venue's displayed
+        convention is the reference and its high readings are real, so
+        nothing is excluded - but every surface that ASSUMES an expected
+        daily yield reads ``min(current, median(trailing window))`` so a
+        transient spike never sizes or justifies a position. Each board
+        option's observation carries the basis; the successor history
+        appends this cycle's readings bounded to the window per symbol;
+        one evidence line names every pool whose expectation was floored.
+
+        Args:
+            options: The assembled board options.
+            book: The persisted book carrying the trailing readings.
+
+        Returns:
+            The stamped options, the successor history, and the evidence
+            lines for the floored pools.
+        """
+        window = self._income_history_cycles()
+        stamped: list[PoolBoardOption] = []
+        successor: list[AprReadingSample] = []
+        evidence: list[str] = []
+        for option in options:
+            reading = option.observation.emissions_apr
+            symbol_key = option.symbol.lower()
+            prior = tuple(
+                sample.reading for sample in book.apr_history if sample.symbol.lower() == symbol_key
+            )
+            basis = conservative_income_apr(reading, prior + (reading,))
+            stamped.append(
+                option.model_copy(
+                    update={
+                        "observation": option.observation.model_copy(
+                            update={"conservative_income_apr": basis}
+                        )
+                    }
+                )
+            )
+            successor.append(AprReadingSample(symbol=option.symbol, reading=reading))
+            if basis < reading:
+                evidence.append(
+                    f"conservative income basis: {option.symbol} expected-yield surfaces "
+                    f"read {format_apr_percent(basis)}, the trailing {len(prior) + 1}-cycle "
+                    f"median flooring the instantaneous {format_apr_percent(reading)}; "
+                    "the qualifying gates and the ranking keep the raw venue-convention "
+                    "reading"
+                )
+        trimmed = _trim_apr_history(tuple(successor), book.apr_history, window)
+        return tuple(stamped), trimmed, tuple(evidence)
 
     def _ensure_board(self) -> None:
         """Enumerate the verified board once per runner unless cached.
@@ -2311,6 +2412,26 @@ class CycleRunner:
             )
 
         engine = PolicyEngine(self._parameters, load_event_calendar())
+        # The pinned path stamps the same conservative income basis (the
+        # captain's 2026-09-28 correction): expected-yield surfaces read
+        # min(current, the trailing median) so a transient spike never
+        # sizes a pinned entry either. Pinned runs carry their own book
+        # window; the qualifying gates keep the raw reading.
+        basis = conservative_income_apr(
+            observation.emissions_apr,
+            tuple(
+                sample.reading
+                for sample in book.apr_history
+                if sample.symbol.lower() == (self._symbol or "").lower()
+            )
+            + (observation.emissions_apr,),
+        )
+        observation = observation.model_copy(update={"conservative_income_apr": basis})
+        pinned_history = _trim_apr_history(
+            (AprReadingSample(symbol=self._symbol, reading=observation.emissions_apr),),
+            book.apr_history,
+            self._income_history_cycles(),
+        )
         outcome = engine.decide(state, observation)
         window = evaluate_event_window(
             observation.observed_at, observation.token_address, engine.calendar
@@ -2330,6 +2451,7 @@ class CycleRunner:
             event_window=window,
             outcome=outcome,
             input_notes=notes,
+            apr_history=pinned_history,
         )
 
     def _decide_selector(
@@ -2444,6 +2566,14 @@ class CycleRunner:
         engine = PolicyEngine(self._parameters, load_event_calendar())
         session_state = self._session_state(book, self._last_reconciliation)
         cooldowns = self._cooldown_map(book)
+        # The conservative income basis (the captain's 2026-09-28
+        # correction) stamps every board observation before ANY evaluation:
+        # each pool's expected-yield surfaces - the held folds' recenter
+        # economics included - read min(current, the trailing-cycle median)
+        # so a transient spike never sizes or justifies a position, while
+        # the qualifying gates, the ranking, and the dilution monitor keep
+        # the raw venue-convention reading - information, never exclusion.
+        options, successor_history, income_evidence = self._income_basis_stamping(options, book)
         options_by_symbol = {option.symbol: option for option in options}
         # One fold per held position: each position's own lifecycle - its
         # safety exits, its recenters, its out-of-range grace - is judged by
@@ -2497,7 +2627,8 @@ class CycleRunner:
                 )
             inventory_outcome = engine.decide(session_state, inventory_option.observation)
         # The board evaluation stays exactly the selector's: the complete
-        # entry gate chain per pool over the flat session posture.
+        # entry gate chain per pool over the flat session posture, over the
+        # conservatively-stamped observations.
         evaluations = evaluate_pool_entries(engine, session_state, options, cooldowns)
         cash_usdc = Decimal(self._last_reconciliation.safe_usdc_units).scaleb(-6)
         equity_usdc = options[0].observation.equity_usd if options else cash_usdc + lp_value
@@ -2549,7 +2680,7 @@ class CycleRunner:
                 decision=PolicyDecision(
                     action=PolicyActionKind.HOLD,
                     reason=reason,
-                    diagnostics=(allocation.summary, plan.summary),
+                    diagnostics=(allocation.summary, plan.summary, *income_evidence),
                 ),
                 next_state=session_state,
             )
@@ -2563,6 +2694,8 @@ class CycleRunner:
         summary = f"portfolio: {allocation.summary}; {plan.summary}; " + board_summary_line(
             evaluations, decision_option.symbol
         )
+        if income_evidence:
+            summary += "; " + " ".join(income_evidence)
         return StrategyDecisionReport(
             symbol=decision_option.symbol,
             pool_address=decision_option.pool_address,
@@ -2587,6 +2720,8 @@ class CycleRunner:
             gate_trace_basis=allocation.gate_trace_basis,
             gate_trace=allocation.gate_trace,
             idle_cash=idle_cash,
+            apr_history=successor_history,
+            income_basis_evidence=income_evidence,
         )
 
     def _option_for_plan(
@@ -3623,14 +3758,18 @@ class CycleRunner:
             # The idle-cash episode stamp rides the rebuilt book: the
             # signature the alert layer compares against next cycle, or
             # None once the book deploys or the band empties so a later
-            # episode alerts again from its first cycle.
+            # episode alerts again from its first cycle. The conservative
+            # income window's successor readings ride with it (the
+            # captain's 2026-09-28 correction): the trailing median the
+            # next cycle floors its income expectations at.
             return rebuilt.model_copy(
                 update={
                     "idle_cash_alert_signature": (
                         decision_report.idle_cash.signature
                         if decision_report.idle_cash is not None
                         else None
-                    )
+                    ),
+                    "apr_history": decision_report.apr_history,
                 }
             )
         position = book.position
@@ -3683,6 +3822,11 @@ class CycleRunner:
                 "day_start_equity_usd": next_state.day_start_equity_usd,
                 "peak_equity_usdc": next_state.peak_equity_usd,
                 "halted_day": next_state.halted_day,
+                "apr_history": (
+                    decision_report.apr_history
+                    if decision_report is not None and decision_report.apr_history
+                    else book.apr_history
+                ),
                 "updated_at": self._now(),
             }
         )
@@ -4456,6 +4600,12 @@ class CycleRunner:
                         f"idle-cash exclusion {row.symbol} ({row.reason}{gate_segment}): "
                         f"{row.detail}",
                     )
+            # The conservative income basis's evidence rides every cycle
+            # report the same way (the captain's 2026-09-28 correction):
+            # each floored pool's basis, window, and instantaneous reading
+            # stay answerable from the report and the audit store alone.
+            if decision_report.income_basis_evidence:
+                decision_diagnostics = decision_diagnostics + decision_report.income_basis_evidence
             event_window = decision_report.event_window.description
             input_notes = decision_report.input_notes
         else:
@@ -4891,8 +5041,69 @@ def _portfolio_parameters_from_environment(
         concentration_cap_fraction=_decimal(
             CYCLE_CONCENTRATION_CAP_ENV, PortfolioParameters().concentration_cap_fraction
         ),
+        concentration_cap_activation_equity_usdc=_decimal(
+            CYCLE_CONCENTRATION_CAP_ACTIVATION_USDC_ENV,
+            PortfolioParameters().concentration_cap_activation_equity_usdc,
+        ),
         switch_margin_fraction=switch_margin_fraction,
     )
+
+
+def _income_history_cycles_from_environment(
+    environ: Mapping[str, str] = os.environ,
+) -> int:
+    """Read the conservative income window from the sealed environment.
+
+    Args:
+        environ: Environment mapping carrying the optional override; an
+            absent or empty variable keeps the sealed default.
+
+    Returns:
+        The trailing window in cycles, at least one and at most the hard
+        ceiling.
+
+    Raises:
+        ValueError: If the override sits outside its interval.
+    """
+    raw = environ.get(CYCLE_INCOME_HISTORY_CYCLES_ENV, "").strip()
+    if not raw:
+        return DEFAULT_INCOME_HISTORY_CYCLES
+    value = int(raw)
+    if value < 1:
+        raise ValueError(f"{CYCLE_INCOME_HISTORY_CYCLES_ENV} must be at least one, not {raw!r}")
+    if value > HARD_MAX_INCOME_HISTORY_CYCLES:
+        raise ValueError(
+            f"{CYCLE_INCOME_HISTORY_CYCLES_ENV} must not exceed "
+            f"{HARD_MAX_INCOME_HISTORY_CYCLES} cycles, not {raw!r}"
+        )
+    return value
+
+
+def _trim_apr_history(
+    current: tuple[AprReadingSample, ...],
+    prior: tuple[AprReadingSample, ...],
+    window: int,
+) -> tuple[AprReadingSample, ...]:
+    """Merge one cycle's readings into the trailing window, per symbol.
+
+    Args:
+        current: This cycle's per-symbol readings, board order.
+        prior: The persisted history, oldest first.
+        window: The maximum samples kept per symbol.
+
+    Returns:
+        The successor history, per symbol the most recent ``window``
+        readings, ordered by symbol for reproducible books.
+    """
+    merged: dict[str, list[AprReadingSample]] = {}
+    for sample in prior:
+        merged.setdefault(sample.symbol.lower(), []).append(sample)
+    for sample in current:
+        merged.setdefault(sample.symbol.lower(), []).append(sample)
+    kept: list[AprReadingSample] = []
+    for samples in merged.values():
+        kept.extend(samples[-window:])
+    return tuple(sorted(kept, key=lambda sample: sample.symbol.lower()))
 
 
 def build_cycle_runner(
@@ -4904,6 +5115,7 @@ def build_cycle_runner(
     parameters: PolicyParameters = LOCKED_POLICY_PARAMETERS,
     aero_conversion_min_usdc: Decimal = DEFAULT_AERO_CONVERSION_MIN_USDC,
     portfolio_parameters: PortfolioParameters | None = None,
+    income_history_cycles: int | None = None,
 ) -> CycleRunner:
     """Assemble the live cycle runner from the application settings.
 
@@ -4920,6 +5132,8 @@ def build_cycle_runner(
             triggers the reward conversion inside the act step.
         portfolio_parameters: The allocator's portfolio bounds; None keeps
             the locked defaults carrying the switch margin.
+        income_history_cycles: The conservative income window in cycles;
+            None keeps the sealed default.
 
     Returns:
         The fully wired runner; nothing has been read yet.
@@ -4994,6 +5208,7 @@ def build_cycle_runner(
         parameters=parameters,
         aero_conversion_min_usdc=aero_conversion_min_usdc,
         portfolio_parameters=portfolio_parameters,
+        income_history_cycles=income_history_cycles,
     )
 
 
@@ -5135,6 +5350,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--concentration-cap-activation-usdc",
+        type=Decimal,
+        default=None,
+        help=(
+            "The book equity at or above which the per-name concentration "
+            "cap engages (default 1000, the hard ceiling - the captain's "
+            "2026-09-28 ruling); below it the cap does not bind at all and "
+            "the book funds toward the cap at the proven per-position scale. "
+            "The sealed AERO_BOT_CYCLE_CONCENTRATION_CAP_ACTIVATION_USDC "
+            "variable supplies the same value when the flag is absent."
+        ),
+    )
+    parser.add_argument(
         "--aero-conversion-min-usdc",
         type=Decimal,
         default=None,
@@ -5167,6 +5395,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ("--min-position-usdc", arguments.min_position_usdc),
         ("--min-position-floor-usdc", arguments.min_position_floor_usdc),
         ("--concentration-cap", arguments.concentration_cap),
+        ("--concentration-cap-activation-usdc", arguments.concentration_cap_activation_usdc),
     ):
         if value is not None and value <= 0:
             parser.error(f"{flag} must be positive")
@@ -5188,6 +5417,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--min-position-floor-usdc must not exceed the minimum position size "
             f"({resolved_min_position} USDC); the floor bounds the coherence rule, "
             "it never raises the minimum"
+        )
+    if (
+        arguments.concentration_cap_activation_usdc is not None
+        and arguments.concentration_cap_activation_usdc > PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC
+    ):
+        parser.error(
+            "--concentration-cap-activation-usdc must not exceed the hard "
+            f"{PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC} USDC total cap; the activation equity may "
+            "only engage the concentration cap sooner, never later"
         )
     if arguments.max_positions is not None and arguments.max_positions < 1:
         parser.error("--max-positions must be at least one")
@@ -5212,6 +5450,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else _aero_conversion_min_from_environment(os.environ)
         )
         portfolio_parameters = _portfolio_parameters_from_environment(os.environ, switch_margin)
+        income_history_cycles = _income_history_cycles_from_environment(os.environ)
         if arguments.tier_band is not None:
             portfolio_parameters = portfolio_parameters.model_copy(
                 update={"tier_band_fraction": arguments.tier_band}
@@ -5231,6 +5470,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.concentration_cap is not None:
             portfolio_parameters = portfolio_parameters.model_copy(
                 update={"concentration_cap_fraction": arguments.concentration_cap}
+            )
+        if arguments.concentration_cap_activation_usdc is not None:
+            portfolio_parameters = portfolio_parameters.model_copy(
+                update={
+                    "concentration_cap_activation_equity_usdc": (
+                        arguments.concentration_cap_activation_usdc
+                    )
+                }
             )
         configured_reference = (
             parse_reference_quotes(arguments.reference_price)
@@ -5290,6 +5537,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parameters,
             aero_conversion_min,
             portfolio_parameters,
+            income_history_cycles,
         )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"the cycle runner is unavailable: {error}", file=sys.stderr)
