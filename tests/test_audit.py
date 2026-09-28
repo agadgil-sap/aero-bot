@@ -186,6 +186,83 @@ def test_concurrent_appends_remain_contiguous_and_verifiable(tmp_path: Path) -> 
     assert store.verify_chain().record_count == 16
 
 
+def test_append_retries_a_transient_writer_lock_and_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock-flavored OperationalError retries with backoff instead of killing the cycle.
+
+    Production evidence (2026-09-28 11:32 UTC): the live re-entry mint died
+    mid-act when its audit append surfaced ``database is locked`` after the
+    five-second connect timeout, wedging the book between a completed exit
+    and a never-run re-entry. The append now waits out bounded contention.
+    """
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    durable = store._append_durable
+    failures = ["database is locked", "database is busy"]
+    sleeps: list[float] = []
+    monkeypatch.setattr("aero_bot.audit.time.sleep", sleeps.append)
+
+    def contend_then_append(
+        event_type: AuditEventType, created_at_text: str, payload_json: str
+    ) -> object:
+        """Raise the first two lock errors, then delegate to the real append."""
+        if failures:
+            raise sqlite3.OperationalError(failures.pop(0))
+        return durable(event_type, created_at_text, payload_json)
+
+    monkeypatch.setattr(store, "_append_durable", contend_then_append)
+
+    record = store.append(AuditEventType.SYSTEM_STATE, fixture_payload(), CREATED_AT)
+
+    assert record.sequence == 1
+    assert sleeps == [0.5, 1.0]
+    assert store.verify_chain().status is AuditVerificationStatus.VERIFIED
+
+
+def test_append_reraises_a_lock_that_outlives_every_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock that survives the whole bounded schedule still surfaces honestly."""
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    sleeps: list[float] = []
+    monkeypatch.setattr("aero_bot.audit.time.sleep", sleeps.append)
+
+    def always_locked(
+        event_type: AuditEventType, created_at_text: str, payload_json: str
+    ) -> object:
+        """Contend forever like a wedged external writer."""
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "_append_durable", always_locked)
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        store.append(AuditEventType.SYSTEM_STATE, fixture_payload(), CREATED_AT)
+
+    assert sleeps == [0.5, 1.0, 2.0, 4.0, 8.0]
+
+
+def test_append_never_retries_a_non_lock_operational_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-lock SQLite failure surfaces immediately without any retry."""
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    sleeps: list[float] = []
+    monkeypatch.setattr("aero_bot.audit.time.sleep", sleeps.append)
+
+    def no_such_table(
+        event_type: AuditEventType, created_at_text: str, payload_json: str
+    ) -> object:
+        """Fail like a schema or disk fault, never a lock."""
+        raise sqlite3.OperationalError("no such table: audit_records")
+
+    monkeypatch.setattr(store, "_append_durable", no_such_table)
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        store.append(AuditEventType.SYSTEM_STATE, fixture_payload(), CREATED_AT)
+
+    assert sleeps == []
+
+
 def test_secret_shaped_fields_and_naive_timestamps_are_rejected(tmp_path: Path) -> None:
     """Credential-bearing schemas and ambiguous event times never reach SQLite."""
     # Empty initialized store must remain unchanged after both rejected append attempts.

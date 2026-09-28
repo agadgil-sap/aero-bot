@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 from collections.abc import Sequence
 from contextlib import closing
 from datetime import UTC, datetime
@@ -40,6 +41,12 @@ AUDIT_SCHEMA_VERSION = 1
 GENESIS_HASH = "0" * 64
 # Five seconds gives concurrent local writers time to complete a short append transaction.
 SQLITE_TIMEOUT_SECONDS = 5.0
+# A writer-lock contention that outlives the connect timeout is retried with
+# bounded backoff before it may surface: a live cycle died mid-act on
+# "database is locked" on 2026-09-28 (the audit append inside the re-entry
+# mint), so a transient local lock (a concurrent append, backup, or
+# dashboard verification) must never kill an acting cycle again.
+SQLITE_LOCK_RETRY_DELAYS_SECONDS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
 # Restrictive database permissions allow only the current local user to read or write records.
 DATABASE_FILE_MODE = 0o600
 # Restrictive directory permissions prevent other local users from traversing audit storage.
@@ -303,7 +310,7 @@ class AuditStore:
         payload: BaseModel,
         created_at: datetime,
     ) -> AuditRecord:
-        """Append one canonical model payload inside an immediate SQLite transaction.
+        """Append one canonical model payload with bounded writer-lock retry.
 
         Args:
             event_type: Reviewed category identifying the recorded application behavior.
@@ -315,11 +322,46 @@ class AuditStore:
 
         Raises:
             ValueError: If time is naive or payload fields could contain signing credentials.
+            sqlite3.OperationalError: If the writer lock stays contended past every retry.
         """
         # Canonical timestamp is computed before acquiring the short database write lock.
         created_at_text = self._normalize_datetime(created_at)
         # Canonical payload and secret rejection happen before any durable mutation.
         payload_json = self._canonical_payload(payload)
+        # One attempt per configured backoff plus the first try; only a
+        # lock-flavored OperationalError retries, and everything else
+        # (corruption, schema, misuse) still surfaces immediately.
+        attempts = len(SQLITE_LOCK_RETRY_DELAYS_SECONDS) + 1
+        for attempt in range(attempts):
+            try:
+                return self._append_durable(event_type, created_at_text, payload_json)
+            except sqlite3.OperationalError as error:
+                message = str(error).lower()
+                lock_contended = "locked" in message or "busy" in message
+                if not lock_contended or attempt + 1 == attempts:
+                    raise
+                time.sleep(SQLITE_LOCK_RETRY_DELAYS_SECONDS[attempt])
+        raise sqlite3.OperationalError("database is locked past every retry")
+
+    def _append_durable(
+        self,
+        event_type: AuditEventType,
+        created_at_text: str,
+        payload_json: str,
+    ) -> AuditRecord:
+        """Append inside one immediate SQLite transaction; no retry here.
+
+        Args:
+            event_type: Reviewed category identifying the recorded application behavior.
+            created_at_text: The already-normalized canonical timestamp.
+            payload_json: The already-canonical payload text.
+
+        Returns:
+            The immutable durable record linked to its predecessor.
+
+        Raises:
+            AuditIntegrityError: If the existing chain verifies corrupt under the lock.
+        """
         with closing(self._connect()) as connection, connection:
             # Immediate mode serializes sequence and predecessor selection across local writers.
             connection.execute("BEGIN IMMEDIATE")

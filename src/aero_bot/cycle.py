@@ -654,6 +654,13 @@ class CycleReconciliation(BaseModel):
     tracked_token_id: Annotated[int, Field(ge=0)] | None = None
     # Whether the tracked position is staked in the gauge.
     tracked_staked: bool = False
+    # Every tracked position id that reconciles empty on-chain - zero
+    # liquidity, zero checkpointed fees, unstaked in the Safe - and so
+    # leaves the book's tracking this cycle. The crashed-exit heal: a
+    # cycle that dies between a completed withdraw and its re-entry
+    # leaves exactly this shape tracked, and a stale tracking re-commands
+    # a dead NFT every cycle (the 2026-09-28 position_empty halt loop).
+    empty_tracked_token_ids: Annotated[tuple[int, ...], Field(min_length=0)] = ()
     # The held-inventory quantity in whole stock tokens, zero when none.
     held_stock_quantity: Annotated[Decimal, Field(ge=0)] = Decimal("0")
     # The symbol whose stock balance held_stock_quantity measures; None
@@ -1606,6 +1613,13 @@ class CycleRunner:
         if reconciliation.out_of_band:
             halted_reason = reconciliation.out_of_band
         else:
+            if reconciliation.empty_tracked_token_ids:
+                # The crashed-exit heal: an empty tracked NFT is chain truth
+                # saying the exit finished, so the stale tracking drops
+                # before decide re-commands a dead position into the
+                # position_empty refusal loop (2026-09-28 live wedge).
+                for empty_token_id in reconciliation.empty_tracked_token_ids:
+                    book = _book_with_position_removed(book, empty_token_id)
             book = self._adopt_into_book(book, reconciliation)
             decision_report = self._decide(
                 book,
@@ -1794,6 +1808,7 @@ class CycleRunner:
             ValueError: If the anchor symbol resolves to nothing.
         """
         diagnostics: list[str] = []
+        empty_tracked: list[int] = []
         safe_usdc = self._balances.fetch_token_balance(BASE_USDC_ADDRESS, self._safe_address)
         safe_aero = self._balances.fetch_token_balance(AERO_TOKEN_ADDRESS, self._safe_address)
         relayer_eth = (
@@ -1832,6 +1847,33 @@ class CycleRunner:
                 break
             staked = owner == gauge
             tracked_ids.add(tracked.token_id)
+            view = status.position
+            fees_owed0_units = getattr(status, "fees_owed0_units", 0)
+            fees_owed1_units = getattr(status, "fees_owed1_units", 0)
+            if (
+                not staked
+                and getattr(view, "liquidity", 0) == 0
+                and fees_owed0_units == 0
+                and fees_owed1_units == 0
+            ):
+                # The position's exit already completed on-chain (a cycle
+                # crashed between the withdraw and the re-entry); the empty
+                # NFT carries no exposure to manage, so the tracking drops
+                # here and decide never re-commands the dead token.
+                empty_tracked.append(tracked.token_id)
+                diagnostics.append(
+                    f"tracked position {tracked.token_id} on {tracked.symbol} "
+                    f"(in the Safe) valued {status.position_value_usdc} USDC against "
+                    f"{tracked.committed_usd} committed"
+                )
+                diagnostics.append(
+                    f"tracked position {tracked.token_id} on {tracked.symbol} reconciles "
+                    "EMPTY on-chain (no liquidity, no owed fees, unstaked in the Safe); "
+                    "dropping the stale tracking from the book - the exit already "
+                    "completed on-chain when a crashed cycle died between the withdraw "
+                    "and the re-entry, and the empty NFT carries no exposure to manage"
+                )
+                continue
             position_statuses.append(
                 PositionStatusRecord(
                     symbol=tracked.symbol,
@@ -1959,6 +2001,7 @@ class CycleRunner:
             held_symbol=held_symbol,
             out_of_band=out_of_band,
             diagnostics=tuple(diagnostics),
+            empty_tracked_token_ids=tuple(empty_tracked),
         )
 
     def _await_post_action_visibility(self, actions: tuple[CycleActionRecord, ...]) -> bool:
