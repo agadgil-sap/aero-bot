@@ -890,7 +890,7 @@ class PolicyEngine:
             The typed decision plus the successor state to thread forward.
         """
         # Day rollover and the daily loss halt are evaluated before any gate.
-        working_state = self._observe_day(state, observation)
+        working_state = self.observe_day(state, observation)
         # Captain's ruling (2026-09-09): the B20 pools are continuous DeFi
         # markets - nights and weekends are in scope - so the scheduled and
         # session-derived event windows no longer gate entries or force
@@ -935,7 +935,7 @@ class PolicyEngine:
             One line per ordered gate: verdict, measurement, and bound.
         """
         flat_basis = state.model_copy(update={"position": None, "held_inventory": None})
-        working_state = self._observe_day(flat_basis, observation)
+        working_state = self.observe_day(flat_basis, observation)
         latch_equity = _latch_equity_of(observation)
         lines: list[str] = []
         # Gate 1: the daily loss halt - the latched day, the day-start
@@ -1205,8 +1205,14 @@ class PolicyEngine:
             )
         )
 
-    def _observe_day(self, state: PolicyState, observation: PolicyObservation) -> PolicyState:
+    def observe_day(self, state: PolicyState, observation: PolicyObservation) -> PolicyState:
         """Apply day rollover, peak tracking, and both daily loss latches.
+
+        The portfolio runner persists these shared session facts after its
+        independently evaluated per-position folds. This pure public method
+        gives that rebuild the exact same day transition as decide and the
+        entry-gate trace; persisting the unobserved input state instead would
+        reset the day and forget the high-water mark on every scheduled cycle.
 
         The day-start latch keeps its exact shipped semantics: a marked
         drawdown of at least the halt fraction from the America/New_York
