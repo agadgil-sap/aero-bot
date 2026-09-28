@@ -33,14 +33,35 @@ liquidity regardless of range: halving the window halves the value carried
 per unit and doubles the concentration APR.
 """
 
+from collections.abc import Sequence
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 
+from pydantic import BaseModel
+
 from aero_bot.concentrated import MATH_PRECISION
+from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, NonNegativeDecimal
 
 # The frontend annualizes with 24 * 60 * 60 * 365 seconds.
 SECONDS_PER_YEAR = Decimal(31_536_000)
 # AERO, the emissions token, uses 18 decimals on Base.
 AERO_DECIMALS = 18
+
+
+class AprReadingSample(BaseModel):
+    """Carry one cycle's qualifying reading for the trailing window.
+
+    The conservative income expectation (the captain's 2026-09-28
+    correction) floors itself at the median of each pool's trailing
+    samples, threaded through the cycle book.
+    """
+
+    # Frozen strict fields keep one sample exactly as threaded.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The registry-matched stock symbol the reading belongs to.
+    symbol: str
+    # The raw qualifying emissions APR in the displayed convention.
+    reading: NonNegativeDecimal
 
 
 def format_apr_percent(value: Decimal) -> str:
@@ -243,3 +264,62 @@ def emissions_apr_at_tick_width(
             * SECONDS_PER_YEAR
         )
         return +(annual_reward_usdc / denominator)
+
+
+def median_decimal(values: Sequence[Decimal]) -> Decimal:
+    """Return the median of one non-empty sequence of decimals.
+
+    An even count averages the two middle values; the ordering is the
+    numeric sort, so the result is deterministic for any input order.
+
+    Args:
+        values: The readings whose median is wanted; never empty.
+
+    Returns:
+        The median reading.
+
+    Raises:
+        ValueError: If the sequence is empty.
+    """
+    if not values:
+        raise ValueError("the median of an empty reading set is undefined")
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[middle]
+    with localcontext() as context:
+        context.prec = MATH_PRECISION
+        return +((ordered[middle - 1] + ordered[middle]) / Decimal(2))
+
+
+def conservative_income_apr(
+    current_reading: Decimal,
+    trailing_readings: Sequence[Decimal],
+) -> Decimal:
+    """Floor one expected-yield assumption at the trailing median.
+
+    The captain's 2026-09-28 correction: the venue's displayed convention
+    is the reference and its high readings are real, but a position is
+    never sized or justified by a transient reading. The conservative
+    income expectation is therefore ``min(current, median(trailing))`` -
+    a spike reads as the median (the trailing window floors the
+    assumption), a genuine collapse reads as the current (the lower
+    stands), and a stable board reads unchanged. Information, never
+    exclusion: the qualifying gates and the ranking keep reading the raw
+    venue-convention APR.
+
+    Args:
+        current_reading: The instantaneous qualifying APR, the raw
+            venue-convention fraction.
+        trailing_readings: The recent qualifying readings for the same
+            pool, current included or not; the median of these floors
+            the expectation.
+
+    Returns:
+        The conservative income-expectation APR.
+    """
+    if not trailing_readings:
+        return current_reading
+    with localcontext() as context:
+        context.prec = MATH_PRECISION
+        return +min(current_reading, median_decimal(trailing_readings))

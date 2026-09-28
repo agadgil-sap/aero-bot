@@ -6,8 +6,10 @@ import pytest
 
 from aero_bot.emissions_apr import (
     aerodrome_display_emissions_apr,
+    conservative_income_apr,
     emissions_apr_at_tick_width,
     format_apr_percent,
+    median_decimal,
     staked_value_usdc,
 )
 from aero_bot.history import price_usdc_per_stock
@@ -136,3 +138,40 @@ def test_width_family_at_one_cell_equals_the_display_convention() -> None:
         * Decimal(31_536_000)
     )
     assert apr_cell == pytest.approx(annual / denominator_centered, rel=Decimal("0.05"))
+
+
+class TestConservativeIncomeExpectation:
+    """The captain's 2026-09-28 correction: information, never exclusion.
+
+    The venue's displayed convention is the reference and its high
+    readings are real - the boosted-yield thesis deploys into them. The
+    conservative income expectation only floors what the yield-ASSUMING
+    surfaces read: min(current, median(trailing)), so a transient spike
+    never sizes or justifies a position.
+    """
+
+    def test_the_median_of_odd_and_even_windows(self) -> None:
+        """Odd windows take the middle; even windows average the two."""
+        assert median_decimal([Decimal("1"), Decimal("9"), Decimal("5")]) == Decimal("5")
+        assert median_decimal(
+            [Decimal("2"), Decimal("3"), Decimal("10"), Decimal("40")]
+        ) == Decimal("6.5")
+        with pytest.raises(ValueError, match="empty"):
+            median_decimal([])
+
+    def test_a_spike_reads_as_the_trailing_median(self) -> None:
+        """The 2026-09-28 shape: 300 instantaneous against a 2-3 window."""
+        basis = conservative_income_apr(
+            Decimal("300"), [Decimal("2"), Decimal("3"), Decimal("300")]
+        )
+        assert basis == Decimal("3")
+
+    def test_a_collapse_reads_as_the_current_lower_reading(self) -> None:
+        """The basis never inflates an expectation above the current."""
+        assert conservative_income_apr(Decimal("1"), [Decimal("2"), Decimal("3")]) == (Decimal("1"))
+        assert conservative_income_apr(Decimal("2"), [Decimal("10")]) == Decimal("2")
+
+    def test_a_cold_start_or_flat_window_reads_unchanged(self) -> None:
+        """No history, or a matching window, changes nothing."""
+        assert conservative_income_apr(Decimal("5"), []) == Decimal("5")
+        assert conservative_income_apr(Decimal("5"), [Decimal("5"), Decimal("5")]) == Decimal("5")

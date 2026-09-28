@@ -462,6 +462,18 @@ class PolicyObservation(BaseModel):
     # Raw emissions APR is the pool's AERO emissions APR per staked liquidity
     # before any haircut, in the same convention Aerodrome displays.
     emissions_apr: NonNegativeDecimal
+    # The conservative income-expectation basis (the captain's 2026-09-28
+    # correction): when the caller carries one, every surface that ASSUMES
+    # an expected daily yield - the range-width solve, the gas
+    # cost-versus-yield sense-checks, the income-forgone accounting -
+    # reads this basis instead of the instantaneous reading, so a
+    # position is never sized or justified by a transient spike. The
+    # qualifying gates themselves (the emissions floor, dilution, the
+    # board ranking) keep reading the raw venue-convention APR: the
+    # high readings are real and deploying into them is the strategy.
+    # None means no conservative basis is in hand and the raw reading
+    # stands, the default every one-shot surface carries.
+    conservative_income_apr: NonNegativeDecimal | None = None
     # Fee APR annualizes the pool's gross swap fees; it feeds the expected
     # daily gross yield the gas sense-check gate compares batch costs against.
     fee_apr: NonNegativeDecimal = Decimal("0")
@@ -499,6 +511,28 @@ class PolicyObservation(BaseModel):
     # absence fails the derived width toward the locked ceiling with an
     # explicit fallback label on the entry or recenter decision.
     ranging: RangingEvidence | None = None
+
+    @property
+    def income_expectation_apr(self) -> Decimal:
+        """Return the APR every yield-assuming surface should read.
+
+        The conservative-income rule (the captain's 2026-09-28 correction):
+        when a conservative basis is carried and sits below the
+        instantaneous reading, the expectation surfaces read the basis -
+        the trailing window floors the assumption, never the spike. A
+        basis above the current reading (the yield collapsed) never
+        inflates the expectation: the current, lower reading stands.
+
+        Returns:
+            min(emissions_apr, conservative_income_apr) when a basis is
+            carried, else the raw emissions APR.
+        """
+        if (
+            self.conservative_income_apr is not None
+            and self.conservative_income_apr < self.emissions_apr
+        ):
+            return self.conservative_income_apr
+        return self.emissions_apr
 
     @model_validator(mode="after")
     def require_aware_observation_time(self) -> Self:
@@ -1008,12 +1042,15 @@ class PolicyEngine:
                 + f" (measured {gas_price} gwei; bound <= {ceiling} gwei)"
             )
         # Gate 8: the batch cost versus the expected daily gross yield at
-        # exactly the sized position (the yield-duration sense-check).
+        # exactly the sized position (the yield-duration sense-check). The
+        # expectation reads the conservative income basis when one is
+        # carried (the captain's 2026-09-28 correction): a spike never
+        # justifies the batch cost.
         total_units = (
             self._parameters.enter_batch_gas_units + self._parameters.safe_overhead_gas_per_batch
         )
         expected_daily_yield = (
-            size_usd * (observation.emissions_apr + observation.fee_apr) / DAYS_PER_YEAR
+            size_usd * (observation.income_expectation_apr + observation.fee_apr) / DAYS_PER_YEAR
         )
         if gas_price is None:
             lines.append(
@@ -1136,7 +1173,12 @@ class PolicyEngine:
         return solve_range_width(
             RangingObservations(
                 pool_price_usdc=observation.amm_price_usdc,
-                emissions_apr=observation.emissions_apr,
+                # The width solve sizes the range against an expected daily
+                # yield: it reads the conservative income basis when one is
+                # carried (the captain's 2026-09-28 correction), so a
+                # transient spike never narrows the range the position
+                # must live in after the reading normalizes.
+                emissions_apr=observation.income_expectation_apr,
                 gauge_liquidity_raw=evidence.gauge_liquidity_raw,
                 staked_tvl_usd=evidence.staked_tvl_usd,
                 active_liquidity_raw=evidence.active_liquidity_raw,
@@ -1292,11 +1334,11 @@ class PolicyEngine:
         Returns:
             A one-line lost-yield evidence tuple for decision diagnostics.
         """
-        daily_yield = position.committed_usd * observation.emissions_apr / DAYS_PER_YEAR
+        daily_yield = position.committed_usd * observation.income_expectation_apr / DAYS_PER_YEAR
         return (
             f"Income protection: out of range the staked position earns no emissions, "
             f"and every minute out of range forgoes yield at the pool's qualifying "
-            f"APR {format_apr_percent(observation.emissions_apr)} - about {daily_yield} "
+            f"APR {format_apr_percent(observation.income_expectation_apr)} - about {daily_yield} "
             f"USDC per day on the committed {position.committed_usd} USDC.",
         )
 
@@ -2237,7 +2279,9 @@ class PolicyEngine:
             Decimal(0),
         )
         expected_daily_gross_yield = (
-            position_value_usd * (observation.emissions_apr + observation.fee_apr) / DAYS_PER_YEAR
+            position_value_usd
+            * (observation.income_expectation_apr + observation.fee_apr)
+            / DAYS_PER_YEAR
         )
         if expected_daily_gross_yield <= 0:
             return False, (
@@ -2321,8 +2365,13 @@ class PolicyEngine:
             * self._parameters.eth_price_assumption_usd
         )
         # Expected daily gross yield credits raw emissions plus fees on top.
+        # Expected daily gross yield credits emissions plus fees on top,
+        # on the conservative income basis when one is carried (the
+        # captain's 2026-09-28 correction: never the spike).
         expected_daily_gross_yield = (
-            position_value_usd * (observation.emissions_apr + observation.fee_apr) / DAYS_PER_YEAR
+            position_value_usd
+            * (observation.income_expectation_apr + observation.fee_apr)
+            / DAYS_PER_YEAR
         )
         if cost_usd > self._parameters.gas_cost_max_gross_yield_fraction * (
             expected_daily_gross_yield

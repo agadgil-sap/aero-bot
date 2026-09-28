@@ -21,30 +21,28 @@ The book runs a tiered portfolio of up to ten concurrent positions on the proven
 
 - **Tiered allocation.** The top-ranked pool by weighted qualifying APR receives the largest tranche; pools inside the configurable band of the top (default: qualifying APR at or above fifty percent of the top's, `AERO_BOT_CYCLE_TIER_BAND_FRACTION` or `--tier-band`) share the remaining tiers weight-proportionally; the residual is cash.
 Measured in-range discipline can weight the ranking (`weighted_apr = APR x measured in-range fraction`); names without a measurement rank on their raw APR exactly like the locked selector ranking, and wiring the live measurement is the documented follow-up.
-- **Count-as-output bounds.** At most ten concurrent positions (`AERO_BOT_CYCLE_MAX_POSITIONS`, hard ceiling), no tranche below the effective minimum position size (the gnhf 36 coherence rule below), and no name above the thirty-five percent concentration cap of book equity (`AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION`); the deployed count emerges from the qualifying distribution under these bounds.
+- **Count-as-output bounds.** At most ten concurrent positions (`AERO_BOT_CYCLE_MAX_POSITIONS`, hard ceiling), no tranche below the effective minimum position size (the coherence rule below), and no name above the thirty-five percent concentration cap of book equity once the cap is engaged (`AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION` - the activation ruling below); the deployed count emerges from the qualifying distribution under these bounds.
 A rich board deploys up to ten; a thin book runs three-to-five plus cash.
 - **Portfolio mechanics.** The 1000 USDC total cap spans every position (the LP executor counts the cycle book's tracked live positions toward it and refuses strangers); the per-pool cap and the measured one-percent depth gate are unchanged per position; the continuous drawdown latch and the day-start halt operate at portfolio equity; every position keeps its own out-of-range grace discipline.
 - **Rebalancing.** A held pool whose weighted APR decayed below the switch margin versus the next qualifying in-band candidate - the selector's thirty percent margin (`AERO_BOT_CYCLE_SWITCH_MARGIN_FRACTION`) generalized from switch-to-switch to portfolio reallocation - is exited and the candidate entered, exit-before-entry inside the one step, with the exit-plus-entry gas economics passing and the minimum hold window and the gauge's early-exit penalty window respected.
 - **Sequencing.** The rebalance plan runs one fixed order - safety exits, the held-inventory resolution, recenters, reallocations, then entries - so every exit lands before the entry it funds, exactly one position is funded per step, and the total cap is never breached even transiently.
 A refusal or failure halts the cycle with its completed prefix as chain truth the next cycle reconciles.
 
-### Parameter coherence: the effective minimum (captain's gnhf 36 ruling)
+### Concentration cap activation and parameter coherence (captain's rulings, gnhf 36 superseded 2026-09-28)
 
-The configured eighty-USDC minimum and the thirty-five percent concentration cap were mutually unsatisfiable below 80 / 0.35 = 228.57 USDC of book equity.
-The clamp forced every tranche under the minimum, so the captain's trial-scale book (about 105 USDC) refused its top-qualified pool every cycle with `below_min_position_size` while every protective gate passed.
-The coherence rule ships the unblock: the EFFECTIVE per-name minimum is `max(floor, min(configured minimum, concentration clamp at the live equity))` - the clamp governs when it binds, the configured eighty governs naturally at 300-plus equity, and a hard gas-efficiency floor (default 30 USDC, `AERO_BOT_CYCLE_MIN_POSITION_FLOOR_USDC`, never above the configured minimum) bounds how far the rule may lower the bound.
-The floor never licenses breaching the concentration cap: when the clamp itself sits below the floor, the book stays cash - the cap is the locked safety bound.
-Every `below_min_position_size` exclusion names the effective minimum and its full derivation (both bounds, the floor, the arithmetic, and the governing term) beside the percent-annotated income forgone.
+**CAPTAIN RULING 2026-09-28: the per-name concentration cap is IGNORED until the book reaches the activation equity (default 1000 USDC, `AERO_BOT_CYCLE_CONCENTRATION_CAP_ACTIVATION_USDC` or `--concentration-cap-activation-usdc`; the hard ceiling is the 1000-USDC total cap itself, so a sealed override can only engage the cap sooner, never later).**
+Below it the cap does not bind at all and sizing follows the tier logic under the configured eighty-USDC minimum - so the captain's trial-scale book (about 105 USDC) runs the proven single-position ~80-105 shape plus residual cash while it funds toward the cap, and at 1000-plus the thirty-five-percent bound governs every name.
+The ruling supersedes the gnhf 36 interplay directly: the gnhf 36 coherence rule (the effective minimum `max(floor, min(configured minimum, concentration clamp))` with the hard 30-USDC gas-efficiency floor, `AERO_BOT_CYCLE_MIN_POSITION_FLOOR_USDC`) stays only for the sealed early-activation override, where an engaged clamp below the configured minimum can still bind - and the floor never licenses breaching an engaged cap: when the clamp itself sits below the floor, the book stays cash.
 
-At the defaults (minimum 80, floor 30, concentration fraction 0.35), the boundary table reads:
+At the defaults (activation 1000, minimum 80, fraction 0.35, floor 30), the boundary table reads:
 
-| Book equity (USDC) | Concentration clamp (0.35 x equity) | Effective minimum | Governing term | Behavior |
-| --- | --- | --- | --- | --- |
-| below 85.71 | below 30 | 30 | the hard floor | stays cash - the cap is never breached to reach the floor |
-| 85.71 to 228.57 | 30 to 80 | the clamp | the concentration clamp | funds at the clamp (the trial-scale unblock: at 105 equity the clamp is 36.84, so the top pool funds at 36.84) |
-| 228.57 and above | 80 and above | 80 | the configured minimum | the classic bound: at 300-plus equity the eighty governs naturally |
+| Book equity (USDC) | Concentration cap | Effective minimum | Behavior |
+| --- | --- | --- | --- |
+| below 1000 | not engaged - no per-name clamp | 80 (the configured minimum) | the proven ~100-per-position shape: at 105 equity a single qualifying pool funds the full deployable target (105, over the 80 minimum) with the residual as cash |
+| 1000 and above | engaged at 0.35 x equity (350 at 1000) | 80 (the clamp sits above the minimum) | the classic bound: no name above thirty-five percent of the book |
+| early-activation override (engaged below 228.57) | engaged at 0.35 x equity | the gnhf 36 rule | the clamp governs between 85.71 and 228.57; below the 30-USDC floor the book stays cash, never breaching the engaged cap |
 
-The `below_min_position_size` boundary crosses at exactly 228.57 (minimum over fraction) and 85.71 (floor over fraction) USDC equity; both crossings scale with any sealed override of the three parameters.
+Every `below_min_position_size` exclusion names the effective minimum and its full derivation - the engaged bounds and the governing term, or the not-engaged line naming the activation equity - beside the percent-annotated income forgone.
 
 The anti-churn discipline is part of the same heritage:
 
@@ -68,7 +66,22 @@ The halt protection itself is unchanged: a true book drawdown still latches at t
 - **The gate chain is audit evidence.** Every cycle's decision diagnostics - and therefore every `cycle_reported` audit record - carry the complete per-gate evaluation for the top-ranked pool at the exact basis the allocator judged it: eight ordered lines (`daily_loss_halt`, `reentry_cooldown`, `condition_flat`, `reference_freshness`, `emissions_floor`, `entry_size`, `gas_ceiling`, `gas_cost_vs_yield`), each with its verdict, measurement, and bound.
 Any why-is-it-flat question is answerable from the audit store alone.
 - **A flat book carries a flat label.** While no position exists the top-level reason is `flat_awaiting_entry` (qualified pools stayed unfunded) or `no_qualifying_pool` (nothing qualified), never a position-scoped reason; the tracked-symbol fields stay explicitly null, matching the pnl layer.
-- **A silent idle book alerts.** When more than the configurable fraction of equity sits as cash (default eighty percent, `AERO_BOT_ALERT_IDLE_CASH_FRACTION`) while at least one pool ranks above the tier band but stays excluded by a gate or bound, the alerting email fires once per episode - the cycle book carries the episode signature, and only the first cycle of a changed cause alerts - naming the pool, the gate, the bound, and the income forgone.
+- **A silent idle book alerts.** When more than the configurable fraction of equity sits as cash (default eighty percent, `AERO_BOT_ALERT_IDLE_CASH_FRACTION`) while at least one pool ranks above the tier band but stays excluded by a gate or bound, the alerting email fires once per episode - the cycle book carries the episode signature, and only the first cycle of a changed cause alerts - naming the pool, the gate, the bound, and the income forgone (quoted on the conservative income basis, never the spike).
+
+### Conservative income expectations (captain's correction, 2026-09-28)
+
+The reference for APR is the VENUE ITSELF - aerodrome.finance/liquidity/stocks - and the venue UI genuinely displays the very high emissions APRs the engine reads (the captain saw MSTRc at 19k percent there; the engine read 25,400 percent an hour later; both real under the venue convention: the current gauge reward rate annualized against the currently staked cell value, which is thin on the stock pools).
+The earlier 4-155 percent band came from DefiLlama's external screen with its haircut convention - a secondary surface, never the reference.
+Deploying into high-emissions moments is the core strategy (the boosted yield thesis), so nothing excludes a high reading.
+The correction, with the convention verification in [lp_execution.md](lp_execution.md)'s displayed-APR section:
+
+- **Information, never exclusion.** The engine's qualifying emissions APR is verified to match the venue's own UI convention exactly - the gauge's reward rate x seconds per year x AERO price over the current cell's staked value (reproduced to the digit in the live decomposition; the only divergences are the frontend's own display lag and its +9,000 percent clamp).
+High readings rank, qualify, and deploy exactly as before.
+- **Conservative income expectations in sizing.** Wherever entry sizing or the income-forgone accounting assumes an expected daily yield, the assumption reads a conservative floor: `min(current reading, median of the trailing N-cycle readings)` per pool (default N=6 cycles - half an hour at the five-minute cadence, `AERO_BOT_CYCLE_INCOME_HISTORY_CYCLES`; hard ceiling 48).
+The affected surfaces: the range-width solve, the gas cost-versus-yield sense-checks (entry, recenter, and switch economics), the out-of-range lost-yield evidence, and every income-forgone line - a transient spike never narrows a range, justifies a batch cost, or inflates a forgone-income number.
+The readings thread through the cycle book (`apr_history`), so the window survives restarts; a cold book reads unchanged (the median of one reading is itself).
+- **Evidence on every cycle.** Each cycle's decision diagnostics - and therefore each `cycle_reported` audit record - carry one line per floored pool naming the basis, the window, and the instantaneous reading (`conservative income basis: METAc expected-yield surfaces read 3 (about 300 percent), the trailing 6-cycle median flooring the instantaneous 281.72 (about 28,172 percent)`).
+- **Display alignment.** The dashboard shows the engine's qualifying emissions APR (the venue convention) as the primary yield number - the `/api/cycle/latest-apr` endpoint and its panel - with the DefiLlama screen clearly labeled a secondary external reference under a different haircut convention.
 
 ## The fixed cycle order
 

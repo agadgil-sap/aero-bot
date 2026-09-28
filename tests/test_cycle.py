@@ -27,7 +27,9 @@ from aero_bot.allocator import PortfolioParameters
 from aero_bot.audit import AuditEventType, AuditRecord, AuditStore
 from aero_bot.cycle import (
     CYCLE_AERO_CONVERSION_MIN_ENV,
+    CYCLE_CONCENTRATION_CAP_ACTIVATION_USDC_ENV,
     CYCLE_CONCENTRATION_CAP_ENV,
+    CYCLE_INCOME_HISTORY_CYCLES_ENV,
     CYCLE_MAX_POSITIONS_ENV,
     CYCLE_MIN_POSITION_FLOOR_USDC_ENV,
     CYCLE_MIN_POSITION_USDC_ENV,
@@ -45,13 +47,16 @@ from aero_bot.cycle import (
     ReentryCooldown,
     TrackedPosition,
     _aero_conversion_min_from_environment,
+    _income_history_cycles_from_environment,
     _out_of_range_grace_from_environment,
     _portfolio_parameters_from_environment,
     _reference_price_from_environment,
     _switch_margin_from_environment,
     _symbol_from_arguments_and_environment,
+    _trim_apr_history,
     decode_minted_token_id,
 )
+from aero_bot.emissions_apr import AprReadingSample
 from aero_bot.history import price_usdc_per_stock
 from aero_bot.lp_executor import (
     NFPM_INCREASE_LIQUIDITY_TOPIC0,
@@ -667,6 +672,7 @@ def make_runner(
     sleep: Callable[[float], None] | None = None,
     parameters: PolicyParameters | None = None,
     aero_conversion_min_usdc: Decimal | None = None,
+    income_history_cycles: int | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, AuditStore, CycleStateStore]:
     """Assemble one cycle runner over fully scripted boundaries."""
     store_path = tmp_path / "cycle_state.json"
@@ -733,6 +739,7 @@ def make_runner(
             if aero_conversion_min_usdc is not None
             else DEFAULT_AERO_CONVERSION_MIN_USDC
         ),
+        income_history_cycles=income_history_cycles,
     )
     return runner, fake_executor, audit, state_store
 
@@ -1502,15 +1509,34 @@ SELECTOR_REFERENCES = {"AAAc": FIXTURE_AMM_PRICE, "BBBc": FIXTURE_AMM_PRICE}
 
 
 def selector_listings(bbb_emissions_multiplier: int = 2) -> tuple[BoardListing, ...]:
-    """Build the two-pool scripted board: AAAc plain, BBBc scaled emissions."""
+    """Build the two-pool scripted board: AAAc plain, BBBc scaled emissions.
+
+    The staked liquidity is sized so both pools read qualifying APRs of
+    about 250 and 500 percent at the fixture AERO price - a moderate
+    regime where the income-basis flooring rarely changes an assertion,
+    so the ordinary portfolio tests exercise the allocator (the
+    thin-staked high-reading shapes live in their own tests).
+    """
     return (
-        BoardListing(symbol="AAAc", pool=make_candidate()),
+        BoardListing(
+            symbol="AAAc",
+            pool=make_candidate(
+                staked0=15_600 * 10**6,
+                staked1=100 * 10**STOCK_DECIMALS,
+            ),
+        ),
         BoardListing(
             symbol="BBBc",
             pool=make_candidate(
                 pool_address=SELECTOR_BBB_POOL,
                 token1_address=SELECTOR_BBB_TOKEN,
                 emissions_per_second=bbb_emissions_multiplier * 4_494_371_922_759_724,
+                # One USDC more staked than AAAc: the doubled emissions
+                # then rank BBBc clear of the band floor by a real margin
+                # instead of an exact 2:1 ratio that one ulp of division
+                # rounding can flip.
+                staked0=15_601 * 10**6,
+                staked1=100 * 10**STOCK_DECIMALS,
             ),
         ),
     )
@@ -1602,7 +1628,13 @@ class TestSelectorCycles:
         assert any("funds 2 tranche(s)" in note for note in report.input_notes)
 
     def test_a_thin_book_never_deploys_below_the_minimum_position(self, tmp_path: Path) -> None:
-        """A ten-USDC trial book stays cash under the eighty-USDC floor."""
+        """A ten-USDC trial book stays cash under the eighty-USDC floor.
+
+        Below the activation equity the concentration cap no longer clamps
+        the tier target down (the captain's 2026-09-28 ruling), so the
+        floored eighty-USDC minimum exceeds the ten-USDC deployable budget
+        and the exclusion names the cash bound honestly.
+        """
         runner, executor, state_store = selector_runner(
             tmp_path, sources=SelectorCycleSources(), balances=FakeBalances()
         )
@@ -1615,7 +1647,10 @@ class TestSelectorCycles:
         assert report.decision_action == "hold"
         assert executor.calls == []
         assert state_store.load().positions == ()
-        assert any("below_min_position_size" in note for note in report.input_notes)
+        assert any(
+            "insufficient_cash: tier target 80 exceeds the 10.000000 deployable left" in note
+            for note in report.input_notes
+        )
 
     def test_selector_counts_tracked_lp_in_daily_loss_equity(self, tmp_path: Path) -> None:
         """Deployed LP capital cannot masquerade as a selector-mode daily loss."""
@@ -1670,10 +1705,12 @@ class TestSelectorCycles:
         assert executor.calls[2][1] == "AAAc"
         book = state_store.load()
         assert [position.symbol for position in book.positions] == ["BBBc", "AAAc"]
-        # The top tier clamps at the thirty-five percent concentration
-        # bound of the 500 USDC book; the second tier takes its weight share.
-        assert book.positions[0].committed_usd == Decimal("175")
-        assert book.positions[1].committed_usd == Decimal("166.6666666666666666666666667")
+        # Below the 1000-USDC activation equity the concentration cap does
+        # not bind (the captain's 2026-09-28 ruling): each tier takes its
+        # full weight share of the 500 USDC book - two-thirds to the top
+        # name, one-third to the second, quantized down to USDC's grid.
+        assert book.positions[0].committed_usd == Decimal("333.328996")
+        assert book.positions[1].committed_usd == Decimal("166.671003")
 
     def test_selector_holds_a_funded_pool_inside_the_margin_while_cash_deploys(
         self, tmp_path: Path
@@ -1933,8 +1970,10 @@ class TestCycleConfiguration:
             parameters: object,
             aero_min: object,
             portfolio: PortfolioParameters | None = None,
+            income_history_cycles: object = None,
         ) -> object:
             built["portfolio"] = portfolio
+            built["income_history_cycles"] = income_history_cycles
             return FakeRunner()
 
         monkeypatch.setattr(cycle_module, "build_cycle_runner", fake_build)
@@ -2078,14 +2117,20 @@ class TestCycleConfiguration:
         assert defaults.min_position_usdc == Decimal("80")
         assert defaults.min_position_floor_usdc == Decimal("30")
         assert defaults.concentration_cap_fraction == Decimal("0.35")
+        assert defaults.concentration_cap_activation_equity_usdc == Decimal("1000")
         assert defaults.switch_margin_fraction == Decimal("0.30")
-        assert defaults.effective_minimum_position_usdc(Decimal("105")) == Decimal("36.75")
+        # Below the activation equity the cap does not bind (the captain's
+        # 2026-09-28 ruling): the configured eighty governs.
+        assert defaults.effective_minimum_position_usdc(Decimal("105")) == Decimal("80")
+        assert defaults.concentration_bound_usdc(Decimal("105")) is None
+        assert defaults.concentration_bound_usdc(Decimal("1000")) == Decimal("350.00")
         tuned = _portfolio_parameters_from_environment(
             {
                 CYCLE_TIER_BAND_ENV: "0.6",
                 CYCLE_MAX_POSITIONS_ENV: "5",
                 CYCLE_MIN_POSITION_USDC_ENV: "90",
                 CYCLE_CONCENTRATION_CAP_ENV: "0.25",
+                CYCLE_CONCENTRATION_CAP_ACTIVATION_USDC_ENV: "500",
             },
             Decimal("0.5"),
         )
@@ -2093,6 +2138,7 @@ class TestCycleConfiguration:
         assert tuned.max_concurrent_positions == 5
         assert tuned.min_position_usdc == Decimal("90")
         assert tuned.concentration_cap_fraction == Decimal("0.25")
+        assert tuned.concentration_cap_activation_equity_usdc == Decimal("500")
         assert tuned.switch_margin_fraction == Decimal("0.5")
         floored = _portfolio_parameters_from_environment(
             {
@@ -2890,9 +2936,9 @@ class TestFlatLabelAndIdleCashEvidence:
     """The gnhf 34 label and idle-book fixes, pinned over the thin flat book.
 
     The flat thin book (ten USDC of cash, qualifying pools on the board,
-    every tranche clamped below the eighty-USDC minimum by the
-    concentration cap) is exactly the posture the production bot sat in
-    all night while its top-level label read ``open_in_range``.
+    every tier target floored to the eighty-USDC minimum the cash cannot
+    fund) is exactly the posture the production bot sat in all night
+    while its top-level label read ``open_in_range``.
     """
 
     def test_flat_unfunded_book_carries_the_flat_label_not_open_in_range(
@@ -2936,7 +2982,7 @@ class TestFlatLabelAndIdleCashEvidence:
             text.startswith("gate emissions_floor: ") for text in report.decision_diagnostics
         )
         assert any(
-            text.startswith("idle-cash exclusion BBBc (below_min_position_size): ")
+            text.startswith("idle-cash exclusion BBBc (insufficient_cash): ")
             for text in report.decision_diagnostics
         )
 
@@ -2995,3 +3041,129 @@ class TestFlatLabelAndIdleCashEvidence:
         assert payload["tracked_token_id"] is None
         assert payload["position_value_usdc"] is None
         assert payload["position_count"] == 0
+
+
+def thin_staked_listings(
+    bbb_emissions_multiplier: int = 2,
+) -> tuple[BoardListing, ...]:
+    """Build the thin-staked high-emissions board (the venue's real shape).
+
+    The default candidate's staked liquidity (250 USDC and 3 stock in the
+    current cell) reproduces the live stock-pool shape the captain
+    verified on the venue UI itself: displayed APRs of about 15,445 and
+    30,891 percent - real readings under the venue convention, exactly
+    what the boosted-yield thesis deploys into.
+    """
+    return (
+        BoardListing(symbol="AAAc", pool=make_candidate()),
+        BoardListing(
+            symbol="BBBc",
+            pool=make_candidate(
+                pool_address=SELECTOR_BBB_POOL,
+                token1_address=SELECTOR_BBB_TOKEN,
+                emissions_per_second=bbb_emissions_multiplier * 4_494_371_922_759_724,
+            ),
+        ),
+    )
+
+
+class TestConservativeIncomeCycles:
+    """The captain's 2026-09-28 correction over live selector cycles.
+
+    The venue's displayed convention is the reference: high emissions
+    APRs are real and the book DEPLOYS into them. The conservative income
+    expectation only floors what the yield-assuming surfaces read -
+    min(current, median of the trailing window threaded through the
+    cycle book) - so a transient spike never sizes or justifies a
+    position. Information, never exclusion.
+    """
+
+    def thin_runner(
+        self, tmp_path: Path, *, listings: tuple[BoardListing, ...] | None = None
+    ) -> tuple[CycleRunner, CycleStateStore]:
+        """Assemble one selector runner over the thin-staked board."""
+        runner, _, _, state_store = make_runner(
+            tmp_path,
+            sources=SelectorCycleSources(usdc_units=SELECTOR_BOOK_USDC_UNITS).with_listings(
+                listings if listings is not None else thin_staked_listings()
+            ),
+            balances=FakeBalances(usdc_units=SELECTOR_BOOK_USDC_UNITS),
+            symbol=None,
+        )
+        return runner, state_store
+
+    def test_high_readings_still_deploy_the_boosted_yield_thesis(self, tmp_path: Path) -> None:
+        """The core strategy: a 15,445-percent board funds, never excluded."""
+        runner, _ = self.thin_runner(tmp_path)
+        report = runner.run(CycleMode.DRY_RUN)
+        assert report.decision_action == "enter"
+        assert report.symbol == "BBBc"  # the top emitter wins the ranking
+        # The raw readings are far above the historical external band and
+        # the book deploys into them anyway - the venue convention is the
+        # reference and the boost is the strategy.
+        assert "board [AAAc: qualified at APR 154." in " ".join(report.input_notes)
+        assert "BBBc: qualified at APR 308." in " ".join(report.input_notes)
+
+    def test_a_cold_book_reads_unchanged_and_threads_its_history(self, tmp_path: Path) -> None:
+        """Cycle one: no history, the basis equals the reading, samples thread."""
+        runner, state_store = self.thin_runner(tmp_path)
+        report = runner.run(CycleMode.DRY_RUN)
+        assert not any("conservative income basis" in text for text in report.decision_diagnostics)
+        book = state_store.load()
+        assert [sample.symbol for sample in book.apr_history] == ["AAAc", "BBBc"]
+        assert all(sample.reading > 0 for sample in book.apr_history)
+
+    def test_a_spike_is_floored_in_sizing_but_still_deploys(self, tmp_path: Path) -> None:
+        """The correction's exact shape: information, never exclusion.
+
+        Cycle one reads the thin board (about 154.45 and 308.90 as raw
+        fractions); cycle two spikes the reward streams tenfold. The
+        spiked cycle still ENTERS - the readings are real - but its
+        income expectations floor at the trailing median and the evidence
+        line names both numbers.
+        """
+        first_runner, state_store = self.thin_runner(tmp_path)
+        first = first_runner.run(CycleMode.DRY_RUN)
+        assert first.decision_action == "enter"
+        assert not any("conservative income basis" in text for text in first.decision_diagnostics)
+        second_runner, _ = self.thin_runner(
+            tmp_path, listings=thin_staked_listings(bbb_emissions_multiplier=20)
+        )
+        second = second_runner.run(CycleMode.DRY_RUN)
+        # The spiked board still deploys: the boosted-yield thesis.
+        assert second.decision_action == "enter"
+        assert second.symbol == "BBBc"
+        # The income basis evidence names the flooring for the spiked
+        # pool; AAAc read unchanged, so its expectation floors at itself
+        # and carries no line.
+        joined = " ".join(second.decision_diagnostics)
+        assert "conservative income basis: BBBc" in joined
+        assert "flooring the instantaneous" in joined
+        assert "the qualifying gates and the ranking keep the raw" in joined
+        assert "conservative income basis: AAAc" not in joined
+        # The book threads the spiked readings for the next window.
+        book = state_store.load()
+        spiked = {sample.symbol: sample.reading for sample in book.apr_history}
+        assert spiked["BBBc"] > Decimal("3000")  # the tenfold reading
+
+    def test_the_window_bounds_and_env_wiring(self) -> None:
+        """The window defaults to six cycles and refuses out-of-interval."""
+        assert _income_history_cycles_from_environment({}) == 6
+        assert (
+            _income_history_cycles_from_environment({CYCLE_INCOME_HISTORY_CYCLES_ENV: "12"}) == 12
+        )
+        with pytest.raises(ValueError, match="at least one"):
+            _income_history_cycles_from_environment({CYCLE_INCOME_HISTORY_CYCLES_ENV: "0"})
+        with pytest.raises(ValueError, match="must not exceed 48"):
+            _income_history_cycles_from_environment({CYCLE_INCOME_HISTORY_CYCLES_ENV: "49"})
+
+    def test_the_trim_keeps_the_most_recent_window_per_symbol(self) -> None:
+        """The successor history bounds each pool to the window."""
+        prior = tuple(
+            AprReadingSample(symbol="AAAc", reading=Decimal(str(value)))
+            for value in range(1, 7)  # six prior samples
+        )
+        current = (AprReadingSample(symbol="AAAc", reading=Decimal("99")),)
+        trimmed = _trim_apr_history(current, prior, 6)
+        readings = [sample.reading for sample in trimmed if sample.symbol == "AAAc"]
+        assert readings == [Decimal(str(value)) for value in range(2, 7)] + [Decimal("99")]
