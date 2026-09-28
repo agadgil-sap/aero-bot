@@ -20,9 +20,21 @@ receives the largest tranche, pools inside the configurable band of the
 top (default: qualifying APR at or above fifty percent of the top's)
 share the remaining tiers, and the residual is cash. The bounds that
 make count-as-output honest are locked parameters with hard ceilings:
-at most ten concurrent positions, no tranche below the eighty-USDC
-minimum (below it cash stays cash), and no name above the thirty-five
-percent concentration cap of book equity. Rebalancing generalizes the
+at most ten concurrent positions, no tranche below the per-name minimum
+position size, and no name above the thirty-five percent concentration
+cap of book equity.
+
+The minimum is COHERENT with the concentration cap (the gnhf 36
+deployment unblock): the effective per-name minimum is
+``max(floor, min(configured minimum, concentration clamp at the live
+equity))`` - at the captain's trial scale (a 105-USDC book) the
+thirty-five percent clamp (36.84) governs under the configured
+eighty, so the book deploys at the clamp instead of refusing forever,
+while at 300-plus USDC equity the configured eighty governs naturally.
+The hard floor (default thirty USDC) bounds how far the coherence rule
+may lower the minimum - a gas-efficiency floor, never a license to
+breach the concentration cap: when the clamp itself sits below the
+floor the book stays cash, because the cap is the locked safety bound. Rebalancing generalizes the
 selector's thirty percent switch margin from switch-to-switch to
 portfolio reallocation: a held pool whose weighted APR decayed below the
 margin versus the next qualifying candidate inside the band is exited
@@ -69,6 +81,13 @@ DEFAULT_MAX_CONCURRENT_POSITIONS = 10
 # The default minimum position size in USDC: below it, cash stays cash
 # (locked parameter; the captain's count-as-output ruling).
 DEFAULT_MIN_POSITION_USDC = Decimal("80")
+# The default hard floor under the EFFECTIVE minimum position size in
+# USDC (the gnhf 36 parameter-coherence ruling): the coherence rule
+# lowers the per-name minimum to the concentration clamp when the clamp
+# governs, but never below this gas-efficiency floor (configurable in
+# the sealed cycle environment through
+# AERO_BOT_CYCLE_MIN_POSITION_FLOOR_USDC).
+DEFAULT_MIN_POSITION_FLOOR_USDC = Decimal("30")
 # The default per-name concentration cap as a fraction of book equity
 # (locked parameter; the measured-edge baseline's MSTRc argument).
 DEFAULT_CONCENTRATION_CAP_FRACTION = Decimal("0.35")
@@ -95,8 +114,17 @@ class PortfolioParameters(BaseModel):
     # The maximum concurrent deployed positions (default ten, the
     # captain's ceiling; the deployed count emerges under it).
     max_concurrent_positions: Annotated[int, Field(ge=1)] = DEFAULT_MAX_CONCURRENT_POSITIONS
-    # The minimum position size in USDC: a tranche below it stays cash.
+    # The minimum position size in USDC: a tranche below the EFFECTIVE
+    # minimum stays cash. The effective minimum is the coherent
+    # max(floor, min(this configured minimum, the per-name concentration
+    # clamp at the live equity)); the configured value governs naturally
+    # whenever the clamp sits above it (the 300-plus-equity regime).
     min_position_usdc: Annotated[Decimal, Field(gt=0)] = DEFAULT_MIN_POSITION_USDC
+    # The hard floor under the effective minimum position size in USDC:
+    # the coherence rule never lowers a per-name minimum below it. A
+    # floor above the configured minimum is incoherent (it would raise
+    # the minimum above the configured bound) and refuses validation.
+    min_position_floor_usdc: Annotated[Decimal, Field(gt=0)] = DEFAULT_MIN_POSITION_FLOOR_USDC
     # The per-name concentration cap as a fraction of book equity.
     concentration_cap_fraction: Annotated[Decimal, Field(gt=0)] = DEFAULT_CONCENTRATION_CAP_FRACTION
     # The tier band: qualifying APR at or above this fraction of the
@@ -128,6 +156,12 @@ class PortfolioParameters(BaseModel):
                 f"min_position_usdc {self.min_position_usdc} exceeds the hard "
                 f"{PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC} USDC total cap"
             )
+        if self.min_position_floor_usdc > self.min_position_usdc:
+            raise ValueError(
+                f"min_position_floor_usdc {self.min_position_floor_usdc} exceeds the "
+                f"configured minimum position size {self.min_position_usdc}; the floor "
+                "bounds the coherence rule, it never raises the minimum"
+            )
         if self.concentration_cap_fraction > Decimal(1):
             raise ValueError("concentration_cap_fraction must not exceed one")
         if self.tier_band_fraction > Decimal(1):
@@ -140,6 +174,58 @@ class PortfolioParameters(BaseModel):
                 f"ceiling of {PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC} USDC"
             )
         return self
+
+    def effective_minimum_position_usdc(self, equity_usdc: Decimal) -> Decimal:
+        """Return the coherent per-name entry minimum at one book equity.
+
+        The gnhf 36 parameter-coherence rule: the configured minimum and
+        the per-name concentration clamp are mutually unsatisfiable
+        below an equity of ``min_position_usdc / concentration_cap_fraction``
+        (80 / 0.35 = 228.57 USDC at the defaults), so the EFFECTIVE
+        minimum takes whichever of the two binds - and the hard floor
+        bounds how far that coherence may lower it:
+        ``max(floor, min(configured minimum, concentration clamp))``.
+
+        Args:
+            equity_usdc: The portfolio equity pricing the concentration
+                clamp.
+
+        Returns:
+            The per-name minimum a tranche must meet to fund.
+        """
+        concentration_bound = self.concentration_cap_fraction * equity_usdc
+        return max(
+            self.min_position_floor_usdc,
+            min(self.min_position_usdc, concentration_bound),
+        )
+
+    def describe_effective_minimum(self, equity_usdc: Decimal) -> str:
+        """Name the effective minimum's derivation and governing term.
+
+        Every below-effective-minimum exclusion carries this line so an
+        operator reads the binding term and both bounds at a glance (the
+        gnhf 34-35 evidence style), never a bare number.
+
+        Args:
+            equity_usdc: The portfolio equity pricing the concentration
+                clamp.
+
+        Returns:
+            One phrase stating the full derivation and its governing term.
+        """
+        concentration_bound = self.concentration_cap_fraction * equity_usdc
+        if concentration_bound < self.min_position_floor_usdc:
+            governing = "the hard floor governs"
+        elif concentration_bound < self.min_position_usdc:
+            governing = "the concentration clamp governs under the configured minimum"
+        else:
+            governing = "the configured minimum governs"
+        return (
+            f"effective minimum min({self.min_position_usdc} configured, "
+            f"{concentration_bound} concentration clamp on equity {equity_usdc}) "
+            f"floored at {self.min_position_floor_usdc} = "
+            f"{self.effective_minimum_position_usdc(equity_usdc)}; {governing}"
+        )
 
 
 class PortfolioExclusionReason(StrEnum):
@@ -838,6 +924,11 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
         )
     total_weight = sum((weight for _, weight in slotted), Decimal("0"))
     concentration_bound = resolved.concentration_cap_fraction * equity_usdc
+    # The coherent per-name entry minimum (the gnhf 36 rule): whichever
+    # of the configured minimum and the concentration clamp binds, over
+    # the hard floor - the two bounds can never again be mutually
+    # unsatisfiable the way 80-versus-36.84 starved the 105-USDC book.
+    effective_minimum = resolved.effective_minimum_position_usdc(equity_usdc)
     # The lost-yield basis: one day of the pool's qualifying emissions APR
     # on the tranche it would have earned, the same framing the
     # out-of-range diagnostics carry (the captain's gnhf 34 ruling).
@@ -846,11 +937,12 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
     remaining = deployable
     for rank, (evaluation, weight) in enumerate(slotted, start=1):
         target = deployable * weight / total_weight
-        # The minimum position size floors the tranche - a position near
-        # the proven per-position scale - so a thin budget deploys to the
-        # top names first instead of being split into sub-minimum stubs.
-        if target < resolved.min_position_usdc:
-            target = resolved.min_position_usdc
+        # The effective minimum position size floors the tranche - a
+        # position near the proven per-position scale - so a thin budget
+        # deploys to the top names first instead of being split into
+        # sub-minimum stubs.
+        if target < effective_minimum:
+            target = effective_minimum
         clamped = False
         if target > concentration_bound:
             target = concentration_bound
@@ -908,23 +1000,29 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                 )
             )
             continue
-        if tranche.budget_usd < resolved.min_position_usdc:
-            bound_line = (
-                f"the tier target clamped to the {concentration_bound} USDC per-name "
-                f"concentration bound ({resolved.concentration_cap_fraction} of equity "
-                f"{equity_usdc}) below the minimum, so the engine sized "
-                f"{tranche.budget_usd} USDC"
-                if clamped
-                else f"the engine's capped size {tranche.budget_usd} USDC sits below "
-                f"the {resolved.min_position_usdc} USDC minimum position size"
-            )
+        if tranche.budget_usd < effective_minimum:
+            derivation = resolved.describe_effective_minimum(equity_usdc)
+            if clamped:
+                bound_line = (
+                    f"the tier target clamped to the {concentration_bound} USDC per-name "
+                    f"concentration bound ({resolved.concentration_cap_fraction} of "
+                    f"equity {equity_usdc}) and that locked bound sits below the "
+                    f"effective minimum {effective_minimum} USDC, so the engine sized "
+                    f"{tranche.budget_usd} USDC; the book stays cash rather than "
+                    f"breach the concentration cap to reach the floor; {derivation}"
+                )
+            else:
+                bound_line = (
+                    f"the engine's capped size {tranche.budget_usd} USDC sits below "
+                    f"the effective minimum {effective_minimum} USDC; {derivation}"
+                )
             excluded.append(
                 ExcludedPool(
                     symbol=evaluation.symbol,
                     reason=PortfolioExclusionReason.BELOW_MIN_POSITION_SIZE,
                     cause=(
-                        f"size {tranche.budget_usd} below the {resolved.min_position_usdc} "
-                        "minimum"
+                        f"size {tranche.budget_usd} below the effective minimum "
+                        f"{effective_minimum}"
                         + (
                             f" after the {concentration_bound} concentration clamp"
                             if clamped
@@ -1258,6 +1356,10 @@ def plan_portfolio_rebalance(  # noqa: PLR0912, PLR0915 - one fixed precedence
     deployable = allocation.deployable_usdc
     total_weight = sum((weight for _, weight in in_band), Decimal("0"))
     concentration_bound = resolved.concentration_cap_fraction * equity_usdc
+    # The same coherent per-name minimum governs replacements: a freed
+    # tranche must meet the effective minimum, never the unsatisfiable
+    # configured-versus-clamp pair that starved the small book.
+    effective_minimum = resolved.effective_minimum_position_usdc(equity_usdc)
     for fact in sorted(held, key=lambda item: item.symbol):
         if fact.symbol in exiting_symbols:
             continue
@@ -1323,7 +1425,7 @@ def plan_portfolio_rebalance(  # noqa: PLR0912, PLR0915 - one fixed precedence
                 )
             )
             continue
-        if tranche.budget_usd < resolved.min_position_usdc:
+        if tranche.budget_usd < effective_minimum:
             deferred.append(
                 DeferredReallocation(
                     symbol=fact.symbol,
@@ -1331,8 +1433,9 @@ def plan_portfolio_rebalance(  # noqa: PLR0912, PLR0915 - one fixed precedence
                     reason=PortfolioExclusionReason.REALLOCATION_TOO_SMALL,
                     detail=(
                         f"the freed capital sizes a {tranche.budget_usd} USDC replacement "
-                        f"below the {resolved.min_position_usdc} USDC minimum; the held "
-                        "pool stays"
+                        f"below the effective minimum {effective_minimum} USDC "
+                        f"({resolved.describe_effective_minimum(equity_usdc)}); "
+                        "the held pool stays"
                     ),
                 )
             )

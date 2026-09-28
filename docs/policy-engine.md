@@ -25,7 +25,7 @@ The engine never signs, broadcasts, or touches a wallet.
 | Daily loss halt | 5 percent of day-start equity, plus the continuous latch from the running equity high-water mark carried across the New York day boundary (captain's 2026-09-27 ruling) |
 | Portfolio tier band | 50 percent of the top's weighted qualifying APR (captain's gnhf 33 allocator ruling; `AERO_BOT_CYCLE_TIER_BAND_FRACTION`) |
 | Maximum concurrent positions | 10 (locked hard ceiling; `AERO_BOT_CYCLE_MAX_POSITIONS`) - the deployed count is an output of qualification |
-| Minimum position size | 80 USDC (`AERO_BOT_CYCLE_MIN_POSITION_USDC`); below it cash stays cash |
+| Minimum position size | 80 USDC configured (`AERO_BOT_CYCLE_MIN_POSITION_USDC`), cohered with the concentration cap per the gnhf 36 rule: the effective per-name minimum is max(30 USDC hard floor, min(80, the 35 percent concentration clamp at the live equity)) (`AERO_BOT_CYCLE_MIN_POSITION_FLOOR_USDC`); below the effective minimum cash stays cash |
 | Per-name concentration cap | 35 percent of book equity (`AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION`) |
 | Starting equity | 200 USDC |
 | Reference staleness bound (entries) | 300 seconds |

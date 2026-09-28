@@ -21,12 +21,30 @@ The book runs a tiered portfolio of up to ten concurrent positions on the proven
 
 - **Tiered allocation.** The top-ranked pool by weighted qualifying APR receives the largest tranche; pools inside the configurable band of the top (default: qualifying APR at or above fifty percent of the top's, `AERO_BOT_CYCLE_TIER_BAND_FRACTION` or `--tier-band`) share the remaining tiers weight-proportionally; the residual is cash.
 Measured in-range discipline can weight the ranking (`weighted_apr = APR x measured in-range fraction`); names without a measurement rank on their raw APR exactly like the locked selector ranking, and wiring the live measurement is the documented follow-up.
-- **Count-as-output bounds.** At most ten concurrent positions (`AERO_BOT_CYCLE_MAX_POSITIONS`, hard ceiling), no tranche below the minimum position size of 80 USDC (`AERO_BOT_CYCLE_MIN_POSITION_USDC` - below it, cash stays cash), and no name above the thirty-five percent concentration cap of book equity (`AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION`); the deployed count emerges from the qualifying distribution under these bounds.
-A rich board deploys up to ten; a thin board runs three-to-five plus cash.
+- **Count-as-output bounds.** At most ten concurrent positions (`AERO_BOT_CYCLE_MAX_POSITIONS`, hard ceiling), no tranche below the effective minimum position size (the gnhf 36 coherence rule below), and no name above the thirty-five percent concentration cap of book equity (`AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION`); the deployed count emerges from the qualifying distribution under these bounds.
+A rich board deploys up to ten; a thin book runs three-to-five plus cash.
 - **Portfolio mechanics.** The 1000 USDC total cap spans every position (the LP executor counts the cycle book's tracked live positions toward it and refuses strangers); the per-pool cap and the measured one-percent depth gate are unchanged per position; the continuous drawdown latch and the day-start halt operate at portfolio equity; every position keeps its own out-of-range grace discipline.
 - **Rebalancing.** A held pool whose weighted APR decayed below the switch margin versus the next qualifying in-band candidate - the selector's thirty percent margin (`AERO_BOT_CYCLE_SWITCH_MARGIN_FRACTION`) generalized from switch-to-switch to portfolio reallocation - is exited and the candidate entered, exit-before-entry inside the one step, with the exit-plus-entry gas economics passing and the minimum hold window and the gauge's early-exit penalty window respected.
 - **Sequencing.** The rebalance plan runs one fixed order - safety exits, the held-inventory resolution, recenters, reallocations, then entries - so every exit lands before the entry it funds, exactly one position is funded per step, and the total cap is never breached even transiently.
 A refusal or failure halts the cycle with its completed prefix as chain truth the next cycle reconciles.
+
+### Parameter coherence: the effective minimum (captain's gnhf 36 ruling)
+
+The configured eighty-USDC minimum and the thirty-five percent concentration cap were mutually unsatisfiable below 80 / 0.35 = 228.57 USDC of book equity.
+The clamp forced every tranche under the minimum, so the captain's trial-scale book (about 105 USDC) refused its top-qualified pool every cycle with `below_min_position_size` while every protective gate passed.
+The coherence rule ships the unblock: the EFFECTIVE per-name minimum is `max(floor, min(configured minimum, concentration clamp at the live equity))` - the clamp governs when it binds, the configured eighty governs naturally at 300-plus equity, and a hard gas-efficiency floor (default 30 USDC, `AERO_BOT_CYCLE_MIN_POSITION_FLOOR_USDC`, never above the configured minimum) bounds how far the rule may lower the bound.
+The floor never licenses breaching the concentration cap: when the clamp itself sits below the floor, the book stays cash - the cap is the locked safety bound.
+Every `below_min_position_size` exclusion names the effective minimum and its full derivation (both bounds, the floor, the arithmetic, and the governing term) beside the percent-annotated income forgone.
+
+At the defaults (minimum 80, floor 30, concentration fraction 0.35), the boundary table reads:
+
+| Book equity (USDC) | Concentration clamp (0.35 x equity) | Effective minimum | Governing term | Behavior |
+| --- | --- | --- | --- | --- |
+| below 85.71 | below 30 | 30 | the hard floor | stays cash - the cap is never breached to reach the floor |
+| 85.71 to 228.57 | 30 to 80 | the clamp | the concentration clamp | funds at the clamp (the trial-scale unblock: at 105 equity the clamp is 36.84, so the top pool funds at 36.84) |
+| 228.57 and above | 80 and above | 80 | the configured minimum | the classic bound: at 300-plus equity the eighty governs naturally |
+
+The `below_min_position_size` boundary crosses at exactly 228.57 (minimum over fraction) and 85.71 (floor over fraction) USDC equity; both crossings scale with any sealed override of the three parameters.
 
 The anti-churn discipline is part of the same heritage:
 
@@ -142,7 +160,7 @@ See [the LP execution fast-path section](docs/lp_execution.md) for the verified 
 - One template unit per symbol: `systemctl enable --now aero-bot-cycle@AAPLc.timer` for a pinned pool, or `aero-bot-cycle@auto.timer` for the cross-board selector (the sealed `AERO_BOT_CYCLE_SYMBOL` variable in `/etc/aero-bot/cycle.env` reaches the same selector mode; unset, empty, or `auto` selects, an explicit symbol pins).
 - Default cadence `OnCalendar=hourly` with `Persistent=true` (missed ticks catch up) and `RandomizedDelaySec=180`; a `systemctl edit` drop-in changes the cadence.
 - `Type=oneshot`, `Restart=no`: cycles never overlap and never auto-retry - the next tick reconciles.
-- Sealed environment through `/etc/aero-bot/cycle.env` (mode 0600): the symbol's Safe, the relayer address, the key-source selection (chapter 1's sealed variable or 0600 key file under `/etc/aero-bot/`), the optional reference quote (single or per-symbol pairs), the optional symbol pin, the optional switch margin, the optional out-of-range grace window (`AERO_BOT_CYCLE_OUT_OF_RANGE_GRACE_MINUTES`, default 10), the optional reward-conversion threshold (`AERO_BOT_CYCLE_AERO_CONVERSION_MIN_USDC`, default 5), and the allocator's optional portfolio bounds (`AERO_BOT_CYCLE_TIER_BAND_FRACTION` default 0.50, `AERO_BOT_CYCLE_MAX_POSITIONS` default 10, `AERO_BOT_CYCLE_MIN_POSITION_USDC` default 80, `AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION` default 0.35 - every override under the hard ceilings).
+- Sealed environment through `/etc/aero-bot/cycle.env` (mode 0600): the symbol's Safe, the relayer address, the key-source selection (chapter 1's sealed variable or 0600 key file under `/etc/aero-bot/`), the optional reference quote (single or per-symbol pairs), the optional symbol pin, the optional switch margin, the optional out-of-range grace window (`AERO_BOT_CYCLE_OUT_OF_RANGE_GRACE_MINUTES`, default 10), the optional reward-conversion threshold (`AERO_BOT_CYCLE_AERO_CONVERSION_MIN_USDC`, default 5), and the allocator's optional portfolio bounds (`AERO_BOT_CYCLE_TIER_BAND_FRACTION` default 0.50, `AERO_BOT_CYCLE_MAX_POSITIONS` default 10, `AERO_BOT_CYCLE_MIN_POSITION_USDC` default 80, `AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION` default 0.35, `AERO_BOT_CYCLE_MIN_POSITION_FLOOR_USDC` default 30 under the configured minimum - every override under the hard ceilings).
 - Hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, state under `StateDirectory=aero-bot`.
 - The JSON report lands in the journal: `journalctl -u aero-bot-cycle@AAPLc.service`.
 
