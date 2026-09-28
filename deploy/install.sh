@@ -279,6 +279,15 @@ for unit in "${REPO_ROOT}"/deploy/systemd/*.service "${REPO_ROOT}"/deploy/system
     install -o root -g root -m 0644 "${unit}" "${UNIT_DIR}/"
 done
 systemctl daemon-reload
+# The long-running services (the dashboard, any armed watchtower) keep
+# serving the process they started with: an upgrade that only refreshes
+# units and code leaves yesterday's process running the old environment
+# forever - the gnhf 35 postmortem found the dashboard still verifying an
+# empty store two days after the gnhf 34 deploy precisely because nothing
+# restarted it. try-restart restarts only units that are already active,
+# so the installer still never arms anything: a stopped service stays
+# stopped and Phase 2's enable --now remains the only arming path.
+systemctl try-restart aero-bot-dashboard.service 'aero-bot-watchtower@*.service'
 
 # ---------------------------------------------------------------- firewall
 log "configuring ufw: default-deny inbound, OpenSSH only"

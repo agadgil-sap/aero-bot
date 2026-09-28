@@ -39,6 +39,7 @@ from typing import Annotated, Self
 from pydantic import BaseModel, Field, model_validator
 
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, NonNegativeDecimal
+from aero_bot.emissions_apr import format_apr_percent
 from aero_bot.policy import (
     PolicyActionKind,
     PolicyDecision,
@@ -738,15 +739,17 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                         symbol=evaluation.symbol,
                         reason=PortfolioExclusionReason.BELOW_TIER_BAND,
                         cause=(
-                            f"weighted {weight} below band floor {band_floor} "
+                            f"weighted {format_apr_percent(weight)} below band floor "
+                            f"{format_apr_percent(band_floor)} "
                             f"({resolved.tier_band_fraction} of the top's "
-                            f"{ranked_not_held[0][1]})"
+                            f"{format_apr_percent(ranked_not_held[0][1])})"
                         ),
                         emissions_apr=evaluation.emissions_apr,
                         detail=(
-                            f"weighted APR {weight} sits below the tier band floor "
-                            f"{band_floor} ({resolved.tier_band_fraction} of the top's "
-                            f"{ranked_not_held[0][1]})"
+                            f"weighted APR {format_apr_percent(weight)} sits below "
+                            f"the tier band floor {format_apr_percent(band_floor)} "
+                            f"({resolved.tier_band_fraction} of the top's "
+                            f"{format_apr_percent(ranked_not_held[0][1])})"
                         ),
                     )
                 )
@@ -865,7 +868,7 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
         forgone_per_day = +(target * evaluation.emissions_apr / days_per_year)
         forgone_line = (
             f"income forgone about {forgone_per_day} USDC per day at the qualifying "
-            f"APR {evaluation.emissions_apr}"
+            f"APR {format_apr_percent(evaluation.emissions_apr)}"
         )
         if target > remaining:
             excluded.append(
@@ -932,7 +935,8 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                     detail=(
                         f"{bound_line}; cash stays cash; income forgone about "
                         f"{tranche.budget_usd * evaluation.emissions_apr / days_per_year} "
-                        f"USDC per day at the qualifying APR {evaluation.emissions_apr}"
+                        f"USDC per day at the qualifying APR "
+                        f"{format_apr_percent(evaluation.emissions_apr)}"
                     ),
                     forgone_income_usdc_per_day=(
                         +tranche.budget_usd * evaluation.emissions_apr / days_per_year
@@ -1039,8 +1043,9 @@ def _composed_reallocation_decision(
         reason=PolicyReason.POOL_SWITCH_TRIGGERED,
         diagnostics=(
             f"Reallocating {held.symbol} -> {tranche.symbol}: the candidate's weighted "
-            f"qualifying APR {tranche.weighted_apr} exceeds the held "
-            f"{held.emissions_apr} by more than the {margin_fraction} relative margin "
+            f"qualifying APR {format_apr_percent(tranche.weighted_apr)} exceeds the "
+            f"held {format_apr_percent(held.emissions_apr)} by more than the "
+            f"{margin_fraction} relative margin "
             "while the held pool earned no tier it outranks.",
             *gas_diagnostics,
             *entry_decision.diagnostics,
@@ -1361,8 +1366,9 @@ def plan_portfolio_rebalance(  # noqa: PLR0912, PLR0915 - one fixed precedence
                     gas_diagnostics,
                 ),
                 diagnostic=(
-                    f"reallocating {fact.symbol} -> {evaluation.symbol}: held weighted APR "
-                    f"{fact.emissions_apr} decayed below the {threshold} margin threshold "
+                    f"reallocating {fact.symbol} -> {evaluation.symbol}: held weighted "
+                    f"APR {format_apr_percent(fact.emissions_apr)} decayed below the "
+                    f"{threshold} margin threshold "
                     f"and the candidate earned tier {tranche.tier_rank}"
                 ),
             )
@@ -1382,7 +1388,8 @@ def plan_portfolio_rebalance(  # noqa: PLR0912, PLR0915 - one fixed precedence
                 outcome=tranche.entry_outcome,
                 diagnostic=(
                     f"entering {tranche.symbol} at tier {tranche.tier_rank}: "
-                    f"{tranche.budget_usd} USDC at weighted APR {tranche.weighted_apr}"
+                    f"{tranche.budget_usd} USDC at weighted APR "
+                    f"{format_apr_percent(tranche.weighted_apr)}"
                 ),
             )
         )

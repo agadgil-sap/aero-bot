@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field, model_validator
 
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, NonNegativeDecimal
+from aero_bot.emissions_apr import format_apr_percent
 from aero_bot.ranging import (
     RangingEvidence,
     RangingObservations,
@@ -979,8 +980,8 @@ class PolicyEngine:
         lines.append(
             "gate emissions_floor: "
             + ("PASS" if emissions_pass else "FAIL")
-            + f" (measured raw APR {observation.emissions_apr}; bound >= "
-            f"{self._parameters.min_entry_emissions_apr})"
+            + f" (measured raw APR {format_apr_percent(observation.emissions_apr)}; "
+            f"bound >= {format_apr_percent(self._parameters.min_entry_emissions_apr)})"
         )
         # Gate 6: the equity and depth caps leaving a positive size.
         equity_cap = observation.equity_usd * self._parameters.max_position_equity_fraction
@@ -1295,8 +1296,8 @@ class PolicyEngine:
         return (
             f"Income protection: out of range the staked position earns no emissions, "
             f"and every minute out of range forgoes yield at the pool's qualifying "
-            f"APR {observation.emissions_apr} - about {daily_yield} USDC per day on the "
-            f"committed {position.committed_usd} USDC.",
+            f"APR {format_apr_percent(observation.emissions_apr)} - about {daily_yield} "
+            f"USDC per day on the committed {position.committed_usd} USDC.",
         )
 
     def _out_of_range_grace_exit(
@@ -1442,8 +1443,9 @@ class PolicyEngine:
                 PolicyActionKind.DILUTION_EXIT,
                 PolicyReason.DILUTION_EXIT_TRIGGERED,
                 (
-                    f"Raw emissions APR {observation.emissions_apr} fell below the entry "
-                    f"threshold {self._parameters.min_entry_emissions_apr} while open.",
+                    f"Raw emissions APR {format_apr_percent(observation.emissions_apr)} fell "
+                    f"below the entry threshold "
+                    f"{format_apr_percent(self._parameters.min_entry_emissions_apr)} while open.",
                     "Exit path burns the position and swaps all inventory back to USDC.",
                 ),
                 with_cooldown=True,
@@ -2448,8 +2450,9 @@ class PolicyEngine:
                 hold_state,
                 PolicyReason.EMISSIONS_BELOW_ENTRY_THRESHOLD,
                 (
-                    f"Raw emissions APR {observation.emissions_apr} is below the "
-                    f"entry threshold {self._parameters.min_entry_emissions_apr}.",
+                    f"Raw emissions APR {format_apr_percent(observation.emissions_apr)} is below "
+                    f"the entry threshold "
+                    f"{format_apr_percent(self._parameters.min_entry_emissions_apr)}.",
                 ),
             )
         # Size is the smaller of the equity cap and the pool depth hard gate.
@@ -2498,8 +2501,9 @@ class PolicyEngine:
                 action=PolicyActionKind.ENTER,
                 reason=PolicyReason.ENTRY_THRESHOLD_MET,
                 diagnostics=(
-                    f"Raw emissions APR {observation.emissions_apr} meets the entry "
-                    f"threshold {self._parameters.min_entry_emissions_apr}.",
+                    f"Raw emissions APR {format_apr_percent(observation.emissions_apr)} meets "
+                    f"the entry threshold "
+                    f"{format_apr_percent(self._parameters.min_entry_emissions_apr)}.",
                     f"Size {size_usd} USDC is min(equity cap {equity_cap}, depth cap {depth_cap}).",
                     f"Range {entry_range.lower_price}..{entry_range.upper_price} "
                     f"USDC per stock around pool price {observation.amm_price_usdc} "

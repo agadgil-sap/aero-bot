@@ -797,6 +797,40 @@ class TestIdleCashAlert:
         assert "income forgone about" in line
         assert "0.971" in line
 
+    def test_the_alerts_apr_reads_in_percent_beside_the_raw_fraction(self) -> None:
+        """The idle line can never be misread by a factor of one hundred.
+
+        The gnhf 35 postmortem: the overnight escalation read the SNDKc
+        board reading 542.14 as "542 percent" - the runtime carries
+        decimal fractions, so the alert renders both scales.
+        """
+        state = self.idle_state().model_copy(
+            update={
+                "exclusions": (
+                    IdleCashExclusion(
+                        symbol="SNDKc",
+                        reason="below_min_position_size",
+                        gate="",
+                        detail=(
+                            "the tier target clamped to the 36.86 USDC per-name "
+                            "concentration bound below the minimum; income forgone "
+                            "about 35.13 USDC per day at the qualifying APR "
+                            "542.14 (about 54,214 percent)"
+                        ),
+                        emissions_apr=Decimal("542.14"),
+                        forgone_income_usdc_per_day=Decimal("35.13"),
+                    ),
+                ),
+                "signature": "SNDKc:below_min_position_size:",
+            }
+        )
+        report = calm_report().model_copy(
+            update={"decision_reason": "flat_awaiting_entry", "idle_cash": state}
+        )
+        alerts = evaluate_alerts(report, parse_alert_config({}))
+        assert len(alerts) == 1
+        assert "qualifying APR 542.14 (about 54,214 percent)" in alerts[0]
+
     def test_stays_quiet_while_the_same_episode_persists(self) -> None:
         """Only the first cycle of a changed signature alerts."""
         report = calm_report().model_copy(

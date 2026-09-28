@@ -33,6 +33,7 @@ from typing import Protocol, TextIO, runtime_checkable
 import httpx
 
 from aero_bot.cycle import CycleReport
+from aero_bot.emissions_apr import format_apr_percent
 
 # Environment variable selecting the alert transport: smtp, resend, or none.
 ALERT_PROVIDER_ENV = "AERO_BOT_ALERT_PROVIDER"
@@ -516,7 +517,7 @@ def evaluate_alerts(report: CycleReport, config: AlertConfig) -> tuple[str, ...]
         alerts.append(
             f"idle book: {idle.cash_fraction} of equity ({idle.cash_usdc} of "
             f"{idle.equity_usd} USDC) sits as cash while {top.symbol} ranks "
-            f"in-band at qualifying APR {top.emissions_apr} but stays excluded "
+            f"in-band at qualifying APR {format_apr_percent(top.emissions_apr)} but stays excluded "
             f"({top.reason}{gate_segment}) - {top.detail}"
         )
     return tuple(alerts)

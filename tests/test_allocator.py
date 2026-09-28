@@ -10,6 +10,7 @@ from aero_bot.allocator import (
     PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC,
     DeferredReallocation,
     HeldPositionFact,
+    PortfolioAllocation,
     PortfolioExclusionReason,
     PortfolioParameters,
     PortfolioRebalancePlan,
@@ -882,3 +883,113 @@ class TestEntryGateTransparencyAndScaledLatches:
         )
         assert "CCCc (below_tier_band: weighted" in allocation.summary
         assert "below band floor" in allocation.summary
+
+
+class TestLiveSndkcNight:
+    """The gnhf 35 live reproduction: the 2026-09-28 SNDKc flat book.
+
+    The second production evidence pass, verbatim from the VM cycle at
+    2026-09-28T05:30Z and the on-chain decomposition at block 51893582:
+    SNDKc topped the board at a qualifying APR of 347.907... read as a
+    decimal fraction in Aerodrome's displayed convention - 34,791 percent,
+    the per-cell concentration number whose denominator (a 5,078-USDC
+    current-cell staked value) collapsed overnight while the reward
+    stream held. Every protective gate PASSED; the book stayed flat on
+    the honest bound conflict - the 35-percent concentration bound
+    (36.86 USDC of a 105.30 book) sits below the 80-USDC minimum - and
+    these tests pin that the operator reads gate, bound, measured value,
+    percent, and the full chain.
+    """
+
+    LIVE_CASH = Decimal("102.263507")
+    LIVE_EQUITY = Decimal("105.3026673647274842033170387")
+    LIVE_SNDKC_APR = Decimal("347.907697331990933767452574132184551184787645543487960275680")
+    LIVE_CONCENTRATION_BOUND = Decimal("36.85593357765461947116096354")
+
+    def session(self) -> PolicyState:
+        """Build the morning's session state: healthy, no halt."""
+        day = BASE_TIME.astimezone(__import__("zoneinfo").ZoneInfo("America/New_York")).date()
+        return PolicyState(
+            day=day,
+            day_start_equity_usd=Decimal("102.263507"),
+            peak_equity_usd=Decimal("105.3181507845350552886065412"),
+        )
+
+    def board(self) -> tuple[PoolBoardOption, ...]:
+        """Build the morning's board: SNDKc far above the band."""
+        return (
+            board_option(
+                "SNDKc",
+                "0x" + "3" * 40,
+                "0x" + "4" * 40,
+                emissions_apr=self.LIVE_SNDKC_APR,
+                equity_usd=self.LIVE_EQUITY,
+            ),
+            board_option(
+                "MSTRc",
+                "0x" + "1" * 40,
+                "0x" + "2" * 40,
+                emissions_apr=Decimal("153.5826647602950643433296005"),
+                equity_usd=self.LIVE_EQUITY,
+            ),
+        )
+
+    def allocation(self) -> PortfolioAllocation:
+        """Run the allocator over the morning's board at the live basis."""
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, self.session(), self.board(), {})
+        return allocate_portfolio(
+            engine,
+            self.session(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=self.LIVE_CASH,
+            equity_usdc=self.LIVE_EQUITY,
+        )
+
+    def test_the_summary_names_the_bound_conflict_with_both_bounds(self) -> None:
+        """The excluded line carries reason, size, minimum, and clamp bound."""
+        allocation = self.allocation()
+        assert allocation.tranches == ()
+        sndkc = next(item for item in allocation.excluded if item.symbol == "SNDKc")
+        assert sndkc.reason is PortfolioExclusionReason.BELOW_MIN_POSITION_SIZE
+        assert (
+            f"SNDKc (below_min_position_size: size {self.LIVE_CONCENTRATION_BOUND} "
+            "below the 80 minimum after the "
+            f"{self.LIVE_CONCENTRATION_BOUND} concentration clamp)" in allocation.summary
+        )
+
+    def test_the_detail_line_reads_the_apr_in_percent(self) -> None:
+        """The forgone-income line renders both APR scales.
+
+        The live line read ``at the qualifying APR 347.907...`` and every
+        operator read it as 347.9 percent; the annotation prevents the
+        one-hundred-x misread.
+        """
+        allocation = self.allocation()
+        sndkc = next(item for item in allocation.excluded if item.symbol == "SNDKc")
+        assert sndkc.detail is not None
+        assert "income forgone about 35.13003557266472636969790386 USDC per day" in sndkc.detail
+        assert "347.907697331990933767452574132184551184787645543487960275680" in sndkc.detail
+        assert "(about 34,791 percent)" in sndkc.detail
+
+    def test_the_full_gate_chain_rides_the_allocation_all_pass(self) -> None:
+        """The eight-gate chain shows every protective gate passing.
+
+        The determination the escalation asked for: no gate refuses on bad
+        data - the flat book is the sizing bound conflict alone, and the
+        trace proves it cycle over cycle.
+        """
+        allocation = self.allocation()
+        assert allocation.gate_trace_symbol == "SNDKc"
+        assert allocation.gate_trace_basis.startswith("entry gate chain for SNDKc at the")
+        assert f"{self.LIVE_CONCENTRATION_BOUND} USDC tranche basis" in allocation.gate_trace_basis
+        assert f"portfolio equity {self.LIVE_EQUITY}" in allocation.gate_trace_basis
+        assert len(allocation.gate_trace) == 8
+        assert all(": PASS" in line for line in allocation.gate_trace)
+        emissions_line = next(
+            line for line in allocation.gate_trace if line.startswith("gate emissions_floor:")
+        )
+        assert "(about 34,791 percent)" in emissions_line
+        assert "1.5 (about 150 percent)" in emissions_line

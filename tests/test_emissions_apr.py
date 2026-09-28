@@ -7,6 +7,7 @@ import pytest
 from aero_bot.emissions_apr import (
     aerodrome_display_emissions_apr,
     emissions_apr_at_tick_width,
+    format_apr_percent,
     staked_value_usdc,
 )
 from aero_bot.history import price_usdc_per_stock
@@ -20,6 +21,29 @@ from aero_bot.lp_plan import position_amounts_for_liquidity
 FROZEN_REWARD_RATE_UNITS = 102_277_628_210_565_102  # 0.10227763 AERO/s
 FROZEN_AERO_PRICE_USDC = Decimal("0.5428")
 FROZEN_CELL_STAKED_VALUE_USDC = Decimal("210935")
+
+
+def test_format_apr_percent_renders_the_fraction_with_its_percent() -> None:
+    """The operator annotation keeps the raw fraction and adds percent.
+
+    The gnhf 35 postmortem: every reader of a bare ``raw APR 542.14`` line
+    read the decimal fraction as percent - a one-hundred-x misread. The
+    annotation renders the raw value unchanged (the audited,
+    machine-comparable figure) with the percent reading beside it.
+    """
+    assert format_apr_percent(Decimal("2.0")) == "2.0 (about 200 percent)"
+    assert format_apr_percent(Decimal("1.5")) == "1.5 (about 150 percent)"
+    # The overnight SNDKc reading: 542.14 as a fraction is 54,214 percent,
+    # never "542 percent".
+    assert format_apr_percent(Decimal("542.14")) == "542.14 (about 54,214 percent)"
+    # Large readings carry thousands separators so their magnitude reads.
+    assert (
+        format_apr_percent(Decimal("347.907697331990933767452574"))
+        == "347.907697331990933767452574 (about 34,791 percent)"
+    )
+    # Rounding is half-up and zero still renders.
+    assert format_apr_percent(Decimal("0.005")) == "0.005 (about 1 percent)"
+    assert format_apr_percent(Decimal("0")) == "0 (about 0 percent)"
 
 
 def test_frozen_aaplc_case_reproduces_the_displayed_830_percent() -> None:
