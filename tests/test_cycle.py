@@ -593,6 +593,9 @@ def tracked_status(
     accrued_aero_units: int | None = None,
     fee_growth_inside0_x128: int | None = None,
     fee_growth_inside1_x128: int | None = None,
+    liquidity: int = 12_345,
+    fees_owed0_units: int = 0,
+    fees_owed1_units: int = 0,
 ) -> LpPositionStatusReport:
     """Build one minimal tracked-position status via unchecked construction."""
     view = SimpleNamespace(
@@ -600,7 +603,7 @@ def tracked_status(
         tick_upper=FIXTURE_RANGE_UPPER,
         token0_address=BASE_USDC_ADDRESS,
         token1_address=STOCK_TOKEN_ADDRESS,
-        liquidity=12_345,
+        liquidity=liquidity,
     )
     return LpPositionStatusReport.model_construct(
         symbol="FIXc",
@@ -615,6 +618,8 @@ def tracked_status(
         unrealized_pnl_usdc=pnl,
         pnl_diagnostic="" if pnl is not None else "no entry cost",
         fees_owed_usdc=fees_usdc,
+        fees_owed0_units=fees_owed0_units,
+        fees_owed1_units=fees_owed1_units,
         accrued_aero_earned_units=accrued_aero_units,
         fee_growth_inside0_x128=fee_growth_inside0_x128,
         fee_growth_inside1_x128=fee_growth_inside1_x128,
@@ -1385,6 +1390,158 @@ class TestReconciliation:
         assert rebuilt.held_inventory is not None
         assert rebuilt.held_inventory.symbol == "FIXc"
         assert rebuilt.held_inventory.stock_quantity == Decimal("0.14296689")
+
+
+class TestCrashedExitHeal:
+    """The 2026-09-28 live wedge: an empty tracked NFT heals out of the book.
+
+    Production evidence: the 11:24 UTC cycle withdrew METAc token 7149956
+    on-chain (decrease_liquidity and collect included), then the re-entry
+    mint died at 11:32 on an audit-store ``database is locked`` crash before
+    the book updated. Every later cycle re-commanded the dead NFT into a
+    withdraw ``position_empty`` refusal and halted - fifteen-plus identical
+    crash-loops while the capital sat safe in the Safe. The reconcile now
+    drops a verifiably empty tracked position so decide never re-commands
+    it, and the crash recovery is idempotent.
+    """
+
+    def test_empty_tracked_position_drops_with_evidence(self, tmp_path: Path) -> None:
+        """A zero-liquidity unstaked NFT leaves the book with a loud diagnostic."""
+        reads = FakeReads(empty_inventory())
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status(liquidity=0, value=Decimal("0"), pnl=None),
+        )
+        runner, _, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        assert decision_recon.empty_tracked_token_ids == (TRACKED_TOKEN_ID,)
+        assert decision_recon.tracked_token_id is None
+        assert decision_recon.position_statuses == ()
+        assert any("reconciles EMPTY on-chain" in line for line in decision_recon.diagnostics)
+        assert any(
+            "dropping the stale tracking from the book" in line
+            for line in decision_recon.diagnostics
+        )
+        # The final reconciliation is clean and the book no longer tracks the dead NFT.
+        assert report.reconciliation.empty_tracked_token_ids == ()
+        assert report.reconciliation.tracked_token_id is None
+        assert state_store.load().positions == ()
+
+    def test_live_heal_never_attempts_the_dead_withdraw_and_redeploys(self, tmp_path: Path) -> None:
+        """The wedged book heals, no withdraw is commanded, capital redeploys."""
+        reads = FakeReads(empty_inventory())
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status(liquidity=0, value=Decimal("0"), pnl=None),
+        )
+        runner, executor, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
+        assert executor is not None
+
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_price_usdc=FIXTURE_AMM_PRICE,
+        )
+
+        assert report.halted_reason == ""
+        assert "position_empty" not in report.halted_reason
+        assert all(call[0] not in ("withdraw", "unstake") for call in executor.calls)
+        assert [call[0] for call in executor.calls] == ["mint", "stake"]
+        book = state_store.load()
+        assert book.position is not None
+        assert book.position.token_id == TRACKED_TOKEN_ID
+
+    def test_healed_book_reruns_clean_and_idempotent(self, tmp_path: Path) -> None:
+        """The cycle after the heal carries no empty residual and no error."""
+        reads = FakeReads(empty_inventory())
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status(liquidity=0, value=Decimal("0"), pnl=None),
+        )
+        runner, _, _, _ = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        first = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+        assert first.decision_reconciliation is not None
+        assert first.decision_reconciliation.empty_tracked_token_ids == (TRACKED_TOKEN_ID,)
+
+        second = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+        assert second.decision_reconciliation is not None
+        assert second.decision_reconciliation.empty_tracked_token_ids == ()
+        assert second.halted_reason == ""
+
+    def test_stray_stock_from_the_crashed_reentry_is_adopted(self, tmp_path: Path) -> None:
+        """The balancing swap's leftover stock is adopted once the book is flat."""
+        reads = FakeReads(empty_inventory())
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status(liquidity=0, value=Decimal("0"), pnl=None),
+        )
+        # The 11:27 balancing swap bought stock for the mint that never ran.
+        balances = FakeBalances(stock_units=2_100_000)
+        runner, _, _, state_store = make_runner(
+            tmp_path,
+            book=tracked_book(),
+            reads=reads,
+            balances=balances,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        assert decision_recon.empty_tracked_token_ids == (TRACKED_TOKEN_ID,)
+        assert any(
+            "adopting unrecorded FIXc stock balance" in line for line in decision_recon.diagnostics
+        )
+        book = state_store.load()
+        assert book.positions == ()
+        assert book.held_inventory is not None
+        assert book.held_inventory.symbol == "FIXc"
+        assert book.held_inventory.stock_quantity == Decimal("0.021")
+
+    def test_live_liquidity_is_never_dropped(self, tmp_path: Path) -> None:
+        """A position carrying liquidity stays tracked whatever its range."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status())
+        runner, _, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        assert report.reconciliation.empty_tracked_token_ids == ()
+        assert state_store.load().position is not None
+
+    def test_owed_fees_are_never_dropped(self, tmp_path: Path) -> None:
+        """A zero-liquidity NFT still owed fees stays tracked for the collect."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status(liquidity=0, value=Decimal("0"), pnl=None, fees_owed0_units=500),
+        )
+        runner, _, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        assert report.reconciliation.empty_tracked_token_ids == ()
+        assert report.reconciliation.tracked_token_id == TRACKED_TOKEN_ID
+        assert state_store.load().position is not None
+
+    def test_staked_position_is_never_dropped(self, tmp_path: Path) -> None:
+        """A gauge-held NFT stays governed by the unstake path even when empty."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status(owner=GAUGE_ADDRESS, liquidity=0, value=Decimal("0"), pnl=None),
+        )
+        runner, _, _, state_store = make_runner(tmp_path, book=tracked_book(), reads=reads)
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        assert report.reconciliation.empty_tracked_token_ids == ()
+        assert state_store.load().position is not None
 
 
 class TestReferenceEnvironment:
