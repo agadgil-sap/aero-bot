@@ -102,7 +102,7 @@ See [the decision command documentation](docs/strategy.md) for the observation a
 ## Cycle command
 
 The `aero-bot-cycle` command runs one scheduled decision cycle - reconcile on-chain state, run the locked policy engine, and execute the authorized action through the audited capped surfaces - then exits; a hardened systemd timer decides when cycles run.
-Selector mode runs the portfolio allocator (the captain's gnhf 33 ruling): the ranked qualifying board funds tiered positions - up to ten concurrent, the deployed count an output of qualification under the minimum-size and concentration bounds, cash as dry powder - with reallocations past the thirty percent decay margin and a per-position yield attribution rolled up daily.
+Selector mode runs the portfolio allocator (the captain's gnhf 33 ruling): the ranked qualifying board funds tiered positions - up to ten concurrent, the deployed count an output of qualification under the minimum-size and concentration bounds (no minimum at all below the 1000-USDC activation equity, the captain's sub-1000 correction) - with reallocations past the thirty percent decay margin and a per-position yield attribution rolled up daily.
 A crashed cycle reconciles toward chain truth and never double-acts, adopting a crashed entry only through the audit chain's own confirmed-mint evidence.
 See [the cycle command documentation](docs/cycle.md) for the fixed cycle order, the allocator doctrine, the action mapping, the crash discipline, and the systemd wiring.
 Each cycle can email its summary and alerts through a sealed-credential SMTP or Resend-style transport; see [the alerts documentation](docs/alerts.md) for the configuration and semantics.

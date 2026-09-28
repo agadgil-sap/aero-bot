@@ -205,18 +205,23 @@ class TestParameterCeilings:
 
 
 class TestParameterCoherence:
-    """The captain's 2026-09-28 activation ruling over the gnhf 36 interplay.
+    """The activation ruling over the gnhf 36 interplay, as corrected same-day.
+
+    The captain's 2026-09-28 activation ruling over the gnhf 36 interplay,
+    as corrected the same day by the captain's sub-1000 ruling.
 
     The per-name concentration cap is IGNORED until the book reaches the
     activation equity (default 1000 USDC, the funded scale the trial book
-    grows toward): below it the cap does not bind at all and sizing
-    follows the tier logic under the configured eighty-USDC minimum, so
-    the trial-scale book runs the proven single-position ~80-105 shape
-    plus residual cash. The gnhf 36 coherence machinery - the effective
-    minimum max(floor, min(configured, clamp)) with the hard floor -
-    stays for the sealed early-activation override, where an engaged
-    clamp below the configured minimum can still bind. These tests pin
-    both regimes and the exact activation boundary both sides.
+    grows toward) - and below it there is no per-name minimum either:
+    the book deploys its available funds, because a minimum the unfunded
+    book cannot meet is a reserve that starves it (the live 2026-09-28
+    trap: 78.03 USDC of free cash against the eighty-USDC minimum froze
+    the 105.73-USDC book fully idle while a pool qualified). The gnhf 36
+    coherence machinery - the effective minimum max(floor, min(configured,
+    clamp)) with the hard floor - stays for the sealed early-activation
+    override, where an engaged clamp below the configured minimum can
+    still bind. These tests pin both regimes and the exact activation
+    boundary both sides.
     """
 
     # The defaults: 80 minimum, 0.35 concentration fraction, 30 floor,
@@ -230,15 +235,17 @@ class TestParameterCoherence:
     FLOOR_CROSSING_EQUITY = Decimal("600") / Decimal("7")
 
     def test_the_activation_regimes_of_the_effective_minimum(self) -> None:
-        """Below activation the configured minimum governs; at it the clamp engages."""
+        """Below activation there is no minimum at all; at it the clamp engages."""
         parameters = self.PARAMETERS
-        # The captain's trial scale: the cap is not engaged, so the
-        # configured eighty governs and the derivation names the ruling.
+        # The captain's trial scale: the cap is not engaged and neither is
+        # any per-name minimum - the book deploys its available funds and
+        # the derivation names the sub-1000 ruling.
         assert parameters.concentration_bound_usdc(Decimal("105")) is None
-        assert parameters.effective_minimum_position_usdc(Decimal("105")) == Decimal("80")
+        assert parameters.effective_minimum_position_usdc(Decimal("105")) == Decimal("0")
         assert parameters.describe_effective_minimum(Decimal("105")) == (
-            "the concentration cap is not engaged below the 1000 USDC activation equity "
-            "(book equity 105); the configured minimum 80 governs"
+            "no minimum below the 1000 USDC activation equity "
+            "(book equity 105); the book deploys its available funds "
+            "without a per-name minimum or reserve (the captain's sub-1000 ruling)"
         )
         # The funded scale: the cap engages and the clamp (350) sits above
         # the configured eighty, which governs naturally.
@@ -253,7 +260,7 @@ class TestParameterCoherence:
         parameters = self.PARAMETERS
         just_below = Decimal("999.99")
         assert parameters.concentration_bound_usdc(just_below) is None
-        assert parameters.effective_minimum_position_usdc(just_below) == Decimal("80")
+        assert parameters.effective_minimum_position_usdc(just_below) == Decimal("0")
         assert parameters.concentration_bound_usdc(Decimal("1000")) == Decimal("350.00")
         assert parameters.effective_minimum_position_usdc(Decimal("1000")) == Decimal("80")
 
@@ -310,8 +317,8 @@ class TestParameterCoherence:
 
         The exact trial-scale basis the captain's brief named: one
         qualifying pool, 105 USDC of cash - the book funds the full tier
-        target (105, above the eighty minimum, no clamp below the
-        activation equity) and holds no forced residual.
+        target (105, with no minimum below the activation equity) and
+        holds no forced residual.
         """
         board = (board_option("BBBc", BBB_POOL, BBB_TOKEN),)
         engine = PolicyEngine()
@@ -417,6 +424,197 @@ class TestParameterCoherence:
         assert "below the effective minimum 80 USDC" in deferred.detail
         assert "floored at 30 = 80" in deferred.detail
         assert "the configured minimum governs" in deferred.detail
+
+
+class TestSubActivationDeployment:
+    """The captain's 2026-09-28 sub-1000 correction, pinned on the live wedge.
+
+    The production evidence (the rollout scout's first healed scheduled
+    cycle, 2026-09-28T20:05Z): the 105.73-USDC book held 78.027448 USDC
+    of free cash beside about 24.59 USDC of loose METAc stock pending
+    convergence and 3.34 USDC of unclaimed AERO, the top pool qualified,
+    and the cycle stayed fully idle - every tier target floored to the
+    eighty-USDC minimum the free cash could not fund, an exclusion the
+    captain rated exactly what it was: a dry-powder reserve the unfunded
+    book never needed. The correction removes BOTH the minimum and the
+    reserve below the activation equity: the book deploys its available
+    funds. Above the activation equity nothing changes - the funded
+    scale's bounds govern exactly as the gnhf 37 ruling locked them,
+    and the captain will revisit that policy once the book is actually
+    funded.
+    """
+
+    LIVE_CASH = Decimal("78.027448")
+    LIVE_EQUITY = Decimal("105.73")
+
+    def live_allocation(self) -> PortfolioAllocation:
+        """Run the allocator at the exact live basis of the healed cycle."""
+        board = (
+            board_option(
+                "MSTRc",
+                "0x" + "1" * 40,
+                "0x" + "2" * 40,
+                emissions_apr=Decimal("208.12"),
+                equity_usd=self.LIVE_EQUITY,
+            ),
+        )
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, PolicyState(), board, {})
+        return allocate_portfolio(
+            engine,
+            PolicyState(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=self.LIVE_CASH,
+            equity_usdc=self.LIVE_EQUITY,
+        )
+
+    def test_the_live_wedge_funds_the_full_available_cash(self) -> None:
+        """The exact 2026-09-28 no-entry posture now deploys every deployable cent.
+
+        Before the correction this basis refused with
+        ``insufficient_cash: tier target 80 exceeds the 78.027448
+        deployable left`` while the pool qualified and every protective
+        gate passed. After it the single qualifying pool takes the whole
+        deployable budget with no floored target, no residual reserve,
+        and no exclusion at all.
+        """
+        allocation = self.live_allocation()
+        assert [tranche.symbol for tranche in allocation.tranches] == ["MSTRc"]
+        assert allocation.tranches[0].budget_usd == Decimal("78.0274480")
+        assert allocation.cash_residual_usdc == Decimal("0")
+        assert allocation.excluded == ()
+        assert "dry powder" not in allocation.summary
+
+    def test_a_dust_book_deploys_its_whole_budget(self) -> None:
+        """Even a ten-USDC book deploys - no stub is too small below activation.
+
+        At a live-shape emissions APR the ten-USDC position's daily yield
+        dwarfs its batch gas cost, so the cost-share bound passes and the
+        full budget funds.
+        """
+        board = (board_option("BBBc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("208.12")),)
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, PolicyState(), board, {})
+        allocation = allocate_portfolio(
+            engine,
+            PolicyState(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("10.000000"),
+            equity_usdc=Decimal("10.000000"),
+        )
+        assert [tranche.symbol for tranche in allocation.tranches] == ["BBBc"]
+        assert allocation.tranches[0].budget_usd == Decimal("10.000000")
+        assert allocation.cash_residual_usdc == Decimal("0")
+        assert allocation.excluded == ()
+
+    def test_the_tier_split_never_leaves_a_below_band_stub_reserve(self) -> None:
+        """A two-name sub-activation board splits the cash, no forced residual."""
+        board = (
+            board_option("AAAc", AAA_POOL, AAA_TOKEN, emissions_apr=Decimal("2.0")),
+            board_option("BBBc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("3.0")),
+        )
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, PolicyState(), board, {})
+        allocation = allocate_portfolio(
+            engine,
+            PolicyState(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("78.027448"),
+            equity_usdc=Decimal("105.73"),
+        )
+        budgets = {tranche.symbol: tranche.budget_usd for tranche in allocation.tranches}
+        # Weights 3/5 and 2/5 of the 78.027448 deployable budget.
+        assert budgets["BBBc"].quantize(Decimal("0.000001")) == Decimal("46.816468")
+        assert budgets["AAAc"].quantize(Decimal("0.000001")) == Decimal("31.210979")
+        # The residual is at most one quantum of tier-share rounding dust,
+        # never a reserve: the summary names it plain cash below activation.
+        assert allocation.cash_residual_usdc <= Decimal("0.000001")
+        assert "dry powder" not in allocation.summary
+        assert not any(
+            item.reason is PortfolioExclusionReason.INSUFFICIENT_CASH
+            for item in allocation.excluded
+        )
+
+    def test_the_above_activation_minimum_is_untouched(self) -> None:
+        """The funded scale keeps its eighty: a 78-USDC tranche still refuses.
+
+        The same free-cash amount at a 1200-USDC equity refuses exactly
+        as before - the captain will revisit the above-1000 policy once
+        the book is actually funded, and nothing here pre-empts that.
+        """
+        board = (board_option("BBBc", BBB_POOL, BBB_TOKEN),)
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, PolicyState(), board, {})
+        allocation = allocate_portfolio(
+            engine,
+            PolicyState(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("78.027448"),
+            equity_usdc=Decimal("1200"),
+        )
+        assert allocation.tranches == ()
+        excluded = next(
+            item
+            for item in allocation.excluded
+            if item.reason is PortfolioExclusionReason.INSUFFICIENT_CASH
+        )
+        assert "tier target 80 exceeds the 78.027448 deployable left" in excluded.cause
+
+    def test_small_tranches_still_refuse_on_real_gates(self) -> None:
+        """Removing the minimum never loosens the protective gate chain.
+
+        Two real protections pin the interaction at the sub-activation
+        scale: a genuinely uneconomic dust position - whose daily yield
+        cannot carry its batch gas cost under the locked five-percent
+        cost-share bound - still refuses on the gas gate with the typed
+        reason and the income forgone, and a halted book funds nothing
+        at any size.
+        """
+        board = (board_option("BBBc", BBB_POOL, BBB_TOKEN),)
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, PolicyState(), board, {})
+        dust = allocate_portfolio(
+            engine,
+            PolicyState(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("10.000000"),
+            equity_usdc=Decimal("10.000000"),
+        )
+        assert dust.tranches == ()
+        refused = next(
+            item
+            for item in dust.excluded
+            if item.reason is PortfolioExclusionReason.ENTRY_GATE_REFUSED
+        )
+        assert refused.gate == "gas_gate_deferred"
+        assert refused.forgone_income_usdc_per_day is not None
+        halted = PolicyState(day=BASE_TIME.date(), halted_day=BASE_TIME.date())
+        halted_allocation = allocate_portfolio(
+            engine,
+            halted,
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("78.027448"),
+            equity_usdc=Decimal("105.73"),
+        )
+        assert halted_allocation.tranches == ()
+        halted_refusal = next(
+            item
+            for item in halted_allocation.excluded
+            if item.reason is PortfolioExclusionReason.ENTRY_GATE_REFUSED
+        )
+        assert "daily_loss_halt_active" in halted_refusal.detail
 
 
 class TestTierConstruction:
@@ -1195,18 +1393,18 @@ class TestLiveSndkcNight:
     def test_the_morning_funds_the_proven_single_position_shape(self) -> None:
         """The activation ruling's demanded verification: a funded tranche at 105.
 
-        The gnhf 37 verification the captain's brief demanded: a fixture
-        decision at the exact 105-equity production basis showing the
-        funded tranche - the full 102.26 deployable target under the
-        eighty minimum, no clamp below the activation equity, nothing
-        force-deployed past the band.
+        The gnhf 37 verification the captain's brief demanded, as the
+        sub-1000 correction completes it: a fixture decision at the exact
+        105-equity production basis showing the funded tranche - the full
+        102.26 deployable target with no minimum and no clamp below the
+        activation equity, nothing force-deployed past the band.
         """
         allocation = self.allocation()
         assert [tranche.symbol for tranche in allocation.tranches] == ["SNDKc"]
         tranche = allocation.tranches[0]
         assert tranche.budget_usd == self.LIVE_CASH
         effective = PortfolioParameters().effective_minimum_position_usdc(self.LIVE_EQUITY)
-        assert effective == Decimal("80")
+        assert effective == Decimal("0")
         assert tranche.budget_usd >= effective
         assert allocation.cash_residual_usdc == Decimal("0")
         assert not any(

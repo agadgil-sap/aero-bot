@@ -5369,8 +5369,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Decimal,
         default=None,
         help=(
-            "The configured minimum position size in USDC; below the EFFECTIVE "
-            "minimum cash stays cash (default 80; the sealed "
+            "The configured minimum position size in USDC at or above the "
+            "concentration-cap activation equity (default 1000); below that "
+            "equity there is no minimum - the book deploys its available "
+            "funds (default 80; the sealed "
             "AERO_BOT_CYCLE_MIN_POSITION_USDC variable supplies the same value "
             "when the flag is absent)."
         ),

@@ -158,29 +158,34 @@ AERO_BOT_BASE_RPC_URL=https://base.publicnode.com
 # observed price exceeds this many USDC converts to USDC inside the cycle's
 # act step (default 5, the captain's 2026-09-27 ruling).
 #AERO_BOT_CYCLE_AERO_CONVERSION_MIN_USDC=5
-# The allocator's portfolio bounds (the captain's gnhf 33 ruling): every
-# default is locked and every override stays under the hard ceilings -
-# at most ten concurrent positions, a positive minimum position size
-# inside the total cap, and fractions inside (0, 1]. The deployed count
-# stays an output of qualification under the bounds; cash is never
-# force-deployed.
+# The allocator's portfolio bounds (the captain's gnhf 33 ruling, as
+# corrected below the activation equity by the captain's 2026-09-28
+# sub-1000 ruling): every default is locked and every override stays
+# under the hard ceilings - at most ten concurrent positions, a positive
+# minimum position size inside the total cap, and fractions inside
+# (0, 1]. Below the activation equity (default 1000 USDC) there is no
+# per-name minimum and no minimum-driven reserve at all - the book
+# deploys its available funds into the qualifying board; the configured
+# minimum governs only at or above the activation equity.
 #AERO_BOT_CYCLE_TIER_BAND_FRACTION=0.50
 #AERO_BOT_CYCLE_MAX_POSITIONS=10
 #AERO_BOT_CYCLE_MIN_POSITION_USDC=80
 #AERO_BOT_CYCLE_CONCENTRATION_CAP_FRACTION=0.35
 # The hard floor under the effective minimum position size (gnhf 36
-# parameter coherence): the effective minimum is
-# max(this floor, min(the minimum above, the per-name concentration
-# clamp at the live equity)) - a small book deploys at the clamp, never
-# below this floor, and a book whose clamp sits under the floor stays
-# cash. The floor must stay at or under the configured minimum.
+# parameter coherence, engaged-cap regime only): the effective minimum
+# is max(this floor, min(the minimum above, the per-name concentration
+# clamp at the live equity)) - a small engaged book deploys at the
+# clamp, never below this floor, and a book whose clamp sits under the
+# floor stays cash. The floor must stay at or under the configured
+# minimum.
 #AERO_BOT_CYCLE_MIN_POSITION_FLOOR_USDC=30
 # The book equity at or above which the per-name concentration cap
-# engages (the captain's 2026-09-28 ruling): below it the cap does not
-# bind at all and the book funds toward the cap running the proven
-# ~100-per-position shape under the configured minimum. The hard
-# ceiling is the 1000-USDC total cap itself, so an override can only
-# engage the cap sooner, never later.
+# AND the configured minimum engage (the captain's 2026-09-28 rulings):
+# below it neither binds - the cap does not clamp and there is no
+# per-name minimum, so the book deploys its available funds into the
+# qualifying board while it funds toward the cap. The hard ceiling is
+# the 1000-USDC total cap itself, so an override can only engage the
+# cap sooner, never later.
 #AERO_BOT_CYCLE_CONCENTRATION_CAP_ACTIVATION_USDC=1000
 # The trailing window of cycle readings the conservative income
 # expectation floors itself at (the captain's 2026-09-28 correction,

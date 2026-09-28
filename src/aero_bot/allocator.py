@@ -24,16 +24,21 @@ at most ten concurrent positions, no tranche below the per-name minimum
 position size, and no name above the thirty-five percent concentration
 cap of book equity.
 
-The minimum and the concentration cap are coherent under the captain's
-2026-09-28 activation ruling, which supersedes the gnhf 36 interplay:
-the per-name concentration bound applies only at or above a locked
-activation equity (default 1000 USDC, the funded scale the trial book
-grows toward); below it the cap does not bind at all and sizing follows
-the tier logic under the configured eighty-USDC minimum - so a
-105-USDC book runs the proven single-position ~80-105 shape plus
-residual cash instead of starving behind a clamp that was never meant
-for the trial scale. The gnhf 36 coherence machinery stays for the
-sealed early-activation override: engaged books compute the effective
+The minimum and the concentration cap are coherent under the
+captain's 2026-09-28 activation ruling, as corrected the same day by
+the captain's sub-1000 ruling: below the activation equity (default
+1000 USDC) there is NO per-name minimum and NO minimum-driven reserve
+at all - the book deploys its available funds into the qualifying
+board, because a minimum the unfunded book cannot meet is a reserve
+that starves it (the live 2026-09-28 trap: 78.03 USDC of free cash
+against the 80-USDC minimum froze the 105.73-USDC book fully idle
+while a pool qualified). At or above the activation equity the funded
+scale's bounds govern unchanged - the configured eighty-USDC minimum
+and the thirty-five percent concentration cap exactly as the ruling
+locked them - and the captain will revisit that policy once the book
+is actually funded. The gnhf 36 coherence machinery stays for the
+sealed early-activation override, where an engaged clamp below the
+configured minimum still binds: engaged books compute the effective
 minimum as ``max(floor, min(configured minimum, concentration clamp))``
 with the hard gas-efficiency floor (default thirty USDC) bounding how
 far the rule may lower the bound - never a license to breach the cap.
@@ -81,8 +86,10 @@ DEFAULT_TIER_BAND_FRACTION = Decimal("0.50")
 HARD_MAX_CONCURRENT_POSITIONS = 10
 # The default maximum concurrent deployed positions.
 DEFAULT_MAX_CONCURRENT_POSITIONS = 10
-# The default minimum position size in USDC: below it, cash stays cash
-# (locked parameter; the captain's count-as-output ruling).
+# The default minimum position size in USDC at or above the activation
+# equity: below it, cash stays cash (locked parameter; the captain's
+# count-as-output ruling). Below the activation equity there is NO
+# minimum at all (the captain's 2026-09-28 sub-1000 correction).
 DEFAULT_MIN_POSITION_USDC = Decimal("80")
 # The default hard floor under the EFFECTIVE minimum position size in
 # USDC (the gnhf 36 parameter-coherence ruling): the coherence rule
@@ -131,8 +138,11 @@ class PortfolioParameters(BaseModel):
     # The maximum concurrent deployed positions (default ten, the
     # captain's ceiling; the deployed count emerges under it).
     max_concurrent_positions: Annotated[int, Field(ge=1)] = DEFAULT_MAX_CONCURRENT_POSITIONS
-    # The minimum position size in USDC: a tranche below the EFFECTIVE
-    # minimum stays cash. The effective minimum is the coherent
+    # The minimum position size in USDC at or above the activation
+    # equity: a tranche below the EFFECTIVE minimum stays cash. Below the
+    # activation equity there is no minimum at all (the captain's
+    # sub-1000 correction), so the book deploys its available funds. At
+    # or above activation the effective minimum is the coherent
     # max(floor, min(this configured minimum, the per-name concentration
     # clamp at the live equity)); the configured value governs naturally
     # whenever the clamp sits above it (the 300-plus-equity regime).
@@ -146,11 +156,13 @@ class PortfolioParameters(BaseModel):
     concentration_cap_fraction: Annotated[Decimal, Field(gt=0)] = DEFAULT_CONCENTRATION_CAP_FRACTION
     # The book equity at or above which the per-name concentration cap
     # engages (the captain's 2026-09-28 ruling): below the activation
-    # equity the cap does not bind at all and sizing follows the tier
-    # logic under the configured minimum, so the trial-scale book runs
-    # the proven ~100-per-position shape while it funds toward the cap.
-    # The hard ceiling is the total exposure cap itself, so a sealed
-    # override can only engage the cap sooner, never later.
+    # equity the cap does not bind and neither does any per-name
+    # minimum - the unfunded book deploys its available funds into the
+    # qualifying board while it funds toward the cap - and at or above
+    # it the thirty-five-percent bound governs every name beside the
+    # configured minimum. The hard ceiling is the total exposure cap
+    # itself, so a sealed override can only engage the cap sooner,
+    # never later.
     concentration_cap_activation_equity_usdc: Annotated[Decimal, Field(gt=0)] = (
         DEFAULT_CONCENTRATION_CAP_ACTIVATION_USDC
     )
@@ -216,8 +228,8 @@ class PortfolioParameters(BaseModel):
         applies only when the book has reached the activation equity
         (default 1000 USDC, the funded scale the trial book grows toward);
         below it the cap does not bind at all, so the trial-scale book runs
-        the proven ~100-per-position shape with the configured minimum
-        governing sizing and the residual as cash.
+        the proven deploy-what-you-have shape with no per-name minimum
+        at all (the captain's sub-1000 correction).
 
         Args:
             equity_usdc: The portfolio equity the bound is judged against.
@@ -233,15 +245,15 @@ class PortfolioParameters(BaseModel):
     def effective_minimum_position_usdc(self, equity_usdc: Decimal) -> Decimal:
         """Return the coherent per-name entry minimum at one book equity.
 
-        The gnhf 36 parameter-coherence rule, as superseded by the
-        captain's 2026-09-28 activation ruling: below the activation
-        equity the concentration cap does not bind at all, so the
-        configured minimum governs unchanged (the hard floor can never
-        raise it - the validator keeps the floor at or under the
-        configured minimum). At or above the activation equity the clamp
+        The captain's 2026-09-28 ruling as corrected the same day by the
+        captain's sub-1000 ruling: below the activation equity neither
+        the concentration cap nor ANY per-name minimum binds - the
+        unfunded book deploys its available funds, because a minimum the
+        book cannot meet is a reserve that starves it. At or above the
+        activation equity the funded scale's bounds govern: the clamp
         engages at thirty-five percent of a book that is already at the
-        thousand-USDC scale, so the configured eighty governs there too
-        at the defaults; the coherence rule still protects the sealed
+        thousand-USDC scale, the configured eighty governs there at the
+        defaults, and the coherence rule still protects the sealed
         early-activation override, where ``max(floor, min(configured
         minimum, concentration clamp))`` keeps the two bounds
         satisfiable without ever breaching the cap to reach the floor.
@@ -251,11 +263,12 @@ class PortfolioParameters(BaseModel):
                 clamp.
 
         Returns:
-            The per-name minimum a tranche must meet to fund.
+            The per-name minimum a tranche must meet to fund; zero below
+            the activation equity (no minimum at all).
         """
         concentration_bound = self.concentration_bound_usdc(equity_usdc)
         if concentration_bound is None:
-            return self.min_position_usdc
+            return Decimal("0")
         return max(
             self.min_position_floor_usdc,
             min(self.min_position_usdc, concentration_bound),
@@ -277,10 +290,10 @@ class PortfolioParameters(BaseModel):
         """
         if self.concentration_bound_usdc(equity_usdc) is None:
             return (
-                f"the concentration cap is not engaged below the "
+                f"no minimum below the "
                 f"{self.concentration_cap_activation_equity_usdc} USDC activation equity "
-                f"(book equity {equity_usdc}); the configured minimum "
-                f"{self.min_position_usdc} governs"
+                f"(book equity {equity_usdc}); the book deploys its available funds "
+                "without a per-name minimum or reserve (the captain's sub-1000 ruling)"
             )
         concentration_bound = self.concentration_cap_fraction * equity_usdc
         if concentration_bound < self.min_position_floor_usdc:
@@ -1173,6 +1186,15 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
         if excluded
         else ""
     )
+    # Below the activation equity there is no dry-powder policy - the
+    # captain's sub-1000 ruling - so the residual wording names plain
+    # cash; the dry-powder framing stays for the engaged-cap book where
+    # the gnhf 33 count-as-output ruling genuinely holds cash back.
+    residual_wording = (
+        f"{residual} USDC stays cash"
+        if concentration_bound is None
+        else f"{residual} USDC stays cash (dry powder)"
+    )
     return PortfolioAllocation(
         tranches=tuple(tranches),
         excluded=tuple(excluded),
@@ -1185,7 +1207,7 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
         summary=(
             f"allocation funds {len(tranches)} tranche(s) [{tier_text}] totaling {funded} "
             f"USDC beside {len(held)} held position(s) committed {committed} USDC; "
-            f"{residual} USDC stays cash (dry powder) under the "
+            f"{residual_wording} under the "
             f"{resolved.total_exposure_cap_usdc} USDC total cap with {projected} USDC projected"
             f"{excluded_text}"
         ),
