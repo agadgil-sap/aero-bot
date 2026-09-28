@@ -745,6 +745,25 @@ class TestCountAsOutput:
         assert allocation.tranches == ()
         assert allocation.cash_residual_usdc == Decimal("400")
         assert "count bound" in allocation.summary
+        assert "dry powder" in allocation.summary
+
+    def test_a_full_sub_1000_book_names_plain_cash(self) -> None:
+        """Below the activation equity the count-bound residual is plain cash."""
+        parameters = PortfolioParameters(max_concurrent_positions=1)
+        allocation = allocate_portfolio(
+            PolicyEngine(),
+            PolicyState(),
+            board_evaluations(),
+            {},
+            held=(held_fact("DDDc", token_id=1, apr=Decimal("1.6")),),
+            cash_usdc=Decimal("40"),
+            equity_usdc=Decimal("200"),
+            parameters=parameters,
+        )
+        assert allocation.tranches == ()
+        assert allocation.cash_residual_usdc == Decimal("40")
+        assert "count bound" in allocation.summary
+        assert "dry powder" not in allocation.summary
 
     def test_below_minimum_target_stays_cash(self) -> None:
         """A tier target under eighty USDC never deploys."""

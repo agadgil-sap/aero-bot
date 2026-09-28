@@ -15,6 +15,7 @@ from aero_bot.advisor import (
     AdvisorWindowFacts,
 )
 from aero_bot.risk_manager import (
+    CONCENTRATION_CAP_ACTIVATION_USDC,
     DAILY_LOSS_HALT_FRACTION,
     RISK_FINDING_MAX,
     RISK_MANAGER_REPORT_NAME,
@@ -269,13 +270,13 @@ class TestPortfolioPosture:
     """The allocator ruling's concentration and count bounds audit offline."""
 
     def test_a_largest_position_above_thirty_five_percent_breaches(self) -> None:
-        """One name above the concentration cap of equity is flagged."""
+        """One name above the concentration cap of an activated book is flagged."""
         result = audit(
             episode(
                 T0,
                 facts=facts_picture(
-                    equity="100.0",
-                    committed="40.0",
+                    equity="1000.0",
+                    committed="400.0",
                     largest_position_share="0.40",
                 ),
             )
@@ -295,8 +296,8 @@ class TestPortfolioPosture:
             episode(
                 T0,
                 facts=facts_picture(
-                    equity="100.0",
-                    committed="35.0",
+                    equity="1000.0",
+                    committed="350.0",
                     largest_position_share="0.35",
                 ),
             )
@@ -307,7 +308,7 @@ class TestPortfolioPosture:
 
     def test_an_absent_share_is_an_absence_never_a_guess(self) -> None:
         """A corpus without portfolio facts skips the concentration check."""
-        result = audit(episode(T0, facts=facts_picture(equity="100.0", committed="40.0")))
+        result = audit(episode(T0, facts=facts_picture(equity="1000.0", committed="400.0")))
         assert RiskFindingKind.CONCENTRATION_CAP_BREACH not in [
             finding.kind for finding in result.findings
         ]
@@ -320,6 +321,149 @@ class TestPortfolioPosture:
     def test_ten_positions_exactly_stay_within_the_ceiling(self) -> None:
         """The ceiling reads above, not at, ten."""
         assert audit(episode(T0, facts=facts_picture(position_count=10))).findings == ()
+
+
+class TestSubActivationPosture:
+    """Below the activation equity the same readings stay informational."""
+
+    def test_a_concentrated_sub_1000_book_is_informational_not_a_breach(self) -> None:
+        """The live-basis posture (0.738 of 105.73) records elevated risk, never a breach."""
+        result = audit(
+            episode(
+                T0,
+                facts=facts_picture(
+                    equity="105.73",
+                    committed="78.03",
+                    largest_position_share="0.738",
+                ),
+            )
+        )
+        assert [finding.kind for finding in result.findings] == [
+            RiskFindingKind.CONCENTRATION_CAP_ELEVATED
+        ]
+        assert "informational" in result.findings[0].detail
+        assert "activation equity" in result.findings[0].detail
+        assert result.contradictions == ()
+        assert result.findings_by_episode == {}
+
+    def test_a_high_entry_share_below_activation_is_informational(self) -> None:
+        """An entry committing most of the unfunded book deploys as authorized."""
+        result = audit(
+            episode(
+                T0,
+                facts=facts_picture(equity="105.73", committed="102.6", action="enter"),
+            )
+        )
+        assert [finding.kind for finding in result.findings] == [
+            RiskFindingKind.SIZING_FRACTION_ELEVATED
+        ]
+        assert result.contradictions == ()
+
+    def test_a_quiet_desk_over_the_informational_posture_never_contradicts(self) -> None:
+        """Every desk quiet over the authorized posture stays non-contradicted."""
+        grounded = episode(
+            T0,
+            facts=facts_picture(equity="105.73", committed="78.03", largest_position_share="0.738"),
+            student=brief_with(()),
+            seats=(quiet_seat(TeacherSeatName.CLAUDE), quiet_seat(TeacherSeatName.CODEX)),
+        )
+        result = audit(grounded)
+        assert [finding.kind for finding in result.findings] == [
+            RiskFindingKind.CONCENTRATION_CAP_ELEVATED
+        ]
+        assert result.contradictions == ()
+        assert result.kinds_for(grounded) == ()
+
+    def test_a_breach_beside_an_informational_finding_contradicts_on_the_breach_alone(self) -> None:
+        """A real contradiction names its breach kind, never the informational reading."""
+        grounded = episode(
+            T0,
+            facts=facts_picture(
+                equity="105.73", day_pnl="-6.0", committed="78.03", largest_position_share="0.738"
+            ),
+            student=brief_with(()),
+        )
+        result = audit(grounded)
+        assert {finding.kind for finding in result.findings} == {
+            RiskFindingKind.DAY_PNL_CONTRADICTION,
+            RiskFindingKind.CONCENTRATION_CAP_ELEVATED,
+        }
+        assert [(entry.desk, entry.finding_kinds) for entry in result.contradictions] == [
+            ("student", (RiskFindingKind.DAY_PNL_CONTRADICTION,))
+        ]
+        assert result.kinds_for(grounded) == (RiskFindingKind.DAY_PNL_CONTRADICTION,)
+
+    def test_the_activation_boundary_splits_the_concentration_reading(self) -> None:
+        """999.99 reads informational; 1000 breaches - the allocator's boundary."""
+        below = audit(
+            episode(
+                T0,
+                facts=facts_picture(
+                    equity="999.99", committed="738.0", largest_position_share="0.738"
+                ),
+            )
+        )
+        assert [finding.kind for finding in below.findings] == [
+            RiskFindingKind.CONCENTRATION_CAP_ELEVATED
+        ]
+        at = audit(
+            episode(
+                T0 + timedelta(hours=1),
+                facts=facts_picture(
+                    equity="1000.0", committed="738.0", largest_position_share="0.738"
+                ),
+            )
+        )
+        assert [finding.kind for finding in at.findings] == [
+            RiskFindingKind.CONCENTRATION_CAP_BREACH
+        ]
+
+    def test_the_activation_boundary_splits_the_sizing_reading(self) -> None:
+        """The same over-fraction entry breaches only once activated."""
+        below = audit(
+            episode(
+                T0,
+                facts=facts_picture(
+                    equity="999.99", day_start="999.99", committed="999.99", action="enter"
+                ),
+            )
+        )
+        assert [finding.kind for finding in below.findings] == [
+            RiskFindingKind.SIZING_FRACTION_ELEVATED
+        ]
+        at = audit(
+            episode(
+                T0 + timedelta(hours=1),
+                facts=facts_picture(
+                    equity="1000.0", day_start="1000.0", committed="850.0", action="enter"
+                ),
+            )
+        )
+        assert [finding.kind for finding in at.findings] == [RiskFindingKind.SIZING_CAP_BREACH]
+
+    def test_an_absent_equity_skips_the_concentration_reading(self) -> None:
+        """The regime cannot be judged without equity; an absence is never a guess."""
+        result = audit(
+            episode(
+                T0,
+                facts=facts_picture(equity=None, committed="40.0", largest_position_share="0.40"),
+            )
+        )
+        assert result.findings == ()
+
+    def test_informational_findings_stay_visible_in_the_report_counts(self) -> None:
+        """The elevated-risk reading rides the report while nothing contradicts."""
+        grounded = episode(
+            T0,
+            facts=facts_picture(equity="105.73", committed="102.6", action="enter"),
+            student=brief_with(()),
+        )
+        report = compose_report(audit(grounded), 1, T0)
+        assert [(counted.reason, counted.count) for counted in report.finding_counts] == [
+            (RiskFindingKind.SIZING_FRACTION_ELEVATED, 1)
+        ]
+        assert report.contradiction_counts == ()
+        assert report.findings[0].kind == RiskFindingKind.SIZING_FRACTION_ELEVATED
 
 
 class TestExposureVersusCaps:
@@ -336,11 +480,11 @@ class TestExposureVersusCaps:
         assert audit(episode(T0, facts=facts_picture(committed="1000.0"))).findings == ()
 
     def test_an_entry_above_eighty_percent_of_equity_breaches_sizing(self) -> None:
-        """The locked sizing fraction binds at the entry moment."""
+        """The locked sizing fraction binds at the entry moment of an activated book."""
         result = audit(
             episode(
                 T0,
-                facts=facts_picture(equity="100.0", committed="80.01", action="enter"),
+                facts=facts_picture(equity="1000.0", committed="800.01", action="enter"),
             )
         )
         assert [finding.kind for finding in result.findings] == [RiskFindingKind.SIZING_CAP_BREACH]
@@ -351,7 +495,7 @@ class TestExposureVersusCaps:
             audit(
                 episode(
                     T0,
-                    facts=facts_picture(equity="100.0", committed="80.0", action="enter"),
+                    facts=facts_picture(equity="1000.0", committed="800.0", action="enter"),
                 )
             ).findings
             == ()
@@ -361,7 +505,7 @@ class TestExposureVersusCaps:
         """A drifted open position is judged by the hard cap alone."""
         assert (
             audit(
-                episode(T0, facts=facts_picture(equity="100.0", committed="45.0", action="hold"))
+                episode(T0, facts=facts_picture(equity="1000.0", committed="450.0", action="hold"))
             ).findings
             == ()
         )
@@ -658,3 +802,7 @@ class TestLockedConstants:
     def test_the_halt_fraction_is_five_percent(self) -> None:
         """The latch fraction is the policy's locked value."""
         assert Decimal("0.05") == DAILY_LOSS_HALT_FRACTION
+
+    def test_the_activation_equity_is_one_thousand(self) -> None:
+        """The informational boundary mirrors the allocator's locked default."""
+        assert Decimal("1000") == CONCENTRATION_CAP_ACTIVATION_USDC

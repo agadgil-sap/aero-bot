@@ -838,7 +838,9 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
     deployable budget until the count bound, the minimum size, and the
     concentration cap say otherwise, and everything left is cash. No
     entry bar is ever tightened or loosened to chase deployment - the
-    bounds decide, and cash is dry powder.
+    bounds decide, and cash is dry powder once the activation equity
+    engages the cap (below it the book deploys its available funds with
+    no reserve held back).
 
     Args:
         engine: The locked per-pool policy engine re-deriving entries.
@@ -942,6 +944,11 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                 f"{reason_detail}"
             ),
         )
+    # The per-name concentration bound, None while the book sits below the
+    # activation equity (the captain's 2026-09-28 rulings): the unfunded
+    # book deploys its available funds with no per-name clamp and no
+    # per-name minimum at all while it funds toward the cap.
+    concentration_bound = resolved.concentration_bound_usdc(equity_usdc)
     # The count bound: held slots come off the concurrent ceiling first.
     open_slots = resolved.max_concurrent_positions - len(held)
     slotted = in_band[: max(open_slots, 0)]
@@ -973,7 +980,8 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
             summary=(
                 f"allocation holds {len(held)} position(s) at the "
                 f"{resolved.max_concurrent_positions}-position count bound; cash "
-                f"{cash_usdc} USDC stays dry powder"
+                f"{cash_usdc} USDC stays cash"
+                + (" (dry powder)" if concentration_bound is not None else "")
             ),
         )
     for evaluation, _ in in_band[open_slots:]:
@@ -1016,11 +1024,6 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
     # also guarantees a single-pool board's share never exceeds its
     # deployable budget.
     total_weight = sum((weight for _, weight in slotted), Decimal("0"))
-    # The per-name concentration bound, None while the book sits below the
-    # activation equity (the captain's 2026-09-28 ruling): the trial-scale
-    # book funds toward the cap running the proven ~100-per-position shape
-    # with no per-name clamp at all.
-    concentration_bound = resolved.concentration_bound_usdc(equity_usdc)
     # The coherent per-name entry minimum (the gnhf 36 rule over the
     # activated cap): whichever of the configured minimum and the engaged
     # concentration clamp binds, over the hard floor - the two bounds can

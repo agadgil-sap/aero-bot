@@ -256,9 +256,11 @@ class UpgradeDivergenceDigest(BaseModel):
     availability_gaps: tuple[AvailabilityGap, ...] = ()
     # Both answered; the teacher alone raised labels.
     label_divergences: tuple[LabelDivergence, ...] = ()
-    # The deterministic risk desk flagged the posture; the student
-    # answered quiet. Backed by the finding itself - realized
-    # deterministic truth, never a pending read.
+    # The deterministic risk desk flagged the posture with a breach
+    # finding; the student answered quiet. Backed by the finding itself -
+    # realized deterministic truth, never a pending read - while the
+    # informational elevated-risk findings below the activation equity
+    # stay in the posture count above and never gate a miss.
     posture_misses: tuple[PostureMiss, ...] = ()
     # A teacher's stated view graded right while the student's view was
     # wrong, declined, or missing. Backed by the hindsight view grades -
@@ -380,7 +382,10 @@ def build_divergence_digest(
     fourth class draws from the deterministic risk desk's posture audit
     instead: a posture miss is backed by the finding itself, realized
     deterministic truth at the episode's timestamp, so it needs no
-    hindsight verdict and no stream scoping. The fifth class draws from
+    hindsight verdict and no stream scoping - and only breach findings
+    join the per-episode mapping, so the informational elevated-risk
+    findings below the activation equity never gate a miss. The fifth
+    class draws from
     the hindsight view grades: a conviction miss is a teacher's stated
     view that graded right against realized outcomes while the
     student's own view was wrong, declined, or missing - decided truth,
