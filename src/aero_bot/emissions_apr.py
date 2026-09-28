@@ -33,7 +33,7 @@ liquidity regardless of range: halving the window halves the value carried
 per unit and doubles the concentration APR.
 """
 
-from decimal import Decimal, localcontext
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 
 from aero_bot.concentrated import MATH_PRECISION
 
@@ -41,6 +41,30 @@ from aero_bot.concentrated import MATH_PRECISION
 SECONDS_PER_YEAR = Decimal(31_536_000)
 # AERO, the emissions token, uses 18 decimals on Base.
 AERO_DECIMALS = 18
+
+
+def format_apr_percent(value: Decimal) -> str:
+    """Render one APR fraction with its percent reading beside it.
+
+    The runtime carries every APR as a decimal fraction in Aerodrome's
+    displayed convention (8.3 is 830 percent), but operators read percent:
+    the gnhf 35 postmortem found the overnight escalation reading ``raw APR
+    542.14`` as "542 percent" when the number is 54,214 percent - the
+    current-cell staked value had collapsed below the pool's reward stream.
+    Every operator-facing surface therefore prints the raw fraction - the
+    audited, machine-comparable value - with its percent reading beside it
+    so the two scales can never be confused again.
+
+    Args:
+        value: The APR as a decimal fraction (1.5 is 150 percent).
+
+    Returns:
+        The annotated rendering, for example ``2.0 (about 200 percent)``.
+    """
+    with localcontext() as context:
+        context.prec = MATH_PRECISION
+        percent = +(value * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return f"{value} (about {percent:,} percent)"
 
 
 def staked_value_usdc(

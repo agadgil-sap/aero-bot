@@ -260,6 +260,41 @@ class TestDashboardUnit:
         assert 'chmod 0640 "${CONFIG_DIR}/dashboard.env"' in installer
         assert '[[ ! -f "${CONFIG_DIR}/dashboard.env" ]]' in installer
 
+    def test_the_installer_restarts_active_long_running_services(self) -> None:
+        """A deploy never leaves yesterday's process serving the old environment.
+
+        The gnhf 35 postmortem: the gnhf 34 deploy refreshed the dashboard
+        unit and code, but nothing restarted the already-running service,
+        so the process started two days earlier kept serving with no sealed
+        environment - its audit-health endpoint reported an empty store
+        until a manual restart. try-restart restarts only active units, so
+        a stopped service still stays stopped and the installer still
+        never arms anything.
+        """
+        installer = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "systemctl try-restart aero-bot-dashboard.service" in installer
+        assert "'aero-bot-watchtower@*.service'" in installer
+        # The restart is a refresh of already-active units only: no start,
+        # no enable, no restart of the oneshot services whose every run
+        # re-executes with the current environment anyway.
+        executed = [
+            line.strip() for line in installer.splitlines() if line.strip().startswith("systemctl ")
+        ]
+        assert all(
+            command
+            in (
+                "systemctl daemon-reload",
+                "systemctl try-restart aero-bot-dashboard.service 'aero-bot-watchtower@*.service'",
+            )
+            for command in executed
+        )
+
+    def test_the_upgrade_path_documents_the_restart(self) -> None:
+        """The day-two runbook names the restart-on-upgrade behavior."""
+        doc = DEPLOYMENT_DOC.read_text(encoding="utf-8")
+        assert "try-restart" in doc
+        assert "yesterday's process serving the old environment" in doc
+
     def test_every_unit_in_the_kit_installs_under_system(self) -> None:
         """The installer copies exactly the kit's units."""
         units = sorted(path.name for path in Path("deploy/systemd").iterdir())

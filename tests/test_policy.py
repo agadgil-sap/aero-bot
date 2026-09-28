@@ -2235,6 +2235,23 @@ class TestEntryGateTrace:
         assert "1.0" in emissions_line
         assert "1.5" in emissions_line
 
+    def test_trace_annotates_every_apr_with_its_percent_reading(self) -> None:
+        """The emissions line reads unambiguously in both scales.
+
+        The gnhf 35 postmortem: the runtime carries APRs as decimal
+        fractions in the displayed convention, and every operator reading
+        a bare fraction mistook it for percent by one hundred x - the
+        overnight SNDKc escalation read "542.14" as 542 percent when the
+        number is 54,214 percent. The trace renders both scales.
+        """
+        engine = PolicyEngine()
+        lines = engine.entry_gate_trace(
+            PolicyState(), base_observation(emissions_apr=Decimal("542.14"))
+        )
+        emissions_line = next(line for line in lines if line.startswith("gate emissions_floor:"))
+        assert "542.14 (about 54,214 percent)" in emissions_line
+        assert "1.5 (about 150 percent)" in emissions_line
+
     def test_trace_halt_fail_carries_the_anchor_and_bound(self) -> None:
         """A latched halt names the anchor and the five-percent bound."""
         state = PolicyState(

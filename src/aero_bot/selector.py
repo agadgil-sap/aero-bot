@@ -32,6 +32,7 @@ from decimal import Decimal
 from pydantic import BaseModel
 
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, NonNegativeDecimal
+from aero_bot.emissions_apr import format_apr_percent
 from aero_bot.policy import (
     DAYS_PER_YEAR,
     GWEI_PER_ETH,
@@ -169,7 +170,7 @@ def _board_summary(evaluations: Sequence[PoolEntryEvaluation], selected_symbol: 
     parts = [
         f"{evaluation.symbol}: "
         + (
-            f"qualified at APR {evaluation.emissions_apr}"
+            f"qualified at APR {format_apr_percent(evaluation.emissions_apr)}"
             if evaluation.qualifies
             else (
                 f"skipped ({evaluation.blocked_reason.value})"
@@ -403,8 +404,9 @@ def evaluate_switch(
         return None, "no other pool qualified for entry, so no switch was considered"
     threshold = held_emissions_apr * (Decimal(1) + switch_margin_fraction)
     margin_note = (
-        f"best other qualifying APR {best.emissions_apr} on {best.symbol} against the "
-        f"held {held_emissions_apr} on {held_symbol} plus the {switch_margin_fraction} "
+        f"best other qualifying APR {format_apr_percent(best.emissions_apr)} on "
+        f"{best.symbol} against the held {format_apr_percent(held_emissions_apr)} on "
+        f"{held_symbol} plus the {switch_margin_fraction} "
         f"margin (threshold {threshold})"
     )
     if best.emissions_apr <= threshold:
@@ -449,8 +451,10 @@ def _composed_switch_decision(directive: SwitchDirective) -> PolicyDecision:
         reason=PolicyReason.POOL_SWITCH_TRIGGERED,
         diagnostics=(
             f"Switching {directive.from_symbol} -> {directive.to_symbol}: the candidate's "
-            f"qualifying emissions APR {directive.candidate_emissions_apr} exceeds the held "
-            f"{directive.held_emissions_apr} by more than the {directive.margin_fraction} "
+            f"qualifying emissions APR "
+            f"{format_apr_percent(directive.candidate_emissions_apr)} exceeds the held "
+            f"{format_apr_percent(directive.held_emissions_apr)} by more than the "
+            f"{directive.margin_fraction} "
             "relative switch margin.",
             *directive.diagnostics,
             *entry_decision.diagnostics,
