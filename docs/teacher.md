@@ -137,7 +137,7 @@ Five divergence classes exist; the first three draw only from episodes whose hin
 - **Misses** - a teacher flagged anomalies, the student answered unflagged, and bad followed.
 - **Availability gaps** - a teacher answered a brief the student never gave; the entry carries the student's own recorded outcome, empty when the episode carried no observation at all.
 - **Label divergences** - both flagged, but the teacher named labels the student did not.
-- **Posture misses** - the deterministic risk desk (see [the risk-manager documentation](risk-manager.md)) found a posture problem and the student's accepted brief stayed quiet; backed by the finding itself, realized deterministic truth, never a pending read or a hindsight verdict.
+- **Posture misses** - the deterministic risk desk (see [the risk-manager documentation](risk-manager.md)) recorded a breach finding and the student's accepted brief stayed quiet; backed by the finding itself, realized deterministic truth, never a pending read or a hindsight verdict - and never the informational elevated-risk readings below the activation equity, which stay report-visible without gating.
 - **Conviction misses** - the conviction layer's fifth class: a teacher's stated position view graded right against realized outcomes within the horizon while the student's own view was wrong, declined, or missing; backed by the decided view grades alone, so it opens the honest gate without any bad outcome and lets the teachers' proposals cite measured conviction.
 
 Pending and quiet episodes contribute only context counts (grounded, bad, and quiet tallies, plus the hindsight desk scores - now carrying each desk's view grading - embedded in the prompt) - never entries.
@@ -170,7 +170,7 @@ The daily launchd agent `com.aero-bot.teacher-upgrade` (10:10, after the 09:50 h
 
 ## The risk manager
 
-The `aero-bot-risk-manager` command is the intelligence layer's fifth surface: the separation-of-duties counterparty desk that independently audits the corpus's posture snapshots - the day-P&L identity, the five-percent halt line and its entry discipline, exposure against the 1000 USDC hard cap and the eighty-percent sizing fraction, and the portfolio posture (the thirty-five percent concentration cap and the ten-position ceiling) - and records every desk whose accepted brief stayed quiet over a flagged posture.
+The `aero-bot-risk-manager` command is the intelligence layer's fifth surface: the separation-of-duties counterparty desk that independently audits the corpus's posture snapshots - the day-P&L identity, the five-percent halt line and its entry discipline, exposure against the 1000 USDC hard cap and the eighty-percent sizing fraction, and the portfolio posture (the thirty-five percent concentration cap and the ten-position ceiling; the sizing and concentration bounds read as informational elevated risk, never breaches, below the 1000 USDC activation equity) - and records every desk whose accepted brief stayed quiet over a flagged posture.
 It is deterministic and offline like the scorer, its report lands as `reports/risk_manager_last.json` beside the corpus, and the upgrade loop consumes the same pure audit as its fourth evidence class.
 The full contract - the finding kinds, the contradiction rule, the upgrade wiring - lives in [the risk-manager documentation](risk-manager.md).
 The daily launchd agent `com.aero-bot.teacher-risk-manager` (10:00, between the scorer's 09:50 report and the 10:10 proposer) makes the audit part of the same morning rhythm.

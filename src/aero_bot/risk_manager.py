@@ -25,12 +25,19 @@ can recompute by hand:
   anchor day violates the halt discipline, because the halt blocks new
   entries for the rest of that day.
 - **Exposure versus caps.** Committed exposure above the 1000 USDC hard
-  ceiling breaches it, and an entry committing above eighty percent of
-  current equity breaches the locked sizing fraction.
+  ceiling breaches it at any equity. The sizing fraction and the per-name
+  concentration cap engage only at or above the allocator's activation
+  equity (default 1000 USDC): at or above it an entry committing above
+  eighty percent of equity, or one name above thirty-five percent,
+  breaches; below it the same readings record informational
+  elevated-risk findings - the captain's sub-1000 ruling authorizes the
+  deploy-what-you-have book - which stay visible in the report but never
+  breach and never contradict.
 - **Contradictions.** A desk's accepted brief that carried no anomaly
-  flags on an episode with any finding is a contradiction: the desk read a
-  broken posture as quiet. Absences are never contradictions - an absent
-  desk gave no verdict to contradict.
+  flags on an episode with any breach finding is a contradiction: the
+  desk read a broken posture as quiet. Informational findings and
+  absences are never contradictions - a quiet desk over an authorized
+  sub-1000 posture, or an absent desk, gave no verdict to contradict.
 
 Every check is deterministic and fail-closed: malformed or non-finite
 economics strings are absences, never guesses, and the findings land as
@@ -80,6 +87,11 @@ POSITION_EQUITY_FRACTION = Decimal("0.80")
 # The locked per-name concentration cap of book equity (the allocator
 # ruling, gnhf 33; docs/policy-engine.md).
 CONCENTRATION_CAP_FRACTION = Decimal("0.35")
+# The book equity at or above which the sizing fraction and the
+# concentration cap bind (the allocator's activation default, gnhf 37
+# and the captain's sub-1000 correction): below it a high position share
+# or a concentrated book is informational elevated risk, never a breach.
+CONCENTRATION_CAP_ACTIVATION_USDC = Decimal("1000")
 # The locked ceiling on concurrent positions (the allocator ruling).
 MAX_CONCURRENT_POSITIONS = 10
 # The LP executor's hard exposure ceilings in USDC (raised from 100 to
@@ -109,10 +121,14 @@ RISK_POSTURE_RULES = (
     "action observed later on the same anchor day violates the halt "
     "discipline; committed exposure above 1000 USDC breaches the hard cap; "
     "an entry committing above eighty percent of equity breaches the "
-    "sizing fraction; the largest single position above thirty-five "
-    "percent of equity breaches the concentration cap; more than ten "
-    "tracked positions breaches the count ceiling; and a desk's accepted "
-    "brief with no anomaly flags on an episode carrying any finding is a "
+    "sizing fraction and the largest single position above thirty-five "
+    "percent of equity breaches the concentration cap, both only at or "
+    "above the 1000 USDC activation equity - below it the same readings "
+    "record informational elevated-risk findings (the captain's sub-1000 "
+    "ruling authorizes the concentrated deploy-what-you-have book) that "
+    "never breach and never contradict; more than ten tracked positions "
+    "breaches the count ceiling; and a desk's accepted brief with no "
+    "anomaly flags on an episode carrying any breach finding is a "
     "contradiction. Malformed or non-finite readings are absences, never "
     "guesses"
 )
@@ -136,6 +152,26 @@ class RiskFindingKind:
     CONCENTRATION_CAP_BREACH = "concentration_cap_breach"
     # The book tracks more positions than the ten-position ceiling.
     COUNT_CAP_BREACH = "count_cap_breach"
+    # An entry committed above eighty percent of current equity while the
+    # book sits below the activation equity: informational elevated risk
+    # (the captain's sub-1000 ruling authorizes the posture), never a
+    # breach or a contradiction.
+    SIZING_FRACTION_ELEVATED = "sizing_fraction_elevated"
+    # One name sits above the thirty-five percent concentration cap while
+    # the book sits below the activation equity: informational elevated
+    # risk, never a breach or a contradiction.
+    CONCENTRATION_CAP_ELEVATED = "concentration_cap_elevated"
+
+
+# The finding kinds recorded as informational elevated risk below the
+# activation equity: visible in the report and its counts, never a
+# breach, a desk contradiction, or an upgrade posture miss.
+INFORMATIONAL_FINDING_KINDS = frozenset(
+    {
+        RiskFindingKind.SIZING_FRACTION_ELEVATED,
+        RiskFindingKind.CONCENTRATION_CAP_ELEVATED,
+    }
+)
 
 
 class RiskFinding(BaseModel):
@@ -218,23 +254,26 @@ class PostureAudit:
     grounded_episode_count: int
     # Every finding in chronological order.
     findings: tuple[RiskFinding, ...]
-    # The findings grouped by episode object identity, so consumers (the
-    # upgrade digest) can join them back to the desks' reads; keyed the
+    # The breach findings grouped by episode object identity, so consumers
+    # (the upgrade digest) can join them back to the desks' reads; keyed the
     # same way the digest's verdict mapping keys, over the same loader
-    # objects.
+    # objects. Informational elevated-risk findings stay in ``findings``
+    # and the report counts but never join: they carry no contradiction
+    # semantics.
     findings_by_episode: Mapping[int, tuple[RiskFinding, ...]] = field(default_factory=dict)
     # Every contradiction in chronological order.
     contradictions: tuple[DeskContradiction, ...] = ()
 
     def kinds_for(self, episode: TeacherEpisode) -> tuple[str, ...]:
-        """List the stable finding kinds recorded on one episode.
+        """List the stable breach kinds recorded on one episode.
 
         Args:
             episode: The corpus episode to look up.
 
         Returns:
-            The episode's finding kinds in recorded order, bounded to
-            five; an unflagged episode yields nothing.
+            The episode's breach finding kinds in recorded order, bounded
+            to five; an unflagged episode, or one carrying only
+            informational elevated-risk findings, yields nothing.
         """
         kinds = tuple(finding.kind for finding in self.findings_by_episode.get(id(episode), ()))
         return kinds[:RISK_FINDING_KINDS_PER_ENTRY]
@@ -354,7 +393,9 @@ def _posture_findings(
             f"committed {facts.committed_usdc} exceeds the 1000 USDC hard exposure ceiling",
         )
     # Exposure versus caps: the eighty-percent sizing bound applies at
-    # entry-kind actions, the moments capital commits.
+    # entry-kind actions, the moments capital commits - a breach at or
+    # above the activation equity, informational elevated risk below it
+    # where the sub-1000 ruling authorizes the deploy-what-you-have book.
     action = facts.latest_action
     if (
         action in ENTRY_ACTIONS
@@ -364,14 +405,27 @@ def _posture_findings(
         and committed > equity * POSITION_EQUITY_FRACTION + POSTURE_TOLERANCE_USDC
     ):
         bound = equity * POSITION_EQUITY_FRACTION
-        _record(
-            RiskFindingKind.SIZING_CAP_BREACH,
-            f"entry action {action} committed {facts.committed_usdc} above "
-            f"the eighty-percent sizing bound {bound} of equity "
-            f"{facts.equity_usdc}",
-        )
+        if equity >= CONCENTRATION_CAP_ACTIVATION_USDC:
+            _record(
+                RiskFindingKind.SIZING_CAP_BREACH,
+                f"entry action {action} committed {facts.committed_usdc} above "
+                f"the eighty-percent sizing bound {bound} of equity "
+                f"{facts.equity_usdc}",
+            )
+        else:
+            _record(
+                RiskFindingKind.SIZING_FRACTION_ELEVATED,
+                f"entry action {action} committed {facts.committed_usdc} above "
+                f"the eighty-percent sizing bound {bound} of equity "
+                f"{facts.equity_usdc} - informational below the "
+                f"{CONCENTRATION_CAP_ACTIVATION_USDC} USDC activation equity: "
+                "the sub-1000 book deploys its available funds",
+            )
     # Portfolio posture (the allocator ruling): the per-name concentration
-    # bound and the count ceiling, both read from the composed facts.
+    # bound and the count ceiling, both read from the composed facts. The
+    # concentration bound carries the same activation split the sizing
+    # bound does, so an absent equity skips the check entirely - the
+    # regime cannot be judged, and an absence is never a guess.
     if facts.position_count > MAX_CONCURRENT_POSITIONS:
         _record(
             RiskFindingKind.COUNT_CAP_BREACH,
@@ -379,13 +433,27 @@ def _posture_findings(
             f"{MAX_CONCURRENT_POSITIONS}-position ceiling",
         )
     share = _parse_usdc(facts.largest_position_share)
-    if share is not None and share > CONCENTRATION_CAP_FRACTION + POSTURE_TOLERANCE_USDC:
-        _record(
-            RiskFindingKind.CONCENTRATION_CAP_BREACH,
-            f"the largest position holds {facts.largest_position_share} of "
-            f"equity {facts.equity_usdc} above the "
-            f"{CONCENTRATION_CAP_FRACTION} concentration cap",
-        )
+    if (
+        share is not None
+        and equity is not None
+        and share > CONCENTRATION_CAP_FRACTION + POSTURE_TOLERANCE_USDC
+    ):
+        if equity >= CONCENTRATION_CAP_ACTIVATION_USDC:
+            _record(
+                RiskFindingKind.CONCENTRATION_CAP_BREACH,
+                f"the largest position holds {facts.largest_position_share} of "
+                f"equity {facts.equity_usdc} above the "
+                f"{CONCENTRATION_CAP_FRACTION} concentration cap",
+            )
+        else:
+            _record(
+                RiskFindingKind.CONCENTRATION_CAP_ELEVATED,
+                f"the largest position holds {facts.largest_position_share} of "
+                f"equity {facts.equity_usdc} above the "
+                f"{CONCENTRATION_CAP_FRACTION} concentration cap - informational "
+                f"below the {CONCENTRATION_CAP_ACTIVATION_USDC} USDC activation "
+                "equity: the sub-1000 ruling authorizes the concentrated book",
+            )
     return tuple(findings)
 
 
@@ -399,9 +467,10 @@ def audit_corpus_posture(
     file order is never chronology) and applies the locked posture
     arithmetic: the day-P&L identity, the five-percent halt line and its
     entry discipline across the same anchor day, and the hard and sizing
-    caps. Every desk that answered an episode carrying any finding with a
-    brief free of anomaly flags is recorded as a contradiction; absences
-    gave no verdict and are never contradictions.
+    caps. Every desk that answered an episode carrying any breach finding
+    with a brief free of anomaly flags is recorded as a contradiction;
+    informational elevated-risk findings and absences gave no verdict to
+    contradict and are never contradictions.
 
     Args:
         episodes: The corpus's episodes in any order.
@@ -456,13 +525,24 @@ def audit_corpus_posture(
             halted_anchors.add(anchor)
         if episode_findings:
             findings.extend(episode_findings)
-            findings_by_episode[id(episode)] = tuple(episode_findings)
-            kinds = tuple(finding.kind for finding in episode_findings)[
-                :RISK_FINDING_KINDS_PER_ENTRY
-            ]
-            # The desks' verdicts: every answered brief with no anomaly
-            # flags read a flagged posture as quiet.
-            contradictions.extend(_quiet_contradictions(episode, kinds))
+            # Only breach findings carry contradiction semantics: the
+            # informational elevated-risk findings below the activation
+            # equity stay visible above while a quiet desk over them is
+            # never a contradiction and the upgrade digest never reads
+            # them as posture misses.
+            breach_findings = tuple(
+                finding
+                for finding in episode_findings
+                if finding.kind not in INFORMATIONAL_FINDING_KINDS
+            )
+            if breach_findings:
+                findings_by_episode[id(episode)] = breach_findings
+                kinds = tuple(finding.kind for finding in breach_findings)[
+                    :RISK_FINDING_KINDS_PER_ENTRY
+                ]
+                # The desks' verdicts: every answered brief with no anomaly
+                # flags read a flagged posture as quiet.
+                contradictions.extend(_quiet_contradictions(episode, kinds))
     return PostureAudit(
         grounded_episode_count=len(grounded),
         findings=tuple(findings),
@@ -661,11 +741,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "CONCENTRATION_CAP_ACTIVATION_USDC",
     "CONCENTRATION_CAP_FRACTION",
     "DAILY_LOSS_HALT_FRACTION",
     "DeskContradiction",
     "ENTRY_ACTIONS",
     "EXPOSURE_HARD_CAP_USDC",
+    "INFORMATIONAL_FINDING_KINDS",
     "MAX_CONCURRENT_POSITIONS",
     "NEW_YORK",
     "POSITION_EQUITY_FRACTION",

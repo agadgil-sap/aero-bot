@@ -1124,8 +1124,8 @@ class TestPostureWiring:
         flagged = episode(
             T0,
             facts=posture_picture(
-                equity="120.0",
-                day_start="100.0",
+                equity="1200.0",
+                day_start="1000.0",
                 day_pnl="-10.0",
                 committed="1200.0",
                 action="enter",
@@ -1141,6 +1141,28 @@ class TestPostureWiring:
             RiskFindingKind.HARD_CAP_BREACH,
             RiskFindingKind.SIZING_CAP_BREACH,
         }
+
+    def test_an_informational_sub_1000_finding_never_gates_a_posture_miss(self) -> None:
+        """The authorized deploy-what-you-have entry stays visible, never a miss."""
+        grounded = episode(
+            T0,
+            facts=posture_picture(
+                equity="105.73",
+                day_start="105.73",
+                day_pnl="0.0",
+                committed="102.6",
+                action="enter",
+            ),
+            student=student_payload(brief=brief_with(())),
+        )
+        audit = audit_corpus_posture((grounded,))
+        assert [finding.kind for finding in audit.findings] == [
+            RiskFindingKind.SIZING_FRACTION_ELEVATED
+        ]
+        digest = build_divergence_digest((grounded,), (), HORIZON, posture_audit=audit)
+        assert digest.posture_finding_count == 1
+        assert digest.posture_misses == ()
+        assert digest.total_divergences == 0
 
     def test_a_flagged_student_never_contributes_a_posture_miss(self) -> None:
         """A desk that raised any label gave a verdict, not a miss."""

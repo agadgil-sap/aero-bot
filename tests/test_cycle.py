@@ -1749,6 +1749,7 @@ def selector_runner(
     executor: object | None = None,
     sources: SelectorCycleSources | None = None,
     balances: FakeBalances | None = None,
+    aero_conversion_min_usdc: Decimal | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, CycleStateStore]:
     """Assemble one selector-mode cycle runner over the scripted board."""
     runner, fake_executor, _, state_store = make_runner(
@@ -1763,6 +1764,7 @@ def selector_runner(
         balances=balances
         if balances is not None
         else FakeBalances(usdc_units=SELECTOR_BOOK_USDC_UNITS),
+        aero_conversion_min_usdc=aero_conversion_min_usdc,
     )
     return runner, fake_executor, state_store
 
@@ -1784,13 +1786,16 @@ class TestSelectorCycles:
         assert any("board [" in note for note in report.input_notes)
         assert any("funds 2 tranche(s)" in note for note in report.input_notes)
 
-    def test_a_thin_book_never_deploys_below_the_minimum_position(self, tmp_path: Path) -> None:
-        """A ten-USDC trial book stays cash under the eighty-USDC floor.
+    def test_a_thin_sub_activation_book_deploys_its_available_funds(self, tmp_path: Path) -> None:
+        """A ten-USDC trial book deploys below the activation equity.
 
-        Below the activation equity the concentration cap no longer clamps
-        the tier target down (the captain's 2026-09-28 ruling), so the
-        floored eighty-USDC minimum exceeds the ten-USDC deployable budget
-        and the exclusion names the cash bound honestly.
+        The captain's 2026-09-28 sub-1000 correction: no minimum and no
+        dry-powder reserve bind until the book reaches the 1000-USDC
+        activation equity, so the ten-USDC book funds its top-ranked
+        pool at the engine-sized share of the whole budget instead of
+        refusing forever behind a floored eighty-USDC target - the exact
+        posture the live 105.73-USDC book sat in on 78.03 USDC of free
+        cash (the allocator pins carry the verbatim live numbers).
         """
         runner, executor, state_store = selector_runner(
             tmp_path, sources=SelectorCycleSources(), balances=FakeBalances()
@@ -1801,13 +1806,10 @@ class TestSelectorCycles:
             key_bytes=b"\x01" * 32,
             reference_prices_by_symbol=SELECTOR_REFERENCES,
         )
-        assert report.decision_action == "hold"
-        assert executor.calls == []
-        assert state_store.load().positions == ()
-        assert any(
-            "insufficient_cash: tier target 80 exceeds the 10.000000 deployable left" in note
-            for note in report.input_notes
-        )
+        assert report.decision_action == "enter"
+        assert executor.calls, "the thin book deploys its available funds"
+        assert state_store.load().positions != ()
+        assert not any("insufficient_cash" in note for note in report.input_notes)
 
     def test_selector_counts_tracked_lp_in_daily_loss_equity(self, tmp_path: Path) -> None:
         """Deployed LP capital cannot masquerade as a selector-mode daily loss."""
@@ -2276,9 +2278,10 @@ class TestCycleConfiguration:
         assert defaults.concentration_cap_fraction == Decimal("0.35")
         assert defaults.concentration_cap_activation_equity_usdc == Decimal("1000")
         assert defaults.switch_margin_fraction == Decimal("0.30")
-        # Below the activation equity the cap does not bind (the captain's
-        # 2026-09-28 ruling): the configured eighty governs.
-        assert defaults.effective_minimum_position_usdc(Decimal("105")) == Decimal("80")
+        # Below the activation equity neither the cap nor ANY minimum binds
+        # (the captain's 2026-09-28 sub-1000 correction): the unfunded book
+        # deploys its available funds.
+        assert defaults.effective_minimum_position_usdc(Decimal("105")) == Decimal("0")
         assert defaults.concentration_bound_usdc(Decimal("105")) is None
         assert defaults.concentration_bound_usdc(Decimal("1000")) == Decimal("350.00")
         tuned = _portfolio_parameters_from_environment(
@@ -3220,16 +3223,37 @@ class TestFlatLabelAndIdleCashEvidence:
     The flat thin book (ten USDC of cash, qualifying pools on the board,
     every tier target floored to the eighty-USDC minimum the cash cannot
     fund) is exactly the posture the production bot sat in all night
-    while its top-level label read ``open_in_range``.
+    while its top-level label read ``open_in_range``. The minimum now
+    binds only at or above the 1000-USDC activation equity (the
+    captain's sub-1000 correction), so the fixture prices the book
+    there through its unclaimed AERO - 1700 AERO at the fixture's 0.6
+    USDC price on ten USDC of cash - keeping every refusal line exactly
+    as the sub-1000 book used to read while the machinery stays pinned
+    at the scale where the minimum still governs.
     """
+
+    # 1700 AERO x 0.6 USDC = 1020 USDC on 10 USDC of cash: equity 1030.
+    ABOVE_ACTIVATION_AERO_UNITS = 1700 * 10**18
+
+    def flat_runner(
+        self, tmp_path: Path, *, live: bool = False
+    ) -> tuple[CycleRunner, FakeExecutor | None, CycleStateStore]:
+        """Assemble the ten-USDC flat book priced above the activation equity."""
+        return selector_runner(
+            tmp_path,
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(aero_units=self.ABOVE_ACTIVATION_AERO_UNITS),
+            # The reward conversion is suppressed so the flat LIVE cycle
+            # takes no treasury action: this fixture prices equity, it
+            # does not test conversion.
+            aero_conversion_min_usdc=(Decimal("100000") if live else None),
+        )
 
     def test_flat_unfunded_book_carries_the_flat_label_not_open_in_range(
         self, tmp_path: Path
     ) -> None:
         """A flat book never reports a position-scoped reason."""
-        runner, executor, state_store = selector_runner(
-            tmp_path, sources=SelectorCycleSources(), balances=FakeBalances()
-        )
+        runner, executor, state_store = self.flat_runner(tmp_path, live=True)
         assert executor is not None
         report = runner.run(
             CycleMode.LIVE,
@@ -3244,14 +3268,14 @@ class TestFlatLabelAndIdleCashEvidence:
         assert report.positions == ()
         assert report.reconciliation.tracked_token_id is None
         assert report.reconciliation.tracked_status is None
+        assert executor.calls == []
+        assert state_store.load().positions == ()
 
     def test_the_gate_chain_and_idle_consequences_ride_the_decision_diagnostics(
         self, tmp_path: Path
     ) -> None:
         """Every cycle carries the per-gate evaluation and the consequence lines."""
-        runner, _, _ = selector_runner(
-            tmp_path, sources=SelectorCycleSources(), balances=FakeBalances()
-        )
+        runner, _, _ = self.flat_runner(tmp_path)
         report = runner.run(CycleMode.DRY_RUN)
         assert any(
             text.startswith("entry gate chain for BBBc at the")
@@ -3270,9 +3294,7 @@ class TestFlatLabelAndIdleCashEvidence:
 
     def test_the_idle_episode_alerts_once_then_stays_quiet(self, tmp_path: Path) -> None:
         """The signature changes on the first cycle and persists after."""
-        runner, _, state_store = selector_runner(
-            tmp_path, sources=SelectorCycleSources(), balances=FakeBalances()
-        )
+        runner, _, state_store = self.flat_runner(tmp_path)
         first = runner.run(CycleMode.DRY_RUN)
         assert first.idle_cash is not None
         assert first.idle_cash.signature_changed
@@ -3301,9 +3323,7 @@ class TestFlatLabelAndIdleCashEvidence:
         """The why-is-it-flat question is answerable from the store alone."""
         from aero_bot.cycle import record_cycle_report
 
-        runner, _, _ = selector_runner(
-            tmp_path, sources=SelectorCycleSources(), balances=FakeBalances()
-        )
+        runner, _, _ = self.flat_runner(tmp_path)
         report = runner.run(CycleMode.DRY_RUN)
         audit = AuditStore(tmp_path / "chain-audit.sqlite3")
         record_cycle_report(audit, report, QUIET_INSTANT)
