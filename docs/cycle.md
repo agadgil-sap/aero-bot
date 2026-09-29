@@ -108,8 +108,9 @@ The exit swap (`aero-bot-lp execute exit-swap`) is the canary-proven reverse-dir
 
 ## Day economics: the equity anchor and the day P&L
 
-The five-percent daily loss halt anchors on the day-start equity at the America/New_York rollover, and that anchor prices the whole book: Safe USDC, held stock, and the tracked position's marked value - the same composition the engine's observation and the selector's equity gate carry.
+The five-percent daily loss halt anchors on the day-start equity at the America/New_York rollover, and that anchor prices the whole book: Safe USDC, held stock, every tracked position's marked value, and unclaimed AERO at its observed price - the same composition the engine's observation and the selector's equity gate carry.
 The engine's own day-rollover reset is authoritative: on rollover it re-anchors from the fully composed observation, so a deployed position can never read as a drawdown against a cash-only anchor.
+In portfolio mode the selected pool's full-equity observation advances the shared day, day-start anchor, running peak, and halt latch before the book saves; persisting the pre-observation session state instead resets the day every cycle and can admit an entry after a real five-percent loss.
 The production book exposed exactly that trap on 2026-09-23 - an 80.73 anchor beside a roughly 99 book - which is why the cycle's pre-decision seed matches the composition too: whenever the book carries no anchor yet, the seed is cash plus the tracked LP mark, never cash alone.
 The report and the `cycle_reported` audit record both carry `equity_usdc`, `day_start_equity_usdc`, and `day_pnl_usdc`, so the daily number the captain reads is computed where the decision happened, not reconstructed afterward.
 An out-of-band cycle carries no day economics and says so in `day_diagnostic` rather than publishing a number it cannot stand behind.

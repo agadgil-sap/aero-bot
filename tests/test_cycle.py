@@ -3033,6 +3033,131 @@ class TestGraceExitMapping:
 class TestContinuousLatchBook:
     """The running-peak latch persisted across cycles in the book."""
 
+    def test_portfolio_loss_latch_survives_exit_and_blocks_reentry(self, tmp_path: Path) -> None:
+        """A 110-to-104 book still protects entries after its held position exits.
+
+        The live 2026-09-28 book kept day=None and a stale peak despite
+        funded cycles. Replay the same shape through three persisted selector
+        cycles: a 110 high-water hold, a 104 downside stop that must execute,
+        and a flat 104 posture after the stop's cooldown has expired.
+        """
+        now = QUIET_INSTANT
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS, value=Decimal("80")))
+        sources = SelectorCycleSources(usdc_units=30_000_000)
+        balances = FakeBalances(usdc_units=30_000_000)
+        book = tracked_book(
+            symbol="BBBc", committed=Decimal("80"), entered_at=now - timedelta(hours=2)
+        )
+        runner, executor, state_store = selector_runner(
+            tmp_path, book=book, reads=reads, sources=sources, balances=balances
+        )
+        assert executor is not None
+        clock = [now]
+        runner._now = lambda: clock[0]
+
+        high = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=SELECTOR_REFERENCES)
+        high_book = state_store.load()
+        assert high.decision_action == "hold"
+        assert high.equity_usd == Decimal("110")
+
+        clock[0] += timedelta(minutes=5)
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status(owner=GAUGE_ADDRESS, value=Decimal("74")).model_copy(
+                update={
+                    "position": SimpleNamespace(
+                        tick_lower=-90,
+                        tick_upper=-75,
+                        token0_address=BASE_USDC_ADDRESS,
+                        token1_address=STOCK_TOKEN_ADDRESS,
+                        liquidity=12_345,
+                    )
+                }
+            ),
+        )
+        stopped = runner.run(
+            CycleMode.LIVE, key_bytes=b"\x01" * 32, reference_prices_by_symbol=SELECTOR_REFERENCES
+        )
+        stopped_book = state_store.load()
+        assert stopped.equity_usd == Decimal("104")
+        assert stopped.decision_action == "stop_out"
+        assert [call[0] for call in executor.calls] == ["unstake", "withdraw", "exit_swap"]
+        assert stopped_book.positions == ()
+
+        # The scripted exit returns the marked position value to cash.
+        # No new external deposit or state-file edit is introduced.
+        clock[0] += timedelta(minutes=20)
+        sources._usdc_units = 104_000_000
+        balances.usdc_units = 104_000_000
+        flat = runner.run(
+            CycleMode.LIVE, key_bytes=b"\x01" * 32, reference_prices_by_symbol=SELECTOR_REFERENCES
+        )
+        assert flat.decision_action == "hold"
+        assert flat.decision_reason == "no_qualifying_pool"
+        assert any("gate daily_loss_halt: FAIL" in line for line in flat.decision_diagnostics)
+        assert [call[0] for call in executor.calls] == ["unstake", "withdraw", "exit_swap"]
+        assert high_book.day == now.date()
+        assert high_book.day_start_equity_usd == Decimal("110")
+        assert high_book.peak_equity_usdc == Decimal("110")
+        assert stopped_book.day == now.date()
+        assert stopped_book.halted_day == now.date()
+        assert stopped_book.peak_equity_usdc == Decimal("110")
+        assert state_store.load().halted_day == now.date()
+
+        # New York midnight resets the day-start anchor to 104, but the
+        # cross-day peak still forbids fresh exposure at the 110-to-104 loss.
+        clock[0] += timedelta(days=1)
+        next_day = runner.run(
+            CycleMode.LIVE, key_bytes=b"\x01" * 32, reference_prices_by_symbol=SELECTOR_REFERENCES
+        )
+        rolled = state_store.load()
+        assert next_day.decision_action == "hold"
+        assert any("gate daily_loss_halt: FAIL" in line for line in next_day.decision_diagnostics)
+        assert rolled.day == clock[0].date()
+        assert rolled.day_start_equity_usd == Decimal("104")
+        assert rolled.peak_equity_usdc == Decimal("110")
+        assert rolled.halted_day == clock[0].date()
+        assert [call[0] for call in executor.calls] == ["unstake", "withdraw", "exit_swap"]
+
+    def test_portfolio_day_anchor_includes_unclaimed_aero(self, tmp_path: Path) -> None:
+        """The day-start mark and current equity use identical portfolio assets."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS, value=Decimal("80")))
+        runner, _, state_store = selector_runner(
+            tmp_path,
+            book=tracked_book(symbol="BBBc", committed=Decimal("80")),
+            reads=reads,
+            sources=SelectorCycleSources(usdc_units=30_000_000),
+            balances=FakeBalances(usdc_units=30_000_000, aero_units=10**18),
+        )
+        first = runner.run(CycleMode.DRY_RUN)
+        assert first.decision_action == "hold"
+        assert first.equity_usd == Decimal("110.6")
+        assert first.day_start_equity_usd == first.equity_usd
+        assert first.day_pnl_usdc == Decimal("0")
+        assert state_store.load().day_start_equity_usd == first.equity_usd
+
+        second = runner.run(CycleMode.DRY_RUN)
+        assert second.day_start_equity_usd == first.equity_usd
+        assert second.day_pnl_usdc == Decimal("0")
+
+    def test_portfolio_session_marks_all_held_names(self, tmp_path: Path) -> None:
+        """The shared day transition counts every sibling position once."""
+        runner, _, state_store = selector_runner(
+            tmp_path,
+            book=portfolio_book(),
+            reads=portfolio_reads(),
+            sources=SelectorCycleSources(usdc_units=30_000_000),
+            balances=FakeBalances(usdc_units=30_000_000, aero_units=10**18),
+        )
+        first = runner.run(CycleMode.DRY_RUN)
+        assert len(first.positions) == 2
+        assert first.equity_usd == Decimal("46.6")
+        assert first.day_start_equity_usd == first.equity_usd
+        assert first.day_pnl_usdc == Decimal("0")
+        assert state_store.load().peak_equity_usdc == first.equity_usd
+
     def test_peak_equity_survives_cycle_boundaries(self, tmp_path: Path) -> None:
         """The book carries the running peak forward between scheduled cycles."""
         runner, _, _, state_store = make_runner(tmp_path)

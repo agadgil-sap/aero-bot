@@ -2703,8 +2703,16 @@ class CycleRunner:
             now=self._now(),
             penalty_blocked_symbols=frozenset(penalty_blocked),
         )
+        # Every pool fold calls the engine's day transition, but the shared
+        # session_state above was still its unobserved INPUT. Persisting it
+        # reset the NY day and high-water mark on every portfolio cycle,
+        # losing a five-percent halt before the next cycle could honor it.
+        # Observe the selected pool's full portfolio equity once for the
+        # session facts shared by every fold and by the reported day P&L.
+        decision_option = self._option_for_plan(plan, options, evaluations)
+        session_state = engine.observe_day(session_state, decision_option.observation)
         # The leading outcome: the first planned step when the plan acts,
-        # else a portfolio hold over the session facts. A flat book never
+        # else a portfolio hold over the observed session facts. A flat book never
         # carries a position-scoped reason (the gnhf 34 flat-label fix):
         # flat with qualifying pools names the awaiting-entry posture and
         # flat with none names the empty board, exactly like the
@@ -2732,7 +2740,6 @@ class CycleRunner:
         # the alert layer rate-limits on (the captain's gnhf 34 ruling -
         # a silent idle book must never happen again).
         idle_cash = _idle_cash_state(allocation, cash_usdc, equity_usdc, book)
-        decision_option = self._option_for_plan(plan, options, evaluations)
         window = evaluate_event_window(self._now(), decision_option.token_address, engine.calendar)
         summary = f"portfolio: {allocation.summary}; {plan.summary}; " + board_summary_line(
             evaluations, decision_option.symbol
@@ -3887,7 +3894,8 @@ class CycleRunner:
             book: The post-action book the act layer threaded.
             reconciliation: The final on-chain reconciliation.
             decision_report: The portfolio decision carrying the folds.
-            session_state: The post-fold session facts.
+            session_state: The observed shared session facts, rolled over by the
+                policy engine at the selected pool's full portfolio equity.
 
         Returns:
             The rebuilt book.
