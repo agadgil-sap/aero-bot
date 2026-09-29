@@ -445,7 +445,8 @@ class PortfolioAllocation(BaseModel):
     # The USDC available for new deployment this pass (cash bounded by
     # the total-cap headroom).
     deployable_usdc: NonNegativeDecimal = Decimal("0")
-    # The cash left after the tranches: dry powder for APR spikes.
+    # The cash left after the tranches: dry powder for APR spikes once
+    # the activation equity engages the cap; plain cash below it.
     cash_residual_usdc: NonNegativeDecimal = Decimal("0")
     # The total committed value the allocation projects across every
     # position once its tranches fund.

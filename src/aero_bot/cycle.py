@@ -20,8 +20,10 @@ decides when cycles happen. One cycle, in fixed order:
    through the complete entry gate chain and hands the ranked qualifying
    board to the portfolio allocator (the captain's gnhf 33 ruling): tiered
    positions with the deployed count as an output of qualification, cash
-   as dry powder, and per-position lifecycle folds for safety and
-   maintenance; market windows no longer gate entries since the
+   as dry powder once the activation equity engages the cap (below it the
+   book deploys its available funds, the captain's sub-1000 ruling), and
+   per-position lifecycle folds for safety and maintenance; market
+   windows no longer gate entries since the
    2026-09-09 twenty-four-seven ruling.
 3. **Act.** Only when the policy authorizes an action does the cycle execute
    it, and only through the proven audited executor surfaces (mint, stake,
