@@ -1,7 +1,8 @@
 """Behavior tests for the capped manual LP lifecycle execution module."""
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal, localcontext
 from pathlib import Path
@@ -371,6 +372,20 @@ class FakeSources:
         return self._decimals[token_address.lower()]
 
 
+@dataclass
+class ScriptedPoolState:
+    """One coherent per-block pool state for the fee-growth-path views."""
+
+    # The sqrtPriceX96 and signed current tick of the pinned block.
+    sqrt_ratio: int
+    current_tick: int
+    # The block's two global fee-growth accumulators.
+    fee_growth_global0_x128: int
+    fee_growth_global1_x128: int
+    # Per-boundary-tick ten-word pieces: stakedLiquidityNet, outside0, outside1.
+    tick_words: dict[int, tuple[int, int, int]] = field(default_factory=dict)
+
+
 class LpRpcScript:
     """Serve scripted JSON-RPC results for the LP executor's read calls."""
 
@@ -433,6 +448,8 @@ class LpRpcScript:
         fee_growth_global1_x128: int = 1 << 128,
         fee_growth_outside0_x128: int = 0,
         fee_growth_outside1_x128: int = 0,
+        fee_growth_tick_words: dict[int, tuple[int, int, int]] | None = None,
+        pool_states_by_tag: Mapping[str, ScriptedPoolState] | None = None,
         fee_growth_reads_revert: bool = False,
         aero_price_usdc: Decimal | None = Decimal("0.5"),
         post_swap_stock_balance_units: int | None = None,
@@ -531,6 +548,13 @@ class LpRpcScript:
             fee_growth_global1_x128: The token-one accumulator answer.
             fee_growth_outside0_x128: Every tick's token-zero outside word.
             fee_growth_outside1_x128: Every tick's token-one outside word.
+            fee_growth_tick_words: Optional per-tick ten-word layout pieces as
+                (stakedLiquidityNet, feeGrowthOutside0X128,
+                feeGrowthOutside1X128) raw words, overriding the shared
+                outside-word defaults for exactly that boundary tick.
+            pool_states_by_tag: Optional per-block-tag pool state served to
+                the five fee-growth-path views; a read pinned to a tag the
+                script does not know fails the test loudly.
             fee_growth_reads_revert: The fee-growth views revert, so the
                 computed measurement fails open to the checkpoint.
             aero_price_usdc: Live USDC/AERO price served to the price read;
@@ -600,6 +624,11 @@ class LpRpcScript:
         self.fee_growth_global1_x128 = fee_growth_global1_x128
         self.fee_growth_outside0_x128 = fee_growth_outside0_x128
         self.fee_growth_outside1_x128 = fee_growth_outside1_x128
+        self.fee_growth_tick_words = fee_growth_tick_words
+        self.pool_states_by_tag = dict(pool_states_by_tag) if pool_states_by_tag else None
+        # Every block tag the five fee-growth-path pool views were read at,
+        # in arrival order, so tests can prove a single-block snapshot.
+        self.pool_state_block_tags: list[str] = []
         self.fee_growth_reads_revert = fee_growth_reads_revert
         self.aero_price_usdc = aero_price_usdc
         self.post_swap_stock_balance_units = post_swap_stock_balance_units
@@ -626,7 +655,8 @@ class LpRpcScript:
         elif method == "eth_blockNumber":
             result = hex(self.fast_block_number)
         elif method == "eth_call":
-            result = self._eth_call(str(params[0]["to"]).lower(), str(params[0]["data"]))
+            block_tag = str(params[1]) if len(params) > 1 else "latest"
+            result = self._eth_call(str(params[0]["to"]).lower(), str(params[0]["data"]), block_tag)
         elif method == "eth_estimateGas":
             calldata = str(params[0]["data"])
             self.estimate_requests.append(calldata)
@@ -671,7 +701,7 @@ class LpRpcScript:
             raise AssertionError(f"unexpected LP executor RPC method {method}")
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
 
-    def _eth_call(self, to_address: str, data: str) -> str:
+    def _eth_call(self, to_address: str, data: str, block_tag: str = "latest") -> str:
         """Answer one read-only contract call from the scripted token state."""
         if to_address == AERODROME_VOLATILE_FACTORY_ADDRESS and data.startswith("0x79bc57d5"):
             if self.aero_price_usdc is None:
@@ -688,7 +718,7 @@ class LpRpcScript:
                 return word_hex(int(self.aero_price_usdc * 10**6))
         usdc_token = BASE_USDC_ADDRESS.lower()
         if to_address == POOL_ADDRESS:
-            return self._pool_view(data)
+            return self._pool_view(data, block_tag)
         if data.startswith(f"0x{ERC20_ALLOWANCE_SELECTOR}"):
             spender = address_argument(data, 1)
             if to_address == usdc_token:
@@ -772,7 +802,7 @@ class LpRpcScript:
                 return word_hex(int(NFPM_ADDRESS, 16))
         raise AssertionError(f"unexpected LP eth_call payload {data[:10]}")
 
-    def _pool_view(self, data: str) -> str:
+    def _pool_view(self, data: str, block_tag: str = "latest") -> str:
         """Answer one fast-path identity or state view on the fixture pool."""
         if self.fast_views_revert:
             raise _ScriptedRevertError("pool views unavailable")
@@ -788,6 +818,9 @@ class LpRpcScript:
         if data.startswith("0xc45a0155"):
             return word_hex(int(SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS, 16))
         if data.startswith("0x3850c7bd"):
+            state = self._pinned_state(block_tag)
+            if state is not None:
+                return "0x" + word_hex(state.sqrt_ratio)[2:] + signed_word(state.current_tick).hex()
             return (
                 "0x"
                 + word_hex(self.fast_sqrt_ratio)[2:]
@@ -800,18 +833,45 @@ class LpRpcScript:
         if self.fee_growth_reads_revert:
             raise _ScriptedRevertError("fee growth views unavailable")
         if data.startswith("0xf3058399"):
-            return word_hex(self.fee_growth_global0_x128)
-        if data.startswith("0x46141319"):
-            return word_hex(self.fee_growth_global1_x128)
-        if data.startswith("0xf30dba93"):
-            return (
-                "0x"
-                + word_hex(1)[2:]
-                + word_hex(0)[2:]
-                + word_hex(self.fee_growth_outside0_x128)[2:]
-                + word_hex(self.fee_growth_outside1_x128)[2:]
+            state = self._pinned_state(block_tag)
+            return word_hex(
+                state.fee_growth_global0_x128 if state is not None else self.fee_growth_global0_x128
             )
+        if data.startswith("0x46141319"):
+            state = self._pinned_state(block_tag)
+            return word_hex(
+                state.fee_growth_global1_x128 if state is not None else self.fee_growth_global1_x128
+            )
+        if data.startswith("0xf30dba93"):
+            tick = int.from_bytes(bytes.fromhex(data[-64:]), "big", signed=True)
+            state = self._pinned_state(block_tag)
+            if state is not None:
+                if tick not in state.tick_words:
+                    raise AssertionError(f"pinned state has no words for tick {tick}")
+                staked_net, outside0, outside1 = state.tick_words[tick]
+            elif self.fee_growth_tick_words is not None and tick in self.fee_growth_tick_words:
+                staked_net, outside0, outside1 = self.fee_growth_tick_words[tick]
+            else:
+                staked_net = 0
+                outside0 = self.fee_growth_outside0_x128
+                outside1 = self.fee_growth_outside1_x128
+            # The Slipstream ticks view returns its whole ten-word Tick.Info.
+            words = [1, 0, staked_net, outside0, outside1, 0, 0, 0, 0, 1]
+            return "0x" + "".join(word_hex(word)[2:] for word in words)
         raise AssertionError(f"unexpected pool view payload {data[:10]}")
+
+    def _pinned_state(self, block_tag: str) -> ScriptedPoolState | None:
+        """Resolve one block tag against the script's per-tag pool states.
+
+        Records every fee-growth-path block tag, and refuses an unknown pin
+        loudly so a cross-block read can never pass silently.
+        """
+        self.pool_state_block_tags.append(block_tag)
+        if self.pool_states_by_tag is None:
+            return None
+        if block_tag not in self.pool_states_by_tag:
+            raise AssertionError(f"no scripted pool state at block tag {block_tag}")
+        return self.pool_states_by_tag[block_tag]
 
     def _require_penalty_reads(self) -> None:
         """Raise the scripted revert when penalty-state reads must fail."""
@@ -1972,6 +2032,8 @@ def make_position_words(
     fees_owed1: int = 11,
     tick_lower: int = LP_RANGE_LOWER,
     tick_upper: int = LP_RANGE_UPPER,
+    fee_growth_inside0_last_x128: int = 0,
+    fee_growth_inside1_last_x128: int = 0,
 ) -> list[bytes]:
     """Encode one coherent twelve-word positions view for the fixture pool.
 
@@ -1981,6 +2043,8 @@ def make_position_words(
         fees_owed1: Checkpointed token-one fees awaiting collection.
         tick_lower: The position's inclusive lower tick.
         tick_upper: The position's exclusive upper tick.
+        fee_growth_inside0_last_x128: The checkpointed token-zero inside word.
+        fee_growth_inside1_last_x128: The checkpointed token-one inside word.
 
     Returns:
         The twelve ABI words the NFPM positions view returns.
@@ -1994,8 +2058,8 @@ def make_position_words(
         signed_word(tick_lower),
         signed_word(tick_upper),
         liquidity.to_bytes(32, "big"),
-        (0).to_bytes(32, "big"),
-        (0).to_bytes(32, "big"),
+        fee_growth_inside0_last_x128.to_bytes(32, "big"),
+        fee_growth_inside1_last_x128.to_bytes(32, "big"),
         fees_owed0.to_bytes(32, "big"),
         fees_owed1.to_bytes(32, "big"),
     ]
@@ -2695,6 +2759,190 @@ def test_position_status_computes_fees_from_fee_growth() -> None:
     )
     assert "feeGrowthInside" in report.fee_method_diagnostic
     assert "feeGrowthGlobal" in report.fee_method_diagnostic
+
+
+# The 2026-09-30 live MSTRc capture (position NFT 7271074, pool
+# 0x8b27f626ab668197000bc722a1012022caed10e2, read block ~51975090): the
+# pool was above range (tick -4303 against boundaries -4420/-4380) and the
+# journal reported a computed claimable of 1.034075571924010162117120939E+43
+# USDC against a zero checkpoint - the fee-attribution defect.
+LIVE_MSTRC_CURRENT_TICK = -4303
+LIVE_MSTRC_TICK_LOWER = -4420
+LIVE_MSTRC_TICK_UPPER = -4380
+LIVE_MSTRC_LIQUIDITY = 30388749828
+LIVE_MSTRC_GLOBAL0 = 6348359815442566416136941820188541719
+LIVE_MSTRC_GLOBAL1 = 3426222436549636506271053858903015393
+LIVE_MSTRC_CHECKPOINT0 = 8522848918586780597944410057011601
+LIVE_MSTRC_CHECKPOINT1 = 5487740149534364754868198657308176
+# The ten-word Slipstream Tick.Info at each boundary; word two is the
+# signed stakedLiquidityNet (negative, so near the uint256 modulus as a raw
+# word) and the fee-growth outside words live at three and four.
+LIVE_MSTRC_TICKS_LOWER = (
+    619238500386,
+    2727183378,
+    115792089237316195423570985008687907853269984665640564039457584007885468073486,
+    6316857001977070292611634670061602978,
+    3405077133396165203413201819063206646,
+    9567102668339938664474596662416585297615329698869,
+    115792089237316195423570985008687907853269984665640564039457584007903014502296,
+    280833676297676677553027480516392595874650769,
+    1790675205,
+    1,
+)
+LIVE_MSTRC_TICKS_UPPER = (
+    101665260954,
+    115792089237316195423570985008687907853269984665640564039457584007870189948298,
+    115792089237316195423570985008687907853269984665640564039457584007900647559155,
+    6325786899514416697404244758337500717,
+    3411072933555161261180178451592571708,
+    9604225217353292753278367300200329291668892370363,
+    115792089237316195423570985008687907853269984665640564039457584007902902924768,
+    280833676297677053537210882017318842026481828,
+    1790700547,
+    1,
+)
+# The venue-faithful inside words the correct decode derives from the
+# capture: while above range, inside equals outside_upper minus outside_lower.
+LIVE_MSTRC_INSIDE0 = 8929897537346404792610088275897739
+LIVE_MSTRC_INSIDE1 = 5995800158996057766976632529365062
+LIVE_MSTRC_FEES0_UNITS = 36351
+LIVE_MSTRC_FEES1_UNITS = 45372
+
+
+def live_mstrc_rpc_script() -> LpRpcScript:
+    """Script the exact live MSTRc fee-growth words at the fixture pool."""
+    return LpRpcScript(
+        owner_addresses={77: GAUGE_ADDRESS},
+        position_words=make_position_words(
+            liquidity=LIVE_MSTRC_LIQUIDITY,
+            fees_owed0=0,
+            fees_owed1=0,
+            tick_lower=LIVE_MSTRC_TICK_LOWER,
+            tick_upper=LIVE_MSTRC_TICK_UPPER,
+            fee_growth_inside0_last_x128=LIVE_MSTRC_CHECKPOINT0,
+            fee_growth_inside1_last_x128=LIVE_MSTRC_CHECKPOINT1,
+        ),
+        fast_current_tick=LIVE_MSTRC_CURRENT_TICK,
+        fee_growth_global0_x128=LIVE_MSTRC_GLOBAL0,
+        fee_growth_global1_x128=LIVE_MSTRC_GLOBAL1,
+        fee_growth_tick_words={
+            LIVE_MSTRC_TICK_LOWER: (
+                LIVE_MSTRC_TICKS_LOWER[2],
+                LIVE_MSTRC_TICKS_LOWER[3],
+                LIVE_MSTRC_TICKS_LOWER[4],
+            ),
+            LIVE_MSTRC_TICK_UPPER: (
+                LIVE_MSTRC_TICKS_UPPER[2],
+                LIVE_MSTRC_TICKS_UPPER[3],
+                LIVE_MSTRC_TICKS_UPPER[4],
+            ),
+        },
+    )
+
+
+def test_position_status_decodes_the_live_slipstream_tick_words() -> None:
+    """The 1.034e43 live defect reads plausible fees from the right words.
+
+    Reproduces the 2026-09-30 production capture end to end: the same raw
+    ten-word tick returns, globals, and NFPM checkpoint that printed an
+    astronomical computed claimable must instead price the position's real
+    sub-cent accrual from feeGrowthOutside words three and four.
+    """
+    executor, rpc_script, safe_script = make_lp_executor(rpc_script=live_mstrc_rpc_script())
+
+    report = executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC)
+
+    assert report.fee_growth_inside0_x128 == LIVE_MSTRC_INSIDE0
+    assert report.fee_growth_inside1_x128 == LIVE_MSTRC_INSIDE1
+    assert report.fees_earned_since_checkpoint0_units == LIVE_MSTRC_FEES0_UNITS
+    assert report.fees_earned_since_checkpoint1_units == LIVE_MSTRC_FEES1_UNITS
+    assert report.fees_earned_since_checkpoint0_units < 10**9
+    price = price_usdc_per_stock(LP_SQRT_RATIO, False, STOCK_DECIMALS, 6)
+    expected_usdc = +(
+        Decimal(LIVE_MSTRC_FEES0_UNITS) * Decimal(10) ** -6
+        + Decimal(LIVE_MSTRC_FEES1_UNITS) * Decimal(10) ** -STOCK_DECIMALS * price
+    )
+    assert report.fees_earned_since_checkpoint_usdc == expected_usdc
+    assert report.claimable_fees_computed_usdc == expected_usdc
+    assert report.claimable_fees_computed_usdc < Decimal("1")
+
+
+def test_position_status_fee_growth_survives_a_wrapped_accumulator() -> None:
+    """A genuinely wrapping inside word still measures forward correctly.
+
+    The checkpoint sits just below the uint256 modulus and the live inside
+    word wrapped past it, so the raw delta is negative while the modular
+    delta is the true eight whole growth units - the venue's own collect
+    arithmetic, preserved byte for byte.
+    """
+    executor, rpc_script, safe_script = make_lp_executor(
+        rpc_script=LpRpcScript(
+            owner_addresses={77: GAUGE_ADDRESS},
+            position_words=make_position_words(
+                fee_growth_inside0_last_x128=(1 << 256) - (5 << 128),
+                fee_growth_inside1_last_x128=(1 << 256) - (5 << 128),
+            ),
+            fee_growth_global0_x128=3 << 128,
+            fee_growth_global1_x128=3 << 128,
+        )
+    )
+
+    report = executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC)
+
+    assert report.fee_growth_inside0_x128 == 3 << 128
+    assert report.fees_earned_since_checkpoint0_units == 12_345 * 8
+    assert report.fees_earned_since_checkpoint1_units == 12_345 * 8
+
+
+def test_position_status_pins_fee_growth_reads_to_one_block() -> None:
+    """The five identity reads share one pinned block across a crossing.
+
+    The pinned block holds the tick inside the range with zero outside
+    words; by the latest block a crossing complemented the lower boundary's
+    outside word and moved the tick below range. A read mixing the pinned
+    classification with the latest words would compute a negative inside
+    delta and manufacture astronomical fees - the pinned snapshot cannot.
+    """
+    pin_tag = hex(51_000_000)
+    rpc_script = live_mstrc_rpc_script()
+    rpc_script.pool_states_by_tag = {
+        pin_tag: ScriptedPoolState(
+            sqrt_ratio=LP_SQRT_RATIO,
+            current_tick=LP_RANGE_LOWER + 5,
+            fee_growth_global0_x128=7 << 128,
+            fee_growth_global1_x128=7 << 128,
+            tick_words={
+                LP_RANGE_LOWER: (0, 0, 0),
+                LP_RANGE_UPPER: (0, 0, 0),
+            },
+        ),
+        "latest": ScriptedPoolState(
+            sqrt_ratio=LP_SQRT_RATIO,
+            current_tick=LP_RANGE_LOWER - 5,
+            fee_growth_global0_x128=9 << 128,
+            fee_growth_global1_x128=9 << 128,
+            tick_words={
+                LP_RANGE_LOWER: (0, 7 << 128, 7 << 128),
+                LP_RANGE_UPPER: (0, 0, 0),
+            },
+        ),
+    }
+    rpc_script.position_words = make_position_words(
+        fee_growth_inside0_last_x128=3 << 128,
+        fee_growth_inside1_last_x128=3 << 128,
+    )
+    executor, rpc_script, safe_script = make_lp_executor(rpc_script=rpc_script)
+
+    report = executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC)
+
+    # The pinned block's identity: tick inside, both outsides zero, so each
+    # inside word equals its 7<<128 global against the 3<<128 checkpoint.
+    assert report.fee_growth_inside0_x128 == 7 << 128
+    assert report.fees_earned_since_checkpoint0_units == 12_345 * 4
+    assert report.fees_earned_since_checkpoint1_units == 12_345 * 4
+    # Every fee-growth-path read carried the same pinned block tag; the
+    # latest-tagged observation reads that precede them are not the identity.
+    assert rpc_script.pool_state_block_tags[-5:] == [pin_tag] * 5
 
 
 def test_position_status_fee_growth_failure_fails_open_to_the_checkpoint() -> None:

@@ -475,6 +475,56 @@ def test_decode_pool_slot0_view_reproduces_the_live_capture() -> None:
     assert tick == -11613
 
 
+def test_decode_pool_ticks_view_decodes_the_live_slipstream_capture() -> None:
+    """The ten-word Slipstream tick view yields its fee words at three and four.
+
+    Reproduces the 2026-09-30 live MSTRc boundary reads whose word two (the
+    signed stakedLiquidityNet, negative so near the uint256 modulus) was
+    previously decoded as feeGrowthOutside0 and manufactured astronomical
+    claimable-fee readings.
+    """
+    from aero_bot.lp_calldata import decode_pool_ticks_view_result
+
+    # Encoded from the captured raw words of ticks(-4420) on the live pool.
+    lower_words = (
+        619238500386,
+        2727183378,
+        115792089237316195423570985008687907853269984665640564039457584007885468073486,
+        6316857001977070292611634670061602978,
+        3405077133396165203413201819063206646,
+        9567102668339938664474596662416585297615329698869,
+        115792089237316195423570985008687907853269984665640564039457584007903014502296,
+        280833676297676677553027480516392595874650769,
+        1790675205,
+        1,
+    )
+    result = "0x" + "".join(f"{word:064x}" for word in lower_words)
+
+    liquidity_gross, liquidity_net, outside0, outside1 = decode_pool_ticks_view_result(result)
+
+    assert liquidity_gross == lower_words[0]
+    assert liquidity_net == lower_words[1]
+    assert outside0 == lower_words[3]
+    assert outside1 == lower_words[4]
+    # The near-modulus stakedLiquidityNet at word two is exactly the word the
+    # defective decode read as feeGrowthOutside0; it must never surface here.
+    assert outside0 != lower_words[2]
+
+
+def test_decode_pool_ticks_view_requires_the_ten_word_layout() -> None:
+    """A truncated or padded tick return refuses instead of mis-decoding."""
+    from aero_bot.lp_calldata import decode_pool_ticks_view_result
+
+    for word_count in (4, 5, 9, 11):
+        result = "0x" + "00" * 32 * word_count
+        try:
+            decode_pool_ticks_view_result(result)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"a {word_count}-word tick return was accepted")
+
+
 def test_decode_view_results_reject_malformed_returns() -> None:
     """Every decoder refuses non-hex, short, and non-word payloads."""
     from aero_bot.lp_calldata import (

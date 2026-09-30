@@ -4470,9 +4470,26 @@ class CycleRunner:
             row_diagnostic = ""
             row_fees: Decimal | None = None
             price_now = prices.get(record.symbol)
-            if (
-                row is not None
-                and row.liquidity_units is not None
+            if row is None:
+                row_diagnostic = (
+                    "no baseline row: the position entered after the day started "
+                    "(its fee baseline re-snapshots at adoption)"
+                )
+            elif (
+                row.liquidity_units is not None and row.liquidity_units != status.position.liquidity
+            ):
+                # The day's fee-growth delta spans a liquidity change, so one
+                # liquidity number cannot price it: the accrual before the
+                # change belonged to the baseline liquidity and the accrual
+                # after to the new one. Report unmeasured rather than
+                # attribute growth to liquidity that no longer backs it.
+                row_diagnostic = (
+                    f"liquidity changed since the day baseline "
+                    f"({row.liquidity_units} -> {status.position.liquidity}); "
+                    "the day's fee growth is unmeasurable against one liquidity"
+                )
+            elif (
+                row.liquidity_units is not None
                 and row.fee_growth_inside0_x128 is not None
                 and row.fee_growth_inside1_x128 is not None
                 and status.fee_growth_inside0_x128 is not None
@@ -4499,11 +4516,6 @@ class CycleRunner:
                     )
                 )
                 row_fees = +(usdc_side + stock_side * price_now)
-            elif row is None:
-                row_diagnostic = (
-                    "no baseline row: the position entered after the day started "
-                    "(its fee baseline re-snapshots at adoption)"
-                )
             else:
                 row_diagnostic = "fee words unmeasured this cycle"
             row_mtm: Decimal | None = None

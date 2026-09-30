@@ -4281,15 +4281,21 @@ class LpLifecycleExecutor:
     def _read_computed_fee_growth(
         self, observation: LpPoolObservation, position: LpPositionView
     ) -> tuple[int | None, int | None, str]:
-        """Read the range's live inside fee growth from the pool's own views.
+        """Read the range's live inside fee growth from one pinned block.
 
         The measurement is the standard concentrated-liquidity identity over
-        the pool's live state: ``feeGrowthGlobal0/1X128()`` and both range
+        the pool's own state: ``feeGrowthGlobal0/1X128()`` and both range
         boundaries' ``ticks(int24)`` outside words, combined with the current
-        tick by the v3 inside formula, all read as one consecutive burst of
-        read-only calls. Any failed read leaves the computed measurement
-        absent rather than guessing - the checkpointed lower bound stays the
-        fallback.
+        tick by the v3 inside formula. Every one of the five reads is pinned
+        to the same freshly read block number, so a tick crossing between two
+        reads can never mix a pre-crossing classification with post-crossing
+        outside words - the 2026-09-30 cross-block hazard that could turn a
+        negative inside delta into a uint256-wrapped astronomical fee claim.
+        The NFPM checkpoint itself needs no pin: only the position's owner
+        can modify it, and this executor holds the execution lock, so the
+        checkpoint read moments earlier is the same word at the pinned block.
+        Any failed read leaves the computed measurement absent rather than
+        guessing - the checkpointed lower bound stays the fallback.
 
         Args:
             observation: The block-pinned pool observation naming the pool.
@@ -4303,25 +4309,37 @@ class LpLifecycleExecutor:
         method = (
             "computed fees: liquidity times the delta of feeGrowthInside, itself "
             "feeGrowthGlobal minus the range boundaries' feeGrowthOutside words "
-            "at the read block (the v3 identity); pre-share pool-side "
-            "entitlement - any protocol share applies at collect"
+            "of the ten-word Slipstream tick view, every read pinned to one "
+            "block (the v3 identity); pre-share pool-side entitlement - any "
+            "protocol share applies at collect"
         )
         pool = observation.pool_address
         try:
+            block_tag = hex(self._rpc.fetch_block_number())
             _, tick_current = decode_pool_slot0_view(
-                self._rpc.eth_call(pool, build_pool_slot0_read_calldata())
+                self._rpc.eth_call_at(pool, build_pool_slot0_read_calldata(), block_tag)
             )
             global0 = self._read_word(
-                pool, build_pool_fee_growth_global_read_calldata(0), "feeGrowthGlobal0X128()"
+                pool,
+                build_pool_fee_growth_global_read_calldata(0),
+                "feeGrowthGlobal0X128()",
+                block_tag,
             )
             global1 = self._read_word(
-                pool, build_pool_fee_growth_global_read_calldata(1), "feeGrowthGlobal1X128()"
+                pool,
+                build_pool_fee_growth_global_read_calldata(1),
+                "feeGrowthGlobal1X128()",
+                block_tag,
             )
             _, _, outside_lower0, outside_lower1 = decode_pool_ticks_view_result(
-                self._rpc.eth_call(pool, build_pool_ticks_read_calldata(position.tick_lower))
+                self._rpc.eth_call_at(
+                    pool, build_pool_ticks_read_calldata(position.tick_lower), block_tag
+                )
             )
             _, _, outside_upper0, outside_upper1 = decode_pool_ticks_view_result(
-                self._rpc.eth_call(pool, build_pool_ticks_read_calldata(position.tick_upper))
+                self._rpc.eth_call_at(
+                    pool, build_pool_ticks_read_calldata(position.tick_upper), block_tag
+                )
             )
         except (ExecutorRpcRevertError, ExecutionUnavailableError, ValueError) as error:
             return (
@@ -6067,13 +6085,17 @@ class LpLifecycleExecutor:
             self._now(),
         )
 
-    def _read_word(self, to_address: str, calldata: str, source: str) -> int:
+    def _read_word(
+        self, to_address: str, calldata: str, source: str, block_tag: str = "latest"
+    ) -> int:
         """Perform one word-returning read-only call and decode it.
 
         Args:
             to_address: The contract being called.
             calldata: Complete 0x-prefixed call payload.
             source: Human label naming the call in diagnostics.
+            block_tag: The block tag the call is evaluated against, pinned
+                to one block by callers whose words must stay coherent.
 
         Returns:
             The decoded unsigned integer.
@@ -6081,7 +6103,7 @@ class LpLifecycleExecutor:
         Raises:
             ExecutionUnavailableError: If the return is not one full word.
         """
-        result = self._rpc.eth_call(to_address, calldata)
+        result = self._rpc.eth_call_at(to_address, calldata, block_tag)
         if not result.startswith("0x") or len(result) != 2 + 64:
             raise ExecutionUnavailableError(
                 f"{source} returned {max(len(result) - 2, 0)} bytes instead of 32"
