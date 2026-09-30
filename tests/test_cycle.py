@@ -567,7 +567,12 @@ def portfolio_book() -> CycleStateBook:
     )
 
 
-def portfolio_reads(*, fee_growth: int | None = None, earned_aero: int | None = None) -> FakeReads:
+def portfolio_reads(
+    *,
+    fee_growth: int | None = None,
+    earned_aero: int | None = None,
+    liquidity: int = 12_345,
+) -> FakeReads:
     """Serve both portfolio positions as staked with matching statuses."""
     reads = FakeReads(inventory_with_ids((TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1)))
     for token_id in (TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1):
@@ -578,6 +583,7 @@ def portfolio_reads(*, fee_growth: int | None = None, earned_aero: int | None = 
                 accrued_aero_units=earned_aero,
                 fee_growth_inside0_x128=fee_growth,
                 fee_growth_inside1_x128=fee_growth,
+                liquidity=liquidity,
             ).model_copy(update={"token_id": token_id}),
         )
     return reads
@@ -1741,6 +1747,19 @@ class SelectorCycleSources(FakeCycleSources):
         return 0
 
 
+def single_name_sources(**kwargs: object) -> SelectorCycleSources:
+    """Serve the board trimmed to the held BBBc name alone.
+
+    The post-minimum-removal allocator deploys any idle cash into a fresh
+    qualifying name, so tests that need a funded book to hold - the latch
+    and day-anchor arcs - serve the held name only, leaving the cash with
+    no second pool to enter.
+    """
+    sources = SelectorCycleSources(**kwargs)
+    held = tuple(item for item in selector_listings() if item.symbol.lower() == "bbbc")
+    return sources.with_listings(held)
+
+
 def selector_runner(
     tmp_path: Path,
     *,
@@ -2525,6 +2544,51 @@ class TestPortfolioCycles:
             + attribution.unattributed_usdc
         )
 
+    def test_attribution_reports_unmeasured_fees_when_liquidity_changed(
+        self, tmp_path: Path
+    ) -> None:
+        """A mid-day liquidity change leaves the day's fee growth unmeasured.
+
+        The day-baseline liquidity multiplied by the day's fee-growth delta
+        would attribute growth to liquidity that no longer backs it - the
+        day's fee component must read unmeasured instead, naming the change.
+        """
+        runner, _, state_store = selector_runner(
+            tmp_path,
+            book=portfolio_book(),
+            reads=portfolio_reads(fee_growth=2 << 128, earned_aero=2 * 10**18),
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        first = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=SELECTOR_REFERENCES)
+        assert first.yield_attribution is not None
+
+        # The next cycle's positions carry less liquidity (a partial burn)
+        # while the fee words still advance.
+        reads = portfolio_reads(
+            fee_growth=3 << 128,
+            earned_aero=7 * 10**18,
+            liquidity=9_000,
+        )
+        runner, _, _ = selector_runner(
+            tmp_path,
+            book=state_store.load(),
+            reads=reads,
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        later = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=SELECTOR_REFERENCES)
+        attribution = later.yield_attribution
+        assert attribution is not None
+        rows = {row.symbol: row for row in attribution.positions}
+        for row in rows.values():
+            assert row.fees_earned_usdc is None
+            assert "liquidity changed" in row.diagnostic
+            assert "12345" in row.diagnostic
+            assert "9000" in row.diagnostic
+        assert attribution.fees_earned_usdc is None
+        assert "fees earned unmeasured" in attribution.diagnostic
+
     def test_report_and_payload_carry_the_portfolio_fields(self, tmp_path: Path) -> None:
         """Positions ride the report and the audited cycle summary."""
         runner, _, _ = selector_runner(
@@ -3047,7 +3111,7 @@ class TestContinuousLatchBook:
         now = QUIET_INSTANT
         reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
         reads.set_status(TRACKED_TOKEN_ID, tracked_status(owner=GAUGE_ADDRESS, value=Decimal("80")))
-        sources = SelectorCycleSources(usdc_units=30_000_000)
+        sources = single_name_sources(usdc_units=30_000_000)
         balances = FakeBalances(usdc_units=30_000_000)
         book = tracked_book(
             symbol="BBBc", committed=Decimal("80"), entered_at=now - timedelta(hours=2)
@@ -3131,7 +3195,7 @@ class TestContinuousLatchBook:
             tmp_path,
             book=tracked_book(symbol="BBBc", committed=Decimal("80")),
             reads=reads,
-            sources=SelectorCycleSources(usdc_units=30_000_000),
+            sources=single_name_sources(usdc_units=30_000_000),
             balances=FakeBalances(usdc_units=30_000_000, aero_units=10**18),
         )
         first = runner.run(CycleMode.DRY_RUN)

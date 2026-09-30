@@ -82,6 +82,15 @@ POOL_FEE_GROWTH_GLOBAL0_READ_SELECTOR = "f3058399"
 POOL_FEE_GROWTH_GLOBAL1_READ_SELECTOR = "46141319"
 # keccak256("ticks(int24)")[0:4], the pool's per-tick state mapping.
 POOL_TICKS_READ_SELECTOR = "f30dba93"
+# The Slipstream ticks view returns its whole Tick.Info struct as ten ABI
+# words: liquidityGross, liquidityNet, stakedLiquidityNet,
+# feeGrowthOutside0X128, feeGrowthOutside1X128, rewardGrowthOutsideX128,
+# tickCumulativeOutside, secondsPerLiquidityOutsideX128, secondsOutside,
+# and the initialized flag.
+SLIPSTREAM_TICK_INFO_WORDS = 10
+SLIPSTREAM_TICK_STAKED_LIQUIDITY_NET_WORD = 2
+SLIPSTREAM_TICK_FEE_GROWTH_OUTSIDE0_WORD = 3
+SLIPSTREAM_TICK_FEE_GROWTH_OUTSIDE1_WORD = 4
 # keccak256("liquidity()")[0:4], the pool's active in-range liquidity.
 POOL_LIQUIDITY_READ_SELECTOR = "1a686502"
 # keccak256("stakedLiquidity()")[0:4], the pool's gauge-staked liquidity.
@@ -697,10 +706,12 @@ def build_pool_fee_growth_global_read_calldata(token_index: int) -> str:
 def build_pool_ticks_read_calldata(tick: int) -> str:
     """ABI-encode the pool's per-tick state read for one boundary tick.
 
-    The Slipstream ``ticks(int24)`` mapping returns four words - the tick's
-    ``liquidityGross``, its signed ``liquidityNet``, and the tick's
-    ``feeGrowthOutside0X128``/``feeGrowthOutside1X128`` accumulators - which
-    the computed-fee measurement reads at both range boundaries.
+    The Slipstream ``ticks(int24)`` mapping returns its whole ten-word
+    Tick.Info struct - the tick's ``liquidityGross``, its signed
+    ``liquidityNet``, its signed ``stakedLiquidityNet``, and the tick's
+    ``feeGrowthOutside0X128``/``feeGrowthOutside1X128`` accumulators among
+    six further protocol words - which the computed-fee measurement reads
+    at both range boundaries.
 
     Args:
         tick: The signed range-boundary tick being read.
@@ -966,7 +977,21 @@ def decode_pool_slot0_view(result: str) -> tuple[int, int]:
 
 
 def decode_pool_ticks_view_result(result: str) -> tuple[int, int, int, int]:
-    """Decode one ticks(int24) return into its four raw words.
+    """Decode one Slipstream ticks(int24) return into its raw fee words.
+
+    The Slipstream tick view returns its whole ten-word Tick.Info struct in
+    order: liquidityGross, the signed liquidityNet, the signed
+    stakedLiquidityNet, feeGrowthOutside0X128, feeGrowthOutside1X128,
+    rewardGrowthOutsideX128, tickCumulativeOutside,
+    secondsPerLiquidityOutsideX128, secondsOutside, and the initialized flag.
+    The fee-growth accumulators live at words three and four.
+
+    The 2026-09-30 fee-attribution defect read word two - stakedLiquidityNet,
+    an int128 that is negative for most crossed boundary ticks and so near
+    the uint256 modulus as a raw word - as feeGrowthOutside0, manufacturing
+    astronomical computed-fee readings on live positions. The decode now
+    requires the exact ten-word layout so a struct change refuses loudly
+    instead of silently decoding through truncation.
 
     Args:
         result: The 0x-prefixed hex return bytes of the ticks view.
@@ -977,14 +1002,25 @@ def decode_pool_ticks_view_result(result: str) -> tuple[int, int, int, int]:
 
     Raises:
         ValueError: If the return is not 0x-prefixed hexadecimal of exactly
-            four whole ABI words.
+            the ten whole ABI words of the Slipstream Tick.Info layout.
     """
-    words = _decode_view_words(result, "ticks view", 4)
+    words = _decode_view_words(result, "ticks view", SLIPSTREAM_TICK_INFO_WORDS)
+    if len(words) != SLIPSTREAM_TICK_INFO_WORDS:
+        raise ValueError(
+            f"ticks view returned {len(words)} words instead of the "
+            f"{SLIPSTREAM_TICK_INFO_WORDS}-word Slipstream Tick.Info layout; "
+            "refusing to decode a truncated or padded struct"
+        )
     liquidity_gross = words[0]
     liquidity_net = int.from_bytes(
         words[1].to_bytes(WORD_BYTES, "big", signed=False), "big", signed=True
     )
-    return liquidity_gross, liquidity_net, words[2], words[3]
+    return (
+        liquidity_gross,
+        liquidity_net,
+        words[SLIPSTREAM_TICK_FEE_GROWTH_OUTSIDE0_WORD],
+        words[SLIPSTREAM_TICK_FEE_GROWTH_OUTSIDE1_WORD],
+    )
 
 
 def decode_address_view_result(result: str) -> str:

@@ -36,6 +36,9 @@ Mint pulls both tokens from the sender through `transferFrom`, so the Safe needs
 `positions(uint256)` returns twelve words in this order, verified against real positions: `uint96 nonce`, `address operator`, `address token0`, `address token1`, `int24 tickSpacing`, `int24 tickLower`, `int24 tickUpper`, `uint128 liquidity`, `uint256 feeGrowthInside0LastX128`, `uint256 feeGrowthInside1LastX128`, `uint128 tokensOwed0`, `uint128 tokensOwed1`.
 A burned token id reverts with the message `ID`.
 
+`ticks(int24)` on the pool returns its whole ten-word `Tick.Info` struct in this order, verified against the live MSTRc pool on 2026-09-30: `uint128 liquidityGross`, `int128 liquidityNet`, `int128 stakedLiquidityNet`, `uint256 feeGrowthOutside0X128`, `uint256 feeGrowthOutside1X128`, `uint256 rewardGrowthOutsideX128`, `int56 tickCumulativeOutside`, `uint160 secondsPerLiquidityOutsideX128`, `uint32 secondsOutside`, `bool initialized`.
+The `stakedLiquidityNet` word at position two is the 2026-09-30 fee-attribution hazard: a decoder that stops at four words reads it as `feeGrowthOutside0` and manufactures astronomical computed fees (see the defect section below).
+
 ### CLGauge functions
 
 | Function | Canonical signature | Selector |
@@ -316,11 +319,19 @@ Nothing in the status path builds, signs, estimates, or audits a transaction: th
 
 The status report also values the NFPM's checkpointed owed fees - the `tokensOwed0/1` columns of the `positions` view - as `fees_owed_usdc`, at the same snapshot price as the composition so the two can never disagree.
 The semantics are a lower bound, stated in the report's diagnostic: Slipstream checkpoints `tokensOwed` only on position modifications (mint, increase, decrease, collect), so between modifications the live claimable accrues uncheckpointed and the reported number understates what a `collect` with `MAX_UINT128` would actually sweep.
-The captain's 2026-09-27 correction ruled the flat `claimable = 0` readings a measurement artifact - fees were never zero - so the status now also computes the real accrual from the pool's own state: `feeGrowthInside` by the exact v3 identity (`feeGrowthGlobal` minus both range boundaries' `feeGrowthOutside` words from `ticks(int24)`, at the read block), the earned amount as `liquidity x delta(feeGrowthInside) >> 128` per side.
+The captain's 2026-09-27 correction ruled the flat `claimable = 0` readings a measurement artifact - fees were never zero - so the status now also computes the real accrual from the pool's own state: `feeGrowthInside` by the exact v3 identity (`feeGrowthGlobal` minus both range boundaries' `feeGrowthOutside` words from `ticks(int24)`, every read pinned to one freshly read block), the earned amount as `liquidity x delta(feeGrowthInside) >> 128` per side.
 The report carries the raw inside words (`fee_growth_inside0/1_x128`), the computed since-checkpoint earnings and their value (`fees_earned_since_checkpoint_usdc`), the computed collect-now estimate (`claimable_fees_computed_usdc` - the checkpointed owed plus the uncheckpointed growth, what a max-uint128 collect would actually sweep), and the named method line (`fee_method_diagnostic`) so every consumer sees computed-versus-checkpointed labeled explicitly.
 A failed accumulator read fails open: the computed fields stay absent and the checkpointed lower bound remains the report.
 Priced pre-share (any protocol share applies at collect), the computed measurement feeds the cycle's fee evidence and yield attribution; policy decisions keep the conservative zero fee APR regardless.
 The remaining path to exact accounting is the realized split decoded from collect and burn receipts at exit.
+
+#### The 2026-09-30 fee-attribution defect and its repair
+
+The live MSTRc position once reported a computed claimable of `1.034075571924010162117120939E+43` USDC (and an earlier reading of `1.708...E+43`) against a zero checkpoint - not income, never traded on, but printed in every journal and report.
+The root cause was the `ticks(int24)` decode, not the pool math: the Slipstream tick view returns its whole ten-word `Tick.Info` struct (`liquidityGross`, `liquidityNet`, `stakedLiquidityNet`, `feeGrowthOutside0X128`, `feeGrowthOutside1X128`, `rewardGrowthOutsideX128`, `tickCumulativeOutside`, `secondsPerLiquidityOutsideX128`, `secondsOutside`, `initialized`), and the decoder read the first four words - so word two, the signed `stakedLiquidityNet` (an int128 that is negative for most crossed boundary ticks and so near the uint256 modulus as a raw word), was consumed as `feeGrowthOutside0`.
+A near-modulus or small-int "outside" word drives the v3 identity to a garbage inside value whose modular delta against the real checkpoint wraps to astronomical fees; both observed live shapes (near-modulus and small-positive inside words) reproduce exactly from the captured production bytes in `tests/test_lp_executor.py`'s live-capture test.
+The repair: the decode requires the exact ten-word layout and reads the fee words at positions three and four, refusing any truncated or padded return instead of silently mis-decoding; the five identity reads (slot0, both globals, both boundary ticks) are pinned to one freshly read block number so a tick crossing between reads can never mix a pre-crossing classification with post-crossing outside words; and the cycle's day yield attribution refuses to price a fee-growth delta against day-baseline liquidity that no longer matches the position (a liquidity change mid-day leaves that row's fee component explicitly unmeasured).
+Wrap semantics are unchanged and pinned by test: the modular delta equals the venue's own collect arithmetic, so a genuinely wrapping accumulator still measures forward - with correctly decoded single-block words a wrapped delta is always the true accrual and can never overstate.
 
 ### The reward conversion (AERO to USDC)
 
