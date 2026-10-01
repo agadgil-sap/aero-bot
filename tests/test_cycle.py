@@ -2,7 +2,7 @@
 
 import json
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, localcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -118,7 +118,17 @@ class FakeConfirmPayload(BaseModel):
 class FakePlanPayload(BaseModel):
     """The mint-plan audit shape the real executor writes."""
 
+    mode: str = "execute"
     budget_usdc: str
+    symbol: str | None = None
+
+
+class FakeStakePlanPayload(BaseModel):
+    """The stake-plan audit shape the real executor writes."""
+
+    mode: str
+    symbol: str
+    token_id: int
 
 
 class FakeCycleSources:
@@ -276,6 +286,10 @@ class FakeExecutor:
         self.fee_wei_per_step = 90_000
         self.confirmed_block_number = 51_000_000
         self.collect_aero_units = 0
+        # Raise KeyboardInterrupt on the Nth mint call (one-indexed) to
+        # simulate the service timeout killing the process mid-act.
+        self.interrupt_on_mint: int | None = None
+        self._mint_calls = 0
 
     def _complete(self, action: str, hashes: tuple[str, ...]) -> LpActionExecutionReport:
         """Build one completed execution report over scripted steps."""
@@ -362,6 +376,9 @@ class FakeExecutor:
     ) -> LpActionExecutionReport:
         """Complete one mint, minting the scripted token id on-chain."""
         self.calls.append(("mint", symbol, budget_usdc, width_spacings))
+        self._mint_calls += 1
+        if self.interrupt_on_mint is not None and self._mint_calls >= self.interrupt_on_mint:
+            raise KeyboardInterrupt("simulated service timeout")
         if self.refuse_next == "mint":
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING, "scripted refusal"
@@ -375,7 +392,7 @@ class FakeExecutor:
         self._audit_confirm("mint", LpExecutionRole.MINT, MINT_TX_HASH)
         self._audit.append(
             AuditEventType.LP_MINT_PLANNED,
-            FakePlanPayload(budget_usdc=str(budget_usdc)),
+            FakePlanPayload(mode="execute", budget_usdc=str(budget_usdc), symbol=symbol),
             self._now,
         )
         self._reads.set_inventory(inventory_with(TRACKED_TOKEN_ID))
@@ -401,7 +418,19 @@ class FakeExecutor:
     ) -> LpActionExecutionReport:
         """Complete one stake, placing the NFT in the gauge's custody."""
         self.calls.append(("stake", symbol, token_id))
-        self._reads.set_status(token_id, tracked_status(owner=GAUGE_ADDRESS))
+        if self.refuse_next == "stake":
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.BROADCAST_CONFIRMATION_MISSING, "scripted refusal"
+            )
+        self._audit.append(
+            AuditEventType.LP_STAKE_PLANNED,
+            FakeStakePlanPayload(mode="execute", symbol=symbol, token_id=token_id),
+            self._now,
+        )
+        self._reads.set_status(
+            token_id,
+            tracked_status(owner=GAUGE_ADDRESS).model_copy(update={"token_id": token_id}),
+        )
         return self._complete("stake", ("0x" + "cd" * 32,))
 
     def execute_unstake(
@@ -705,7 +734,7 @@ def make_runner(
         )
         audit.append(
             AuditEventType.LP_MINT_PLANNED,
-            FakePlanPayload(budget_usdc="7"),
+            FakePlanPayload(mode="execute", budget_usdc="7"),
             QUIET_INSTANT,
         )
     fake_reads = reads if reads is not None else FakeReads()
@@ -1786,6 +1815,481 @@ def selector_runner(
         aero_conversion_min_usdc=aero_conversion_min_usdc,
     )
     return runner, fake_executor, state_store
+
+
+# ---------------------------------------------------------------------------
+# The 2026-09-30 timeout incident fixtures: the four live names, pools, and
+# the scout report's exact NFT ids and liquidity values
+# (data/aero-bot-cycle-timeout/report.md).
+# ---------------------------------------------------------------------------
+
+# The surviving sibling the book kept tracking through the timeout.
+TIMEOUT_SIBLING_TOKEN_ID = 7_310_376
+# The killed cycle's three confirmed entries: NFT id, symbol, audited mint
+# budget (the newest execute-mode plan before each stake plan), and the
+# scout's live NFPM liquidity read (the third NFT's independent read hit an
+# RPC reset, so its value mirrors the confirmed receipt's deployment).
+TIMEOUT_ENTRIES: tuple[tuple[int, str, Decimal, int, Decimal], ...] = (
+    (7_311_805, "TSLAc", Decimal("13.64859652562234191269156890"), 3_610_260_828, Decimal("12")),
+    (7_312_392, "METAc", Decimal("15.08330000"), 2_790_693_399, Decimal("12.2")),
+    (7_312_807, "SNDKc", Decimal("6.923894099820873036278282779"), 2_410_317_416, Decimal("11.5")),
+)
+# The book's day facts at the timeout, from the live persisted book: the
+# day-start anchor the 11:46 cycle seeded and the running peak.
+TIMEOUT_DAY_START = Decimal("104.2348945939082132986662799")
+TIMEOUT_PEAK = Decimal("105.7353328824604165332248358")
+# The equity the post-timeout cycles marked: sibling plus cash, omitting the
+# three staked positions (the phantom drawdown's reading, mirrored at the
+# fixture's digit width so every sum stays exact in the ambient context).
+TIMEOUT_OMITTED_EQUITY = Decimal("68.528421317312414697474")
+# Distinct synthetic pool identities per name so custody verification and
+# board resolution never alias across pools.
+TIMEOUT_POOL_ADDRESSES = {
+    "MSTRc": "0x3100000000000000000000000000000000001001",
+    "TSLAc": "0x3100000000000000000000000000000000001002",
+    "METAc": "0x3100000000000000000000000000000000001003",
+    "SNDKc": "0x3100000000000000000000000000000000001004",
+}
+TIMEOUT_STOCK_TOKENS = {
+    "MSTRc": "0x4100000000000000000000000000000000001001",
+    "TSLAc": "0x4100000000000000000000000000000000001002",
+    "METAc": "0x4100000000000000000000000000000000001003",
+    "SNDKc": "0x4100000000000000000000000000000000001004",
+}
+TIMEOUT_GAUGE_ADDRESSES = {
+    "MSTRc": "0x5100000000000000000000000000000000001001",
+    "TSLAc": "0x5100000000000000000000000000000000001002",
+    "METAc": "0x5100000000000000000000000000000000001003",
+    "SNDKc": "0x5100000000000000000000000000000000001004",
+}
+TIMEOUT_NFPM_ADDRESSES = {
+    "MSTRc": "0x6100000000000000000000000000000000001001",
+    "TSLAc": "0x6100000000000000000000000000000000001002",
+    "METAc": "0x6100000000000000000000000000000000001003",
+    "SNDKc": "0x6100000000000000000000000000000000001004",
+}
+# Both fixtures share one price, so one reference map serves every name.
+TIMEOUT_REFERENCES = dict.fromkeys(TIMEOUT_POOL_ADDRESSES, FIXTURE_AMM_PRICE)
+
+
+def timeout_listings() -> tuple[BoardListing, ...]:
+    """Build the four-name board the timed-out cycle traded across."""
+    return tuple(
+        BoardListing(
+            symbol=symbol,
+            pool=make_candidate(
+                pool_address=TIMEOUT_POOL_ADDRESSES[symbol],
+                token1_address=TIMEOUT_STOCK_TOKENS[symbol],
+                gauge_address=TIMEOUT_GAUGE_ADDRESSES[symbol],
+                nfpm_address=TIMEOUT_NFPM_ADDRESSES[symbol],
+                staked0=15_600 * 10**6,
+                staked1=100 * 10**STOCK_DECIMALS,
+            ),
+        )
+        for symbol in ("MSTRc", "TSLAc", "METAc", "SNDKc")
+    )
+
+
+class TimeoutCycleSources(SelectorCycleSources):
+    """Serve the four-name incident board with per-symbol resolution."""
+
+    def __init__(self, **kwargs: object) -> None:
+        """Configure the incident board and balances."""
+        super().__init__(**kwargs)
+        self._selector_listings = timeout_listings()
+
+    def symbol_address(self, symbol: str) -> str | None:
+        """Resolve the four incident names to their stock tokens."""
+        return TIMEOUT_STOCK_TOKENS.get(symbol)
+
+
+def timeout_status(
+    symbol: str,
+    token_id: int,
+    *,
+    value: Decimal,
+    liquidity: int = 12_345,
+    owner: str | None = None,
+) -> LpPositionStatusReport:
+    """Build one incident position's status in its own pool's custody."""
+    gauge = TIMEOUT_GAUGE_ADDRESSES[symbol]
+    return tracked_status(
+        owner=owner if owner is not None else gauge,
+        value=value,
+        pnl=None,
+        liquidity=liquidity,
+    ).model_copy(
+        update={
+            "symbol": symbol,
+            "token_id": token_id,
+            "pool_address": TIMEOUT_POOL_ADDRESSES[symbol],
+            "gauge_address": gauge,
+        }
+    )
+
+
+def timeout_empty_inventory() -> LpSafePositionsSnapshot:
+    """Build the MSTRc-anchor inventory the Safe-held enumeration returned."""
+    return LpSafePositionsSnapshot(
+        symbol="MSTRc",
+        pool_address=TIMEOUT_POOL_ADDRESSES["MSTRc"],
+        nfpm_address=TIMEOUT_NFPM_ADDRESSES["MSTRc"],
+        positions=(),
+        snapshot_block=123,
+        observed_at=QUIET_INSTANT,
+        caps_enforced=("fixture",),
+        diagnostics=("nothing held; the staked NFTs are gauge-owned",),
+    )
+
+
+def timeout_book(*, halted: date | None = None) -> CycleStateBook:
+    """Build the persisted book exactly as the timeout left it.
+
+    The 11:46 cycle's day facts ride beside the one surviving sibling; the
+    three staked entries never reached the aggregate save.
+    """
+    return CycleStateBook(
+        positions=(
+            TrackedPosition(
+                symbol="MSTRc",
+                token_id=TIMEOUT_SIBLING_TOKEN_ID,
+                pool_address=TIMEOUT_POOL_ADDRESSES["MSTRc"],
+                committed_usd=Decimal("60.29119370327215717546763625"),
+                entered_at=QUIET_INSTANT - timedelta(hours=2),
+            ),
+        ),
+        day=QUIET_INSTANT.date(),
+        day_start_equity_usd=TIMEOUT_DAY_START,
+        peak_equity_usdc=TIMEOUT_PEAK,
+        halted_day=halted,
+        updated_at=QUIET_INSTANT,
+    )
+
+
+def timeout_reads(
+    *,
+    recovered_values: tuple[Decimal, ...] | None = None,
+    sibling_value: Decimal = Decimal("36.198421317312414697474"),
+) -> FakeReads:
+    """Serve the incident's live custody: sibling staked, entries staked.
+
+    The recovered values default to the honest marks (about 35.7 USDC); a
+    test can pass smaller values to simulate a real drawdown instead.
+    """
+    values = recovered_values
+    if values is None:
+        values = tuple(entry[4] for entry in TIMEOUT_ENTRIES)
+    reads = FakeReads(timeout_empty_inventory())
+    reads.set_status(
+        TIMEOUT_SIBLING_TOKEN_ID,
+        timeout_status("MSTRc", TIMEOUT_SIBLING_TOKEN_ID, value=sibling_value),
+    )
+    for (token_id, symbol, _budget, liquidity, _mark), value in zip(
+        TIMEOUT_ENTRIES, values, strict=True
+    ):
+        reads.set_status(
+            token_id, timeout_status(symbol, token_id, value=value, liquidity=liquidity)
+        )
+    return reads
+
+
+def seed_timeout_entries(
+    audit: AuditStore,
+    *,
+    mode: str = "execute",
+    entries: tuple[tuple[int, str, Decimal, int, Decimal], ...] | None = None,
+) -> None:
+    """Append the killed cycle's per-sibling audit evidence in chain order.
+
+    Each sibling leaves one execute-mode mint plan (the committed basis),
+    one stake plan naming the NFT, and the confirmed stake delivery - the
+    same records the production chain carries for the three live entries.
+    """
+    for token_id, symbol, budget, _liquidity, _mark in entries or TIMEOUT_ENTRIES:
+        audit.append(
+            AuditEventType.LP_MINT_PLANNED,
+            FakePlanPayload(mode="execute", budget_usdc=str(budget), symbol=symbol),
+            QUIET_INSTANT,
+        )
+        audit.append(
+            AuditEventType.LP_STAKE_PLANNED,
+            FakeStakePlanPayload(mode=mode, symbol=symbol, token_id=token_id),
+            QUIET_INSTANT,
+        )
+        audit.append(
+            AuditEventType.LP_EXECUTE_CONFIRMED,
+            FakeConfirmPayload(
+                outcome="confirmed",
+                action="stake",
+                role="gauge_deposit",
+                transaction_hash="0x" + "ee" * 32,
+            ),
+            QUIET_INSTANT,
+        )
+
+
+def timeout_runner(
+    tmp_path: Path,
+    *,
+    book: CycleStateBook | None = None,
+    reads: FakeReads | None = None,
+    seed: bool = True,
+) -> tuple[CycleRunner, FakeExecutor | None, AuditStore, CycleStateStore]:
+    """Assemble one selector runner over the incident board and balances."""
+    assembled = make_runner(
+        tmp_path,
+        book=book if book is not None else timeout_book(),
+        reads=reads if reads is not None else timeout_reads(),
+        sources=TimeoutCycleSources(usdc_units=32_330_000),
+        balances=FakeBalances(usdc_units=32_330_000),
+        symbol=None,
+    )
+    if seed:
+        seed_timeout_entries(assembled[2])
+    return assembled
+
+
+class TestTimeoutMultiEntryRecovery:
+    """The 2026-09-30 timeout incident, pinned end to end.
+
+    Production evidence (data/aero-bot-cycle-timeout/report.md): the 11:46 UTC
+    cycle minted and gauge-staked TSLAc 7311805, METAc 7312392, and SNDKc
+    7312807 beside the surviving MSTRc 7310376; systemd's thirty-minute
+    timeout terminated the service before the aggregate book save, and the
+    next cycles enumerated a Safe-owned inventory that cannot see gauge
+    custody - equity marked 68.53 against the 104.23 day anchor and the
+    daily-loss halt latched on the phantom 36-USDC drawdown. The cycle now
+    checkpoints the book after every completed mint-and-stake pair and
+    recovers audit-proven gauge custody in the reconcile, so the killed
+    cycle's completed siblings are priced into equity before the latch
+    observes anything.
+    """
+
+    def test_the_next_cycle_recovers_the_staked_siblings_and_equity(self, tmp_path: Path) -> None:
+        """Equity reads the whole book (about 104.23), not the phantom 68.53."""
+        runner, _, _, state_store = timeout_runner(tmp_path)
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert report.halted_reason == ""
+        assert report.reconciliation.out_of_band == ""
+        assert report.equity_usd == Decimal("104.228421317312414697474")
+        assert any("gate daily_loss_halt: PASS" in line for line in report.decision_diagnostics)
+        book = state_store.load()
+        assert {position.token_id for position in book.positions} == {
+            TIMEOUT_SIBLING_TOKEN_ID,
+            7_311_805,
+            7_312_392,
+            7_312_807,
+        }
+        assert book.halted_day is None
+
+    def test_recovery_diagnostics_name_the_killeds_cycles_evidence(self, tmp_path: Path) -> None:
+        """The reconcile says which NFTs it recovered and why it can prove them."""
+        runner, _, _, _ = timeout_runner(tmp_path)
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        diagnostics = decision_recon.diagnostics
+        for token_id, symbol, _budget, _liquidity, _mark in TIMEOUT_ENTRIES:
+            assert any(
+                f"recovering audit-proven position NFT {token_id} on {symbol}" in line
+                for line in diagnostics
+            ), (token_id, diagnostics)
+        assert any("stake plan" in line and "prove" in line for line in diagnostics), diagnostics
+
+    def test_the_committed_basis_comes_from_the_audited_mint_plan(self, tmp_path: Path) -> None:
+        """Each recovered position carries its own period's mint budget."""
+        runner, _, _, state_store = timeout_runner(tmp_path)
+
+        runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        committed = {
+            position.token_id: position.committed_usd for position in state_store.load().positions
+        }
+        for token_id, _symbol, budget, _liquidity, _mark in TIMEOUT_ENTRIES:
+            assert committed[token_id] == budget
+
+    def test_recovery_is_idempotent_across_cycles(self, tmp_path: Path) -> None:
+        """The cycle after the recovery tracks the same four, no duplicates."""
+        runner, _, _, state_store = timeout_runner(tmp_path)
+
+        first = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+        first_recon = first.decision_reconciliation
+        assert first_recon is not None
+        assert len(first_recon.recovered_positions) == 3
+
+        second = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+        second_recon = second.decision_reconciliation
+        assert second_recon is not None
+        assert second_recon.recovered_positions == ()
+        assert second.halted_reason == ""
+        book = state_store.load()
+        assert len(book.positions) == 4
+        assert len({position.token_id for position in book.positions}) == 4
+
+    def test_the_phantom_latch_clears_through_verified_recovery(self, tmp_path: Path) -> None:
+        """The already-latched book (the live 12:28 shape) unlatches honestly."""
+        runner, _, _, state_store = timeout_runner(
+            tmp_path, book=timeout_book(halted=QUIET_INSTANT.date())
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert any("gate daily_loss_halt: PASS" in line for line in report.decision_diagnostics)
+        assert state_store.load().halted_day is None
+        assert len(state_store.load().positions) == 4
+
+    def test_a_real_loss_still_latches_after_recovery(self, tmp_path: Path) -> None:
+        """Recovered positions marked genuinely down still trip the halt."""
+        runner, _, _, state_store = timeout_runner(
+            tmp_path,
+            reads=timeout_reads(recovered_values=(Decimal("4"), Decimal("4.2"), Decimal("3.5"))),
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        # The siblings still adopt (honest equity over the real marks)...
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        assert len(decision_recon.recovered_positions) == 3
+        assert report.equity_usd == Decimal("80.228421317312414697474")
+        # ...and the 23-percent real drawdown from the 104.23 anchor latches.
+        assert any("gate daily_loss_halt: FAIL" in line for line in report.decision_diagnostics)
+        assert state_store.load().halted_day == QUIET_INSTANT.date()
+
+    def test_dry_run_stake_plans_never_adopt(self, tmp_path: Path) -> None:
+        """Rehearsal evidence cannot prove custody; nothing adopts from it."""
+        runner, _, audit, state_store = timeout_runner(tmp_path, seed=False)
+        seed_timeout_entries(audit, mode="dry_run")
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        assert decision_recon.recovered_positions == ()
+        assert len(state_store.load().positions) == 1
+
+    def test_stranger_custody_on_a_proven_position_refuses(self, tmp_path: Path) -> None:
+        """A stake-plan NFT held by a stranger refuses the cycle out-of-band."""
+        stranger = "0x" + "77" * 20
+        reads = timeout_reads()
+        reads.set_status(
+            7_311_805,
+            timeout_status("TSLAc", 7_311_805, value=Decimal("12"), owner=stranger),
+        )
+        runner, _, _, _ = timeout_runner(tmp_path, reads=reads)
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert "owned by" in report.reconciliation.out_of_band
+        assert report.halted_reason == report.reconciliation.out_of_band
+
+    def test_burned_history_candidates_skip_quietly(self, tmp_path: Path) -> None:
+        """An exited position's stale stake plan adopts nothing and refuses nothing."""
+        runner, _, audit, _ = timeout_runner(tmp_path, seed=False)
+        seed_timeout_entries(audit)
+        # A long-gone exited position: its NFT no longer resolves on-chain
+        # (the fake reads refuse any unscripted status read).
+        audit.append(
+            AuditEventType.LP_STAKE_PLANNED,
+            FakeStakePlanPayload(mode="execute", symbol="TSLAc", token_id=111),
+            QUIET_INSTANT,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert report.reconciliation.out_of_band == ""
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        assert len(decision_recon.recovered_positions) == 3
+
+    def test_a_stake_plan_left_unstaked_adopts_and_the_live_cycle_restakes(
+        self, tmp_path: Path
+    ) -> None:
+        """The sibling crash-entry gap: mint staked nothing, NFT still in the Safe.
+
+        The NFT sits in the anchor pool's own inventory beside the tracked
+        sibling - the exact shape the old reconcile refused out-of-band
+        (untracked beside tracked) and the old empty-book-only adoption
+        could never reach.
+        """
+        reads = FakeReads(inventory_with_ids((7_311_805,)))
+        reads.set_status(
+            TIMEOUT_SIBLING_TOKEN_ID,
+            timeout_status("MSTRc", TIMEOUT_SIBLING_TOKEN_ID, value=Decimal("36.2")),
+        )
+        reads.set_status(
+            7_311_805,
+            timeout_status("TSLAc", 7_311_805, value=Decimal("12"), owner=SAFE_ADDRESS),
+        )
+        runner, executor, audit, state_store = timeout_runner(tmp_path, reads=reads, seed=False)
+        seed_timeout_entries(audit, entries=(TIMEOUT_ENTRIES[0],))
+        assert executor is not None
+
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=TIMEOUT_REFERENCES,
+        )
+
+        assert report.reconciliation.out_of_band == ""
+        assert ("stake", "TSLAc", 7_311_805) in executor.calls
+        book = state_store.load()
+        assert {position.token_id for position in book.positions} == {
+            TIMEOUT_SIBLING_TOKEN_ID,
+            7_311_805,
+        }
+
+    def test_a_hard_interruption_mid_act_leaves_the_completed_siblings_saved(
+        self, tmp_path: Path
+    ) -> None:
+        """The timeout itself: three entries planned, killed on the third mint."""
+        runner, executor, _, state_store = timeout_runner(
+            tmp_path,
+            book=CycleStateBook(day=QUIET_INSTANT.date()),
+            reads=FakeReads(timeout_empty_inventory()),
+            seed=False,
+        )
+        assert executor is not None
+        executor.mint_token_ids = [7_311_805, 7_312_392, 7_312_807]
+        executor.interrupt_on_mint = 3
+
+        with pytest.raises(KeyboardInterrupt):
+            runner.run(
+                CycleMode.LIVE,
+                key_bytes=b"\x01" * 32,
+                reference_prices_by_symbol=TIMEOUT_REFERENCES,
+            )
+
+        # The two completed mint-and-stake pairs already persisted: the
+        # aggregate save never ran, but the per-sibling checkpoints did.
+        assert {position.token_id for position in state_store.load().positions} == {
+            7_311_805,
+            7_312_392,
+        }
+
+    def test_no_checkpoint_lands_before_the_stake_confirms(self, tmp_path: Path) -> None:
+        """A refused stake leaves the store flat: no half-saved position."""
+        runner, executor, _, state_store = timeout_runner(
+            tmp_path,
+            book=CycleStateBook(day=QUIET_INSTANT.date()),
+            reads=FakeReads(timeout_empty_inventory()),
+            seed=False,
+        )
+        assert executor is not None
+        executor.refuse_next = "stake"
+
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=TIMEOUT_REFERENCES,
+        )
+
+        assert "refused" in report.halted_reason
+        assert state_store.load().positions == ()
 
 
 class TestSelectorCycles:

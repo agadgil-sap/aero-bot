@@ -44,7 +44,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal, localcontext
+from decimal import Decimal, InvalidOperation, localcontext
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, Protocol
@@ -75,6 +75,7 @@ from aero_bot.execution_lock import ExecutionLockUnavailableError, exclusive_exe
 from aero_bot.executor import (
     DEFAULT_CANARY_SAFE_ADDRESS,
     SAFE_ADDRESS_ENV,
+    ExecutionMode,
     ExecutionUnavailableError,
 )
 from aero_bot.history import price_usdc_per_stock
@@ -201,6 +202,14 @@ POST_ACTION_VISIBILITY_BASE_BACKOFF_SECONDS = 0.5
 POST_ACTION_VISIBILITY_MAX_BACKOFF_SECONDS = 4.0
 # The policy day boundary follows the engine's America/New_York convention.
 POLICY_TIMEZONE = ZoneInfo("America/New_York")
+
+
+# The bounded count of untracked stake-plan candidates one reconcile
+# verifies: the book holds at most ten concurrent positions, and a killed
+# cycle's completed siblings always sit at the newest end of the audit
+# chain, so the newest dozen candidates cover every incident shape however
+# long the chain grows.
+STAKE_RECOVERY_CANDIDATE_LIMIT = 12
 
 
 def _cycle_progress(line: str) -> None:
@@ -624,6 +633,35 @@ class PositionStatusRecord(BaseModel):
     status: LpPositionStatusReport
 
 
+class RecoveredPositionRecord(BaseModel):
+    """Carry one audit-proven untracked position's recovery evidence.
+
+    The 2026-09-30 timeout incident: a killed multi-entry cycle leaves its
+    completed siblings staked in their gauges, invisible to the Safe-owned
+    inventory, and the next cycle marks their value as a loss. This record
+    is the reconcile's proof that one such NFT is ours - the audit chain's
+    execute-mode stake plan naming it, verified against its live custody.
+    """
+
+    # Frozen strict fields keep one record coherent.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The registry-matched stock symbol the stake plan named.
+    symbol: str
+    # The position NFT id the stake plan named.
+    token_id: Annotated[int, Field(ge=0)]
+    # The pool the live status read resolved the position in.
+    pool_address: EvmAddress
+    # The audited mint plan's budget, the committed basis at entry.
+    committed_usd: Annotated[Decimal, Field(gt=0)]
+    # The stake plan record's instant, the entry's proven timestamp.
+    entered_at: datetime
+    # Whether the verified custody is the pool's gauge (True) or the Safe.
+    staked: bool
+    # The position's live status read backing the custody verification.
+    status: LpPositionStatusReport
+
+
 class CycleReconciliation(BaseModel):
     """Carry one coherent on-chain reconciliation snapshot."""
 
@@ -663,6 +701,12 @@ class CycleReconciliation(BaseModel):
     # leaves exactly this shape tracked, and a stale tracking re-commands
     # a dead NFT every cycle (the 2026-09-28 position_empty halt loop).
     empty_tracked_token_ids: Annotated[tuple[int, ...], Field(min_length=0)] = ()
+    # Every audit-proven position recovered this cycle: untracked NFTs
+    # whose execute-mode stake plan the audit chain carries and whose live
+    # custody verifies as ours - the killed multi-entry cycle's gauge-held
+    # siblings the Safe-owned inventory cannot see (the 2026-09-30 timeout
+    # incident's phantom 36-USDC drawdown). Empty when nothing recovers.
+    recovered_positions: tuple[RecoveredPositionRecord, ...] = ()
     # The held-inventory quantity in whole stock tokens, zero when none.
     held_stock_quantity: Annotated[Decimal, Field(ge=0)] = Decimal("0")
     # The symbol whose stock balance held_stock_quantity measures; None
@@ -1623,6 +1667,7 @@ class CycleRunner:
                 for empty_token_id in reconciliation.empty_tracked_token_ids:
                     book = _book_with_position_removed(book, empty_token_id)
             book = self._adopt_into_book(book, reconciliation)
+            book = self._fold_recovered_positions(book, reconciliation)
             decision_report = self._decide(
                 book,
                 reference_price_usdc,
@@ -1897,12 +1942,41 @@ class CycleRunner:
                     f"tracked position {tracked.token_id} is unstaked in the Safe; "
                     "a live HOLD cycle will attempt bounded stake recovery before returning"
                 )
+        # The killed-multi-entry recovery (the 2026-09-30 timeout incident):
+        # completed siblings staked in their gauges are invisible to the
+        # Safe-owned inventory, so the audit chain's own evidence - one
+        # execute-mode stake plan per completed sibling - verifies their
+        # live custody and recovers them beside any surviving tracked
+        # sibling before the equity observation judges anything.
+        recovered: list[RecoveredPositionRecord] = []
+        if not out_of_band:
+            recovered, custody_refusal = self._recover_audit_proven_positions(
+                tracked_ids, diagnostics
+            )
+            if custody_refusal:
+                out_of_band = custody_refusal
+            for record in recovered:
+                position_statuses.append(
+                    PositionStatusRecord(
+                        symbol=record.symbol,
+                        token_id=record.token_id,
+                        pool_address=record.pool_address,
+                        committed_usd=record.committed_usd,
+                        staked=record.staked,
+                        status=record.status,
+                    )
+                )
+        recovered_ids = {record.token_id for record in recovered}
         if position_statuses and not out_of_band:
             primary = position_statuses[0]
             tracked_status = primary.status
             tracked_token_id = primary.token_id
             tracked_staked = primary.staked
-            untracked_live = tuple(token for token in live_ids if token not in tracked_ids)
+            untracked_live = tuple(
+                token
+                for token in live_ids
+                if token not in tracked_ids and token not in recovered_ids
+            )
             if untracked_live:
                 out_of_band = (
                     f"live untracked position NFT(s) {untracked_live} sit beside the "
@@ -2004,7 +2078,129 @@ class CycleRunner:
             out_of_band=out_of_band,
             diagnostics=tuple(diagnostics),
             empty_tracked_token_ids=tuple(empty_tracked),
+            recovered_positions=tuple(recovered),
         )
+
+    def _recover_audit_proven_positions(
+        self,
+        tracked_ids: set[int],
+        diagnostics: list[str],
+    ) -> tuple[list[RecoveredPositionRecord], str]:
+        """Recover audit-proven untracked positions from their live custody.
+
+        A killed multi-entry cycle (the 2026-09-30 thirty-minute systemd
+        timeout) leaves its completed siblings staked in their gauges: the
+        Safe-owned inventory cannot see gauge custody, so the next cycle
+        omits their value from equity and the daily-loss latch reads the
+        omission as a drawdown. The audit chain carries the proof - one
+        execute-mode stake plan per completed sibling naming the NFT and
+        its pool - and the live status read verifies the custody. Only
+        evidence both the audit chain and the chain state prove adopts;
+        anything else skips quietly (burned history) or refuses the cycle
+        (proven custody violated).
+
+        Args:
+            tracked_ids: Every tracked position's NFT id.
+            diagnostics: The reconciliation's evidence lines.
+
+        Returns:
+            The recovered records and any out-of-band refusal (empty when
+            none).
+        """
+        if self._audit_reader is None:
+            return [], ""
+        plans: dict[int, tuple[str, Decimal, datetime]] = {}
+        last_budget_by_symbol: dict[str, Decimal] = {}
+        for record in self._audit_reader.recent_records():
+            payload = json.loads(record.payload_json)
+            if record.event_type is AuditEventType.LP_MINT_PLANNED:
+                # Only execute-mode plans price real deployments; rehearsal
+                # plans price intentions.
+                if payload.get("mode") != ExecutionMode.EXECUTE.value:
+                    continue
+                symbol = payload.get("symbol")
+                budget = payload.get("budget_usdc")
+                if not isinstance(symbol, str) or not isinstance(budget, str):
+                    continue
+                try:
+                    budget_value = Decimal(budget)
+                except InvalidOperation:
+                    continue
+                if budget_value > 0:
+                    last_budget_by_symbol[symbol] = budget_value
+                continue
+            if record.event_type is not AuditEventType.LP_STAKE_PLANNED:
+                continue
+            if payload.get("mode") != ExecutionMode.EXECUTE.value:
+                continue
+            token_id = payload.get("token_id")
+            symbol = payload.get("symbol")
+            if not isinstance(token_id, int) or not isinstance(symbol, str):
+                continue
+            if token_id in tracked_ids or token_id in plans:
+                continue
+            budget = last_budget_by_symbol.get(symbol)
+            if budget is None:
+                # No audited mint basis for this sibling: nothing honest to
+                # commit against, so nothing adopts.
+                continue
+            plans[token_id] = (symbol, budget, record.created_at)
+        recovered: list[RecoveredPositionRecord] = []
+        # Newest plans first, bounded: the book holds at most ten concurrent
+        # positions, so the newest dozen untracked candidates cover every
+        # killed cycle's completed siblings however long the chain grows.
+        for token_id, (symbol, budget, entered_at) in sorted(
+            plans.items(), key=lambda item: item[1][2], reverse=True
+        )[:STAKE_RECOVERY_CANDIDATE_LIMIT]:
+            try:
+                status = self._reads.position_status(symbol, token_id)
+            except (LpExecutionRefusalError, ExecutionUnavailableError, ValueError):
+                # Burned or unresolvable history - an exited position's
+                # stale plan, or a pool that left the registry. Nothing
+                # adopts and nothing refuses.
+                continue
+            owner = normalize_evm_address(status.token_owner_address)
+            gauge = normalize_evm_address(status.gauge_address)
+            view = getattr(status, "position", None)
+            liquidity = getattr(view, "liquidity", 0)
+            owed_fees = (
+                getattr(status, "fees_owed0_units", 0) > 0
+                or getattr(status, "fees_owed1_units", 0) > 0
+            )
+            if owner != self._safe_address and owner != gauge:
+                return recovered, (
+                    f"audit-proven position NFT {token_id} on {symbol} is owned by "
+                    f"{owner}, which is neither the Safe nor the pool's gauge; refusing "
+                    "the cycle"
+                )
+            if liquidity <= 0 and not owed_fees:
+                # An empty residual NFT carries no exposure (the crashed-exit
+                # doctrine); it never adopts and never blocks.
+                continue
+            staked = owner == gauge
+            marked = (
+                str(status.position_value_usdc)
+                if status.position_value_usdc is not None
+                else "an unmeasured"
+            )
+            recovered.append(
+                RecoveredPositionRecord(
+                    symbol=symbol,
+                    token_id=token_id,
+                    pool_address=normalize_evm_address(status.pool_address),
+                    committed_usd=budget,
+                    entered_at=entered_at,
+                    staked=staked,
+                    status=status,
+                )
+            )
+            diagnostics.append(
+                f"recovering audit-proven position NFT {token_id} on {symbol} "
+                f"({'staked in the gauge' if staked else 'held in the Safe'}) valued "
+                f"{marked} USDC against {budget} committed: the killed cycle's "
+                "execute-mode stake plan and the live custody read prove it ours"
+            )
+        return recovered, ""
 
     def _await_post_action_visibility(self, actions: tuple[CycleActionRecord, ...]) -> bool:
         """Wait until the primary RPC reaches every confirmed action's inclusion block.
@@ -2182,6 +2378,63 @@ class CycleRunner:
         if not updates:
             return book
         return book.model_copy(update=updates)
+
+    def _fold_recovered_positions(
+        self, book: CycleStateBook, reconciliation: CycleReconciliation
+    ) -> CycleStateBook:
+        """Fold the reconcile's recovered positions into the book.
+
+        Every recovered record is chain truth the book owes a tracking row:
+        the equity observation, the held folds, and the total cap all see
+        the position the moment it folds. When the recovery proves the
+        prior cycle's equity reading omitted value, the daily-loss latch
+        carried for today is dropped for re-derivation - the engine's own
+        day observation re-latches immediately on any real drawdown, so a
+        phantom latch from omitted siblings clears exactly here while a
+        real loss never stops protecting (the 2026-09-30 timeout
+        incident's fail-closed containment ending through verified
+        reconciliation, never a manual reset).
+
+        Args:
+            book: The reconciled book before the fold.
+            reconciliation: The reconciliation carrying the recovery.
+
+        Returns:
+            The book with every recovered position tracked.
+        """
+        if not reconciliation.recovered_positions:
+            return book
+        existing = {position.token_id for position in book.positions}
+        additions = tuple(
+            TrackedPosition(
+                symbol=record.symbol,
+                token_id=record.token_id,
+                pool_address=record.pool_address,
+                committed_usd=record.committed_usd,
+                entered_at=record.entered_at,
+            )
+            for record in reconciliation.recovered_positions
+            if record.token_id not in existing
+        )
+        if not additions:
+            return book
+        folded = book.model_copy(update={"positions": tuple(book.positions) + additions})
+        _cycle_progress(
+            "recovered audit-proven positions into the book: "
+            + ", ".join(
+                f"{record.symbol} NFT {record.token_id}"
+                for record in reconciliation.recovered_positions
+            )
+        )
+        today = self._now().astimezone(POLICY_TIMEZONE).date()
+        if folded.halted_day == today:
+            folded = folded.model_copy(update={"halted_day": None})
+            _cycle_progress(
+                "the carried daily-loss latch is dropped for re-derivation over the "
+                "recovered book: the prior equity reading omitted the recovered "
+                "positions, and the engine re-latches on any real drawdown"
+            )
+        return folded
 
     def _last_mint_plan(self) -> tuple[Decimal | None, str | None]:
         """Read the newest audited mint plan, the adoption cost basis.
@@ -3679,7 +3932,22 @@ class CycleRunner:
             committed_usd=committed,
             entered_at=self._now(),
         )
-        return _book_with_position_added(book.model_copy(update={"held_inventory": None}), tracked)
+        entered = _book_with_position_added(
+            book.model_copy(update={"held_inventory": None}), tracked
+        )
+        # The per-sibling durability checkpoint (the 2026-09-30 timeout
+        # incident): the mint and its gauge stake are confirmed on-chain,
+        # so the book persists this position the moment it exists. An
+        # interruption between siblings - the thirty-minute service
+        # timeout, a crash, a host loss - can never again leave completed
+        # positions outside the book for the next cycle's equity
+        # observation to misread as a loss.
+        self._state_store.save(entered)
+        _cycle_progress(
+            f"book checkpoint saved: {symbol} position NFT {token_id} minted, "
+            "staked, and tracked; the aggregate rebuild still ends the cycle"
+        )
+        return entered
 
     def _position_staked(self, token_id: int) -> bool:
         """Read one position's staked custody from the decision reconciliation.
