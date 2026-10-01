@@ -86,6 +86,7 @@ from aero_bot.lp_executor import (
     EXIT_REFUSED,
     NFPM_INCREASE_LIQUIDITY_TOPIC0,
     LpActionExecutionReport,
+    LpExecutionRefusalCode,
     LpExecutionRefusalError,
     LpPositionStatusReport,
     LpSafePositionsSnapshot,
@@ -1754,14 +1755,16 @@ class CycleRunner:
                 action.action == "stake_recovery" and action.status == "completed"
                 for action in actions
             )
-            if (
-                stake_recovery_completed
-                and not final_reconciliation.tracked_staked
-                and not halted_reason
-            ):
+            unstaked_after_recovery = tuple(
+                record.token_id
+                for record in final_reconciliation.position_statuses
+                if not record.staked
+            )
+            if stake_recovery_completed and unstaked_after_recovery and not halted_reason:
                 halted_reason = (
-                    "stake recovery was confirmed but final reconciliation still sees the "
-                    "tracked NFT unstaked; leaving the cycle fail-closed for the next retry"
+                    "stake recovery was confirmed but final reconciliation still sees "
+                    f"position NFT(s) {list(unstaked_after_recovery)} unstaked; leaving "
+                    "the cycle fail-closed for the next retry"
                 )
             if not final_reconciliation_verified:
                 final_reconciliation = final_reconciliation.model_copy(
@@ -2094,10 +2097,13 @@ class CycleRunner:
         omits their value from equity and the daily-loss latch reads the
         omission as a drawdown. The audit chain carries the proof - one
         execute-mode stake plan per completed sibling naming the NFT and
-        its pool - and the live status read verifies the custody. Only
-        evidence both the audit chain and the chain state prove adopts;
-        anything else skips quietly (burned history) or refuses the cycle
-        (proven custody violated).
+        its pool, the plan's recorded owner being this Safe - and the live
+        status read verifies the custody. Only evidence both the audit
+        chain and the chain state prove adopts; anything else skips
+        quietly (burned history) or refuses the cycle (proven custody
+        violated). Pinned cycles never fold cross-symbol rows into their
+        single-position book: they skip the recovery and say so, leaving
+        the heal to the next selector cycle.
 
         Args:
             tracked_ids: Every tracked position's NFT id.
@@ -2137,6 +2143,13 @@ class CycleRunner:
             symbol = payload.get("symbol")
             if not isinstance(token_id, int) or not isinstance(symbol, str):
                 continue
+            plan_owner = payload.get("token_owner_address")
+            if not isinstance(plan_owner, str) or plan_owner.lower() != self._safe_address:
+                # The audit store is shared by every Safe that executes
+                # through it and a gauge is a shared custodian, so only the
+                # plan's own recorded owner proves a candidate was minted
+                # for this Safe.
+                continue
             if token_id in tracked_ids or token_id in plans:
                 continue
             budget = last_budget_by_symbol.get(symbol)
@@ -2145,6 +2158,19 @@ class CycleRunner:
                 # commit against, so nothing adopts.
                 continue
             plans[token_id] = (symbol, budget, record.created_at)
+        if self._symbol is not None:
+            if plans:
+                committed = sum(
+                    (budget for _symbol, budget, _entered in plans.values()), Decimal("0")
+                )
+                diagnostics.append(
+                    f"pinned {self._symbol} cycle skips {len(plans)} audit-proven "
+                    f"untracked position candidate(s) {sorted(plans)} carrying "
+                    f"{committed} USDC committed: a pinned book prices one position "
+                    "only and never folds cross-symbol rows, so the next selector "
+                    "cycle verifies and recovers them"
+                )
+            return [], ""
         recovered: list[RecoveredPositionRecord] = []
         # Newest plans first, bounded: the book holds at most ten concurrent
         # positions, so the newest dozen untracked candidates cover every
@@ -2154,10 +2180,17 @@ class CycleRunner:
         )[:STAKE_RECOVERY_CANDIDATE_LIMIT]:
             try:
                 status = self._reads.position_status(symbol, token_id)
-            except (LpExecutionRefusalError, ExecutionUnavailableError, ValueError):
+            except LpExecutionRefusalError as error:
+                if getattr(error, "code", None) == LpExecutionRefusalCode.POSITION_NOT_OWNED:
+                    return recovered, (
+                        f"audit-proven position NFT {token_id} on {symbol} is owned by "
+                        f"a stranger ({error}); refusing the cycle"
+                    )
                 # Burned or unresolvable history - an exited position's
                 # stale plan, or a pool that left the registry. Nothing
                 # adopts and nothing refuses.
+                continue
+            except (ExecutionUnavailableError, ValueError):
                 continue
             owner = normalize_evm_address(status.token_owner_address)
             gauge = normalize_evm_address(status.gauge_address)
@@ -2338,6 +2371,7 @@ class CycleRunner:
         if (
             not book.positions
             and reconciliation.tracked_token_id is not None
+            and not reconciliation.recovered_positions
             and not reconciliation.out_of_band
         ):
             status = reconciliation.tracked_status
@@ -3073,14 +3107,18 @@ class CycleRunner:
         This recovery is intentionally narrow: reconciliation already proved
         every tracked token is owned by the Safe (not a stranger), the
         policy verdict is HOLD, and no normal policy action needs the NFT
-        unstaked. The existing audited stake executor remains the only
-        broadcast surface; one position's recovery failure stops the pass
-        exactly like any other action.
+        unstaked. Only a position the decision reconciliation recorded
+        unstaked is staked - restaking a gauge-held NFT is a broadcast the
+        executor always refuses. The existing audited stake executor
+        remains the only broadcast surface; one position's recovery
+        failure stops the pass exactly like any other action.
         """
         executor = self._executor
         assert executor is not None  # noqa: S101 - live run validated the boundary
         records: list[CycleActionRecord] = []
         for tracked in book.positions:
+            if self._position_staked(tracked.token_id):
+                continue
             try:
                 report = executor.execute_stake(
                     tracked.symbol,

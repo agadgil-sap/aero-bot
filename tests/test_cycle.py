@@ -129,6 +129,7 @@ class FakeStakePlanPayload(BaseModel):
     mode: str
     symbol: str
     token_id: int
+    token_owner_address: str = SAFE_ADDRESS
 
 
 class FakeCycleSources:
@@ -2034,15 +2035,16 @@ def timeout_runner(
     book: CycleStateBook | None = None,
     reads: FakeReads | None = None,
     seed: bool = True,
+    symbol: str | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, AuditStore, CycleStateStore]:
-    """Assemble one selector runner over the incident board and balances."""
+    """Assemble one runner over the incident board and balances."""
     assembled = make_runner(
         tmp_path,
         book=book if book is not None else timeout_book(),
         reads=reads if reads is not None else timeout_reads(),
         sources=TimeoutCycleSources(usdc_units=32_330_000),
         balances=FakeBalances(usdc_units=32_330_000),
-        symbol=None,
+        symbol=symbol,
     )
     if seed:
         seed_timeout_entries(assembled[2])
@@ -2187,6 +2189,145 @@ class TestTimeoutMultiEntryRecovery:
         assert "owned by" in report.reconciliation.out_of_band
         assert report.halted_reason == report.reconciliation.out_of_band
 
+    def test_a_position_not_owned_refusal_on_a_candidate_refuses(self, tmp_path: Path) -> None:
+        """The production custody read refuses strangers instead of returning.
+
+        The real executor's status read raises position_not_owned inside its
+        own ownership gate, never returning a stranger-owned status, so the
+        recovery must distinguish that code from burned history: a
+        Safe-proven NFT held by a stranger is equity the observation must
+        never silently omit.
+        """
+
+        class StrangerCustodyReads(FakeReads):
+            """Mirror the executor's ownership gate on the candidate ids."""
+
+            def __init__(self, base: FakeReads, refuse_ids: frozenset[int]) -> None:
+                super().__init__(base._snapshot)
+                self._statuses = dict(base._statuses)
+                self._refuse_ids = refuse_ids
+
+            def position_status(
+                self,
+                symbol: str,
+                token_id: int,
+                aero_price_usdc: Decimal | None = None,
+                entry_cost_usdc: Decimal | None = None,
+            ) -> LpPositionStatusReport:
+                if token_id in self._refuse_ids:
+                    raise LpExecutionRefusalError(
+                        LpExecutionRefusalCode.POSITION_NOT_OWNED,
+                        f"token {token_id} is owned by a stranger, which is neither "
+                        "this Safe nor the pool's gauge",
+                    )
+                return super().position_status(symbol, token_id, aero_price_usdc, entry_cost_usdc)
+
+        candidates = frozenset(token_id for token_id, *_ in TIMEOUT_ENTRIES)
+        runner, _, _, _ = timeout_runner(
+            tmp_path, reads=StrangerCustodyReads(timeout_reads(), candidates)
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert "owned by a stranger" in report.reconciliation.out_of_band
+        assert "refusing the cycle" in report.reconciliation.out_of_band
+        assert report.halted_reason == report.reconciliation.out_of_band
+
+    def test_a_foreign_safes_stake_plan_never_adopts(self, tmp_path: Path) -> None:
+        """A canary-flavored plan cannot leak its NFT into this book.
+
+        The audit store is shared by every Safe that executes through it
+        and a gauge is a shared custodian, so a foreign Safe's staked NFT
+        passes the live custody read; only the plan's own recorded owner
+        proves the candidate was minted for this runner's Safe.
+        """
+        foreign_safe = "0x" + "88" * 20
+        reads = timeout_reads()
+        reads.set_status(9_999_999, timeout_status("TSLAc", 9_999_999, value=Decimal("5")))
+        runner, _, audit, state_store = timeout_runner(tmp_path, reads=reads)
+        audit.append(
+            AuditEventType.LP_MINT_PLANNED,
+            FakePlanPayload(mode="execute", budget_usdc="5", symbol="TSLAc"),
+            QUIET_INSTANT,
+        )
+        audit.append(
+            AuditEventType.LP_STAKE_PLANNED,
+            FakeStakePlanPayload(
+                mode="execute",
+                symbol="TSLAc",
+                token_id=9_999_999,
+                token_owner_address=foreign_safe,
+            ),
+            QUIET_INSTANT,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert report.reconciliation.out_of_band == ""
+        book = state_store.load()
+        assert {position.token_id for position in book.positions} == {
+            TIMEOUT_SIBLING_TOKEN_ID,
+            7_311_805,
+            7_312_392,
+            7_312_807,
+        }
+
+    def test_a_pinned_cycle_skips_recovery_with_a_visible_reason(self, tmp_path: Path) -> None:
+        """A pinned book cannot represent cross-symbol rows, so it never folds.
+
+        The pinned surfaces price one position and the pinned rebuild writes
+        a single-position book, so folding recovered siblings in a pinned
+        cycle would wipe the very book it healed; the pinned cycle instead
+        skips the recovery and names the skipped candidates and their
+        committed value, leaving the heal to the next selector cycle.
+        """
+        runner, _, _, state_store = timeout_runner(tmp_path, symbol="MSTRc")
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        assert report.reconciliation.out_of_band == ""
+        assert report.reconciliation.recovered_positions == ()
+        skip_lines = [
+            line for line in report.reconciliation.diagnostics if "pinned MSTRc cycle skips" in line
+        ]
+        assert skip_lines, report.reconciliation.diagnostics
+        skip_line = skip_lines[0]
+        assert "3 audit-proven" in skip_line
+        assert "7311805" in skip_line and "7312392" in skip_line and "7312807" in skip_line
+        assert "USDC committed" in skip_line
+        book = state_store.load()
+        assert [position.token_id for position in book.positions] == [TIMEOUT_SIBLING_TOKEN_ID]
+
+    def test_an_empty_book_folds_each_recovered_siblings_own_labels(self, tmp_path: Path) -> None:
+        """The fold is the authoritative adoption for a recovered NFT.
+
+        A newer mint plan for a different symbol (every refused execute
+        mint records its plan) must never label a recovered NFT: pairing
+        that symbol with this pool's NFT would wedge every later cycle on
+        the wrong pool's position read.
+        """
+        runner, _, audit, state_store = timeout_runner(
+            tmp_path, book=CycleStateBook(day=QUIET_INSTANT.date())
+        )
+        audit.append(
+            AuditEventType.LP_MINT_PLANNED,
+            FakePlanPayload(mode="execute", budget_usdc="9", symbol="MSTRc"),
+            QUIET_INSTANT,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert report.reconciliation.out_of_band == ""
+        rows = {
+            position.token_id: (position.symbol, position.committed_usd)
+            for position in state_store.load().positions
+        }
+        assert rows == {
+            7_311_805: ("TSLAc", Decimal("13.64859652562234191269156890")),
+            7_312_392: ("METAc", Decimal("15.08330000")),
+            7_312_807: ("SNDKc", Decimal("6.923894099820873036278282779")),
+        }
+
     def test_burned_history_candidates_skip_quietly(self, tmp_path: Path) -> None:
         """An exited position's stale stake plan adopts nothing and refuses nothing."""
         runner, _, audit, _ = timeout_runner(tmp_path, seed=False)
@@ -2236,7 +2377,7 @@ class TestTimeoutMultiEntryRecovery:
         )
 
         assert report.reconciliation.out_of_band == ""
-        assert ("stake", "TSLAc", 7_311_805) in executor.calls
+        assert executor.calls == [("stake", "TSLAc", 7_311_805)]
         book = state_store.load()
         assert {position.token_id for position in book.positions} == {
             TIMEOUT_SIBLING_TOKEN_ID,
