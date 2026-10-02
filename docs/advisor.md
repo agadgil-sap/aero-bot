@@ -43,6 +43,9 @@ The seat's availability hardened into a dedicated serving architecture, after th
 
 **Measured latencies** (qwen3.6:35b-a3b, native protocol, thinking off, JSON mode on, three replayed real windows): warm 2.1 s, 3.4 s, 3.8 s; cold load 3.3 s page-cached (NVMe-bounded single digits after a reboot); pin verified - the model stays resident with a far-future expiry and zero evictions across windows. One operational caution the measurements surfaced: two Ollama servers must not hold the same ~22 GB model at once (44 GB into a 37.4 GB GPU wedges Metal into command-buffer failures that surface as `http_status` error envelopes), which is exactly why the student model's home is the dedicated plane alone and the fallback leaves the shared instance's eviction policy untouched.
 
+**Sealing the planes on the VM.** The documented contract is primary `http://100.106.111.37:11435` (dedicated) with `AERO_BOT_ADVISOR_FALLBACK_URL=http://100.106.111.37:11434` (shared) sealed behind it in `/etc/aero-bot/advisor.env`.
+The installer's template ships exactly that pair, but a seal written before the dedicated-plane era survives every deploy untouched by design - the 2026-09-28 misconfiguration (shared plane as primary, no fallback) kept the student dark for 36 hours while deploys passed green, which is why every deploy now warns on seal drift and `deploy/seal-repair.sh` exists as the guarded idempotent repair (see [the deployment documentation](deployment.md#seal-drift-and-repair)).
+
 ## One pass
 
 1. **Compose the facts.** The monitor reads the most recent audit records (default window 40), filters to `cycle_reported` summaries, and joins the cycle book: the tracked position and its committed value, the persisted out-of-range wait, the latest report's day economics and fee evidence, halt and action counts, the distinct decision reasons, and re-entry cooldowns.

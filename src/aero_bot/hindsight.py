@@ -79,12 +79,29 @@ DEFAULT_HINDSIGHT_HORIZON_HOURS = 24.0
 HINDSIGHT_HORIZON_BOUNDS = (1.0, 168.0)
 # How many samples the scoreboard's bounded series carry.
 HINDSIGHT_SERIES_MAX = 24
+# The observation-density bar a quiet verdict must clear: at least this
+# many later grounded episodes inside the horizon. A quiet grade is the
+# corpus's false-positive control class - without it every flag-rate
+# number is sensitivity-only - so a quiet verdict must rest on a real
+# observation density (an hour-plus of the five-minute cadence), never on
+# a drained horizon whose tail holds one or two episodes around a Mac
+# sleep gap. Below the bar the verdict stays pending, never guessed quiet.
+HINDSIGHT_QUIET_MIN_FOLLOWERS = 12
+# The report's honest label while the quiet control class carries no
+# volume: flag-rate numbers read like proof (a 172/172 flagged-bad run)
+# when the corpus has never once observed a desk's flag landing on a
+# quiet window, so the report says so instead.
+HINDSIGHT_SENSITIVITY_ONLY_STAMP = "sensitivity-only, no quiet controls"
 # The self-describing truth rule pinned into every report.
 HINDSIGHT_TRUTH_RULE = (
     "a brief is scored against any later episode within the horizon whose "
     "facts show a negative day P&L or a higher halted-cycle count; a brief "
     "stays pending until its horizon has fully elapsed or a bad outcome is "
-    "observed; absences are counted per typed reason and never scored"
+    "observed; a quiet verdict - the false-positive control class - "
+    f"additionally requires at least {HINDSIGHT_QUIET_MIN_FOLLOWERS} later "
+    "grounded episodes inside the horizon, so a quiet grade always rests "
+    "on a real observation density instead of a sparse tail; absences are "
+    "counted per typed reason and never scored"
 )
 # The teacher seats' absence labels that mean no question was asked.
 UNASKED_REASONS = frozenset({"dark", "window_unreachable"})
@@ -196,6 +213,23 @@ class HindsightCalibration(BaseModel):
             + self.unflagged_quiet
             + self.pending
         )
+
+    @property
+    def quiet_sample(self) -> int:
+        """Count the quiet-control windows this desk was graded against."""
+        return self.flagged_quiet + self.unflagged_quiet
+
+    @property
+    def false_positive_rate(self) -> float | None:
+        """Report the flag rate over quiet windows, else None while unsampled.
+
+        This is the desk's false-positive rate - a flagged-quiet window is
+        a flag that landed on a horizon where nothing bad followed. It is
+        measurable only once quiet controls carry volume; None keeps the
+        report honest instead of dividing by zero.
+        """
+        quiet = self.quiet_sample
+        return self.flagged_quiet / quiet if quiet else None
 
 
 class CountedReason(BaseModel):
@@ -375,6 +409,13 @@ class HindsightReport(BaseModel):
     episode_count: Annotated[int, Field(ge=0)]
     # How many episodes carried pulled facts (the scoreable timeline).
     grounded_episode_count: Annotated[int, Field(ge=0)]
+    # How many calibrated episodes graded quiet (the false-positive
+    # control class); defaults so older reports stay loadable.
+    quiet_episode_count: Annotated[int, Field(ge=0)] = 0
+    # The honest calibration label: the sensitivity-only stamp while the
+    # quiet control class carries no volume, else the quiet-control
+    # status; defaults so older reports stay loadable.
+    calibration_caveat: str = ""
     # One score per desk, teacher seats first then the student.
     desks: tuple[HindsightDeskScore, ...] = ()
     # The latest economics and bounded series for context.
@@ -496,6 +537,7 @@ def _bad_outcome_followed(
     grounded_tail: Sequence[TeacherEpisode],
     horizon: timedelta,
     now: datetime,
+    min_quiet_followers: int = HINDSIGHT_QUIET_MIN_FOLLOWERS,
 ) -> bool | None:
     """Decide whether a bad outcome followed one grounded episode.
 
@@ -507,35 +549,44 @@ def _bad_outcome_followed(
         now: The scoring pass's reference time; a quiet verdict requires
             the horizon to have fully elapsed, because more truth may
             still arrive.
+        min_quiet_followers: The observation-density bar a quiet verdict
+            must clear - at least this many later grounded episodes
+            inside the horizon, so a quiet grade (the false-positive
+            control class) never rests on a sparse tail.
 
     Returns:
         True when any later grounded episode inside the horizon observed
         a negative day P&L or a higher halted-cycle count, False when the
-        horizon has fully elapsed with only quiet observations, None
-        while the read stays pending (no later grounded episode inside
-        the horizon, or the horizon has not yet elapsed).
+        horizon has fully elapsed with only quiet observations at the
+        required density, None while the read stays pending (a bad
+        outcome is unobserved and either the horizon has not elapsed or
+        the quiet density bar is unmet).
     """
     baseline = episode.facts
     if baseline is None:
         return None
     limit = episode.created_at + horizon
-    observed = False
+    observed = 0
     for follower in grounded_tail:
         facts = follower.facts
         if facts is None:
             continue
         if not episode.created_at < follower.created_at <= limit:
             continue
-        observed = True
+        observed += 1
         day_pnl = _parse_usdc(facts.day_pnl_usdc)
         if day_pnl is not None and day_pnl < 0.0:
             return True
         if facts.halted_count > baseline.halted_count:
             return True
-    if not observed:
+    if observed == 0:
         return None
     # Quiet so far: quiet is only final once the horizon has drained.
     if now < limit:
+        return None
+    # A drained horizon is not enough: a quiet grade is the corpus's
+    # false-positive control, so it must rest on real observation density.
+    if observed < min_quiet_followers:
         return None
     return False
 
@@ -1069,6 +1120,19 @@ def score_corpus(
     scored = episode_verdicts(episodes, horizon_hours, moment)
     grounded = [episode for episode, _ in scored]
     verdicts: dict[int, bool | None] = {id(episode): verdict for episode, verdict in scored}
+    # The quiet control class: calibrated episodes whose drained horizons
+    # stayed clean at the required density. Zero volume means every flag
+    # rate below is sensitivity-only, and the report must say so.
+    quiet_episode_count = sum(
+        1
+        for episode, verdict in scored
+        if verdict is False and episode.stream in CALIBRATED_STREAMS
+    )
+    calibration_caveat = (
+        HINDSIGHT_SENSITIVITY_ONLY_STAMP
+        if quiet_episode_count == 0
+        else f"quiet controls: {quiet_episode_count} drained windows carry volume"
+    )
     view_grades = grade_corpus_views(episodes, horizon_hours, moment)
     desks: list[HindsightDeskScore] = []
     for seat in TeacherSeatName:
@@ -1110,6 +1174,8 @@ def score_corpus(
         horizon_hours=horizon_hours,
         episode_count=len(episodes),
         grounded_episode_count=len(grounded),
+        quiet_episode_count=quiet_episode_count,
+        calibration_caveat=calibration_caveat,
         desks=tuple(desks),
         scoreboard=scoreboard,
     )
@@ -1172,13 +1238,20 @@ def print_report(report: HindsightReport) -> None:
             print(f"    absent {counted.reason}: {counted.count}")
         calibration = desk.calibration
         if calibration.answered:
+            # The false-positive rate prints only when quiet controls
+            # carry volume, matching the None-returning property.
+            false_positive_note = (
+                f", false positives {calibration.flagged_quiet}/{calibration.quiet_sample}"
+                if calibration.quiet_sample
+                else ""
+            )
             print(
                 f"    calibration: {calibration.scorable} scorable "
                 f"({calibration.flagged_bad} flagged-bad, "
                 f"{calibration.flagged_quiet} flagged-quiet, "
                 f"{calibration.unflagged_bad} unflagged-bad, "
                 f"{calibration.unflagged_quiet} unflagged-quiet), "
-                f"{calibration.pending} pending"
+                f"{calibration.pending} pending{false_positive_note}"
             )
         views = desk.views
         if views.stated or views.declined or views.missing or views.incoherent:
@@ -1202,6 +1275,8 @@ def print_report(report: HindsightReport) -> None:
         day_pnl = scoreboard.latest_day_pnl_usdc
         pnl_note = f", day P&L {day_pnl}" if day_pnl is not None else ""
         print(f"  scoreboard: equity {scoreboard.latest_equity_usdc} USDC{pnl_note}")
+    if report.calibration_caveat:
+        print(f"  calibration caveat: {report.calibration_caveat}")
     print(f"  truth: {report.truth_rule}")
     print(f"  view rule: {report.view_rule}")
 
@@ -1281,6 +1356,8 @@ __all__ = [
     "HINDSIGHT_REPORT_NAME",
     "HINDSIGHT_REPORT_SCHEMA",
     "HINDSIGHT_SERIES_MAX",
+    "HINDSIGHT_QUIET_MIN_FOLLOWERS",
+    "HINDSIGHT_SENSITIVITY_ONLY_STAMP",
     "HINDSIGHT_TRUTH_RULE",
     "HINDSIGHT_VIEW_RULE",
     "HindsightCalibration",

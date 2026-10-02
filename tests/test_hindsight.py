@@ -18,8 +18,10 @@ from aero_bot.advisor import (
 )
 from aero_bot.hindsight import (
     DEFAULT_HINDSIGHT_HORIZON_HOURS,
+    HINDSIGHT_QUIET_MIN_FOLLOWERS,
     HINDSIGHT_REPORT_NAME,
     HINDSIGHT_REPORT_SCHEMA,
+    HINDSIGHT_SENSITIVITY_ONLY_STAMP,
     HINDSIGHT_SERIES_MAX,
     HINDSIGHT_TRUTH_RULE,
     HINDSIGHT_VIEW_RULE,
@@ -138,6 +140,24 @@ def scored(*episodes: TeacherEpisode) -> HindsightReport:
     return score_corpus(episodes, HORIZON, now=NOW)
 
 
+def quiet_tail(
+    start: datetime,
+    count: int = HINDSIGHT_QUIET_MIN_FOLLOWERS,
+    *,
+    minutes: int = 5,
+) -> tuple[TeacherEpisode, ...]:
+    """Build a drained tail of clean followers at cadence density.
+
+    A quiet verdict needs real observation density inside the horizon, so
+    quiet-horizon fixtures pad the tail with clean grounded episodes at
+    the production five-minute cadence.
+    """
+    return tuple(
+        episode(start + timedelta(minutes=minutes * index), facts=facts_picture())
+        for index in range(1, count + 1)
+    )
+
+
 class TestEpisodeVerdicts:
     """The public per-episode export the upgrade digest consumes."""
 
@@ -208,6 +228,7 @@ class TestTruthRule:
         report = scored(
             episode(T0, seats=(claude_outcome(brief=calm_brief(flagged=True)),)),
             episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+            *quiet_tail(T0 + timedelta(hours=2)),
         )
         assert desk_by_name(report, "claude").calibration.flagged_quiet == 1
 
@@ -224,6 +245,7 @@ class TestTruthRule:
         report = scored(
             episode(T0, seats=(claude_outcome(),)),
             episode(T0 + timedelta(hours=2), facts=facts_picture()),
+            *quiet_tail(T0 + timedelta(hours=2)),
         )
         assert desk_by_name(report, "claude").calibration.unflagged_quiet == 1
 
@@ -275,6 +297,7 @@ class TestTruthRule:
             episode(T0, seats=(claude_outcome(brief=calm_brief(flagged=True)),)),
             episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="nan")),
             episode(T0 + timedelta(hours=3), facts=facts_picture(day_pnl="-inf")),
+            *quiet_tail(T0 + timedelta(hours=3)),
         )
         calibration = desk_by_name(report, "claude").calibration
         assert calibration.flagged_quiet == 1
@@ -296,6 +319,7 @@ class TestTruthRule:
         report = scored(
             episode(T0, seats=(claude_outcome(brief=calm_brief(flagged=True)),)),
             episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="not-a-number")),
+            *quiet_tail(T0 + timedelta(hours=2)),
         )
         calibration = desk_by_name(report, "claude").calibration
         assert calibration.flagged_quiet == 1
@@ -305,8 +329,89 @@ class TestTruthRule:
         report = scored(
             episode(T0, facts=facts_picture(halted=2), seats=(claude_outcome(),)),
             episode(T0 + timedelta(hours=2), facts=facts_picture(halted=2)),
+            *quiet_tail(T0 + timedelta(hours=2)),
         )
         assert desk_by_name(report, "claude").calibration.unflagged_quiet == 1
+
+
+class TestQuietControls:
+    """The false-positive control class: density bar, stamps, and rates."""
+
+    def test_a_drained_horizon_below_the_density_bar_stays_pending(self) -> None:
+        """A sparse tail never grades quiet - the control class needs volume."""
+        report = scored(
+            episode(T0, seats=(claude_outcome(),)),
+            *quiet_tail(T0, count=HINDSIGHT_QUIET_MIN_FOLLOWERS - 1),
+        )
+        calibration = desk_by_name(report, "claude").calibration
+        assert calibration.pending == 1
+        assert calibration.unflagged_quiet == 0
+        assert report.quiet_episode_count == 0
+
+    def test_a_drained_horizon_at_the_density_bar_grades_quiet(self) -> None:
+        """Exactly the bar's follower count carries a quiet verdict."""
+        report = scored(
+            episode(T0, seats=(claude_outcome(),)),
+            *quiet_tail(T0, count=HINDSIGHT_QUIET_MIN_FOLLOWERS),
+        )
+        assert desk_by_name(report, "claude").calibration.unflagged_quiet == 1
+        # Only the scored episode's horizon is drained at NOW; the tail
+        # episodes stay pending, so exactly one quiet control exists.
+        assert report.quiet_episode_count == 1
+
+    def test_a_bad_outcome_needs_no_density_to_score(self) -> None:
+        """Sensitivity is unbarred: one losing follower still grades bad."""
+        report = scored(
+            episode(T0, seats=(claude_outcome(),)),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="-0.5")),
+        )
+        assert desk_by_name(report, "claude").calibration.unflagged_bad == 1
+
+    def test_a_report_with_no_quiet_volume_stamps_sensitivity_only(self) -> None:
+        """Zero quiet controls are labeled, never read as proof."""
+        report = scored(
+            episode(T0, seats=(claude_outcome(),)),
+            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="-0.5")),
+        )
+        assert report.quiet_episode_count == 0
+        assert report.calibration_caveat == HINDSIGHT_SENSITIVITY_ONLY_STAMP
+
+    def test_a_report_with_quiet_volume_carries_the_control_status(self) -> None:
+        """Quiet volume swaps the stamp for an honest control count."""
+        report = scored(
+            episode(T0, seats=(claude_outcome(brief=calm_brief(flagged=True)),)),
+            *quiet_tail(T0),
+        )
+        assert report.quiet_episode_count == 1
+        assert HINDSIGHT_SENSITIVITY_ONLY_STAMP not in report.calibration_caveat
+        assert str(report.quiet_episode_count) in report.calibration_caveat
+
+    def test_the_false_positive_rate_measures_only_with_quiet_samples(self) -> None:
+        """The rate divides by the quiet sample; None while unsampled."""
+        unsampled = HindsightCalibration(
+            scorable=1,
+            flagged_bad=1,
+            flagged_quiet=0,
+            unflagged_bad=0,
+            unflagged_quiet=0,
+            pending=0,
+        )
+        assert unsampled.false_positive_rate is None
+        sampled = HindsightCalibration(
+            scorable=4,
+            flagged_bad=2,
+            flagged_quiet=1,
+            unflagged_bad=0,
+            unflagged_quiet=1,
+            pending=0,
+        )
+        assert sampled.quiet_sample == 2
+        assert sampled.false_positive_rate == pytest.approx(0.5)
+
+    def test_the_truth_rule_text_names_the_density_bar(self) -> None:
+        """The self-describing rule stays self-describing after the change."""
+        assert str(HINDSIGHT_QUIET_MIN_FOLLOWERS) in HINDSIGHT_TRUTH_RULE
+        assert "false-positive control" in HINDSIGHT_TRUTH_RULE
 
 
 class TestStreamScoping:

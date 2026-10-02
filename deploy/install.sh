@@ -302,6 +302,46 @@ EOF
     chmod 0640 "${CONFIG_DIR}/dashboard.env"
 fi
 
+# ---------------------------------------------------------------- seal drift
+log "checking the sealed environment files for drift from the documented planes"
+# The installer never rewrites an existing seal (the idempotence design
+# pinned above), and that is exactly how the 2026-09-28 advisor
+# misconfiguration survived every deploy: the sealed primary kept
+# pointing at the shared plane while the dedicated student plane sat
+# unused and the student seat went dark for 36 hours. Every deploy now
+# says so loudly; the repair itself stays the operator's explicit act
+# (deploy/seal-repair.sh, see docs/deployment.md "Seal drift and repair").
+seal_effective_value() {
+    { grep -E "^[[:space:]]*${2}=" "$1" 2>/dev/null || true; } \
+        | tail -n 1 | cut -d= -f2- | tr -d '\r'
+}
+SEAL_DRIFT=0
+if [[ -f "${CONFIG_DIR}/advisor.env" ]]; then
+    SEALED_URL="$(seal_effective_value "${CONFIG_DIR}/advisor.env" AERO_BOT_ADVISOR_URL)"
+    SEALED_FALLBACK="$(seal_effective_value "${CONFIG_DIR}/advisor.env" AERO_BOT_ADVISOR_FALLBACK_URL)"
+    if [[ -n "$SEALED_URL" && "$SEALED_URL" != "http://100.106.111.37:11435" ]]; then
+        SEAL_DRIFT=1
+        log "WARNING: advisor.env primary plane is '$SEALED_URL', not the documented dedicated plane http://100.106.111.37:11435"
+    fi
+    if [[ -z "$SEALED_FALLBACK" ]]; then
+        SEAL_DRIFT=1
+        log "WARNING: advisor.env carries no effective AERO_BOT_ADVISOR_FALLBACK_URL; a downed primary costs every pass"
+    fi
+fi
+if [[ -f "${CONFIG_DIR}/cycle.env" ]]; then
+    SEALED_PROVIDER="$(seal_effective_value "${CONFIG_DIR}/cycle.env" AERO_BOT_ALERT_PROVIDER)"
+    SEALED_RESEND_KEY="$(seal_effective_value "${CONFIG_DIR}/cycle.env" AERO_BOT_ALERT_RESEND_API_KEY)"
+    if [[ -z "$SEALED_PROVIDER" || "$SEALED_PROVIDER" == "none" ]] && [[ -n "$SEALED_RESEND_KEY" ]]; then
+        SEAL_DRIFT=1
+        log "WARNING: cycle.env seals AERO_BOT_ALERT_PROVIDER='${SEALED_PROVIDER:-none}' while a Resend key is sealed; alerts compute and never email"
+    fi
+fi
+if [[ $SEAL_DRIFT -eq 0 ]]; then
+    log "no seal drift detected"
+else
+    log "WARNING: seal drift above survives deploys by design; repair with 'sudo bash deploy/seal-repair.sh --check' then --apply"
+fi
+
 # ---------------------------------------------------------------- systemd
 log "installing the systemd units"
 for unit in "${REPO_ROOT}"/deploy/systemd/*.service "${REPO_ROOT}"/deploy/systemd/*.timer; do

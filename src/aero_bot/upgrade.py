@@ -41,19 +41,25 @@ import json
 import os
 import sys
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import IO, Annotated
 
 from pydantic import BaseModel, Field
 
 from aero_bot.advisor import ADVISOR_SYSTEM_PROMPT, ADVISOR_TEACHING_MAX_CHARS
+from aero_bot.alerts import (
+    AlertTransportError,
+    build_alert_transport,
+    parse_alert_config,
+)
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG
 from aero_bot.hindsight import (
     CALIBRATED_STREAMS,
     DEFAULT_HINDSIGHT_HORIZON_HOURS,
     HINDSIGHT_HORIZON_BOUNDS,
+    HINDSIGHT_SENSITIVITY_ONLY_STAMP,
     HindsightDeskScore,
     ViewGrade,
     ViewGrades,
@@ -105,6 +111,14 @@ UPGRADE_EXEMPLAR_MAX_CHARS = 600
 UPGRADE_DIGEST_ENTRY_MAX = 20
 UPGRADE_DIGEST_BRIEF_MAX_CHARS = 600
 UPGRADE_DIGEST_LABELS_PER_ENTRY = 5
+# The subject prefix every emailed teacher digest carries, so the loop's
+# mail is recognizable beside the cycle's own reports.
+TEACHER_DIGEST_SUBJECT_PREFIX = "[aero-bot][TEACHER]"
+# The bounded rationale head each emailed proposal renders.
+TEACHER_DIGEST_RATIONALE_MAX_CHARS = 400
+# How many trailing days of the proposals trail the email lists, so a
+# proposal repeating unsealed for days is visible in the inbox itself.
+TEACHER_DIGEST_TRAIL_DAYS = 7
 
 
 class DivergenceMiss(BaseModel):
@@ -881,6 +895,170 @@ def print_upgrade_report(report: UpgradeReport) -> None:
             print(f"  {outcome.seat.value}: absent {outcome.outcome}{detail}")
 
 
+def recent_proposal_dates(
+    corpus_dir: Path, *, days: int = TEACHER_DIGEST_TRAIL_DAYS
+) -> tuple[str, ...]:
+    """List the trailing dated proposal files, newest first, bounded.
+
+    Args:
+        corpus_dir: The corpus state directory holding the proposals trail.
+        days: How many trailing dated files to keep.
+
+    Returns:
+        The YYYYMMDD stems of the newest dated proposal files; an absent
+        directory honestly lists nothing.
+    """
+    proposals_dir = corpus_dir / UPGRADE_PROPOSAL_DIR_NAME
+    try:
+        stems = sorted(
+            (path.stem.removeprefix("upgrade-") for path in proposals_dir.glob("upgrade-*.jsonl")),
+            reverse=True,
+        )
+    except OSError:
+        return ()
+    return tuple(stems[:days])
+
+
+def compose_teacher_digest(
+    report: UpgradeReport,
+    *,
+    proposal_dates: Sequence[str] = (),
+) -> tuple[str, str]:
+    """Compose the bounded human digest email subject and body.
+
+    Args:
+        report: The pass report whose evidence the email carries.
+        proposal_dates: The trailing dated proposal-file stems, newest
+            first, so repetition is visible in the inbox.
+
+    Returns:
+        The subject and plain-text body; every line is bounded, ASCII, and
+        derived only from the report's realized evidence.
+    """
+    digest = report.digest
+    proposals = sum(1 for outcome in report.seats if outcome.proposal is not None)
+    day = report.created_at.strftime("%Y-%m-%d")
+    subject = (
+        f"{TEACHER_DIGEST_SUBJECT_PREFIX} upgrade digest {day} - "
+        f"{digest.total_divergences} divergences, {proposals} proposals"
+    )
+    lines: list[str] = [
+        f"teacher upgrade digest {report.created_at.isoformat()} horizon {report.horizon_hours:g}h",
+        "",
+        "divergences:"
+        f"  total {digest.total_divergences} "
+        f"({len(digest.misses)} misses, {len(digest.availability_gaps)} availability gaps, "
+        f"{len(digest.label_divergences)} label divergences, "
+        f"{len(digest.posture_misses)} posture misses, "
+        f"{len(digest.conviction_misses)} conviction misses)",
+        f"  grounded episodes: {digest.grounded_episode_count} "
+        f"({digest.bad_episode_count} bad, {digest.quiet_episode_count} quiet)",
+    ]
+    if digest.malformed_episode_count:
+        lines.append(f"  malformed lines skipped: {digest.malformed_episode_count}")
+    quiet_note = (
+        HINDSIGHT_SENSITIVITY_ONLY_STAMP
+        if digest.quiet_episode_count == 0
+        else f"quiet controls carry volume ({digest.quiet_episode_count} drained windows)"
+    )
+    lines.append(f"  flag-rate caveat: {quiet_note}")
+    lines.append("")
+    lines.append("desks:")
+    for desk in report.desk_scores:
+        availability = f"{desk.availability:.3f}" if desk.availability is not None else "n/a"
+        calibration = desk.calibration
+        false_positive = (
+            f", false positives {calibration.flagged_quiet}/{calibration.quiet_sample}"
+            if calibration.quiet_sample
+            else ""
+        )
+        lines.append(
+            f"  {desk.desk}: {desk.briefs}/{desk.asked} briefs (availability {availability})"
+        )
+        lines.append(
+            f"    calibration: {calibration.scorable} scorable "
+            f"({calibration.flagged_bad} flagged-bad, "
+            f"{calibration.flagged_quiet} flagged-quiet, "
+            f"{calibration.unflagged_bad} unflagged-bad, "
+            f"{calibration.unflagged_quiet} unflagged-quiet), "
+            f"{calibration.pending} pending{false_positive}"
+        )
+    lines.append("")
+    lines.append("proposals:")
+    if report.gated:
+        lines.append("  gated: no scorable divergences, no seat asked")
+    elif not report.seats:
+        lines.append("  no seat outcomes recorded")
+    for outcome in report.seats:
+        if outcome.proposal is not None:
+            lines.append(f"  {outcome.seat.value} [{outcome.model}]: proposed a teaching block")
+            lines.append(
+                "    rationale: "
+                + _bounded_head(outcome.proposal.rationale, TEACHER_DIGEST_RATIONALE_MAX_CHARS)
+            )
+        else:
+            detail = f" - {outcome.detail}" if outcome.detail else ""
+            lines.append(
+                f"  {outcome.seat.value} [{outcome.model}]: absent {outcome.outcome}{detail}"
+            )
+    if proposal_dates:
+        lines.append("")
+        lines.append(
+            "proposal trail (newest first, last "
+            f"{len(proposal_dates)} files): {', '.join(proposal_dates)}"
+        )
+    lines.append("")
+    lines.append("sealing stays the operator's manual act; see docs/teacher.md")
+    return subject, "\n".join(lines)
+
+
+def deliver_teacher_digest(
+    report: UpgradeReport,
+    *,
+    proposal_dates: Sequence[str] = (),
+    environ: Mapping[str, str] | None = None,
+    error_stream: IO[str] | None = None,
+) -> bool:
+    """Deliver the digest email through the sealed alert transport.
+
+    Reuses the already-sealed Resend (or SMTP) configuration exactly as
+    the cycle's alerts do; no provider, account, or domain is provisioned
+    here. Delivery is advisory: a missing configuration or a failed send
+    warns on the error stream and returns False without failing the pass.
+
+    Args:
+        report: The pass report whose digest is emailed.
+        proposal_dates: The trailing dated proposal-file stems, newest first.
+        environ: The environment carrying the alert configuration; None
+            reads the live process environment.
+        error_stream: Where delivery warnings land; stderr by default.
+
+    Returns:
+        Whether the digest email was sent.
+    """
+    resolved_environ = os.environ if environ is None else environ
+    stream = error_stream if error_stream is not None else sys.stderr
+    try:
+        config = parse_alert_config(resolved_environ)
+    except ValueError as error:
+        print(f"the digest email is misconfigured: {error}", file=stream)
+        return False
+    transport = build_alert_transport(config)
+    if transport is None:
+        print(
+            "the digest email is disabled: no alert provider is sealed",
+            file=stream,
+        )
+        return False
+    subject, body = compose_teacher_digest(report, proposal_dates=proposal_dates)
+    try:
+        transport.send(subject, body)
+    except AlertTransportError as error:
+        print(f"digest email delivery failed: {error}", file=stream)
+        return False
+    return True
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the upgrade loop.
 
@@ -937,6 +1115,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Print the full report JSON instead of the human summary.",
     )
+    parser.add_argument(
+        "--email",
+        action="store_true",
+        help=(
+            "Email the digest summary and the day's proposals to the "
+            "operator through the sealed alert transport (see "
+            "docs/alerts.md); nothing is provisioned and a missing or "
+            "failed configuration only warns."
+        ),
+    )
     arguments = parser.parse_args(argv)
     low, high = HINDSIGHT_HORIZON_BOUNDS
     if not low <= arguments.horizon_hours <= high:
@@ -975,6 +1163,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"report: {last_path}")
         if any(outcome.proposal is not None for outcome in report.seats):
             print("  seal: review the proposal file, then follow docs/teacher.md")
+    if arguments.email:
+        if deliver_teacher_digest(report, proposal_dates=recent_proposal_dates(corpus_dir)):
+            print("digest email: sent")
+        else:
+            print("digest email: not sent (see the warning above)")
     return 0
 
 
@@ -998,14 +1191,20 @@ __all__ = [
     "UPGRADE_REPORT_SCHEMA",
     "UPGRADE_SYSTEM_PROMPT",
     "UPGRADE_TIMEOUT_SECONDS",
+    "TEACHER_DIGEST_RATIONALE_MAX_CHARS",
+    "TEACHER_DIGEST_SUBJECT_PREFIX",
+    "TEACHER_DIGEST_TRAIL_DAYS",
     "UpgradeDivergenceDigest",
     "UpgradeProposal",
     "UpgradeReport",
     "ask_upgrade_seat",
     "build_divergence_digest",
     "build_upgrade_user_prompt",
+    "compose_teacher_digest",
+    "deliver_teacher_digest",
     "main",
     "print_upgrade_report",
+    "recent_proposal_dates",
     "run_upgrade_pass",
     "write_upgrade_artifacts",
 ]
