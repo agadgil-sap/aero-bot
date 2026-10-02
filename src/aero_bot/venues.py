@@ -1,12 +1,14 @@
 """Strict venue contracts and fail-closed Aerodrome pool discovery boundary."""
 
+from collections.abc import Mapping
 from datetime import date, datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Annotated, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
-from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress
+from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, normalize_evm_address
 
 # Aerodrome's official classic-contract repository publishes its Base deployments.
 AERODROME_CLASSIC_SOURCE_URL = "https://github.com/aerodrome-finance/contracts"
@@ -32,6 +34,47 @@ SLIPSTREAM_INITIAL_FACTORY_ADDRESS = "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A
 SLIPSTREAM_GAUGE_CAPS_FACTORY_ADDRESS = "0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a"
 # The Gauges V3 Slipstream deployment is the current factory for new concentrated pools.
 SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS = "0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef"
+# The Aerodrome universal router derives each concentrated-liquidity pool's
+# address with CREATE2 under the factory selected by bits 19-20 of the swap
+# path's middle uint24; the low 19 bits carry the pool's tick spacing. The
+# selector flags are fixed by the router's immutable constructor arguments
+# (Basescan contract 0xcaf22ce31298cf2bf1d152862f80216478ad7c67):
+# veloCLFactory is the GAUGE_CAPS deployment behind 0x00, veloCLFactory2 the
+# INITIAL deployment behind 0x10, and veloCLFactory3 the current GAUGES_V3
+# deployment behind 0x08. A path built with the wrong factory's flag derives
+# a codeless address and the router's high-level swap call reverts with empty
+# data, so every swap path must derive this byte from its pool's own factory.
+SLIPSTREAM_ROUTER_FACTORY_FLAGS: Mapping[str, str] = MappingProxyType(
+    {
+        normalize_evm_address(SLIPSTREAM_GAUGE_CAPS_FACTORY_ADDRESS): "00",
+        normalize_evm_address(SLIPSTREAM_INITIAL_FACTORY_ADDRESS): "10",
+        normalize_evm_address(SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS): "08",
+    }
+)
+
+
+def slipstream_router_factory_flag(factory_address: str) -> str:
+    """Return the router path's factory selector byte for one factory.
+
+    Args:
+        factory_address: The pool's creating Slipstream factory address.
+
+    Returns:
+        The two-hex-character selector byte for the router path's middle
+            uint24, as fixed by the router's constructor arguments.
+
+    Raises:
+        ValueError: If the factory is not one of the three router-mapped
+            Slipstream deployments; a swap path refuses rather than guess a
+            factory whose derived pool would hold no contract code.
+    """
+    flag = SLIPSTREAM_ROUTER_FACTORY_FLAGS.get(normalize_evm_address(factory_address))
+    if flag is None:
+        raise ValueError(
+            f"factory {factory_address} is not one of the three router-mapped "
+            "Slipstream deployments; refusing to guess the swap path's factory flag"
+        )
+    return flag
 
 
 class VenueId(StrEnum):

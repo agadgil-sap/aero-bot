@@ -77,6 +77,7 @@ from aero_bot.venues import (
     AERO_TOKEN_ADDRESS,
     BASE_USDC_ADDRESS,
     SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS,
+    SLIPSTREAM_INITIAL_FACTORY_ADDRESS,
     PoolCandidate,
     PoolDiscoveryResult,
     PoolDiscoveryStatus,
@@ -1695,7 +1696,9 @@ def test_exit_swap_dry_run_builds_approval_and_reverse_swap() -> None:
     assert amount_in == 5 * 10**7
     assert minimum == int(Decimal(expected_out) * Decimal("0.99"))
     assert path == bytes.fromhex(
-        build_swap_path(B20_ADDRESS, BASE_USDC_ADDRESS, LP_TICK_SPACING)[2:]
+        build_swap_path(
+            B20_ADDRESS, BASE_USDC_ADDRESS, LP_TICK_SPACING, SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS
+        )[2:]
     )
 
 
@@ -1777,7 +1780,12 @@ def test_aero_swap_dry_run_builds_approval_and_conversion() -> None:
     assert amount_in == 20 * 10**18
     assert minimum == int(Decimal(expected_out) * Decimal("0.99"))
     assert path == bytes.fromhex(
-        build_swap_path(AERO_TOKEN_ADDRESS, BASE_USDC_ADDRESS, LP_TICK_SPACING)[2:]
+        build_swap_path(
+            AERO_TOKEN_ADDRESS,
+            BASE_USDC_ADDRESS,
+            LP_TICK_SPACING,
+            SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS,
+        )[2:]
     )
 
 
@@ -1829,6 +1837,89 @@ def test_aero_swap_refuses_output_above_the_per_pool_cap() -> None:
         executor.dry_run_aero_swap(bytes(Account.create().key))
 
     assert raised.value.code is LpExecutionRefusalCode.AERO_OUTPUT_ABOVE_POOL_CAP
+
+
+def test_aero_swap_routes_the_live_initial_factory_pool_through_the_0x10_flag() -> None:
+    """The reward pool on the INITIAL factory swaps through flag 0x10.
+
+    The live refusal this pins: all 47 reward-conversion attempts from
+    2026-09-29 built AERO || 08 || 07d0 || USDC against the pool discovered
+    at 0xbe00ff35af70e8415d0eb605a286d8a45466a4c1, which lives on the
+    deprecated INITIAL factory (0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a,
+    tick spacing 2000). Flag 0x08 makes the router derive the pool under the
+    GAUGES_V3 factory, where no spacing-2000 AERO/USDC pool exists, so every
+    swap addressed a codeless CREATE2 address and the Safe's execTransaction
+    estimate reverted as GS013 - the executor's fresh-estimate gate refusing
+    estimate_reverted, 47 of 47. The byte-identical calldata with the INITIAL
+    factory's 0x10 flag executed the full-balance swap in the read-only
+    replay (block 52067692), and that byte is what this path must carry.
+    """
+    executor, rpc_script, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            aero_balance_units=20 * 10**18,
+            aero_router_allowance_units=100 * 10**18,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 2),
+        sources=FakeSources(
+            reward_discovery=make_aero_discovery(
+                pools=(
+                    make_candidate(
+                        pool_address="0xbe00ff35af70e8415d0eb605a286d8a45466a4c1",
+                        factory_address=SLIPSTREAM_INITIAL_FACTORY_ADDRESS,
+                        token0_address=BASE_USDC_ADDRESS,
+                        token1_address=AERO_TOKEN_ADDRESS,
+                        tick_spacing=2000,
+                        sqrt_ratio=AERO_POOL_SQRT_RATIO,
+                        reserve1=500_000 * 10**18,
+                    ),
+                )
+            )
+        ),
+    )
+
+    report = executor.dry_run_aero_swap(bytes(Account.create().key))
+
+    assert [transaction.role for transaction in report.transactions] == [LpExecutionRole.AERO_SWAP]
+    commands, inputs, deadline = decode(
+        ["bytes", "bytes[]", "uint256"], decode_inner(rpc_script.estimate_requests[0])[4:]
+    )
+    _, _, _, path, _, _ = decode(
+        ["address", "uint256", "uint256", "bytes", "bool", "uint256"], inputs[0]
+    )
+    assert commands == b"\x00"
+    # AERO || 10 (INITIAL factory) || 07d0 (spacing 2000) || USDC: the exact
+    # replayed-successful shape, never the 08 that refused 47 of 47.
+    assert path == bytes.fromhex(
+        "940181a94a35a4569e4529a3cdfb74e38fd98631"
+        + "10"
+        + "07d0"
+        + "833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+    )
+
+
+def test_aero_swap_refuses_a_pool_on_an_unmapped_factory() -> None:
+    """A deepest pool outside the router's three factory slots refuses."""
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(aero_balance_units=20 * 10**18),
+        sources=FakeSources(
+            reward_discovery=make_aero_discovery(
+                pools=(
+                    make_candidate(
+                        pool_address=AERO_SLIPSTREAM_POOL_ADDRESS,
+                        factory_address="0x" + "ee" * 20,
+                        token0_address=BASE_USDC_ADDRESS,
+                        token1_address=AERO_TOKEN_ADDRESS,
+                    ),
+                )
+            )
+        ),
+    )
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.dry_run_aero_swap(bytes(Account.create().key))
+
+    assert raised.value.code is LpExecutionRefusalCode.AERO_POOL_NOT_DISCOVERED
+    assert "router cannot address" in str(raised.value)
 
 
 def test_execute_aero_swap_broadcasts_both_steps(tmp_path: Path) -> None:

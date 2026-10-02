@@ -41,6 +41,7 @@ from aero_bot.lp_plan import (
     position_range_state,
 )
 from aero_bot.ranging import TICK_PRICE_RATIO
+from aero_bot.venues import SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS
 
 # Native Base USDC, the token-zero side of the AAPLc-like fixture pool.
 USDC_ADDRESS = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
@@ -94,6 +95,7 @@ def pool_observation(**overrides: object) -> LpPoolObservation:
     values: dict[str, object] = {
         "symbol": "AAPLc",
         "pool_address": "0xa3b1e3f9747065e2073722ff4c9027d3ea4994f0",
+        "factory_address": SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS,
         "nfpm_address": NFPM_ADDRESS,
         "gauge_address": GAUGE_ADDRESS,
         "token0_address": USDC_ADDRESS,

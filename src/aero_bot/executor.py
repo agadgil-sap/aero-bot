@@ -73,6 +73,7 @@ from aero_bot.venues import (
     PoolKind,
     VenueId,
     aerodrome_contract_evidence,
+    slipstream_router_factory_flag,
 )
 
 # The Aerodrome universal router of the user's executed reference swap; this
@@ -86,8 +87,6 @@ SAFE_ADDRESS_ENV = "AERO_BOT_SAFE_ADDRESS"
 ROUTER_EXECUTE_SELECTOR = "3593564c"
 # The single command byte of the reference swap: V3_SWAP_EXACT_IN.
 V3_SWAP_EXACT_IN_COMMAND = "00"
-# The concentrated-liquidity path flag marking a tick-spacing segment.
-V3_PATH_TICK_SPACING_FLAG = "08"
 # One concentrated path segment is 20 + 3 + 20 bytes when it spans two tokens.
 PATH_SEGMENT_BYTES = 43
 # keccak256("approve(address,uint256)")[0:4], the bounded allowance setter.
@@ -292,6 +291,9 @@ class SwapQuote(BaseModel):
     token_address: EvmAddress
     # The live Sugar-discovered pool the quote priced through.
     pool_address: EvmAddress
+    # The pool's creating Slipstream factory, selecting the router path's
+    # factory flag byte so the swap addresses the discovered pool itself.
+    factory_address: EvmAddress
     # The pool's Slipstream tick spacing, part of the swap path.
     tick_spacing: Annotated[int, Field(gt=0)]
     # The stock token's decimal count read from its contract.
@@ -824,30 +826,40 @@ def build_swap_path(
     quote_token_address: str,
     stock_token_address: str,
     tick_spacing: int,
+    factory_address: str,
 ) -> str:
     """Build the router's 43-byte concentrated-liquidity swap path.
 
     The path is exactly the reference transaction's shape: the input token,
-    the tick-spacing flag byte, the pool's tick spacing as a big-endian
-    uint16, and the output token.
+    the router's CL factory selector byte, the pool's tick spacing as a
+    big-endian uint16, and the output token. The selector byte comes from
+    the pool's own creating factory (0x08 GAUGES_V3, 0x10 INITIAL, 0x00
+    GAUGE_CAPS) because the router derives the pool by CREATE2 under that
+    factory: a mismatched flag addresses a codeless contract and the swap
+    reverts bare, which is how every reward conversion refused from launch
+    until the flag became factory-derived.
 
     Args:
         quote_token_address: The exact-input USDC side of the swap.
         stock_token_address: The B20 stock contract being bought.
         tick_spacing: The pool's positive Slipstream tick spacing.
+        factory_address: The pool's creating Slipstream factory, which
+            selects the router's factory selector byte.
 
     Returns:
         The 86-character 0x-prefixed path segment.
 
     Raises:
-        ValueError: If the tick spacing is outside the uint16 range.
+        ValueError: If the tick spacing is outside the uint16 range or the
+            factory is not one of the three router-mapped Slipstream
+            deployments.
     """
     if not 1 <= tick_spacing <= 0xFFFF:
         raise ValueError("tick_spacing must fit the path's unsigned 16-bit segment")
     return (
         "0x"
         + normalize_evm_address(quote_token_address)[2:]
-        + V3_PATH_TICK_SPACING_FLAG
+        + slipstream_router_factory_flag(factory_address)
         + format(tick_spacing, "04x")
         + normalize_evm_address(stock_token_address)[2:]
     )
@@ -1631,7 +1643,9 @@ class SwapExecutor:
         gas_price, safe_eth, allowance, live_nonce = self._preflight(preflight_caps)
         relayer_address = normalize_evm_address(Account.from_key(key_bytes).address)
         deadline = int(self._now().timestamp()) + SWAP_DEADLINE_SECONDS
-        path = build_swap_path(BASE_USDC_ADDRESS, quote.token_address, quote.tick_spacing)
+        path = build_swap_path(
+            BASE_USDC_ADDRESS, quote.token_address, quote.tick_spacing, quote.factory_address
+        )
         approval: BuiltExecutionTransaction | None = None
         swap_nonce = live_nonce
         if allowance < quote.usdc_in_units:
@@ -1703,7 +1717,9 @@ class SwapExecutor:
         relayer_nonce = self._rpc.fetch_relayer_nonce(relayer_address)
         relayer_balance = self._rpc.fetch_eth_balance(relayer_address)
         deadline = int(self._now().timestamp()) + SWAP_DEADLINE_SECONDS
-        path = build_swap_path(BASE_USDC_ADDRESS, quote.token_address, quote.tick_spacing)
+        path = build_swap_path(
+            BASE_USDC_ADDRESS, quote.token_address, quote.tick_spacing, quote.factory_address
+        )
         broadcast_started: float | None = None
 
         approval_receipt: ExecutionReceiptOutcome | None = None
@@ -1911,6 +1927,7 @@ class SwapExecutor:
             symbol=listing.symbol,
             token_address=listing.address,
             pool_address=pool.pool_address,
+            factory_address=pool.factory_address,
             tick_spacing=pool.tick_spacing,
             stock_decimals=stock_decimals,
             usdc_in_units=units,

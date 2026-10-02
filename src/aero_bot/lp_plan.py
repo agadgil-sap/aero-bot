@@ -291,6 +291,9 @@ class LpPoolObservation(BaseModel):
     symbol: str
     # The pool contract address.
     pool_address: EvmAddress
+    # The pool's creating Slipstream factory, selecting the swap path's
+    # router factory flag byte so swaps address the discovered pool itself.
+    factory_address: EvmAddress
     # The pool's own NonfungiblePositionManager from its Sugar record.
     nfpm_address: EvmAddress
     # The pool's live CLGauge.
