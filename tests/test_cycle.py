@@ -57,6 +57,7 @@ from aero_bot.cycle import (
     decode_minted_token_id,
 )
 from aero_bot.emissions_apr import AprReadingSample
+from aero_bot.executor import ExecutionUnavailableError
 from aero_bot.history import price_usdc_per_stock
 from aero_bot.lp_executor import (
     NFPM_INCREASE_LIQUIDITY_TOPIC0,
@@ -2474,6 +2475,51 @@ class TestTimeoutMultiEntryRecovery:
         decision_recon = report.decision_reconciliation
         assert decision_recon is not None
         assert len(decision_recon.recovered_positions) == 3
+
+    def test_a_transport_failure_on_a_candidate_fails_the_cycle(self, tmp_path: Path) -> None:
+        """An unreadable proven candidate is unknown truth, not absence.
+
+        The rate-limited public RPC raises ExecutionUnavailableError on
+        exhausted retries; swallowing it as burned history would price the
+        book without the proven sibling and could latch the phantom
+        drawdown this recovery exists to clear, silently. The read must
+        fail the cycle for the systemd retry, like every other reconcile
+        read, and the persisted book must stay untouched.
+        """
+
+        class UnreachableCandidateReads(FakeReads):
+            """Mirror the transport's exhausted retries on one candidate."""
+
+            def __init__(self, base: FakeReads, unreachable_ids: frozenset[int]) -> None:
+                super().__init__(base._snapshot)
+                self._statuses = dict(base._statuses)
+                self._unreachable_ids = unreachable_ids
+
+            def position_status(
+                self,
+                symbol: str,
+                token_id: int,
+                aero_price_usdc: Decimal | None = None,
+                entry_cost_usdc: Decimal | None = None,
+            ) -> LpPositionStatusReport:
+                if token_id in self._unreachable_ids:
+                    raise ExecutionUnavailableError(
+                        f"the status read for token {token_id} exhausted its retries"
+                    )
+                return super().position_status(symbol, token_id, aero_price_usdc, entry_cost_usdc)
+
+        runner, _, _, state_store = timeout_runner(
+            tmp_path, reads=UnreachableCandidateReads(timeout_reads(), frozenset({7_311_805}))
+        )
+
+        with pytest.raises(ExecutionUnavailableError, match="exhausted its retries"):
+            runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        book = state_store.load()
+        assert [position.token_id for position in book.positions] == [
+            TIMEOUT_SIBLING_TOKEN_ID
+        ]
+        assert book.halted_day is None
 
     def test_a_stake_plan_left_unstaked_adopts_and_the_live_cycle_restakes(
         self, tmp_path: Path

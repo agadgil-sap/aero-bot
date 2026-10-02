@@ -2101,7 +2101,10 @@ class CycleRunner:
         status read verifies the custody. Only evidence both the audit
         chain and the chain state prove adopts; anything else skips
         quietly (burned history) or refuses the cycle (proven custody
-        violated). Pinned cycles never fold cross-symbol rows into their
+        violated). A candidate whose status read cannot complete is
+        unknown truth, not absence: the read propagates and fails the
+        cycle for the retry, exactly like every other reconcile read.
+        Pinned cycles never fold cross-symbol rows into their
         single-position book: they skip the recovery and say so, leaving
         the heal to the next selector cycle.
 
@@ -2112,6 +2115,10 @@ class CycleRunner:
         Returns:
             The recovered records and any out-of-band refusal (empty when
             none).
+
+        Raises:
+            ExecutionUnavailableError: If a candidate's live status read
+                cannot complete.
         """
         if self._audit_reader is None:
             return [], ""
@@ -2190,7 +2197,7 @@ class CycleRunner:
                 # stale plan, or a pool that left the registry. Nothing
                 # adopts and nothing refuses.
                 continue
-            except (ExecutionUnavailableError, ValueError):
+            except ValueError:
                 continue
             owner = normalize_evm_address(status.token_owner_address)
             gauge = normalize_evm_address(status.gauge_address)
