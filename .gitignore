@@ -30,5 +30,8 @@ run/
 .gnhf/
 .claude/
 
+# Local investigation scratch drivers, never shipped source.
+scratch/
+
 # macOS metadata.
 .DS_Store
