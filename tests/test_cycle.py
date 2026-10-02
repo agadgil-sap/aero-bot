@@ -2516,9 +2516,7 @@ class TestTimeoutMultiEntryRecovery:
             runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
 
         book = state_store.load()
-        assert [position.token_id for position in book.positions] == [
-            TIMEOUT_SIBLING_TOKEN_ID
-        ]
+        assert [position.token_id for position in book.positions] == [TIMEOUT_SIBLING_TOKEN_ID]
         assert book.halted_day is None
 
     def test_a_stake_plan_left_unstaked_adopts_and_the_live_cycle_restakes(
