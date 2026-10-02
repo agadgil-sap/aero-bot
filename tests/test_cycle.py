@@ -390,12 +390,12 @@ class FakeExecutor:
             self._balances.receipts[MINT_TX_HASH] = mint_receipt(self.mint_receipt_token_id)
         else:
             self._balances.receipts[MINT_TX_HASH] = {"logs": []}
-        self._audit_confirm("mint", LpExecutionRole.MINT, MINT_TX_HASH)
         self._audit.append(
             AuditEventType.LP_MINT_PLANNED,
             FakePlanPayload(mode="execute", budget_usdc=str(budget_usdc), symbol=symbol),
             self._now,
         )
+        self._audit_confirm("mint", LpExecutionRole.MINT, MINT_TX_HASH)
         self._reads.set_inventory(inventory_with(TRACKED_TOKEN_ID))
         report = self._complete("mint", (MINT_TX_HASH,))
         if self.mint_executed_budget is not None:
@@ -724,6 +724,11 @@ def make_runner(
     audit = AuditStore(audit_path)
     if audit_seed:
         audit.append(
+            AuditEventType.LP_MINT_PLANNED,
+            FakePlanPayload(mode="execute", budget_usdc="7"),
+            QUIET_INSTANT,
+        )
+        audit.append(
             AuditEventType.LP_EXECUTE_CONFIRMED,
             FakeConfirmPayload(
                 outcome="confirmed",
@@ -731,11 +736,6 @@ def make_runner(
                 role="mint",
                 transaction_hash=MINT_TX_HASH,
             ),
-            QUIET_INSTANT,
-        )
-        audit.append(
-            AuditEventType.LP_MINT_PLANNED,
-            FakePlanPayload(mode="execute", budget_usdc="7"),
             QUIET_INSTANT,
         )
     fake_reads = reads if reads is not None else FakeReads()
@@ -1378,6 +1378,77 @@ class TestReconciliation:
         assert book.position is not None
         assert book.position.token_id == TRACKED_TOKEN_ID
         assert book.position.committed_usd == Decimal("7")
+
+    def test_a_newer_foreign_mint_plan_never_labels_the_adopted_position(
+        self, tmp_path: Path
+    ) -> None:
+        """The adoption's label is proven for the NFT, never the newest plan.
+
+        A manual execute-mode mint can leave one live Safe-held NFT whose
+        stake plan was never recorded; a later refused entry for a
+        different symbol still writes its own mint plan during the build,
+        crowning the chain's newest plan. Labeling the adopted NFT from
+        that plan pairs another symbol's label with this pool's NFT and
+        wedges every later cycle on the wrong pool's position read.
+        """
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(TRACKED_TOKEN_ID, tracked_status())
+        balances = FakeBalances()
+        balances.receipts[MINT_TX_HASH] = mint_receipt(TRACKED_TOKEN_ID)
+        runner, _, audit, state_store = make_runner(
+            tmp_path, reads=reads, balances=balances, audit_seed=True
+        )
+        audit.append(
+            AuditEventType.LP_MINT_PLANNED,
+            FakePlanPayload(mode="execute", budget_usdc="9", symbol="OTHRc"),
+            QUIET_INSTANT,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        assert report.reconciliation.out_of_band == ""
+        position = state_store.load().position
+        assert position is not None
+        assert position.symbol == "FIXc"
+        assert position.pool_address == POOL_ADDRESS
+        assert position.committed_usd == Decimal("7")
+        second = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+        assert second.halted_reason == ""
+        assert second.decision_action == "hold"
+
+    def test_an_adoption_without_a_receipt_linked_plan_skips_visibly(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No proven committed basis means no adoption, and a visible reason.
+
+        The confirmed delivery can prove the NFT ours while the plan that
+        priced its build never reached the chain (a lost audit append).
+        The book then never guesses a basis: the adoption skips with an
+        operator-visible line rather than adopting silently mislabeled.
+        """
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        balances = FakeBalances()
+        balances.receipts[MINT_TX_HASH] = mint_receipt(TRACKED_TOKEN_ID)
+        runner, _, audit, state_store = make_runner(
+            tmp_path, reads=reads, balances=balances, audit_seed=False
+        )
+        audit.append(
+            AuditEventType.LP_EXECUTE_CONFIRMED,
+            FakeConfirmPayload(
+                outcome="confirmed",
+                action="mint",
+                role="mint",
+                transaction_hash=MINT_TX_HASH,
+            ),
+            QUIET_INSTANT,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        assert report.reconciliation.out_of_band == ""
+        assert report.reconciliation.tracked_token_id == TRACKED_TOKEN_ID
+        assert state_store.load().positions == ()
+        assert "skipping the adoption of live position NFT" in capsys.readouterr().err
 
     def test_unproven_live_positions_refuse_out_of_band(self, tmp_path: Path) -> None:
         """A live position with no audit evidence stops the cycle."""

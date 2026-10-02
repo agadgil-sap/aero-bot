@@ -2374,24 +2374,21 @@ class CycleRunner:
             and not reconciliation.recovered_positions
             and not reconciliation.out_of_band
         ):
-            status = reconciliation.tracked_status
-            committed, planned_symbol = self._last_mint_plan()
-            adopted_symbol = planned_symbol or (
-                self._symbol if self._symbol is not None else reconciliation.symbol
-            )
-            if adopted_symbol == SELECTOR_SYMBOL:
-                adopted_symbol = reconciliation.symbol
-            pool = (
-                status.pool_address
-                if status is not None
-                else self._pool_for_symbol(adopted_symbol).pool_address
-            )
-            if committed is not None:
+            adopted_symbol = reconciliation.symbol
+            committed = self._adoption_mint_label(reconciliation.tracked_token_id)
+            if committed is None:
+                _cycle_progress(
+                    f"skipping the adoption of live position NFT "
+                    f"{reconciliation.tracked_token_id}: no execute-mode mint plan is "
+                    "receipt-linked to its confirmed delivery, so no committed basis "
+                    "is proven; never guessing from a newer plan"
+                )
+            else:
                 updates["positions"] = (
                     TrackedPosition(
                         symbol=adopted_symbol,
                         token_id=reconciliation.tracked_token_id,
-                        pool_address=pool,
+                        pool_address=self._pool_for_symbol(adopted_symbol).pool_address,
                         committed_usd=committed,
                         entered_at=self._now(),
                     ),
@@ -2470,24 +2467,61 @@ class CycleRunner:
             )
         return folded
 
-    def _last_mint_plan(self) -> tuple[Decimal | None, str | None]:
-        """Read the newest audited mint plan, the adoption cost basis.
+    def _adoption_mint_label(self, token_id: int) -> Decimal | None:
+        """Read the committed basis proven for one adopted position.
+
+        The proof is the execute-mode mint plan receipt-linked to the NFT's
+        own confirmed delivery: the executor records the plan during the
+        build, before the delivery it confirms, under the exclusive
+        execution lock - so the newest plan at or before that confirmation
+        is that NFT's own plan. The newest plan in the whole chain proves
+        nothing (a refused mint for another symbol can crown it) and is
+        never read here.
+
+        Args:
+            token_id: The adopted position's NFT id.
 
         Returns:
-            The newest mint budget (or None) and the symbol that plan named
-            (or None when the record carries no symbol).
+            The receipt-linked mint budget, or None when no plan is proven
+            for the NFT's confirmed delivery.
         """
         if self._audit_reader is None:
-            return None, None
-        for record in reversed(self._audit_reader.recent_records()):
-            if record.event_type is not AuditEventType.LP_MINT_PLANNED:
+            return None
+        records = self._audit_reader.recent_records()
+        for offset, record in enumerate(reversed(records)):
+            if record.event_type is not AuditEventType.LP_EXECUTE_CONFIRMED:
                 continue
             payload = json.loads(record.payload_json)
-            budget = payload.get("budget_usdc")
-            symbol = payload.get("symbol")
-            if isinstance(budget, str) and Decimal(budget) > 0:
-                return Decimal(budget), symbol if isinstance(symbol, str) else None
-        return None, None
+            if (
+                payload.get("action") != "mint"
+                or payload.get("role") != "mint"
+                or payload.get("outcome") != "confirmed"
+            ):
+                continue
+            transaction_hash = str(payload.get("transaction_hash", ""))
+            try:
+                receipt = self._balances.fetch_transaction_receipt(transaction_hash)
+                decoded = decode_minted_token_id(receipt)
+            except (ValueError, ExecutionUnavailableError):
+                continue
+            if decoded != token_id:
+                continue
+            for older in reversed(records[: len(records) - offset - 1]):
+                if older.event_type is not AuditEventType.LP_MINT_PLANNED:
+                    continue
+                older_payload = json.loads(older.payload_json)
+                if older_payload.get("mode") != ExecutionMode.EXECUTE.value:
+                    return None
+                budget = older_payload.get("budget_usdc")
+                if not isinstance(budget, str):
+                    return None
+                try:
+                    value = Decimal(budget)
+                except InvalidOperation:
+                    return None
+                return value if value > 0 else None
+            return None
+        return None
 
     # ------------------------------------------------------------------
     # Decision
