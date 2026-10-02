@@ -56,12 +56,16 @@ from aero_bot.safe_tx import (
 from aero_bot.venues import (
     AERO_TOKEN_ADDRESS,
     BASE_USDC_ADDRESS,
+    SLIPSTREAM_GAUGE_CAPS_FACTORY_ADDRESS,
     SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS,
+    SLIPSTREAM_INITIAL_FACTORY_ADDRESS,
+    SLIPSTREAM_ROUTER_FACTORY_FLAGS,
     PoolCandidate,
     PoolDiscoveryResult,
     PoolDiscoveryStatus,
     PoolKind,
     VenueId,
+    slipstream_router_factory_flag,
 )
 
 # Fixture identities mirror official contracts without claiming live observations.
@@ -497,9 +501,35 @@ def test_usdc_units_converts_exactly_and_rejects_finer_precision() -> None:
         usdc_units(Decimal("0.0000001"))
 
 
+def test_router_factory_flags_match_the_router_constructor() -> None:
+    """The flag table pins the router's constructor-fixed factory selectors."""
+    # Verified against the Aerodrome router's decoded constructor arguments
+    # (Basescan 0xcaf22ce31298cf2bf1d152862f80216478ad7c67): veloCLFactory is
+    # GAUGE_CAPS, veloCLFactory2 is INITIAL, veloCLFactory3 is GAUGES_V3.
+    # The live factory/spacing mapping that exposed the defect: the deepest
+    # AERO/USDC pool (0xbe00ff35af70e8415d0eb605a286d8a45466a4c1) lives on the
+    # INITIAL factory at tick spacing 2000, while GAUGES_V3's only AERO/USDC
+    # pool sits at spacing 10 with zero active liquidity - so getPool under
+    # GAUGES_V3 for spacing 2000 returns the zero address.
+    assert {
+        SLIPSTREAM_GAUGE_CAPS_FACTORY_ADDRESS.lower(): "00",
+        SLIPSTREAM_INITIAL_FACTORY_ADDRESS.lower(): "10",
+        SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS.lower(): "08",
+    } == SLIPSTREAM_ROUTER_FACTORY_FLAGS
+    assert slipstream_router_factory_flag(SLIPSTREAM_INITIAL_FACTORY_ADDRESS) == "10"
+    assert (
+        slipstream_router_factory_flag("0x" + SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS[2:].upper())
+        == "08"
+    )
+    with pytest.raises(ValueError, match="not one of the three router-mapped"):
+        slipstream_router_factory_flag("0x" + "ee" * 20)
+
+
 def test_swap_path_matches_the_reference_shape() -> None:
     """The path is exactly token, flag, tick spacing, token."""
-    path = build_swap_path(BASE_USDC_ADDRESS, AAPLC_ADDRESS, 10)
+    path = build_swap_path(
+        BASE_USDC_ADDRESS, AAPLC_ADDRESS, 10, SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS
+    )
     assert path == (
         "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
         + "08"
@@ -509,17 +539,56 @@ def test_swap_path_matches_the_reference_shape() -> None:
     assert len(path) == 2 + 86
 
 
+def test_swap_path_selects_the_flag_from_the_pools_own_factory() -> None:
+    """The middle byte follows the discovered pool's factory, never a constant."""
+    # The live refusal shape: every one of the 47 reward-conversion attempts
+    # from 2026-09-29 built AERO || 08 || 07d0 || USDC, so the router derived
+    # the pool under the GAUGES_V3 factory where no spacing-2000 AERO/USDC
+    # pool exists, addressed a codeless CREATE2 contract, and the Safe's
+    # execTransaction estimate reverted as GS013 - surfaced by the executor's
+    # fresh-estimate gate as estimate_reverted. The identical calldata with
+    # the INITIAL factory's 0x10 flag executed the full-balance swap in
+    # read-only replay (block 52067692), which is the byte selected here.
+    initial = build_swap_path(
+        AERO_TOKEN_ADDRESS, BASE_USDC_ADDRESS, 2000, SLIPSTREAM_INITIAL_FACTORY_ADDRESS
+    )
+    assert initial == (
+        "0x940181a94a35a4569e4529a3cdfb74e38fd98631"
+        + "10"
+        + "07d0"
+        + "833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+    )
+    gauges_v3 = build_swap_path(
+        AERO_TOKEN_ADDRESS, BASE_USDC_ADDRESS, 2000, SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS
+    )
+    assert gauges_v3 == initial[:42] + "08" + initial[44:]
+    gauge_caps = build_swap_path(
+        AERO_TOKEN_ADDRESS, BASE_USDC_ADDRESS, 2000, SLIPSTREAM_GAUGE_CAPS_FACTORY_ADDRESS
+    )
+    assert gauge_caps == initial[:42] + "00" + initial[44:]
+
+
+def test_swap_path_refuses_an_unmapped_factory() -> None:
+    """A factory outside the router's three slots refuses, never guesses."""
+    with pytest.raises(ValueError, match="not one of the three router-mapped"):
+        build_swap_path(BASE_USDC_ADDRESS, AAPLC_ADDRESS, 10, "0x" + "ee" * 20)
+
+
 def test_swap_path_rejects_out_of_range_tick_spacing() -> None:
     """Tick spacing must fit the path's unsigned 16-bit segment."""
     with pytest.raises(ValueError, match="unsigned 16-bit"):
-        build_swap_path(BASE_USDC_ADDRESS, AAPLC_ADDRESS, 0)
+        build_swap_path(BASE_USDC_ADDRESS, AAPLC_ADDRESS, 0, SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS)
     with pytest.raises(ValueError, match="unsigned 16-bit"):
-        build_swap_path(BASE_USDC_ADDRESS, AAPLC_ADDRESS, 0x10000)
+        build_swap_path(
+            BASE_USDC_ADDRESS, AAPLC_ADDRESS, 0x10000, SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS
+        )
 
 
 def test_swap_calldata_encodes_length_prefixed_router_input() -> None:
     """Each bytes-array element includes its length before the swap payload."""
-    path = build_swap_path(BASE_USDC_ADDRESS, AAPLC_ADDRESS, 10)
+    path = build_swap_path(
+        BASE_USDC_ADDRESS, AAPLC_ADDRESS, 10, SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS
+    )
     calldata = build_swap_calldata(SAFE_ADDRESS, ONE_USDC_UNITS, 311_381, path, 0x6A9E34E0)
     expected = (
         "0x3593564c"
@@ -556,7 +625,9 @@ def test_swap_calldata_encodes_length_prefixed_router_input() -> None:
 
 def test_swap_calldata_decodes_with_independent_abi_decoder() -> None:
     """A standard decoder recovers the intended command and nested payload."""
-    path = build_swap_path(BASE_USDC_ADDRESS, AAPLC_ADDRESS, 10)
+    path = build_swap_path(
+        BASE_USDC_ADDRESS, AAPLC_ADDRESS, 10, SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS
+    )
     calldata = build_swap_calldata(SAFE_ADDRESS, ONE_USDC_UNITS, 311_381, path, 2_000_000_000)
     commands, inputs, deadline = decode(
         ["bytes", "bytes[]", "uint256"], bytes.fromhex(calldata[10:])
@@ -574,7 +645,9 @@ def test_swap_calldata_decodes_with_independent_abi_decoder() -> None:
 
 def test_swap_calldata_rejects_malformed_arguments() -> None:
     """Non-positive amounts, deadlines, and wrong-size paths refuse."""
-    path = build_swap_path(BASE_USDC_ADDRESS, AAPLC_ADDRESS, 10)
+    path = build_swap_path(
+        BASE_USDC_ADDRESS, AAPLC_ADDRESS, 10, SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS
+    )
     with pytest.raises(ValueError, match="amount_in_units must be positive"):
         build_swap_calldata(SAFE_ADDRESS, 0, 1, path, 10)
     with pytest.raises(ValueError, match="amount_out_min_units must be positive"):
@@ -639,6 +712,7 @@ def test_quote_model_rejects_incoherent_amounts() -> None:
         "symbol": "FIXc",
         "token_address": B20_ADDRESS,
         "pool_address": POOL_ADDRESS,
+        "factory_address": SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS,
         "tick_spacing": 10,
         "stock_decimals": STOCK_DECIMALS,
         "usdc_in_units": ONE_USDC_UNITS,

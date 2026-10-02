@@ -155,7 +155,12 @@ from aero_bot.safe_tx import (
     sign_safe_tx_hash,
 )
 from aero_bot.signing_key import load_signing_key_source
-from aero_bot.venues import AERO_TOKEN_ADDRESS, BASE_USDC_ADDRESS, PoolDiscoveryStatus
+from aero_bot.venues import (
+    AERO_TOKEN_ADDRESS,
+    BASE_USDC_ADDRESS,
+    SLIPSTREAM_ROUTER_FACTORY_FLAGS,
+    PoolDiscoveryStatus,
+)
 
 # keccak256("ownerOf(uint256)")[0:4], the ERC721 ownership read.
 ERC721_OWNER_OF_SELECTOR = "6352211e"
@@ -2709,6 +2714,18 @@ class LpLifecycleExecutor:
                 int(candidate.pool_address, 16),
             ),
         )
+        # The router can only address pools under its three constructor-mapped
+        # factories; a pool from any other factory would make the swap path
+        # derive a codeless CREATE2 address, so the conversion refuses rather
+        # than guess a flag.
+        if normalize_evm_address(pool.factory_address) not in SLIPSTREAM_ROUTER_FACTORY_FLAGS:
+            raise LpExecutionRefusalError(
+                LpExecutionRefusalCode.AERO_POOL_NOT_DISCOVERED,
+                f"the deepest AERO/USDC pool {pool.pool_address} lives on factory "
+                f"{pool.factory_address}, which the router cannot address (its three "
+                "constructor-mapped Slipstream factories are the only reachable ones); "
+                "refusing rather than building a swap path to a codeless derived address",
+            )
         caps.append("AERO reward token on the protocol's own Slipstream USDC pair")
         caps.append(f"pool {pool.pool_address} from live Sugar discovery")
         caps.append(f"snapshot fresher than {self._policy.snapshot_max_age_seconds} seconds")
@@ -2804,7 +2821,10 @@ class LpLifecycleExecutor:
                     balance_units,
                     amount_out_min_units,
                     build_swap_path(
-                        AERO_TOKEN_ADDRESS, BASE_USDC_ADDRESS, observation.tick_spacing
+                        AERO_TOKEN_ADDRESS,
+                        BASE_USDC_ADDRESS,
+                        observation.tick_spacing,
+                        observation.factory_address,
                     ),
                     deadline,
                 ),
@@ -3149,7 +3169,10 @@ class LpLifecycleExecutor:
                             swap.usdc_in_units,
                             amount_out_min,
                             build_swap_path(
-                                BASE_USDC_ADDRESS, stock_token, observation.tick_spacing
+                                BASE_USDC_ADDRESS,
+                                stock_token,
+                                observation.tick_spacing,
+                                observation.factory_address,
                             ),
                             deadline,
                         ),
@@ -3190,7 +3213,10 @@ class LpLifecycleExecutor:
                             swap.stock_in_units,
                             amount_out_min,
                             build_swap_path(
-                                stock_token, BASE_USDC_ADDRESS, observation.tick_spacing
+                                stock_token,
+                                BASE_USDC_ADDRESS,
+                                observation.tick_spacing,
+                                observation.factory_address,
                             ),
                             deadline,
                         ),
@@ -3806,7 +3832,12 @@ class LpLifecycleExecutor:
                     self._safe_address,
                     balance_units,
                     amount_out_min_units,
-                    build_swap_path(stock_token, BASE_USDC_ADDRESS, observation.tick_spacing),
+                    build_swap_path(
+                        stock_token,
+                        BASE_USDC_ADDRESS,
+                        observation.tick_spacing,
+                        observation.factory_address,
+                    ),
                     deadline,
                 ),
                 description=(
@@ -5242,6 +5273,7 @@ class LpLifecycleExecutor:
         observation = LpPoolObservation(
             symbol=listing.symbol,
             pool_address=pool.pool_address,
+            factory_address=pool.factory_address,
             nfpm_address=pool.nfpm_address,
             gauge_address=pool.gauge_address,
             token0_address=pool.token0_address,
@@ -5359,6 +5391,7 @@ class LpLifecycleExecutor:
         return LpPoolObservation(
             symbol=listing.symbol,
             pool_address=pool_address,
+            factory_address=factory,
             nfpm_address=nfpm,
             gauge_address=gauge,
             token0_address=token0,
