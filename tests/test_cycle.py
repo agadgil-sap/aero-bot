@@ -725,7 +725,7 @@ def make_runner(
     if audit_seed:
         audit.append(
             AuditEventType.LP_MINT_PLANNED,
-            FakePlanPayload(mode="execute", budget_usdc="7"),
+            FakePlanPayload(mode="execute", budget_usdc="7", symbol="FIXc"),
             QUIET_INSTANT,
         )
         audit.append(
@@ -1449,6 +1449,63 @@ class TestReconciliation:
         assert report.reconciliation.tracked_token_id == TRACKED_TOKEN_ID
         assert state_store.load().positions == ()
         assert "skipping the adoption of live position NFT" in capsys.readouterr().err
+
+    def test_the_adopted_row_carries_the_linked_plans_symbol_not_the_anchor(
+        self, tmp_path: Path
+    ) -> None:
+        """The row's pool label is the NFT's own, never the reconcile anchor.
+
+        Slipstream shares one NFPM per generation across every pool, so an
+        empty selector book's anchor (the board's first listing) enumerates
+        every pool's Safe-held NFT: a first entry minted on the allocator's
+        top rank, killed before its stake plan, must adopt with its own
+        plan's symbol - labeling it with the anchor would price and manage
+        the position against the wrong pool with no error.
+        """
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        reads.set_status(
+            TRACKED_TOKEN_ID,
+            tracked_status().model_copy(
+                update={"symbol": "BBBc", "pool_address": SELECTOR_BBB_POOL}
+            ),
+        )
+        balances = FakeBalances(usdc_units=SELECTOR_BOOK_USDC_UNITS)
+        balances.receipts[MINT_TX_HASH] = mint_receipt(TRACKED_TOKEN_ID)
+        runner, _, audit, state_store = make_runner(
+            tmp_path,
+            reads=reads,
+            balances=balances,
+            sources=SelectorCycleSources(usdc_units=SELECTOR_BOOK_USDC_UNITS),
+            symbol=None,
+        )
+        audit.append(
+            AuditEventType.LP_MINT_PLANNED,
+            FakePlanPayload(mode="execute", budget_usdc="12", symbol="BBBc"),
+            QUIET_INSTANT,
+        )
+        audit.append(
+            AuditEventType.LP_EXECUTE_CONFIRMED,
+            FakeConfirmPayload(
+                outcome="confirmed",
+                action="mint",
+                role="mint",
+                transaction_hash=MINT_TX_HASH,
+            ),
+            QUIET_INSTANT,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=SELECTOR_REFERENCES)
+
+        assert report.reconciliation.out_of_band == ""
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        assert decision_recon.symbol == "AAAc"
+        position = state_store.load().position
+        assert position is not None
+        assert position.token_id == TRACKED_TOKEN_ID
+        assert position.symbol == "BBBc"
+        assert position.pool_address == SELECTOR_BBB_POOL
+        assert position.committed_usd == Decimal("12")
 
     def test_unproven_live_positions_refuse_out_of_band(self, tmp_path: Path) -> None:
         """A live position with no audit evidence stops the cycle."""

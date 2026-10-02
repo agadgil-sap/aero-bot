@@ -2374,16 +2374,17 @@ class CycleRunner:
             and not reconciliation.recovered_positions
             and not reconciliation.out_of_band
         ):
-            adopted_symbol = reconciliation.symbol
-            committed = self._adoption_mint_label(reconciliation.tracked_token_id)
-            if committed is None:
+            proven = self._adoption_mint_label(reconciliation.tracked_token_id)
+            if proven is None:
                 _cycle_progress(
                     f"skipping the adoption of live position NFT "
-                    f"{reconciliation.tracked_token_id}: no execute-mode mint plan is "
-                    "receipt-linked to its confirmed delivery, so no committed basis "
-                    "is proven; never guessing from a newer plan"
+                    f"{reconciliation.tracked_token_id}: no execute-mode mint plan "
+                    "receipt-linked to its confirmed delivery proves its symbol and "
+                    "committed basis; never guessing from the anchor pool or a "
+                    "newer plan"
                 )
             else:
+                adopted_symbol, committed = proven
                 updates["positions"] = (
                     TrackedPosition(
                         symbol=adopted_symbol,
@@ -2467,23 +2468,25 @@ class CycleRunner:
             )
         return folded
 
-    def _adoption_mint_label(self, token_id: int) -> Decimal | None:
-        """Read the committed basis proven for one adopted position.
+    def _adoption_mint_label(self, token_id: int) -> tuple[str, Decimal] | None:
+        """Read the symbol and committed basis proven for one adopted position.
 
         The proof is the execute-mode mint plan receipt-linked to the NFT's
         own confirmed delivery: the executor records the plan during the
         build, before the delivery it confirms, under the exclusive
         execution lock - so the newest plan at or before that confirmation
-        is that NFT's own plan. The newest plan in the whole chain proves
-        nothing (a refused mint for another symbol can crown it) and is
-        never read here.
+        is that NFT's own plan, and its payload names the pool the mint
+        targeted. Neither the reconcile anchor (one shared NFPM spans every
+        pool, so the adopting inventory proves nothing about the NFT's
+        pool) nor the newest plan in the whole chain (a refused mint for
+        another symbol can crown it) labels the row.
 
         Args:
             token_id: The adopted position's NFT id.
 
         Returns:
-            The receipt-linked mint budget, or None when no plan is proven
-            for the NFT's confirmed delivery.
+            The receipt-linked plan's symbol and mint budget, or None when
+            no plan is proven for the NFT's confirmed delivery.
         """
         if self._audit_reader is None:
             return None
@@ -2512,14 +2515,15 @@ class CycleRunner:
                 older_payload = json.loads(older.payload_json)
                 if older_payload.get("mode") != ExecutionMode.EXECUTE.value:
                     return None
+                symbol = older_payload.get("symbol")
                 budget = older_payload.get("budget_usdc")
-                if not isinstance(budget, str):
+                if not isinstance(symbol, str) or not isinstance(budget, str):
                     return None
                 try:
                     value = Decimal(budget)
                 except InvalidOperation:
                     return None
-                return value if value > 0 else None
+                return (symbol, value) if value > 0 else None
             return None
         return None
 
