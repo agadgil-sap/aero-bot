@@ -34,7 +34,7 @@ Containment is the design center, not a property that emerges from responsible u
 
 The router is Aerodrome's universal router, and the swap calldata is modeled byte for byte on the Safe's already-executed reference transaction: one `execute` call carrying a single `V3_SWAP_EXACT_IN` command with the 43-byte concentrated-liquidity path `USDC || factoryFlag || tickSpacing(uint16) || stock` and a deadline eight minutes past build time.
 The middle byte is not a neutral flag: it is the router's CL factory selector (0x08 GAUGES_V3, 0x10 INITIAL, 0x00 GAUGE_CAPS, fixed by the router's constructor arguments), and it is derived from the discovered pool's own factory because the router derives the pool by CREATE2 under that factory - a mismatched flag addresses a codeless contract and the swap reverts bare.
-This is the byte that made every reward conversion refuse from launch (see [lp_execution.md](lp_execution.md)); both factories' selection is pinned by test.
+This is the byte that made every reward conversion refuse from launch (see [lp_execution.md](lp_execution.md)); all three factories' selection is pinned by test.
 The offline test suite checks a fixed encoding vector and independently decodes the outer arguments and nested swap payload with a standard ABI decoder.
 Each `bytes[]` element includes its own byte-length word before the payload; omitting that word makes the router interpret the recipient address as a payload length and reject the call before executing the swap.
 The approval the reference transaction preceded its swap with was exact, so the standing allowance here is the bounded 20-USDC number and never the infinite maximum approval.

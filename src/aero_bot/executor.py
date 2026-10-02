@@ -13,7 +13,9 @@ reference transaction: one universal-router ``execute`` call carrying a single
 ``V3_SWAP_EXACT_IN`` command whose params struct holds six head words
 (including the extra zero word this router fork appends after
 ``payerIsSender``), with the 43-byte concentrated-liquidity path
-``USDC || 0x08 || tickSpacing(uint16) || stock`` and a deadline minutes out.
+``USDC || factoryFlag || tickSpacing(uint16) || stock`` - the middle byte
+being the router's CL factory selector, derived from the pool's own factory -
+and a deadline minutes out.
 The approval the reference transaction preceded its swap with was exact, so
 this executor's standing USDC allowance is a bounded number - twenty USDC by
 default - and never the infinite maximum approval.
