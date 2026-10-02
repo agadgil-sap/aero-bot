@@ -20,7 +20,13 @@ from aero_bot.advisor import (
     PositionView,
     ViewConfidence,
 )
-from aero_bot.hindsight import episode_verdicts, grade_corpus_views
+from aero_bot.alerts import AlertTransportError
+from aero_bot.hindsight import (
+    HINDSIGHT_QUIET_MIN_FOLLOWERS,
+    episode_verdicts,
+    grade_corpus_views,
+    score_corpus,
+)
 from aero_bot.risk_manager import RiskFindingKind, audit_corpus_posture
 from aero_bot.teacher import (
     StudentWindowBrief,
@@ -35,6 +41,7 @@ from aero_bot.teacher import (
     TeacherStream,
 )
 from aero_bot.upgrade import (
+    TEACHER_DIGEST_SUBJECT_PREFIX,
     UPGRADE_DIGEST_BRIEF_MAX_CHARS,
     UPGRADE_DIGEST_ENTRY_MAX,
     UPGRADE_PROPOSAL_SCHEMA,
@@ -46,8 +53,11 @@ from aero_bot.upgrade import (
     ask_upgrade_seat,
     build_divergence_digest,
     build_upgrade_user_prompt,
+    compose_teacher_digest,
+    deliver_teacher_digest,
     main,
     print_upgrade_report,
+    recent_proposal_dates,
     run_upgrade_pass,
     write_upgrade_artifacts,
 )
@@ -182,6 +192,17 @@ def miss_episode(
 def bad_follower(at: datetime = T0 + timedelta(hours=2)) -> TeacherEpisode:
     """Build the later episode whose facts realize the bad truth."""
     return episode(at, facts=facts_picture(day_pnl="-0.5"))
+
+
+def quiet_followers(
+    at: datetime = T0 + timedelta(hours=2),
+    count: int = HINDSIGHT_QUIET_MIN_FOLLOWERS,
+) -> tuple[TeacherEpisode, ...]:
+    """Build a drained clean tail dense enough to grade the head quiet."""
+    return tuple(
+        episode(at + timedelta(minutes=5 * index), facts=facts_picture(day_pnl="0.5"))
+        for index in range(count)
+    )
 
 
 def posture_picture(
@@ -369,10 +390,10 @@ class TestDigest:
         assert pending.grounded_episode_count == 2
         quiet = digest_for(
             miss_episode(),
-            episode(T0 + timedelta(hours=2), facts=facts_picture(day_pnl="0.5")),
+            *quiet_followers(),
         )
         assert quiet.total_divergences == 0
-        assert quiet.quiet_episode_count == 1
+        assert quiet.quiet_episode_count >= 1
 
     def test_news_episodes_are_out_of_scope(self) -> None:
         """News has no deterministic follow-up truth to diverge over."""
@@ -1237,3 +1258,163 @@ class TestPostureWiring:
         assert report.gated
         assert report.digest.posture_finding_count == 1
         assert report.digest.posture_misses == ()
+
+
+class TestTeacherDigestEmail:
+    """The emailed digest: bounded, honest, and delivered advisory-only."""
+
+    def _report(self, *, gated: bool = False) -> UpgradeReport:
+        """Build one report with a divergence, scores, and one proposal."""
+        episodes: tuple[TeacherEpisode, ...] = (miss_episode(), bad_follower())
+        digest = build_divergence_digest(
+            episodes,
+            episode_verdicts(episodes, HORIZON, now=NOW),
+            HORIZON,
+        )
+        proposal = UpgradeProposal.model_validate(PROPOSAL_ANSWER)
+        return UpgradeReport(
+            created_at=NOW,
+            horizon_hours=HORIZON,
+            gated=gated,
+            digest=digest,
+            desk_scores=score_corpus(episodes, HORIZON, NOW).desks,
+            seats=(
+                SeatUpgradeOutcome(
+                    seat=TeacherSeatName.CLAUDE,
+                    model="GLM 5.3",
+                    outcome="proposal",
+                    proposal=proposal,
+                ),
+            ),
+        )
+
+    def test_the_subject_and_body_carry_the_loop_evidence(self) -> None:
+        """The email is recognizable, bounded, and honest about quiet volume."""
+        subject, body = compose_teacher_digest(self._report(), proposal_dates=("20260930",))
+        assert subject.startswith(TEACHER_DIGEST_SUBJECT_PREFIX)
+        assert "divergences" in subject
+        assert "2 misses" in body
+        assert "availability" in body
+        assert "student" in body
+        assert "proposed a teaching block" in body
+        assert "rationale:" in body
+        assert "sensitivity-only, no quiet controls" in body
+        assert "proposal trail" in body
+        assert "20260930" in body
+        assert "sealing stays the operator's manual act" in body
+
+    def test_a_quiet_controlled_digest_drops_the_sensitivity_stamp(self) -> None:
+        """Quiet volume swaps the stamp for the control count."""
+        episodes: tuple[TeacherEpisode, ...] = (miss_episode(), *quiet_followers())
+        digest = build_divergence_digest(
+            episodes, episode_verdicts(episodes, HORIZON, now=NOW), HORIZON
+        )
+        report = UpgradeReport(created_at=NOW, horizon_hours=HORIZON, gated=True, digest=digest)
+        _, body = compose_teacher_digest(report)
+        assert "sensitivity-only" not in body
+        assert "quiet controls carry volume" in body
+        assert "gated: no scorable divergences" in body
+
+    def test_the_proposal_trail_lists_newest_first_and_bounded(self, tmp_path: Path) -> None:
+        """The trail helper renders the repetition the operator must see."""
+        proposals = tmp_path / "proposals"
+        proposals.mkdir()
+        for day in range(1, 12):
+            (proposals / f"upgrade-202609{day:02d}.jsonl").write_text("{}\n", encoding="utf-8")
+        assert recent_proposal_dates(tmp_path) == tuple(
+            f"202609{day:02d}" for day in range(11, 4, -1)
+        )
+        assert recent_proposal_dates(tmp_path / "absent") == ()
+
+    def test_delivery_sends_through_the_sealed_transport(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A configured provider sends the composed digest once."""
+        sent: list[tuple[str, str]] = []
+
+        class RecordingTransport:
+            def send(self, subject: str, body: str) -> None:
+                sent.append((subject, body))
+
+        monkeypatch.setattr(
+            "aero_bot.upgrade.build_alert_transport", lambda _config: RecordingTransport()
+        )
+        environ = {
+            "AERO_BOT_ALERT_PROVIDER": "resend",
+            "AERO_BOT_ALERT_FROM": "bot@example.com",
+            "AERO_BOT_ALERT_TO": "capn@example.com",
+            "AERO_BOT_ALERT_RESEND_API_KEY": "re_fixture_key",
+        }
+        assert deliver_teacher_digest(self._report(), environ=environ) is True
+        assert len(sent) == 1
+        assert sent[0][0].startswith(TEACHER_DIGEST_SUBJECT_PREFIX)
+
+    def test_a_disabled_provider_warns_and_never_fails_the_pass(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """No sealed provider means an honest not-sent, never an exception."""
+        assert deliver_teacher_digest(self._report(), environ={}) is False
+        captured = capsys.readouterr()
+        assert "disabled" in captured.err
+
+    def test_a_failed_send_warns_and_returns_false(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A transport failure is advisory, never a crashed pass."""
+
+        class FailingTransport:
+            def send(self, subject: str, body: str) -> None:
+                raise AlertTransportError("resend refused the fixture key")
+
+        monkeypatch.setattr(
+            "aero_bot.upgrade.build_alert_transport", lambda _config: FailingTransport()
+        )
+        environ = {
+            "AERO_BOT_ALERT_PROVIDER": "resend",
+            "AERO_BOT_ALERT_FROM": "bot@example.com",
+            "AERO_BOT_ALERT_TO": "capn@example.com",
+            "AERO_BOT_ALERT_RESEND_API_KEY": "re_fixture_key",
+        }
+        assert deliver_teacher_digest(self._report(), environ=environ) is False
+        captured = capsys.readouterr()
+        assert "delivery failed" in captured.err
+
+    def test_the_cli_email_flag_delivers_after_the_pass(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--email sends the digest once the artifacts are on disk."""
+        corpus_dir = tmp_path / "corpus"
+        write_corpus(corpus_dir, miss_episode(), bad_follower())
+        config_path = tmp_path / "teacher.json"
+        config_path.write_text(
+            json.dumps({"seats": {"claude": {"binary": "/bin/claude"}}}), encoding="utf-8"
+        )
+        monkeypatch.setenv("AERO_BOT_TEACHER_CONFIG", str(config_path))
+        monkeypatch.setenv("AERO_BOT_TEACHER_CORPUS_DIR", str(corpus_dir))
+        monkeypatch.setenv("AERO_BOT_ALERT_PROVIDER", "resend")
+        monkeypatch.setenv("AERO_BOT_ALERT_FROM", "bot@example.com")
+        monkeypatch.setenv("AERO_BOT_ALERT_TO", "capn@example.com")
+        monkeypatch.setenv("AERO_BOT_ALERT_RESEND_API_KEY", "re_fixture_key")
+        transport = ScriptedSeatTransport([proposal_result(), proposal_result()])
+        monkeypatch.setattr(
+            "aero_bot.upgrade.SubprocessTeacherTransport",
+            lambda: cast("TeacherSeatTransport", transport),
+        )
+        sent: list[tuple[str, str]] = []
+
+        class RecordingTransport:
+            def send(self, subject: str, body: str) -> None:
+                sent.append((subject, body))
+
+        monkeypatch.setattr(
+            "aero_bot.upgrade.build_alert_transport", lambda _config: RecordingTransport()
+        )
+        assert main(["--email"]) == 0
+        captured = capsys.readouterr()
+        assert "digest email: sent" in captured.out
+        assert len(sent) == 1
+        assert sent[0][0].startswith(TEACHER_DIGEST_SUBJECT_PREFIX)

@@ -263,7 +263,114 @@ def test_append_never_retries_a_non_lock_operational_error(
     assert sleeps == []
 
 
-def test_secret_shaped_fields_and_naive_timestamps_are_rejected(tmp_path: Path) -> None:
+def test_initialize_retries_a_transient_writer_lock_and_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Store construction waits out a held write lock instead of crashing the reader.
+
+    Production evidence (2026-09-29 23:00 UTC): the daily report's dry
+    cycle died at exit 1 when ``AuditStore`` initialization hit
+    ``PRAGMA user_version = 1`` against a held write lock - the gnhf 38
+    append backoff covered appends, not store construction - so a
+    colliding cycle could kill the 09:00 report at open. Initialization
+    now carries the same bounded backoff.
+    """
+    database = tmp_path / "audit.sqlite3"
+    store = AuditStore(database)
+    initialize_once = store._initialize_once
+    failures = ["database is locked", "database is locked"]
+    sleeps: list[float] = []
+    monkeypatch.setattr("aero_bot.audit.time.sleep", sleeps.append)
+
+    def contend_then_initialize() -> None:
+        """Raise the first two lock errors, then delegate to the real init."""
+        if failures:
+            raise sqlite3.OperationalError(failures.pop(0))
+        initialize_once()
+
+    monkeypatch.setattr(store, "_initialize_once", contend_then_initialize)
+
+    store._initialize()
+
+    assert sleeps == [0.5, 1.0]
+    assert store.verify_chain().status is AuditVerificationStatus.EMPTY
+
+
+def test_initialize_survives_a_real_held_write_lock_at_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second store opens while a real foreign connection holds the write lock.
+
+    The end-to-end shape of the 2026-09-29 crash: a concurrent writer
+    holds the database when the daily report opens its store. The opener
+    retries past the connect timeout window (sleeps monkeypatched so the
+    test stays fast) and initializes as soon as the lock drains.
+    """
+    database = tmp_path / "audit.sqlite3"
+    AuditStore(database)
+    holder = sqlite3.connect(database, timeout=1.0)
+    holder.execute("BEGIN IMMEDIATE")
+    sleeps: list[float] = []
+    released = False
+
+    def sleep_and_release_once(seconds: float) -> None:
+        """Record the backoff, then drain the holder's lock on the first nap."""
+        nonlocal released
+        sleeps.append(seconds)
+        if not released:
+            released = True
+            holder.commit()
+            holder.close()
+
+    # A short connect timeout keeps the real contention fast in tests while
+    # the production five-second timeout bounds the first wait.
+    monkeypatch.setattr("aero_bot.audit.SQLITE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr("aero_bot.audit.time.sleep", sleep_and_release_once)
+
+    reader = AuditStore(database)
+
+    assert sleeps, "initialization never entered the backoff schedule"
+    assert reader.verify_chain().status is AuditVerificationStatus.EMPTY
+
+
+def test_initialize_reraises_a_lock_that_outlives_every_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock that survives the whole bounded schedule still surfaces honestly."""
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    sleeps: list[float] = []
+    monkeypatch.setattr("aero_bot.audit.time.sleep", sleeps.append)
+
+    def always_locked() -> None:
+        """Contend forever like a wedged external writer."""
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "_initialize_once", always_locked)
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        store._initialize()
+
+    assert sleeps == [0.5, 1.0, 2.0, 4.0, 8.0]
+
+
+def test_initialize_never_retries_a_non_lock_operational_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-lock SQLite failure surfaces immediately without any retry."""
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    sleeps: list[float] = []
+    monkeypatch.setattr("aero_bot.audit.time.sleep", sleeps.append)
+
+    def unsupported_version() -> None:
+        """Fail like a schema fault, never a lock."""
+        raise sqlite3.OperationalError("unsupported audit schema version 7")
+
+    monkeypatch.setattr(store, "_initialize_once", unsupported_version)
+
+    with pytest.raises(sqlite3.OperationalError, match="unsupported audit schema"):
+        store._initialize()
+
+    assert sleeps == []
     """Credential-bearing schemas and ambiguous event times never reach SQLite."""
     # Empty initialized store must remain unchanged after both rejected append attempts.
     store = AuditStore(tmp_path / "audit.sqlite3")

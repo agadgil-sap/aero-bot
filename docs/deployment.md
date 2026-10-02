@@ -91,11 +91,32 @@ Remote-only `<file>.pre-<tag>-<timestamp>` files are the rollback snapshots the 
 The SSH transport and remote path default to the production box (`gcloud compute ssh aero-bot --zone us-west1-b`, `/opt/aero-bot`) and override through `AERO_BOT_SSH` / `AERO_BOT_REMOTE_APP`.
 - **The relayer gas tank:** the alert floor (default 0.0005 ETH) warns before the executor's own 0.0002-ETH floor refuses broadcasts.
 
+## Seal drift and repair
+
+The installer never rewrites an existing seal - that idempotence is its safety contract - which is exactly how the 2026-09-28 advisor misconfiguration survived every deploy: the sealed primary kept pointing at the dead shared plane with no fallback while the dedicated student plane sat unused, and the student seat went dark for 36 hours.
+Alerts showed the same shape one level down: `AERO_BOT_ALERT_PROVIDER=none` sealed beside working Resend credentials, so the idle-cash alert computed and never emailed.
+
+Every deploy now checks the seals it refuses to fix and says so loudly:
+
+- a sealed advisor primary that is not the documented dedicated plane (`http://100.106.111.37:11435`), or a missing fallback line;
+- an alert provider sealed `none` while a Resend key is sealed in the same file.
+
+The repair itself stays the operator's explicit act, through the guarded idempotent kit shipped in the deploy tree:
+
+```
+sudo bash deploy/seal-repair.sh --check   # report drift, change nothing (exit 3 on drift)
+sudo bash deploy/seal-repair.sh --apply   # repair, back up, and try-restart the advisor
+```
+
+`--apply` repoints `advisor.env` to the dedicated plane with the shared plane sealed as fallback and enables `AERO_BOT_ALERT_PROVIDER=resend` in `cycle.env` - but only when the Resend key, FROM, and TO are already sealed there; incomplete credentials are a refusal (exit 4), never a guess, and an existing non-none provider (for example `smtp`) is reported as a manual decision rather than stomped.
+Every modified file is backed up beside itself (`.bak-<timestamp>`) with ownership and mode preserved, and a converged seal is a no-op: the repair is idempotent like the installer.
+The one mutating step beyond the seals is `systemctl try-restart aero-bot-advisor.service`, which restarts only an already-active unit; every timer-driven pass reads the repaired seal at its next start regardless.
+
 ## The Mac-side teacher kit
 
 The teacher harness (see [the teacher documentation](teacher.md)) runs on the operator's Mac, not this box: its launchd agents pull one read-only window over `gcloud compute ssh` and ask the advisory seats, so the box itself needs nothing new - the pull only reads the audit database and cycle book through the existing `sudo` path.
 The same installer also generates the student seat's dedicated Ollama plane (`com.aero-bot.student-ollama`, the always-alive server that pins the advisor's model resident on `100.106.111.37:11435`; see [the advisor documentation](advisor.md#the-student-plane)) - the VM's sealed `AERO_BOT_ADVISOR_URL` points at it with the shared instance sealed as the unreachable-fallback.
-Generate the seven user agents from the Mac checkout:
+Generate the eight user agents from the Mac checkout:
 
 ```
 bash deploy/launchd/install-mac.sh

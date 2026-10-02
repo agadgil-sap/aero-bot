@@ -569,7 +569,7 @@ class TestMacTeacherKit:
         """The upgrade argument runs the proposer, not a teacher stream."""
         text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
         assert '"$STREAM" == "upgrade"' in text
-        assert 'run aero-bot-upgrade >>"$LOG_DIR/${STREAM}.log"' in text
+        assert 'run aero-bot-upgrade --email >>"$LOG_DIR/${STREAM}.log"' in text
 
     def test_the_run_script_serves_the_risk_manager(self) -> None:
         """The risk-manager argument runs the audit, not a teacher stream."""
@@ -632,3 +632,238 @@ class TestMacTeacherKit:
         assert 'value="${value//&/&amp;}"' in text
         assert 'value="${value//</&lt;}"' in text
         assert 'value="${value//>/&gt;}"' in text
+
+
+SEAL_REPAIR_SCRIPT = Path("deploy/seal-repair.sh")
+
+
+class TestSealRepairScript:
+    """The guarded idempotent seal repair, exercised behaviorally off-box."""
+
+    def _run(
+        self,
+        mode: str,
+        config_dir: Path,
+        system_ctl: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the script against a fixture seal directory."""
+        return subprocess.run(  # noqa: S603 - our own script, fixture-scoped
+            [
+                "/bin/bash",
+                str(SEAL_REPAIR_SCRIPT),
+                mode,
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "AERO_BOT_CONFIG_DIR": str(config_dir),
+                "AERO_BOT_SYSTEMCTL": str(system_ctl),
+            },
+        )
+
+    def _fixture_config(
+        self,
+        tmp_path: Path,
+        *,
+        advisor_url: str | None,
+        fallback_url: str | None,
+        provider: str | None,
+        resend_key: str | None = "re_sealed_key",
+    ) -> Path:
+        """Build one drifted seal pair matching the 2026-09-28 defect."""
+        config_dir = tmp_path / "aero-bot"
+        config_dir.mkdir()
+        advisor_lines = ["# advisor seal"]
+        if advisor_url:
+            advisor_lines.append(f"AERO_BOT_ADVISOR_URL={advisor_url}")
+        if fallback_url:
+            advisor_lines.append(f"AERO_BOT_ADVISOR_FALLBACK_URL={fallback_url}")
+        (config_dir / "advisor.env").write_text("\n".join(advisor_lines) + "\n", encoding="utf-8")
+        cycle_lines = ["# cycle seal", "AERO_BOT_SAFE_ADDRESS=0x0"]
+        if provider:
+            cycle_lines.append(f"AERO_BOT_ALERT_PROVIDER={provider}")
+        if resend_key:
+            cycle_lines.append(f"AERO_BOT_ALERT_RESEND_API_KEY={resend_key}")
+            cycle_lines.append("AERO_BOT_ALERT_FROM=on@resend.dev")
+            cycle_lines.append("AERO_BOT_ALERT_TO=capn@example.com")
+        (config_dir / "cycle.env").write_text("\n".join(cycle_lines) + "\n", encoding="utf-8")
+        return config_dir
+
+    def _recording_systemctl(self, tmp_path: Path) -> Path:
+        """A fake systemctl that records its arguments."""
+        recorder = tmp_path / "systemctl-fixture"
+        recorder.write_text(
+            f'#!/bin/bash\nprintf "%s\\n" "$@" >>"{tmp_path / "systemctl.log"}"\n',
+            encoding="utf-8",
+        )
+        recorder.chmod(0o755)
+        return recorder
+
+    def test_the_script_parses_as_strict_bash(self) -> None:
+        """Bash's own parser accepts the repair script under strict settings."""
+        completed = subprocess.run(  # noqa: S603 - a syntax check of our own script
+            ["/bin/bash", "-n", str(SEAL_REPAIR_SCRIPT)],
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    def test_check_reports_the_drift_without_touching_anything(self, tmp_path: Path) -> None:
+        """The 2026-09-28 drift is visible and check mode is read-only."""
+        config_dir = self._fixture_config(
+            tmp_path,
+            advisor_url="http://100.106.111.37:11434",
+            fallback_url=None,
+            provider="none",
+        )
+        before = {
+            name: (config_dir / name).read_text(encoding="utf-8")
+            for name in ("advisor.env", "cycle.env")
+        }
+        completed = self._run("--check", config_dir, self._recording_systemctl(tmp_path))
+        assert completed.returncode == 3
+        assert "DRIFT" in completed.stdout
+        assert "11435" in completed.stdout
+        for name, text in before.items():
+            assert (config_dir / name).read_text(encoding="utf-8") == text
+        assert not (tmp_path / "systemctl.log").exists()
+
+    def test_check_passes_a_converged_seal(self, tmp_path: Path) -> None:
+        """A converged seal reports no drift and exits zero."""
+        config_dir = self._fixture_config(
+            tmp_path,
+            advisor_url="http://100.106.111.37:11435",
+            fallback_url="http://100.106.111.37:11434",
+            provider="resend",
+        )
+        completed = self._run("--check", config_dir, self._recording_systemctl(tmp_path))
+        assert completed.returncode == 0
+        assert "no drift" in completed.stdout
+
+    def test_apply_repairs_the_drift_idempotently_and_restarts_the_advisor(
+        self, tmp_path: Path
+    ) -> None:
+        """Apply repoints the plane, enables alerts, restarts once; re-run is a no-op."""
+        config_dir = self._fixture_config(
+            tmp_path,
+            advisor_url="http://100.106.111.37:11434",
+            fallback_url=None,
+            provider="none",
+        )
+        system_ctl = self._recording_systemctl(tmp_path)
+        completed = self._run("--apply", config_dir, system_ctl)
+        assert completed.returncode == 0
+        advisor = (config_dir / "advisor.env").read_text(encoding="utf-8")
+        assert "AERO_BOT_ADVISOR_URL=http://100.106.111.37:11435" in advisor
+        assert "AERO_BOT_ADVISOR_FALLBACK_URL=http://100.106.111.37:11434" in advisor
+        # The stale shared-plane assignment is gone, not duplicated.
+        assert advisor.count("AERO_BOT_ADVISOR_URL=") == 1
+        cycle = (config_dir / "cycle.env").read_text(encoding="utf-8")
+        assert "AERO_BOT_ALERT_PROVIDER=resend" in cycle
+        assert cycle.count("AERO_BOT_ALERT_PROVIDER=") == 1
+        restarts = (tmp_path / "systemctl.log").read_text(encoding="utf-8").splitlines()
+        assert restarts == ["try-restart", "aero-bot-advisor.service"]
+        backups = list(config_dir.glob("*.bak-*"))
+        assert len(backups) == 2
+        # No stray sed suffix files or leftover temporaries: the seal
+        # directory carries exactly the two seals and their backups.
+        assert sorted(path.name for path in config_dir.iterdir()) == sorted(
+            [
+                "advisor.env",
+                "cycle.env",
+                *(path.name for path in backups),
+            ]
+        )
+        # The second apply converges without a restart or new backups.
+        again = self._run("--apply", config_dir, system_ctl)
+        assert again.returncode == 0
+        assert "already converged" in again.stdout
+        assert len(list(config_dir.glob("*.bak-*"))) == 2
+
+    def test_apply_refuses_to_enable_alerts_without_sealed_credentials(
+        self, tmp_path: Path
+    ) -> None:
+        """A missing Resend key is a refusal, never a guessed enable."""
+        config_dir = self._fixture_config(
+            tmp_path,
+            advisor_url="http://100.106.111.37:11435",
+            fallback_url="http://100.106.111.37:11434",
+            provider=None,
+            resend_key=None,
+        )
+        system_ctl = self._recording_systemctl(tmp_path)
+        completed = self._run("--apply", config_dir, system_ctl)
+        assert completed.returncode == 4
+        assert "REFUSED" in completed.stdout
+        assert "AERO_BOT_ALERT_PROVIDER" not in (config_dir / "cycle.env").read_text(
+            encoding="utf-8"
+        )
+        # A converged advisor seal means no restart on a refused apply.
+        assert not (tmp_path / "systemctl.log").exists()
+
+    def test_a_foreign_provider_is_a_manual_decision_never_a_rewrite(self, tmp_path: Path) -> None:
+        """An smtp provider line is reported, not stomped."""
+        config_dir = self._fixture_config(
+            tmp_path,
+            advisor_url="http://100.106.111.37:11435",
+            fallback_url="http://100.106.111.37:11434",
+            provider="smtp",
+        )
+        system_ctl = self._recording_systemctl(tmp_path)
+        completed = self._run("--apply", config_dir, system_ctl)
+        assert completed.returncode == 4
+        assert "MANUAL" in completed.stdout
+        assert "AERO_BOT_ALERT_PROVIDER=smtp" in (config_dir / "cycle.env").read_text(
+            encoding="utf-8"
+        )
+
+    def test_the_root_guard_protects_the_real_seal_directory(self) -> None:
+        """Without root, the real /etc/aero-bot is refused even in check mode."""
+        completed = subprocess.run(  # noqa: S603 - our own script, guard-probed
+            ["/bin/bash", str(SEAL_REPAIR_SCRIPT), "--check"],
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert completed.returncode == 1
+        assert "run as root" in completed.stderr
+
+    def test_bare_invocations_are_refused(self, tmp_path: Path) -> None:
+        """No mode means no action; misuse never mutates."""
+        config_dir = self._fixture_config(
+            tmp_path,
+            advisor_url="http://100.106.111.37:11435",
+            fallback_url="http://100.106.111.37:11434",
+            provider="resend",
+        )
+        completed = self._run("--nonsense", config_dir, self._recording_systemctl(tmp_path))
+        assert completed.returncode == 1
+        assert "usage" in completed.stderr
+
+
+class TestSealDriftWarning:
+    """The installer names drift it refuses to fix, every deploy."""
+
+    def test_the_installer_warns_about_a_drifted_advisor_seal(self) -> None:
+        """The dedicated plane and fallback are checked, loudly."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "seal drift" in text
+        assert (
+            "advisor.env primary plane is '$SEALED_URL', not the documented "
+            "dedicated plane http://100.106.111.37:11435" in text
+        )
+        assert "no effective AERO_BOT_ADVISOR_FALLBACK_URL" in text
+
+    def test_the_installer_warns_about_silent_alerts_with_sealed_credentials(self) -> None:
+        """Provider none while a Resend key is sealed is named every deploy."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        assert "alerts compute and never email" in text
+        assert "seal-repair.sh --check" in text
+
+    def test_the_warning_never_mutates_a_seal(self) -> None:
+        """Drift detection is read-only: no writes into the config dir."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        drift_block = text[text.index("seal drift") : text.index("systemd units")]
+        assert "seal_effective_value" in drift_block
+        assert "sed -i" not in drift_block

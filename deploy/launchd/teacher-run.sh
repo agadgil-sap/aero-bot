@@ -35,8 +35,30 @@ if [[ "$STREAM" == "hindsight" ]]; then
 fi
 if [[ "$STREAM" == "upgrade" ]]; then
     # The upgrade loop proposes teaching blocks from scored divergence;
-    # it is not a teacher stream either.
-    exec "$UV_BIN" run aero-bot-upgrade >>"$LOG_DIR/${STREAM}.log" 2>&1
+    # it is not a teacher stream either. The pass also emails its digest
+    # through the sealed alert transport when the operator has sealed the
+    # overlay below (the existing Resend configuration reused, never a
+    # new provider; owner-only delivery until a sending domain is
+    # verified - see docs/teacher.md). --email only warns when the
+    # overlay is absent, so the pass stays clean while unconfigured.
+    EMAIL_ENV="$STATE_DIR/upgrade-email.env"
+    if [[ -f "$EMAIL_ENV" ]]; then
+        # A key-bearing overlay must be owner-only: any group or other
+        # access bit refuses the pass (stat spells differ between macOS
+        # and Linux, so both are tried before giving up open).
+        EMAIL_MODE="$(stat -f '%Lp' "$EMAIL_ENV" 2>/dev/null \
+            || stat -c '%a' "$EMAIL_ENV" 2>/dev/null || true)"
+        if [[ "$EMAIL_MODE" =~ ^[0-7]+$ ]] && (( (8#$EMAIL_MODE & 8#007) != 0 )); then
+            echo "teacher-run: refusing group/world-readable $EMAIL_ENV (mode $EMAIL_MODE); chmod 600 it" \
+                >>"$LOG_DIR/${STREAM}.log" 2>&1
+            exit 1
+        fi
+        set -a
+        # shellcheck disable=SC1090
+        . "$EMAIL_ENV"
+        set +a
+    fi
+    exec "$UV_BIN" run aero-bot-upgrade --email >>"$LOG_DIR/${STREAM}.log" 2>&1
 fi
 if [[ "$STREAM" == "risk-manager" ]]; then
     # The risk manager audits posture as the counterparty desk; it is not

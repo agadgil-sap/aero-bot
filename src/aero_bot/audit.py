@@ -5,7 +5,7 @@ import json
 import os
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -71,6 +71,37 @@ SENSITIVE_FIELD_NAMES = frozenset(
 
 class AuditIntegrityError(RuntimeError):
     """Indicate that a corrupt chain cannot accept another durable event."""
+
+
+def _run_locked[T](action: Callable[[], T]) -> T:
+    """Run one SQLite action retrying only lock-flavored contention.
+
+    Args:
+        action: The database operation to attempt; one try per configured
+            backoff plus the first.
+
+    Returns:
+        Whatever the action returns on its first non-contended success.
+
+    Raises:
+        sqlite3.OperationalError: The action's own non-lock failure, or a
+            synthetic lock error when the writer lock stays contended past
+            every retry.
+    """
+    # One attempt per configured backoff plus the first try; only a
+    # lock-flavored OperationalError retries, and everything else
+    # (corruption, schema, misuse) still surfaces immediately.
+    attempts = len(SQLITE_LOCK_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(attempts):
+        try:
+            return action()
+        except sqlite3.OperationalError as error:
+            message = str(error).lower()
+            lock_contended = "locked" in message or "busy" in message
+            if not lock_contended or attempt + 1 == attempts:
+                raise
+            time.sleep(SQLITE_LOCK_RETRY_DELAYS_SECONDS[attempt])
+    raise sqlite3.OperationalError("database is locked past every retry")
 
 
 class AuditEventType(StrEnum):
@@ -328,20 +359,8 @@ class AuditStore:
         created_at_text = self._normalize_datetime(created_at)
         # Canonical payload and secret rejection happen before any durable mutation.
         payload_json = self._canonical_payload(payload)
-        # One attempt per configured backoff plus the first try; only a
-        # lock-flavored OperationalError retries, and everything else
-        # (corruption, schema, misuse) still surfaces immediately.
-        attempts = len(SQLITE_LOCK_RETRY_DELAYS_SECONDS) + 1
-        for attempt in range(attempts):
-            try:
-                return self._append_durable(event_type, created_at_text, payload_json)
-            except sqlite3.OperationalError as error:
-                message = str(error).lower()
-                lock_contended = "locked" in message or "busy" in message
-                if not lock_contended or attempt + 1 == attempts:
-                    raise
-                time.sleep(SQLITE_LOCK_RETRY_DELAYS_SECONDS[attempt])
-        raise sqlite3.OperationalError("database is locked past every retry")
+        # The bounded writer-lock retry covers the whole append transaction.
+        return _run_locked(lambda: self._append_durable(event_type, created_at_text, payload_json))
 
     def _append_durable(
         self,
@@ -544,7 +563,22 @@ class AuditStore:
         )
 
     def _initialize(self) -> None:
-        """Create the versioned table and append-only triggers idempotently."""
+        """Create the versioned table and triggers with bounded lock retry.
+
+        The 2026-09-29 23:00 UTC daily report died at exit 1 when its
+        audit-store initialization hit ``PRAGMA user_version = 1`` against
+        a held write lock - the append backoff covers appends, not store
+        construction - so initialization now carries the same bounded
+        backoff: a transient local lock (a concurrent cycle append,
+        backup, or dashboard verification) must never kill a reader at
+        open either.
+        """
+        _run_locked(self._initialize_once)
+        # SQLite creates the main file during initialization, after which mode can be tightened.
+        os.chmod(self._database_path, DATABASE_FILE_MODE)
+
+    def _initialize_once(self) -> None:
+        """Create the versioned table and append-only triggers idempotently; no retry here."""
         with closing(self._connect()) as connection, connection:
             # Version zero is a new database, while any other unsupported version fails closed.
             current_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -589,8 +623,6 @@ class AuditStore:
             )
             # Explicit schema version records successful initialization for future migrations.
             connection.execute("PRAGMA user_version = 1")
-        # SQLite creates the main file during initialization, after which mode can be tightened.
-        os.chmod(self._database_path, DATABASE_FILE_MODE)
 
     def _connect(self) -> sqlite3.Connection:
         """Open one hardened short-lived SQLite connection."""
