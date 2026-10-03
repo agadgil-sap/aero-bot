@@ -3492,6 +3492,30 @@ class TestCycleConfiguration:
                 cycle_module.main(argv)
             assert raised.value.code == 2, argv
 
+    def test_a_malformed_sealed_dust_bound_refuses_with_the_clean_configuration_message(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A non-numeric sealed dust value refuses cleanly, never a traceback."""
+        from aero_bot import cycle as cycle_module
+
+        monkeypatch.setattr(
+            cycle_module,
+            "build_cycle_runner",
+            lambda *args, **kwargs: pytest.fail("the runner must not build"),
+        )
+        for name in (CYCLE_STOCK_DUST_FLOOR_USDC_ENV, CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV):
+            monkeypatch.setenv(name, "abc")
+            assert cycle_module.main(["--dry-run"]) == 1, name
+            assert "invalid configuration:" in capsys.readouterr().err, name
+            monkeypatch.delenv(name)
+        # The argparse-phase coherence pre-check reads the sealed floor even
+        # when the aggregate is flagged, so the malformed value refuses
+        # there too - never a raw decimal traceback out of the CLI.
+        monkeypatch.setenv(CYCLE_STOCK_DUST_FLOOR_USDC_ENV, "abc")
+        argv = ["--dry-run", "--stock-dust-aggregate-usdc", "0.5"]
+        assert cycle_module.main(argv) == 1
+        assert "invalid configuration:" in capsys.readouterr().err
+
     def test_the_floor_flag_never_exceeds_the_minimum(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

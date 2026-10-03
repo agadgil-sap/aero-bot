@@ -6158,13 +6158,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     # The aggregate bound covers the floor wherever the floor came from: a
     # sealed floor above a flagged aggregate would refuse every dust set
-    # on a bound the floor itself already breaches.
-    raw_dust_floor = os.environ.get(CYCLE_STOCK_DUST_FLOOR_USDC_ENV, "").strip()
-    resolved_dust_floor = (
-        arguments.stock_dust_floor_usdc
-        if arguments.stock_dust_floor_usdc is not None
-        else (Decimal(raw_dust_floor) if raw_dust_floor else DEFAULT_STOCK_DUST_FLOOR_USDC)
-    )
+    # on a bound the floor itself already breaches. The sealed floor
+    # resolves through the same reader the configuration phase uses, so a
+    # malformed sealed value refuses here with the clean configuration
+    # message instead of a raw parse traceback.
+    try:
+        resolved_dust_floor = (
+            arguments.stock_dust_floor_usdc
+            if arguments.stock_dust_floor_usdc is not None
+            else _stock_dust_floor_from_environment(os.environ)
+        )
+    except (ValueError, ArithmeticError) as error:
+        print(f"invalid configuration: {error}", file=sys.stderr)
+        return EXIT_FAILURE
     if (
         arguments.stock_dust_aggregate_usdc is not None
         and arguments.stock_dust_aggregate_usdc < resolved_dust_floor
