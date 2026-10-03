@@ -318,3 +318,56 @@ def test_main_runs_the_selector_when_the_symbol_is_auto(
     assert "selector:" in output
     assert "event window (informational):" in output
     audit_factory.return_value.append.assert_called_once()
+
+
+def test_a_closed_market_feed_age_blocks_entries_fail_closed() -> None:
+    """An honest closed-market age can never masquerade as a fresh quote.
+
+    The live reference feed stamps each quote's age from the provider's
+    own as-of time; this is exactly the reference_age_seconds a feed-backed
+    decision carries. A Friday-close quote decided Friday night reads
+    14,279 seconds old - far past the 300-second entry bound - so the
+    enforcement surface holds fail-closed as reference_stale no matter
+    how recently the poll ran.
+    """
+    sources = FakeStrategySources()
+
+    report = run_decision(
+        sources,
+        "FIXc",
+        equity_usd=Decimal("200"),
+        reference_price_usdc=Decimal("100"),
+        reference_age_seconds=14_279,
+        safe_address="0xb69ab6c7e73f711d5f2d10fed8f0d09b1d028c28",
+        observed_at=QUIET_INSTANT,
+    )
+
+    assert report.outcome.decision.action is PolicyActionKind.HOLD
+    assert report.outcome.decision.reason is PolicyReason.REFERENCE_STALE
+    assert "older than the 300-second bound" in report.outcome.decision.diagnostics[0]
+
+
+def test_assemble_board_carries_per_symbol_honest_ages() -> None:
+    """A live-feed symbol's as-of age outranks the shared injected age."""
+    from aero_bot.strategy import assemble_board
+
+    sources = SelectorStrategySources()
+    listings, snapshot_block = sources.enumerate_pools()
+
+    options, _, _, notes = assemble_board(
+        sources,
+        listings,
+        snapshot_block,
+        QUIET_INSTANT,
+        Decimal("200"),
+        {"AAAc": Decimal("100"), "BBBc": Decimal("100")},
+        0,
+        "0xb69ab6c7e73f711d5f2d10fed8f0d09b1d028c28",
+        reference_ages_by_symbol={"BBBc": 14_279},
+    )
+
+    ages = {option.symbol: option.observation.reference_age_seconds for option in options}
+    # AAAc keeps the injected shared age zero; BBBc carries its own honest
+    # as-of measurement straight into the observation the gates read.
+    assert ages == {"AAAc": 0, "BBBc": 14_279}
+    assert any("no real-market reference quote reached this board" not in note for note in notes)

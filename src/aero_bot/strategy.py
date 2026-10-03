@@ -659,8 +659,9 @@ def assemble_observation(
         )
     if reference_price_usdc is None:
         notes.append(
-            "no live real-market reference quote is wired yet; entries block "
-            "fail-closed as reference_stale unless --reference-price injects one"
+            "no real-market reference quote reached this decision; entries block "
+            "fail-closed as reference_stale wherever enforcement applies - inject "
+            "one with --reference-price or arm the live feed with --reference-feed"
         )
     notes.append(
         "policy decisions keep a conservative zero fee APR; the live claimable "
@@ -812,14 +813,15 @@ def assemble_board(
     reference_prices: Mapping[str, Decimal],
     reference_age_seconds: int | None,
     safe_address: str,
+    reference_ages_by_symbol: Mapping[str, int] | None = None,
 ) -> tuple[tuple[PoolBoardOption, ...], Decimal, Decimal | None, tuple[str, ...]]:
     """Assemble one complete observation per board pool from one snapshot.
 
     Shared inputs are hoisted and read once - the AERO price at the pinned
     block, the gas price, the registry state, and the Safe's equity - while
     per-pool reads (decimals, stock balances) stay per pool. A pool without
-    a fresh injected reference quote still assembles, and its entry gate
-    then blocks fail-closed as reference_stale exactly as shipped.
+    a fresh reference quote still assembles, and its entry gate then blocks
+    fail-closed as reference_stale exactly as shipped.
 
     Args:
         sources: The live reads backing every input.
@@ -828,9 +830,13 @@ def assemble_board(
         observed_at: The assembly instant, timezone-aware.
         equity_usd: Optional equity override; the default is the Safe's live
             USDC plus every enumerated stock's value at the snapshot prices.
-        reference_prices: The per-symbol injected real-market quotes.
+        reference_prices: The per-symbol reference quotes.
         reference_age_seconds: Age of the injected quotes; defaults to zero.
         safe_address: The Safe whose balances default the equity input.
+        reference_ages_by_symbol: Optional per-symbol honest ages measured
+            from each provider's own as-of time; a symbol's entry here wins
+            over the shared single age so a live-feed quote is never
+            relabeled with an injected constant's age.
 
     Returns:
         The board options in listing order, the pinned AERO price, the gas
@@ -880,6 +886,15 @@ def assemble_board(
             else pool.token0_address
         )
         reference = reference_prices.get(listing.symbol)
+        reference_age: int | None = None
+        if reference is not None:
+            # A per-symbol age - the live feed's honest as-of measurement -
+            # outranks the shared single age an injected constant carries.
+            per_symbol_age = (reference_ages_by_symbol or {}).get(listing.symbol)
+            if per_symbol_age is not None:
+                reference_age = per_symbol_age
+            else:
+                reference_age = reference_age_seconds if reference_age_seconds is not None else 0
         observation, _, _, _ = assemble_observation(
             sources,
             listing.symbol,
@@ -888,7 +903,7 @@ def assemble_board(
             observed_at,
             equity_usd,
             reference,
-            reference_age_seconds if reference is not None else None,
+            reference_age,
             safe_address,
             stock_decimals=stock_decimals_by_token[stock_token.lower()],
             aero_price=aero_price,
@@ -905,9 +920,9 @@ def assemble_board(
         )
     if not any(listing.symbol in reference_prices for listing in listings):
         notes.append(
-            "no live real-market reference quote is wired yet; scheduled selector mode "
-            "treats external references as diagnostic-only and uses each resolved "
-            "Aerodrome pool's on-chain state for actions"
+            "no real-market reference quote reached this board; entries block "
+            "fail-closed as reference_stale wherever enforcement applies, and "
+            "scheduled selector mode treats references as diagnostic-only"
         )
     notes.append(
         "policy decisions keep a conservative zero fee APR; the live claimable "
