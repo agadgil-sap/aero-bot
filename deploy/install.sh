@@ -158,6 +158,16 @@ AERO_BOT_BASE_RPC_URL=https://base.publicnode.com
 # observed price exceeds this many USDC converts to USDC inside the cycle's
 # act step (default 5, the captain's 2026-09-27 ruling).
 #AERO_BOT_CYCLE_AERO_CONVERSION_MIN_USDC=5
+# The stray-stock dust bounds (the captain's 2026-10-03 ruling): a stray
+# stock balance whose USDC value at its own pool's pinned snapshot price
+# sits strictly below the floor is dust - retained in the Safe, never
+# adopted as inventory, never swapped - while the sum of every ignored
+# dust balance stays at or below the aggregate bound (always at least
+# the floor) so many-token splitting cannot hide meaningful exposure;
+# both overrides sit under the one-USDC hard ceilings, and a balance
+# that cannot be priced still refuses the cycle fail-closed.
+#AERO_BOT_CYCLE_STOCK_DUST_FLOOR_USDC=0.01
+#AERO_BOT_CYCLE_STOCK_DUST_AGGREGATE_USDC=0.10
 # The allocator's portfolio bounds (the captain's gnhf 33 ruling, as
 # corrected below the activation equity by the captain's 2026-09-28
 # sub-1000 ruling): every default is locked and every override stays

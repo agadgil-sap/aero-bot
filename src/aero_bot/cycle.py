@@ -187,6 +187,36 @@ DEFAULT_INCOME_HISTORY_CYCLES = 6
 # The hard ceiling on the window: a sealed override may lengthen the
 # memory, never shorten it below the single-cycle minimum.
 HARD_MAX_INCOME_HISTORY_CYCLES = 48
+# Environment variable carrying the per-token stray-stock dust floor in
+# USDC (default 0.01): a stray stock balance whose value at its own pool's
+# pinned snapshot price sits strictly below this floor is swap dust -
+# retained in the Safe, never adopted as held inventory, never swapped -
+# because an exit swap of sub-cent stock costs more than it returns and
+# the reconciliation's fail-closed guard exists for meaningful exposure,
+# not rounding remainders (the 2026-10-02 post-closeout halt: three
+# sub-cent balancing-leg remainders refused every cycle forever).
+CYCLE_STOCK_DUST_FLOOR_USDC_ENV = "AERO_BOT_CYCLE_STOCK_DUST_FLOOR_USDC"
+# Environment variable carrying the aggregate bound in USDC across every
+# ignored dust balance (default 0.10): the floor is per token, so many
+# dust tokens could otherwise sum to meaningful hidden exposure; the
+# reconcile ignores dust only while the sum of every ignored value stays
+# at or below this bound, and refuses the cycle the moment it does not.
+CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV = "AERO_BOT_CYCLE_STOCK_DUST_AGGREGATE_USDC"
+# The default per-token dust floor in USDC: one cent. A Base swap's gas
+# alone costs on the order of a cent, so sub-cent stock can never pay for
+# its own conversion, and one cent is a hundredth of a percent of the
+# trial book's scale - invisible to every equity decision.
+DEFAULT_STOCK_DUST_FLOOR_USDC = Decimal("0.01")
+# The default aggregate bound across all ignored dust balances: ten
+# cents, the floor's value across the book's full width of names.
+DEFAULT_STOCK_DUST_AGGREGATE_USDC = Decimal("0.10")
+# The hard ceilings sealed overrides may never breach: a floor above one
+# USDC per token (or an aggregate above one USDC) could hide a whole
+# percent of the trial-scale book as "dust" - the bound exists to keep
+# ignored exposure economically meaningless, and an override may only
+# narrow it, never widen it past meaninglessness.
+HARD_MAX_STOCK_DUST_FLOOR_USDC = Decimal("1")
+HARD_MAX_STOCK_DUST_AGGREGATE_USDC = Decimal("1")
 # The default reward-conversion threshold in USDC.
 DEFAULT_AERO_CONVERSION_MIN_USDC = Decimal("5")
 # Dynamic selector sizing keeps ten percent of the observed in-range depth cap
@@ -211,6 +241,46 @@ POLICY_TIMEZONE = ZoneInfo("America/New_York")
 # chain, so the newest dozen candidates cover every incident shape however
 # long the chain grows.
 STAKE_RECOVERY_CANDIDATE_LIMIT = 12
+
+
+def stock_value_usdc_at_pinned_snapshot(
+    units: int, decimals: int, pool: PoolCandidate
+) -> Decimal | None:
+    """Value one stock balance at its own pool's pinned snapshot price.
+
+    The valuation is the same pinned-snapshot doctrine every decision
+    runs under: the pool candidate's own square-root price, pinned to the
+    block its discovery snapshot carried, converted through the token's
+    validated decimals. A price that cannot be computed is unknown truth,
+    not zero: None returns so the caller treats the balance as
+    unpriceable, and unpriceable stock is never safe to ignore.
+
+    Args:
+        units: The raw token-unit balance being valued.
+        decimals: The stock token's decimal count.
+        pool: The verified pool whose pinned snapshot prices the token.
+
+    Returns:
+        The balance's USDC value, or None when the snapshot cannot price it.
+    """
+    try:
+        token0 = pool.token0_address.lower()
+        token1 = pool.token1_address.lower()
+        usdc = BASE_USDC_ADDRESS.lower()
+        if token0 == usdc:
+            stock_is_token0 = False
+        elif token1 == usdc:
+            stock_is_token0 = True
+        else:
+            # Neither side is USDC: the candidate is not a verified USDC
+            # pair, so its ratio prices nothing in USDC terms.
+            return None
+        price = price_usdc_per_stock(pool.sqrt_ratio, stock_is_token0, decimals, 6)
+    except ValueError:
+        return None
+    with localcontext() as context:
+        context.prec = MATH_PRECISION
+        return +(Decimal(units).scaleb(-decimals) * price)
 
 
 def _cycle_progress(line: str) -> None:
@@ -663,6 +733,29 @@ class RecoveredPositionRecord(BaseModel):
     status: LpPositionStatusReport
 
 
+class IgnoredStockDust(BaseModel):
+    """Carry one stray stock balance ignored as economically meaningless dust.
+
+    The reconcile's stray-stock sweep classifies each unrecorded balance at
+    its own pool's freshly pinned snapshot price; a balance strictly below
+    the dust floor is retained in the Safe untouched - never adopted as
+    held inventory, never swapped - and rides the reconciliation's
+    diagnostics, report, and audit record so ignored never means invisible.
+    """
+
+    # Frozen strict fields keep one dust record coherent.
+    model_config = IMMUTABLE_MODEL_CONFIG
+
+    # The registry-matched symbol whose stock token carries the dust.
+    symbol: str
+    # The stock token contract holding the dust balance.
+    token_address: EvmAddress
+    # The dust balance in whole stock tokens.
+    quantity: Annotated[Decimal, Field(ge=0)]
+    # The balance's USDC value at the pool's pinned snapshot price.
+    value_usdc: Annotated[Decimal, Field(ge=0)]
+
+
 class CycleReconciliation(BaseModel):
     """Carry one coherent on-chain reconciliation snapshot."""
 
@@ -713,6 +806,14 @@ class CycleReconciliation(BaseModel):
     # The symbol whose stock balance held_stock_quantity measures; None
     # when no stock is held or the balance is not one pool's inventory.
     held_symbol: str | None = None
+    # Every stray stock balance ignored as dust this cycle: each valued
+    # strictly below the dust floor at its own pool's pinned snapshot
+    # price, retained in the Safe, never adopted, never swapped. Ignored
+    # stays visible - the report, diagnostics, and audit record all carry
+    # these rows, and the aggregate bound guards against many-token
+    # splitting (a dust set whose total exceeds the bound refuses the
+    # cycle instead of hiding meaningful exposure).
+    ignored_stock_dust: tuple[IgnoredStockDust, ...] = ()
     # Nonempty when an out-of-band condition refuses the whole cycle.
     out_of_band: str = ""
     # Human-readable evidence lines covering the reconciliation.
@@ -960,6 +1061,11 @@ class CycleReportPayload(BaseModel):
     # The measured checkpointed-fee accrual as an annual fraction of the
     # position's marked value, else None.
     measured_fee_apr: str | None = None
+    # The symbols whose stray stock balances the reconcile ignored as dust.
+    ignored_dust_symbols: tuple[str, ...] = ()
+    # The total USDC value of every ignored dust balance, else None when
+    # no dust was ignored.
+    ignored_dust_usdc: str | None = None
     # Total delivery fees paid, in wei.
     fee_wei: Annotated[int, Field(ge=0)] = 0
     # The number of actions attempted this cycle.
@@ -1450,6 +1556,8 @@ class CycleRunner:
         aero_conversion_min_usdc: Decimal = DEFAULT_AERO_CONVERSION_MIN_USDC,
         portfolio_parameters: PortfolioParameters | None = None,
         income_history_cycles: int | None = None,
+        stock_dust_floor_usdc: Decimal = DEFAULT_STOCK_DUST_FLOOR_USDC,
+        stock_dust_aggregate_usdc: Decimal = DEFAULT_STOCK_DUST_AGGREGATE_USDC,
     ) -> None:
         """Configure one cycle runner over every injectable boundary.
 
@@ -1483,6 +1591,12 @@ class CycleRunner:
                 the conservative income expectation floors itself at (the
                 captain's 2026-09-28 correction); None uses the sealed
                 default.
+            stock_dust_floor_usdc: The per-token USDC value under which a
+                stray stock balance is dust - retained in the Safe, never
+                adopted, never swapped (the captain's tiny-dust ruling).
+            stock_dust_aggregate_usdc: The bound the sum of every ignored
+                dust balance must stay at or below, so many-token splitting
+                cannot hide meaningful exposure behind the floor.
         """
         self._symbol = symbol.strip() if symbol is not None else None
         self._safe_address = normalize_evm_address(safe_address)
@@ -1499,6 +1613,8 @@ class CycleRunner:
         self._switch_margin_fraction = switch_margin_fraction
         self._parameters = parameters
         self._aero_conversion_min_usdc = aero_conversion_min_usdc
+        self._stock_dust_floor_usdc = stock_dust_floor_usdc
+        self._stock_dust_aggregate_usdc = stock_dust_aggregate_usdc
         self._portfolio_parameters_value = portfolio_parameters
         self._income_history_cycles_value = income_history_cycles
         self._last_reconciliation: CycleReconciliation | None = None
@@ -2001,10 +2117,16 @@ class CycleRunner:
         # The stock sweep finds stray stock the book does not record: pinned
         # cycles read the one anchor token, selector cycles sweep every board
         # token so unsold stock in any pool is adopted with its own symbol.
+        # Each nonzero balance is then classified at its own pool's pinned
+        # snapshot price: meaningful stock flows into the existing adoption
+        # and conversion lanes, while dust below the economic floor is
+        # retained in the Safe, visible in diagnostics and the audit record,
+        # and never swapped (an exit swap of sub-cent stock costs more than
+        # it returns - the 2026-10-02 post-closeout halt pinned this repair).
         stock_units = 0
         held_quantity = Decimal("0")
         held_symbol: str | None = None
-        stray_stocks: list[tuple[str, str, int]] = []
+        stray_candidates: list[tuple[str, str, int, PoolCandidate]] = []
         if book.held_inventory is not None:
             held_token = book.held_inventory.token_address
             held_units = self._balances.fetch_token_balance(held_token, self._safe_address)
@@ -2013,17 +2135,25 @@ class CycleRunner:
             held_symbol = book.held_inventory.symbol
             if held_quantity == 0 and tracked_token_id is None:
                 diagnostics.append("recorded held inventory no longer exists on-chain; clearing")
-        elif self.selector_mode and not book.positions:
-            for listing in self._board_listings():
-                token = self._stock_token_of_pool(listing.pool)
-                units = self._balances.fetch_token_balance(token, self._safe_address)
-                if units > 0:
-                    stray_stocks.append((listing.symbol, token, units))
-        elif anchor != SELECTOR_SYMBOL:
-            stock_address = self._stock_token_address_for(anchor)
-            stock_units = self._balances.fetch_token_balance(stock_address, self._safe_address)
-            if stock_units > 0:
-                stray_stocks.append((anchor, stock_address, stock_units))
+        else:
+            if self.selector_mode and not book.positions:
+                for listing in self._board_listings():
+                    token = self._stock_token_of_pool(listing.pool)
+                    units = self._balances.fetch_token_balance(token, self._safe_address)
+                    if units > 0:
+                        stray_candidates.append((listing.symbol, token, units, listing.pool))
+            elif anchor != SELECTOR_SYMBOL:
+                stock_address = self._stock_token_address_for(anchor)
+                anchor_units = self._balances.fetch_token_balance(stock_address, self._safe_address)
+                if anchor_units > 0:
+                    stray_candidates.append(
+                        (anchor, stock_address, anchor_units, self._pool_for_symbol(anchor))
+                    )
+        stray_stocks, ignored_dust, dust_refusal = self._partition_stray_stock(
+            stray_candidates, diagnostics
+        )
+        if dust_refusal and not out_of_band:
+            out_of_band = dust_refusal
         stray = stray_stocks[0] if len(stray_stocks) == 1 else None
         if len(stray_stocks) > 1:
             if not out_of_band:
@@ -2078,11 +2208,96 @@ class CycleRunner:
             tracked_staked=tracked_staked,
             held_stock_quantity=held_quantity,
             held_symbol=held_symbol,
+            ignored_stock_dust=tuple(ignored_dust),
             out_of_band=out_of_band,
             diagnostics=tuple(diagnostics),
             empty_tracked_token_ids=tuple(empty_tracked),
             recovered_positions=tuple(recovered),
         )
+
+    def _partition_stray_stock(
+        self,
+        candidates: Sequence[tuple[str, str, int, PoolCandidate]],
+        diagnostics: list[str],
+    ) -> tuple[list[tuple[str, str, int]], list[IgnoredStockDust], str]:
+        """Classify stray stock balances into meaningful stock and dust.
+
+        Every nonzero unrecorded balance is valued at its own pool's freshly
+        pinned snapshot price with the token's validated decimals. A balance
+        strictly below the per-token dust floor is dust - retained in the
+        Safe, never adopted, never swapped - but only while the sum of every
+        ignored value stays at or below the aggregate bound, so splitting
+        meaningful exposure across many tokens cannot hide behind the floor.
+        A balance that cannot be priced is unknown truth, never safe to
+        ignore: unpriceable stock refuses the cycle fail-closed.
+
+        Args:
+            candidates: Every nonzero stray balance as (symbol, token,
+                units, pool), in board order.
+            diagnostics: The reconciliation's evidence lines, receiving one
+                line per ignored dust balance plus the aggregate summary.
+
+        Returns:
+            The meaningful stray stocks as (symbol, token, units) tuples,
+            the ignored dust records, and any fail-closed refusal (empty
+            when none).
+        """
+        if not candidates:
+            return [], [], ""
+        meaningful: list[tuple[str, str, int]] = []
+        dust: list[IgnoredStockDust] = []
+        for symbol, token, units, pool in candidates:
+            try:
+                decimals = self._sources.token_decimals(token)
+                value = stock_value_usdc_at_pinned_snapshot(units, decimals, pool)
+            except ValueError:
+                value = None
+            if value is None:
+                return (
+                    meaningful,
+                    dust,
+                    f"the Safe holds unrecorded {symbol} stock whose USDC value "
+                    "cannot be priced at the pinned snapshot (untrusted decimals or a "
+                    "degenerate pool ratio); refusing the cycle until reconciled - "
+                    "unpriceable stock is never safe to ignore",
+                )
+            if value < self._stock_dust_floor_usdc:
+                dust.append(
+                    IgnoredStockDust(
+                        symbol=symbol,
+                        token_address=token,
+                        quantity=Decimal(units).scaleb(-decimals),
+                        value_usdc=value,
+                    )
+                )
+            else:
+                meaningful.append((symbol, token, units))
+        if dust:
+            total = sum((row.value_usdc for row in dust), Decimal("0"))
+            if total > self._stock_dust_aggregate_usdc:
+                return (
+                    meaningful,
+                    dust,
+                    "the Safe's stray stock dust across ("
+                    + ", ".join(row.symbol for row in dust)
+                    + f") totals {total} USDC above the "
+                    f"{self._stock_dust_aggregate_usdc} USDC aggregate bound; refusing "
+                    "the cycle until reconciled - ignored exposure may never sum to "
+                    "meaningful value",
+                )
+            for row in dust:
+                diagnostics.append(
+                    f"ignored {row.symbol} stock dust {row.quantity} tokens worth "
+                    f"{row.value_usdc} USDC at the pinned snapshot price; retained in "
+                    f"the Safe below the {self._stock_dust_floor_usdc} USDC dust floor - "
+                    "never adopted as inventory, never swapped"
+                )
+            diagnostics.append(
+                f"ignored stock dust across {len(dust)} pools totals {total} USDC, "
+                f"within the {self._stock_dust_aggregate_usdc} USDC aggregate bound; "
+                "every balance stays in the Safe"
+            )
+        return meaningful, dust, ""
 
     def _recover_audit_proven_positions(
         self,
@@ -5184,6 +5399,19 @@ def record_cycle_report(audit_sink: AuditStore, report: CycleReport, created_at:
             measured_fee_apr=str(report.fee_evidence.measured_fee_apr)
             if report.fee_evidence is not None and report.fee_evidence.measured_fee_apr is not None
             else None,
+            ignored_dust_symbols=tuple(
+                row.symbol for row in report.reconciliation.ignored_stock_dust
+            ),
+            ignored_dust_usdc=(
+                str(
+                    sum(
+                        (row.value_usdc for row in report.reconciliation.ignored_stock_dust),
+                        Decimal("0"),
+                    )
+                )
+                if report.reconciliation.ignored_stock_dust
+                else None
+            ),
             fee_wei=report.fee_wei,
             action_count=len(report.actions),
             position_count=len(report.positions),
@@ -5405,6 +5633,72 @@ def _aero_conversion_min_from_environment(environ: Mapping[str, str]) -> Decimal
     return value
 
 
+def _stock_dust_floor_from_environment(environ: Mapping[str, str]) -> Decimal:
+    """Read the per-token stray-stock dust floor from the sealed environment.
+
+    Args:
+        environ: The environment mapping carrying the optional floor.
+
+    Returns:
+        The configured USDC floor, or the one-cent default.
+
+    Raises:
+        ValueError: If the configured floor is negative, not a number, or
+            above the hard ceiling an override may never breach.
+    """
+    raw = environ.get(CYCLE_STOCK_DUST_FLOOR_USDC_ENV, "").strip()
+    if not raw:
+        return DEFAULT_STOCK_DUST_FLOOR_USDC
+    value = Decimal(raw)
+    if value < 0:
+        raise ValueError(f"{CYCLE_STOCK_DUST_FLOOR_USDC_ENV} must be non-negative, not {raw!r}")
+    if value > HARD_MAX_STOCK_DUST_FLOOR_USDC:
+        raise ValueError(
+            f"{CYCLE_STOCK_DUST_FLOOR_USDC_ENV} must not exceed "
+            f"{HARD_MAX_STOCK_DUST_FLOOR_USDC} USDC, not {raw!r}; ignored exposure stays "
+            "economically meaningless"
+        )
+    return value
+
+
+def _stock_dust_aggregate_from_environment(
+    environ: Mapping[str, str], floor_usdc: Decimal
+) -> Decimal:
+    """Read the aggregate dust bound from the sealed environment.
+
+    Args:
+        environ: The environment mapping carrying the optional bound.
+        floor_usdc: The resolved per-token floor the bound must cover.
+
+    Returns:
+        The configured USDC aggregate bound, or the ten-cent default
+        raised to the floor whenever the floor itself is higher.
+
+    Raises:
+        ValueError: If the configured bound is negative, not a number,
+            below the per-token floor, or above the hard ceiling.
+    """
+    default = max(DEFAULT_STOCK_DUST_AGGREGATE_USDC, floor_usdc)
+    raw = environ.get(CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV, "").strip()
+    if not raw:
+        return default
+    value = Decimal(raw)
+    if value < 0:
+        raise ValueError(f"{CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV} must be non-negative, not {raw!r}")
+    if value < floor_usdc:
+        raise ValueError(
+            f"{CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV} must be at least the per-token "
+            f"floor {floor_usdc} USDC, not {raw!r}"
+        )
+    if value > HARD_MAX_STOCK_DUST_AGGREGATE_USDC:
+        raise ValueError(
+            f"{CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV} must not exceed "
+            f"{HARD_MAX_STOCK_DUST_AGGREGATE_USDC} USDC, not {raw!r}; ignored exposure "
+            "stays economically meaningless"
+        )
+    return value
+
+
 def _portfolio_parameters_from_environment(
     environ: Mapping[str, str],
     switch_margin_fraction: Decimal,
@@ -5532,6 +5826,8 @@ def build_cycle_runner(
     aero_conversion_min_usdc: Decimal = DEFAULT_AERO_CONVERSION_MIN_USDC,
     portfolio_parameters: PortfolioParameters | None = None,
     income_history_cycles: int | None = None,
+    stock_dust_floor_usdc: Decimal = DEFAULT_STOCK_DUST_FLOOR_USDC,
+    stock_dust_aggregate_usdc: Decimal = DEFAULT_STOCK_DUST_AGGREGATE_USDC,
 ) -> CycleRunner:
     """Assemble the live cycle runner from the application settings.
 
@@ -5550,6 +5846,10 @@ def build_cycle_runner(
             the locked defaults carrying the switch margin.
         income_history_cycles: The conservative income window in cycles;
             None keeps the sealed default.
+        stock_dust_floor_usdc: The per-token USDC value under which stray
+            stock is dust, retained in the Safe and never swapped.
+        stock_dust_aggregate_usdc: The bound the sum of ignored dust must
+            stay at or below.
 
     Returns:
         The fully wired runner; nothing has been read yet.
@@ -5625,6 +5925,8 @@ def build_cycle_runner(
         aero_conversion_min_usdc=aero_conversion_min_usdc,
         portfolio_parameters=portfolio_parameters,
         income_history_cycles=income_history_cycles,
+        stock_dust_floor_usdc=stock_dust_floor_usdc,
+        stock_dust_aggregate_usdc=stock_dust_aggregate_usdc,
     )
 
 
@@ -5792,6 +6094,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--stock-dust-floor-usdc",
+        type=Decimal,
+        default=None,
+        help=(
+            "A stray stock balance whose USDC value at its own pool's "
+            "pinned snapshot price sits strictly below this floor is dust: "
+            "retained in the Safe, never adopted as inventory, never "
+            "swapped (default 0.01; the sealed "
+            "AERO_BOT_CYCLE_STOCK_DUST_FLOOR_USDC variable supplies the same "
+            "value when the flag is absent)."
+        ),
+    )
+    parser.add_argument(
+        "--stock-dust-aggregate-usdc",
+        type=Decimal,
+        default=None,
+        help=(
+            "The bound the sum of every ignored dust balance must stay at "
+            "or below, so splitting exposure across many tokens cannot hide "
+            "behind the floor (default 0.10, always at least the floor; the "
+            "sealed AERO_BOT_CYCLE_STOCK_DUST_AGGREGATE_USDC variable supplies "
+            "the same value when the flag is absent)."
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print the complete report as JSON instead of a summary.",
@@ -5808,6 +6135,59 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--out-of-range-grace-minutes must be positive")
     if arguments.aero_conversion_min_usdc is not None and arguments.aero_conversion_min_usdc < 0:
         parser.error("--aero-conversion-min-usdc must be non-negative")
+    if arguments.stock_dust_floor_usdc is not None and arguments.stock_dust_floor_usdc < 0:
+        parser.error("--stock-dust-floor-usdc must be non-negative")
+    if (
+        arguments.stock_dust_floor_usdc is not None
+        and arguments.stock_dust_floor_usdc > HARD_MAX_STOCK_DUST_FLOOR_USDC
+    ):
+        parser.error(
+            "--stock-dust-floor-usdc must not exceed the hard "
+            f"{HARD_MAX_STOCK_DUST_FLOOR_USDC} USDC ceiling; ignored exposure stays "
+            "economically meaningless"
+        )
+    if arguments.stock_dust_aggregate_usdc is not None and arguments.stock_dust_aggregate_usdc < 0:
+        parser.error("--stock-dust-aggregate-usdc must be non-negative")
+    if arguments.stock_dust_aggregate_usdc is not None and (
+        arguments.stock_dust_floor_usdc is not None
+        and arguments.stock_dust_aggregate_usdc < arguments.stock_dust_floor_usdc
+    ):
+        parser.error(
+            "--stock-dust-aggregate-usdc must be at least the dust floor "
+            f"{arguments.stock_dust_floor_usdc} USDC"
+        )
+    # The aggregate bound covers the floor wherever the floor came from: a
+    # sealed floor above a flagged aggregate would refuse every dust set
+    # on a bound the floor itself already breaches. The sealed floor
+    # resolves through the same reader the configuration phase uses, so a
+    # malformed sealed value refuses here with the clean configuration
+    # message instead of a raw parse traceback.
+    try:
+        resolved_dust_floor = (
+            arguments.stock_dust_floor_usdc
+            if arguments.stock_dust_floor_usdc is not None
+            else _stock_dust_floor_from_environment(os.environ)
+        )
+    except (ValueError, ArithmeticError) as error:
+        print(f"invalid configuration: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+    if (
+        arguments.stock_dust_aggregate_usdc is not None
+        and arguments.stock_dust_aggregate_usdc < resolved_dust_floor
+    ):
+        parser.error(
+            "--stock-dust-aggregate-usdc must be at least the dust floor "
+            f"{resolved_dust_floor} USDC"
+        )
+    if (
+        arguments.stock_dust_aggregate_usdc is not None
+        and arguments.stock_dust_aggregate_usdc > HARD_MAX_STOCK_DUST_AGGREGATE_USDC
+    ):
+        parser.error(
+            "--stock-dust-aggregate-usdc must not exceed the hard "
+            f"{HARD_MAX_STOCK_DUST_AGGREGATE_USDC} USDC ceiling; ignored exposure stays "
+            "economically meaningless"
+        )
     for flag, value in (
         ("--tier-band", arguments.tier_band),
         ("--min-position-usdc", arguments.min_position_usdc),
@@ -5866,6 +6246,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.aero_conversion_min_usdc
             if arguments.aero_conversion_min_usdc is not None
             else _aero_conversion_min_from_environment(os.environ)
+        )
+        stock_dust_floor = (
+            arguments.stock_dust_floor_usdc
+            if arguments.stock_dust_floor_usdc is not None
+            else _stock_dust_floor_from_environment(os.environ)
+        )
+        stock_dust_aggregate = (
+            arguments.stock_dust_aggregate_usdc
+            if arguments.stock_dust_aggregate_usdc is not None
+            else _stock_dust_aggregate_from_environment(os.environ, stock_dust_floor)
         )
         portfolio_parameters = _portfolio_parameters_from_environment(os.environ, switch_margin)
         income_history_cycles = _income_history_cycles_from_environment(os.environ)
@@ -5956,6 +6346,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             aero_conversion_min,
             portfolio_parameters,
             income_history_cycles,
+            stock_dust_floor,
+            stock_dust_aggregate,
         )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"the cycle runner is unavailable: {error}", file=sys.stderr)

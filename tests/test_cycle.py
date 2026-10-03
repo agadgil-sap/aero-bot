@@ -1,7 +1,7 @@
 """Pin the scheduled decision cycle's reconcile-decide-act behavior."""
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, localcontext
 from pathlib import Path
@@ -35,10 +35,14 @@ from aero_bot.cycle import (
     CYCLE_MIN_POSITION_USDC_ENV,
     CYCLE_OUT_OF_RANGE_GRACE_ENV,
     CYCLE_REFERENCE_PRICE_ENV,
+    CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV,
+    CYCLE_STOCK_DUST_FLOOR_USDC_ENV,
     CYCLE_SWITCH_MARGIN_ENV,
     CYCLE_SYMBOL_ENV,
     CYCLE_TIER_BAND_ENV,
     DEFAULT_AERO_CONVERSION_MIN_USDC,
+    DEFAULT_STOCK_DUST_AGGREGATE_USDC,
+    DEFAULT_STOCK_DUST_FLOOR_USDC,
     CycleMode,
     CycleRunner,
     CycleStateBook,
@@ -51,10 +55,13 @@ from aero_bot.cycle import (
     _out_of_range_grace_from_environment,
     _portfolio_parameters_from_environment,
     _reference_price_from_environment,
+    _stock_dust_aggregate_from_environment,
+    _stock_dust_floor_from_environment,
     _switch_margin_from_environment,
     _symbol_from_arguments_and_environment,
     _trim_apr_history,
     decode_minted_token_id,
+    stock_value_usdc_at_pinned_snapshot,
 )
 from aero_bot.emissions_apr import AprReadingSample
 from aero_bot.executor import ExecutionUnavailableError
@@ -715,6 +722,8 @@ def make_runner(
     parameters: PolicyParameters | None = None,
     aero_conversion_min_usdc: Decimal | None = None,
     income_history_cycles: int | None = None,
+    dust_floor_usdc: Decimal | None = None,
+    dust_aggregate_usdc: Decimal | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, AuditStore, CycleStateStore]:
     """Assemble one cycle runner over fully scripted boundaries."""
     store_path = tmp_path / "cycle_state.json"
@@ -782,6 +791,14 @@ def make_runner(
             else DEFAULT_AERO_CONVERSION_MIN_USDC
         ),
         income_history_cycles=income_history_cycles,
+        stock_dust_floor_usdc=(
+            dust_floor_usdc if dust_floor_usdc is not None else DEFAULT_STOCK_DUST_FLOOR_USDC
+        ),
+        stock_dust_aggregate_usdc=(
+            dust_aggregate_usdc
+            if dust_aggregate_usdc is not None
+            else DEFAULT_STOCK_DUST_AGGREGATE_USDC
+        ),
     )
     return runner, fake_executor, audit, state_store
 
@@ -2605,6 +2622,405 @@ class TestTimeoutMultiEntryRecovery:
         assert state_store.load().positions == ()
 
 
+# ---------------------------------------------------------------------------
+# The 2026-10-02 post-closeout dust halt: an empty selector book beside
+# sub-cent swap remainders across multiple pools refused every cycle
+# fail-closed (the out-of-band custody incident's section 6 and the
+# multiposition report's part D.3: TSLAc 2529 wei, METAc 252054 raw,
+# SNDKc 275 wei - swap dust from the entries' balancing legs).
+# ---------------------------------------------------------------------------
+
+# The live post-closeout dust magnitudes mirrored at the fixture's
+# 8-decimal grid: each balance is worth a sliver of one USDC cent at the
+# pinned snapshot price (the live tokens' 18-decimal remainders carried
+# the same sub-cent values at their own prices).
+DUST_UNITS_BY_TOKEN: dict[str, int] = {
+    TIMEOUT_STOCK_TOKENS["TSLAc"]: 2_529,
+    TIMEOUT_STOCK_TOKENS["METAc"]: 252,
+    TIMEOUT_STOCK_TOKENS["SNDKc"]: 275,
+}
+
+
+class DustCycleSources(TimeoutCycleSources):
+    """Serve the incident board with per-token stray balances."""
+
+    def __init__(self, stock_units_by_token: Mapping[str, int], **kwargs: object) -> None:
+        """Configure the per-token stray balances beside the board."""
+        super().__init__(**kwargs)
+        self._stock_units_by_token = {
+            token.lower(): units for token, units in stock_units_by_token.items()
+        }
+
+    def token_balance(self, token_address: str, owner_address: str) -> int:
+        """Serve the Safe's per-token stray balances for the equity default."""
+        if token_address.lower() == BASE_USDC_ADDRESS.lower():
+            return self._usdc_units
+        return self._stock_units_by_token.get(token_address.lower(), 0)
+
+
+class DustBalances(FakeBalances):
+    """Serve the per-token stray balances the RPC surface reads."""
+
+    def __init__(self, stock_units_by_token: Mapping[str, int], **kwargs: object) -> None:
+        """Configure the per-token balances beside the shared defaults."""
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self._stock_units_by_token = {
+            token.lower(): units for token, units in stock_units_by_token.items()
+        }
+
+    def fetch_token_balance(self, token_address: str, owner_address: str) -> int:
+        """Serve the Safe's configured per-token balance."""
+        if token_address.lower() == BASE_USDC_ADDRESS.lower():
+            return self.usdc_units
+        if token_address.lower() == AERO_TOKEN_ADDRESS.lower():
+            return self.aero_units
+        return self._stock_units_by_token.get(token_address.lower(), 0)
+
+
+def dust_units_for_value(value_usdc: Decimal, decimals: int = STOCK_DECIMALS) -> int:
+    """Build the raw units whose pinned-snapshot value is about ``value_usdc``."""
+    return int((value_usdc / FIXTURE_AMM_PRICE * Decimal(10) ** decimals).to_integral_value())
+
+
+def dust_runner(
+    tmp_path: Path,
+    *,
+    stock_units_by_token: Mapping[str, int],
+    book: CycleStateBook | None = None,
+    reads: FakeReads | None = None,
+    dust_floor_usdc: Decimal | None = None,
+    dust_aggregate_usdc: Decimal | None = None,
+) -> tuple[CycleRunner, FakeExecutor | None, AuditStore, CycleStateStore]:
+    """Assemble one selector runner over the incident board with stray dust."""
+    sources = DustCycleSources(stock_units_by_token, usdc_units=SELECTOR_BOOK_USDC_UNITS)
+    balances = DustBalances(stock_units_by_token, usdc_units=SELECTOR_BOOK_USDC_UNITS)
+    return make_runner(
+        tmp_path,
+        book=book,
+        reads=reads if reads is not None else FakeReads(timeout_empty_inventory()),
+        sources=sources,
+        balances=balances,
+        symbol=None,
+        dust_floor_usdc=dust_floor_usdc,
+        dust_aggregate_usdc=dust_aggregate_usdc,
+    )
+
+
+class TestStockDustFloor:
+    """The bounded stray-stock dust floor (the captain's tiny-dust ruling).
+
+    The live empty book refused every cycle on sub-cent swap remainders
+    across multiple pools because the stray-stock sweep had no economic
+    floor: any two nonzero balances, however small, halted the whole
+    book. The floor is a bounded USDC-value classification - each balance
+    valued at its own pool's freshly pinned snapshot price, never adopted,
+    never swapped, retained in the Safe - while meaningful unrecorded
+    stock, aggregate exposure beyond the bound, and unpriceable balances
+    still refuse fail-closed.
+    """
+
+    def test_the_live_post_closeout_dust_shape_no_longer_halts_the_empty_book(
+        self, tmp_path: Path
+    ) -> None:
+        """The reproduced 2026-10-02 halt: dust in three pools, cycle runs."""
+        runner, _, _, state_store = dust_runner(tmp_path, stock_units_by_token=DUST_UNITS_BY_TOKEN)
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert report.halted_reason == ""
+        assert report.reconciliation.out_of_band == ""
+        book = state_store.load()
+        assert book.positions == ()
+        assert book.held_inventory is None
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        assert {row.symbol for row in decision_recon.ignored_stock_dust} == {
+            "TSLAc",
+            "METAc",
+            "SNDKc",
+        }
+        assert any("retained in the Safe" in line for line in decision_recon.diagnostics), (
+            decision_recon.diagnostics
+        )
+        # Balance and equity attribution keep the dust visible: the default
+        # equity composition prices every enumerated stock balance - dust
+        # included - at the same pinned snapshot prices.
+        pools = {listing.symbol: listing.pool for listing in timeout_listings()}
+        dust_values = [
+            stock_value_usdc_at_pinned_snapshot(units, STOCK_DECIMALS, pools[symbol])
+            for symbol, units in (
+                ("TSLAc", 2_529),
+                ("METAc", 252),
+                ("SNDKc", 275),
+            )
+        ]
+        assert all(value is not None for value in dust_values)
+        dust_total = sum((value for value in dust_values if value is not None), Decimal("0"))
+        assert report.equity_usd == Decimal(SELECTOR_BOOK_USDC_UNITS).scaleb(-6) + dust_total
+
+    def test_a_balance_valued_exactly_at_the_floor_is_meaningful_never_dust(
+        self, tmp_path: Path
+    ) -> None:
+        """The floor ignores only strictly-below balances; exact is meaningful."""
+        units = 2_529
+        exact_value = stock_value_usdc_at_pinned_snapshot(
+            units, STOCK_DECIMALS, timeout_listings()[1].pool
+        )
+        assert exact_value is not None
+        runner, _, _, state_store = dust_runner(
+            tmp_path,
+            stock_units_by_token={TIMEOUT_STOCK_TOKENS["TSLAc"]: units},
+            dust_floor_usdc=exact_value,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        assert decision_recon.ignored_stock_dust == ()
+        # Meaningful stray stock in a flat book adopts as held inventory,
+        # exactly as before the floor existed.
+        assert decision_recon.held_symbol == "TSLAc"
+        book = state_store.load()
+        assert book.held_inventory is not None
+        assert book.held_inventory.symbol == "TSLAc"
+
+    def test_a_balance_valued_just_above_the_floor_still_adopts(self, tmp_path: Path) -> None:
+        """The crashed-reentry heal is intact: meaningful stock still adopts."""
+        # 0.021 tokens is worth about 2.1 USDC at the fixture price.
+        runner, _, _, state_store = dust_runner(
+            tmp_path,
+            stock_units_by_token={TIMEOUT_STOCK_TOKENS["METAc"]: 2_100_000},
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert report.reconciliation.out_of_band == ""
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        assert decision_recon.ignored_stock_dust == ()
+        assert decision_recon.held_symbol == "METAc"
+        assert state_store.load().held_inventory is not None
+
+    def test_many_dust_tokens_above_the_aggregate_bound_refuse(self, tmp_path: Path) -> None:
+        """Splitting meaningful exposure into dust-sized pieces cannot hide."""
+        # Each of the four board names carries 0.009 USDC of dust (below
+        # the 0.01 floor), totalling 0.036 - within the default 0.10 bound.
+        # Lowering the aggregate bound to 0.03 makes the same set refuse.
+        per_token = dict.fromkeys(TIMEOUT_STOCK_TOKENS.values(), 8982)
+        within = dust_runner(tmp_path, stock_units_by_token=per_token)
+        report = within[0].run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+        assert report.halted_reason == ""
+
+        over = dust_runner(
+            tmp_path, stock_units_by_token=per_token, dust_aggregate_usdc=Decimal("0.03")
+        )
+        report = over[0].run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert "aggregate bound" in report.reconciliation.out_of_band
+        assert report.halted_reason == report.reconciliation.out_of_band
+        assert over[3].load().held_inventory is None
+
+    def test_dust_totalling_exactly_the_aggregate_bound_stays_within_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The bound is inclusive: exactly at it, nothing meaningful hides."""
+        first = stock_value_usdc_at_pinned_snapshot(
+            2_529, STOCK_DECIMALS, timeout_listings()[1].pool
+        )
+        second = stock_value_usdc_at_pinned_snapshot(
+            252, STOCK_DECIMALS, timeout_listings()[2].pool
+        )
+        assert first is not None
+        assert second is not None
+        exact_total = first + second
+        runner, _, _, _ = dust_runner(
+            tmp_path,
+            stock_units_by_token={
+                TIMEOUT_STOCK_TOKENS["TSLAc"]: 2_529,
+                TIMEOUT_STOCK_TOKENS["METAc"]: 252,
+            },
+            dust_aggregate_usdc=exact_total,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert report.halted_reason == ""
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        assert len(decision_recon.ignored_stock_dust) == 2
+
+    def test_unpriceable_stock_refuses_rather_than_becoming_dust(self, tmp_path: Path) -> None:
+        """A balance the snapshot cannot price is unknown truth, never dust."""
+        sources = DustCycleSources(
+            {TIMEOUT_STOCK_TOKENS["TSLAc"]: 2_529},
+            usdc_units=SELECTOR_BOOK_USDC_UNITS,
+        )
+        degenerate = timeout_listings()[1].pool.model_copy(update={"sqrt_ratio": 0})
+        sources._selector_listings = (
+            BoardListing(symbol="TSLAc", pool=degenerate),
+            *(listing for listing in timeout_listings() if listing.symbol != "TSLAc"),
+        )
+        runner, _, _, _ = make_runner(
+            tmp_path,
+            reads=FakeReads(timeout_empty_inventory()),
+            sources=sources,
+            balances=DustBalances(
+                {TIMEOUT_STOCK_TOKENS["TSLAc"]: 2_529},
+                usdc_units=SELECTOR_BOOK_USDC_UNITS,
+            ),
+            symbol=None,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert "cannot be priced" in report.reconciliation.out_of_band
+        assert "never safe to ignore" in report.reconciliation.out_of_band
+        assert report.halted_reason == report.reconciliation.out_of_band
+
+    def test_untrusted_decimals_refuse_rather_than_become_dust(self, tmp_path: Path) -> None:
+        """A decimals read that fails validation is unpriceable, never dust."""
+
+        class BadDecimalsSources(DustCycleSources):
+            """Serve one token's decimals as an out-of-range value."""
+
+            def token_decimals(self, token_address: str) -> int:
+                if token_address.lower() == TIMEOUT_STOCK_TOKENS["TSLAc"].lower():
+                    # Above the documented ERC20 decimal range: the price
+                    # math refuses to trust it.
+                    return 40
+                return STOCK_DECIMALS
+
+        runner, _, _, _ = make_runner(
+            tmp_path,
+            reads=FakeReads(timeout_empty_inventory()),
+            sources=BadDecimalsSources(
+                {TIMEOUT_STOCK_TOKENS["TSLAc"]: 2_529},
+                usdc_units=SELECTOR_BOOK_USDC_UNITS,
+            ),
+            balances=DustBalances(
+                {TIMEOUT_STOCK_TOKENS["TSLAc"]: 2_529},
+                usdc_units=SELECTOR_BOOK_USDC_UNITS,
+            ),
+            symbol=None,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert "cannot be priced" in report.reconciliation.out_of_band
+        assert report.halted_reason == report.reconciliation.out_of_band
+
+    def test_meaningful_stock_in_multiple_pools_still_refuses_beside_dust(
+        self, tmp_path: Path
+    ) -> None:
+        """The fail-closed guard for real exposure is untouched by the floor."""
+        runner, _, _, state_store = dust_runner(
+            tmp_path,
+            stock_units_by_token={
+                TIMEOUT_STOCK_TOKENS["TSLAc"]: 2_100_000,
+                TIMEOUT_STOCK_TOKENS["METAc"]: 2_100_000,
+                TIMEOUT_STOCK_TOKENS["SNDKc"]: 275,
+            },
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        assert (
+            "the Safe holds unrecorded stock in multiple pools (TSLAc, METAc)"
+            in report.reconciliation.out_of_band
+        )
+        assert report.halted_reason == report.reconciliation.out_of_band
+        book = state_store.load()
+        assert book.held_inventory is None
+        assert book.positions == ()
+
+    def test_recorded_held_inventory_is_never_subject_to_the_floor(self, tmp_path: Path) -> None:
+        """A held-inventory record keeps its own machinery below the floor."""
+        book = CycleStateBook(
+            held_inventory=HeldInventoryRecord(
+                symbol="TSLAc",
+                token_address=TIMEOUT_STOCK_TOKENS["TSLAc"],
+                stock_quantity=Decimal("0.00002529"),
+                held_since=QUIET_INSTANT,
+            )
+        )
+        runner, _, _, _ = dust_runner(
+            tmp_path,
+            stock_units_by_token={TIMEOUT_STOCK_TOKENS["TSLAc"]: 2529},
+            book=book,
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        # The recorded token's balance rides the held-inventory lane, never
+        # the dust classification: its quantity survives the reconcile.
+        assert decision_recon.held_symbol == "TSLAc"
+        assert decision_recon.held_stock_quantity == Decimal("0.00002529")
+        assert decision_recon.ignored_stock_dust == ()
+        assert decision_recon.out_of_band == ""
+
+    def test_dust_is_idempotent_across_repeated_cycles_and_never_swaps(
+        self, tmp_path: Path
+    ) -> None:
+        """Every cycle over the same dust ignores it again; nothing moves."""
+        runner, executor, _, state_store = dust_runner(
+            tmp_path, stock_units_by_token=DUST_UNITS_BY_TOKEN
+        )
+        assert executor is not None
+
+        first = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+        second = runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        for report in (first, second):
+            assert report.halted_reason == ""
+            decision_recon = report.decision_reconciliation
+            assert decision_recon is not None
+            assert len(decision_recon.ignored_stock_dust) == 3
+        book = state_store.load()
+        assert book.positions == ()
+        assert book.held_inventory is None
+        assert executor.calls == []
+
+    def test_the_audit_record_carries_the_ignored_dust(self, tmp_path: Path) -> None:
+        """The cycle_reported payload names every ignored symbol and total."""
+        runner, _, audit, _ = dust_runner(tmp_path, stock_units_by_token=DUST_UNITS_BY_TOKEN)
+
+        runner.run(CycleMode.DRY_RUN, reference_prices_by_symbol=TIMEOUT_REFERENCES)
+
+        payload = json.loads(audit.read_records(1)[0].payload_json)
+        assert set(payload["ignored_dust_symbols"]) == {"TSLAc", "METAc", "SNDKc"}
+        total = Decimal(payload["ignored_dust_usdc"])
+        assert Decimal("0") < total < DEFAULT_STOCK_DUST_FLOOR_USDC
+
+    def test_a_pinned_cycles_anchor_dust_is_ignored_not_adopted(self, tmp_path: Path) -> None:
+        """The pinned sweep floors dust too: no convergence of sub-cents."""
+        sources = DustCycleSources(
+            {TIMEOUT_STOCK_TOKENS["MSTRc"]: 2529}, usdc_units=SELECTOR_BOOK_USDC_UNITS
+        )
+        runner, _, _, state_store = make_runner(
+            tmp_path,
+            reads=FakeReads(timeout_empty_inventory()),
+            sources=sources,
+            balances=DustBalances(
+                {TIMEOUT_STOCK_TOKENS["MSTRc"]: 2529},
+                usdc_units=SELECTOR_BOOK_USDC_UNITS,
+            ),
+            symbol="MSTRc",
+        )
+
+        report = runner.run(CycleMode.DRY_RUN, reference_price_usdc=FIXTURE_AMM_PRICE)
+
+        assert report.reconciliation.out_of_band == ""
+        assert report.halted_reason == ""
+        decision_recon = report.decision_reconciliation
+        assert decision_recon is not None
+        assert [row.symbol for row in decision_recon.ignored_stock_dust] == ["MSTRc"]
+        assert decision_recon.held_symbol is None
+        assert state_store.load().held_inventory is None
+
+
 class TestSelectorCycles:
     """Cross-board portfolio cycles: tiers, hysteresis, and rebalancing."""
 
@@ -2966,9 +3382,13 @@ class TestCycleConfiguration:
             aero_min: object,
             portfolio: PortfolioParameters | None = None,
             income_history_cycles: object = None,
+            stock_dust_floor: object = None,
+            stock_dust_aggregate: object = None,
         ) -> object:
             built["portfolio"] = portfolio
             built["income_history_cycles"] = income_history_cycles
+            built["stock_dust_floor"] = stock_dust_floor
+            built["stock_dust_aggregate"] = stock_dust_aggregate
             return FakeRunner()
 
         monkeypatch.setattr(cycle_module, "build_cycle_runner", fake_build)
@@ -2997,6 +3417,104 @@ class TestCycleConfiguration:
         assert portfolio.min_position_usdc == Decimal("95")
         assert portfolio.min_position_floor_usdc == Decimal("25")
         assert portfolio.concentration_cap_fraction == Decimal("0.3")
+        assert built["stock_dust_floor"] == DEFAULT_STOCK_DUST_FLOOR_USDC
+        assert built["stock_dust_aggregate"] == DEFAULT_STOCK_DUST_AGGREGATE_USDC
+
+    def test_the_dust_flags_reach_the_runner_and_bound_each_other(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The dust flags flow through, and their bounds refuse at the boundary."""
+        from aero_bot import cycle as cycle_module
+
+        built: dict[str, object] = {}
+
+        class FakeRunner:
+            def run(self, mode: CycleMode, **kwargs: object) -> object:
+                raise RuntimeError("selector reached runner")
+
+        def fake_build(
+            settings: object,
+            symbol: object,
+            safe_address: object,
+            relayer: object,
+            switch_margin: object,
+            parameters: object,
+            aero_min: object,
+            portfolio: PortfolioParameters | None = None,
+            income_history_cycles: object = None,
+            stock_dust_floor: object = None,
+            stock_dust_aggregate: object = None,
+        ) -> object:
+            built["stock_dust_floor"] = stock_dust_floor
+            built["stock_dust_aggregate"] = stock_dust_aggregate
+            return FakeRunner()
+
+        monkeypatch.setattr(cycle_module, "build_cycle_runner", fake_build)
+        exit_code = cycle_module.main(
+            [
+                "--symbol",
+                "auto",
+                "--dry-run",
+                "--stock-dust-floor-usdc",
+                "0.02",
+                "--stock-dust-aggregate-usdc",
+                "0.3",
+            ]
+        )
+        assert exit_code == 1
+        assert built["stock_dust_floor"] == Decimal("0.02")
+        assert built["stock_dust_aggregate"] == Decimal("0.3")
+
+        monkeypatch.setattr(
+            cycle_module,
+            "build_cycle_runner",
+            lambda *args, **kwargs: pytest.fail("the runner must not build"),
+        )
+        for argv in (
+            ["--dry-run", "--stock-dust-floor-usdc", "-1"],
+            ["--dry-run", "--stock-dust-floor-usdc", "2"],  # above the hard ceiling
+            ["--dry-run", "--stock-dust-aggregate-usdc", "-1"],
+            ["--dry-run", "--stock-dust-aggregate-usdc", "2"],  # above the hard ceiling
+            [
+                "--dry-run",
+                "--stock-dust-floor-usdc",
+                "0.05",
+                "--stock-dust-aggregate-usdc",
+                "0.02",
+            ],  # the aggregate below the floor
+            [
+                "--dry-run",
+                "--stock-dust-aggregate-usdc",
+                "0.005",
+            ],  # below the sealed-or-default floor, flag floor absent
+        ):
+            with pytest.raises(SystemExit) as raised:
+                cycle_module.main(argv)
+            assert raised.value.code == 2, argv
+
+    def test_a_malformed_sealed_dust_bound_refuses_with_the_clean_configuration_message(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A non-numeric sealed dust value refuses cleanly, never a traceback."""
+        from aero_bot import cycle as cycle_module
+
+        monkeypatch.setattr(
+            cycle_module,
+            "build_cycle_runner",
+            lambda *args, **kwargs: pytest.fail("the runner must not build"),
+        )
+        for name in (CYCLE_STOCK_DUST_FLOOR_USDC_ENV, CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV):
+            monkeypatch.setenv(name, "abc")
+            assert cycle_module.main(["--dry-run"]) == 1, name
+            assert "invalid configuration:" in capsys.readouterr().err, name
+            monkeypatch.delenv(name)
+        # The argparse-phase coherence pre-check reads the sealed floor even
+        # when the aggregate is flagged, so the malformed value refuses
+        # there too - never a raw decimal traceback out of the CLI.
+        monkeypatch.setenv(CYCLE_STOCK_DUST_FLOOR_USDC_ENV, "abc")
+        argv = ["--dry-run", "--stock-dust-aggregate-usdc", "0.5"]
+        assert cycle_module.main(argv) == 1
+        assert "invalid configuration:" in capsys.readouterr().err
 
     def test_the_floor_flag_never_exceeds_the_minimum(
         self, monkeypatch: pytest.MonkeyPatch
@@ -3169,6 +3687,41 @@ class TestCycleConfiguration:
         ) == Decimal("12.5")
         with pytest.raises(ValueError, match="non-negative"):
             _aero_conversion_min_from_environment({CYCLE_AERO_CONVERSION_MIN_ENV: "-1"})
+
+    def test_stock_dust_floor_defaults_overrides_and_ceilings(self) -> None:
+        """The dust floor defaults to one cent and cannot exceed one USDC."""
+        assert _stock_dust_floor_from_environment({}) == Decimal("0.01")
+        assert _stock_dust_floor_from_environment(
+            {CYCLE_STOCK_DUST_FLOOR_USDC_ENV: "0.05"}
+        ) == Decimal("0.05")
+        assert _stock_dust_floor_from_environment({CYCLE_STOCK_DUST_FLOOR_USDC_ENV: "0"}) == (
+            Decimal("0")
+        )
+        with pytest.raises(ValueError, match="non-negative"):
+            _stock_dust_floor_from_environment({CYCLE_STOCK_DUST_FLOOR_USDC_ENV: "-0.01"})
+        with pytest.raises(ValueError, match="must not exceed"):
+            _stock_dust_floor_from_environment({CYCLE_STOCK_DUST_FLOOR_USDC_ENV: "1.01"})
+
+    def test_stock_dust_aggregate_covers_the_floor_and_caps_the_total(self) -> None:
+        """The aggregate bound defaults to ten cents and bounds the floor."""
+        assert _stock_dust_aggregate_from_environment({}, Decimal("0.01")) == Decimal("0.10")
+        assert _stock_dust_aggregate_from_environment(
+            {CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV: "0.25"}, Decimal("0.01")
+        ) == Decimal("0.25")
+        # A raised floor lifts the default bound with it.
+        assert _stock_dust_aggregate_from_environment({}, Decimal("0.5")) == Decimal("0.5")
+        with pytest.raises(ValueError, match="non-negative"):
+            _stock_dust_aggregate_from_environment(
+                {CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV: "-1"}, Decimal("0.01")
+            )
+        with pytest.raises(ValueError, match="at least the per-token floor"):
+            _stock_dust_aggregate_from_environment(
+                {CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV: "0.005"}, Decimal("0.01")
+            )
+        with pytest.raises(ValueError, match="must not exceed"):
+            _stock_dust_aggregate_from_environment(
+                {CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV: "1.5"}, Decimal("0.01")
+            )
 
 
 class TestRewardConversion:
