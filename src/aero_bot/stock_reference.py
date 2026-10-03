@@ -777,8 +777,18 @@ def _yahoo_session(meta: Mapping[str, object], fetched_at: datetime) -> StockRef
         "post": StockReferenceSession.POST_MARKET,
     }
     for key, session in session_by_key.items():
-        window = periods.get(key)
+        if key not in periods:
+            if key == "regular":
+                # Published windows without the required regular one are
+                # incomplete evidence: the missing window might have been
+                # the one bracketing the fetch, so closed stays unproven.
+                corrupt_evidence = True
+            continue
+        window = periods[key]
         if not isinstance(window, Mapping):
+            # A published entry that is not an object is corrupt evidence
+            # for the same reason: it might have been the bracketing window.
+            corrupt_evidence = True
             continue
         start = _parse_window_epoch(window.get("start"))
         end = _parse_window_epoch(window.get("end"))

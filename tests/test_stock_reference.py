@@ -348,6 +348,46 @@ class TestYahooBackend:
             quote = backend.fetch_underlying_quote("NVDAc", "NVDA")
             assert quote.session is StockReferenceSession.UNKNOWN, windows
 
+    def test_nonobject_or_missing_regular_window_reads_unknown_not_closed(self) -> None:
+        """Corrupt or absent regular evidence never proves a closed market."""
+        pre = {"start": 1790928000, "end": 1790947800}
+        post = {"start": 1790971200, "end": 1790985600}
+        incomplete_periods = [
+            # A published regular entry that is not an object.
+            {"pre": pre, "regular": "9:30 to 16:00", "post": post},
+            {"pre": pre, "regular": None, "post": post},
+            {"pre": pre, "regular": 42, "post": post},
+            {"pre": pre, "regular": True, "post": post},
+            # The required regular window missing while siblings publish.
+            {"pre": pre, "post": post},
+        ]
+        # An in-session tick matching the fixture's regular window: the
+        # broken regular window is exactly the one that would have placed
+        # the fetch, so its evidence can never support a closed label.
+        meta = dict(NVDA_CHART_META)
+        meta["regularMarketTime"] = 1790962199
+        for periods in incomplete_periods:
+            meta["currentTradingPeriod"] = periods
+            backend = fixed_yahoo_backend(
+                yahoo_chart_response(meta), fetched_at=datetime(2026, 10, 2, 17, 30, tzinfo=UTC)
+            )
+            quote = backend.fetch_underlying_quote("NVDAc", "NVDA")
+            assert quote.session is StockReferenceSession.UNKNOWN, periods
+
+    def test_valid_open_window_survives_a_corrupt_regular_sibling(self) -> None:
+        """A cleanly published bracketing window still establishes OPEN."""
+        meta = dict(NVDA_CHART_META)
+        meta["currentTradingPeriod"] = {
+            "pre": {"start": 1790928000, "end": 1790947800},
+            "regular": "9:30 to 16:00",
+            "post": {"start": 1790971200, "end": 1790985600},
+        }
+        # The fetch sits inside the valid post window, so the session is
+        # known open despite the corrupt regular sibling.
+        backend = fixed_yahoo_backend(yahoo_chart_response(meta), fetched_at=POST_MARKET_FETCH_AT)
+        quote = backend.fetch_underlying_quote("NVDAc", "NVDA")
+        assert quote.session is StockReferenceSession.POST_MARKET
+
     def test_whole_dollar_integer_price_is_accepted(self) -> None:
         """A bare JSON integer last sale is a valid positive price."""
         meta = dict(NVDA_CHART_META)
