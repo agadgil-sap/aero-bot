@@ -1156,8 +1156,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Optional injected real-market quote in USDC per stock - either "
             "one price for the pinned symbol or per-symbol SYMBOL=PRICE "
             "pairs (AAPLc=318.5,FIXc=100) for selector mode; without it "
-            "entries block fail-closed as reference_stale because no live "
-            "reference feed is wired yet."
+            "entries block fail-closed as reference_stale in enforced "
+            "contexts - the live reference feed arms the cycle, not this "
+            "decision-only CLI."
         ),
     )
     parser.add_argument(
