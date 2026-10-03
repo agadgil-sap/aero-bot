@@ -1,7 +1,9 @@
 """Pin the live underlying-equity reference feed's honest provenance contract."""
 
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from json import dumps
 
 import httpx
 import pytest
@@ -56,6 +58,12 @@ FINNHUB_SAMPLE_BODY = {"c": 261.74, "h": 263.31, "l": 260.68, "o": 261.07, "pc":
 def yahoo_chart_response(meta: object, status: int = 200) -> httpx.Response:
     """Build one chart-endpoint response around the given meta."""
     return httpx.Response(status, json={"chart": {"result": [{"meta": meta}], "error": None}})
+
+
+def yahoo_chart_raw_response(meta: object) -> httpx.Response:
+    """Build one chart response whose raw body may carry Infinity or NaN."""
+    body = dumps({"chart": {"result": [{"meta": meta}], "error": None}})
+    return httpx.Response(200, content=body.encode())
 
 
 def fixed_yahoo_backend(
@@ -237,6 +245,47 @@ class TestYahooBackend:
             with pytest.raises(StockReferenceUnavailableError):
                 backend.fetch_underlying_quote("NVDAc", "NVDA")
 
+    def test_corrupt_timestamps_fail_the_symbol_closed(self) -> None:
+        """A non-finite or out-of-range stamp is per-symbol evidence."""
+        for corrupt_time in (float("inf"), float("nan"), 10**20):
+            meta = dict(NVDA_CHART_META)
+            meta["regularMarketTime"] = corrupt_time
+            backend = fixed_yahoo_backend(
+                yahoo_chart_raw_response(meta), fetched_at=POST_MARKET_FETCH_AT
+            )
+            with pytest.raises(StockReferenceUnavailableError, match="failed validation"):
+                backend.fetch_underlying_quote("NVDAc", "NVDA")
+
+    def test_nonfinite_trading_period_window_fails_the_symbol_closed(self) -> None:
+        """Corrupt session windows are evidence, never a crash."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            meta = dict(NVDA_CHART_META)
+            meta["currentTradingPeriod"] = {"regular": {"start": 1790947800, "end": float("inf")}}
+            return yahoo_chart_raw_response(meta)
+
+        backend = YahooChartStockReferenceBackend(
+            now=lambda: POST_MARKET_FETCH_AT, transport=httpx.MockTransport(handler)
+        )
+        with pytest.raises(StockReferenceUnavailableError, match="failed validation"):
+            backend.fetch_underlying_quote("NVDAc", "NVDA")
+
+    def test_whole_dollar_integer_price_is_accepted(self) -> None:
+        """A bare JSON integer last sale is a valid positive price."""
+        meta = dict(NVDA_CHART_META)
+        meta["regularMarketPrice"] = 262
+        backend = fixed_yahoo_backend(yahoo_chart_response(meta), fetched_at=POST_MARKET_FETCH_AT)
+        quote = backend.fetch_underlying_quote("NVDAc", "NVDA")
+        assert quote.price_usd == Decimal("262")
+
+    def test_boolean_price_is_refused(self) -> None:
+        """A JSON true is never a price despite its integer flavor."""
+        meta = dict(NVDA_CHART_META)
+        meta["regularMarketPrice"] = True
+        backend = fixed_yahoo_backend(yahoo_chart_response(meta), fetched_at=POST_MARKET_FETCH_AT)
+        with pytest.raises(StockReferenceUnavailableError, match="no positive price"):
+            backend.fetch_underlying_quote("NVDAc", "NVDA")
+
     def test_chart_error_object_fails_closed(self) -> None:
         """The endpoint's own error object surfaces as evidence."""
 
@@ -322,6 +371,30 @@ class TestYahooBackend:
         with pytest.raises(StockReferenceUnavailableError, match="above the configured"):
             backend.fetch_underlying_quote("NVDAc", "NVDA")
 
+    def test_oversized_body_is_cut_off_mid_stream(self) -> None:
+        """The byte bound stops the download itself, not just the parse."""
+        pulled = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            def endless() -> Iterator[bytes]:
+                nonlocal pulled
+                while True:
+                    pulled += 8192
+                    yield b"x" * 8192
+
+            return httpx.Response(200, content=endless())
+
+        backend = YahooChartStockReferenceBackend(
+            now=lambda: POST_MARKET_FETCH_AT,
+            transport=httpx.MockTransport(handler),
+            max_response_bytes=1024,
+        )
+        with pytest.raises(StockReferenceUnavailableError, match="above the configured"):
+            backend.fetch_underlying_quote("NVDAc", "NVDA")
+        # Only the one chunk that crossed the bound was pulled from the
+        # endless body: the rest was never downloaded.
+        assert pulled == 8192
+
     def test_invalid_underlying_ticker_is_refused_before_the_url(self) -> None:
         """Ticker metacharacters never reach a URL."""
         backend = fixed_yahoo_backend(
@@ -382,6 +455,45 @@ class TestFinnhubBackend:
         with pytest.raises(StockReferenceUnavailableError, match="no positive current price"):
             backend.fetch_underlying_quote("AAPLc", "AAPL")
 
+    def test_whole_dollar_integer_price_is_accepted_and_bool_refused(self) -> None:
+        """A bare JSON integer last sale quotes; a JSON true never does."""
+
+        def integer_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"c": 262, "t": 1582641000})
+
+        def boolean_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"c": True, "t": 1582641000})
+
+        backend = FinnhubQuoteStockReferenceBackend(
+            "sealed-token",
+            now=lambda: POST_MARKET_FETCH_AT,
+            transport=httpx.MockTransport(integer_handler),
+        )
+        quote = backend.fetch_underlying_quote("AAPLc", "AAPL")
+        assert quote.price_usd == Decimal("262")
+
+        backend = FinnhubQuoteStockReferenceBackend(
+            "sealed-token",
+            now=lambda: POST_MARKET_FETCH_AT,
+            transport=httpx.MockTransport(boolean_handler),
+        )
+        with pytest.raises(StockReferenceUnavailableError, match="no positive current price"):
+            backend.fetch_underlying_quote("AAPLc", "AAPL")
+
+    def test_out_of_range_timestamp_fails_the_symbol_closed(self) -> None:
+        """A stamp no calendar holds is per-symbol evidence, never a crash."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"c": 261.74, "t": 10**20})
+
+        backend = FinnhubQuoteStockReferenceBackend(
+            "sealed-token",
+            now=lambda: POST_MARKET_FETCH_AT,
+            transport=httpx.MockTransport(handler),
+        )
+        with pytest.raises(StockReferenceUnavailableError, match="failed validation"):
+            backend.fetch_underlying_quote("AAPLc", "AAPL")
+
     def test_missing_token_fails_at_construction(self) -> None:
         """The keyed backend refuses to exist without its sealed token."""
         with pytest.raises(ValueError, match="non-empty API token"):
@@ -414,7 +526,7 @@ class TestUnderlyingMapping:
 
 
 class TestStockReferenceFeed:
-    """The feed's per-symbol isolation, cache, and honest ages."""
+    """The feed's per-symbol isolation and honest ages."""
 
     def test_quotes_every_requested_symbol_in_deterministic_order(self) -> None:
         """Every mapped symbol is quoted and ordered by B20 symbol."""
@@ -465,8 +577,8 @@ class TestStockReferenceFeed:
         assert result.quotes == ()
         assert any("no verified underlying mapping" in line for line in result.diagnostics)
 
-    def test_cache_reuses_one_read_inside_the_ttl(self) -> None:
-        """A second read inside the TTL does not re-fetch the provider."""
+    def test_duplicate_symbols_read_the_provider_once(self) -> None:
+        """A symbol repeated in one call is deduplicated, not re-read."""
         backend = StubBackend(
             quotes={
                 "AAPLc": make_quote(
@@ -474,41 +586,54 @@ class TestStockReferenceFeed:
                 )
             }
         )
-        clock = {"now": POST_MARKET_FETCH_AT}
         feed = StockReferenceFeed(
-            backend,
-            underlying_by_symbol={"AAPLc": "AAPL"},
-            now=lambda: clock["now"],
+            backend, underlying_by_symbol={"AAPLc": "AAPL"}, now=lambda: POST_MARKET_FETCH_AT
+        )
+        result = feed.fetch_quotes(["AAPLc", "AAPLc"])
+        assert backend.calls == ["AAPL"]
+        assert [quote.b20_symbol for quote in result.quotes] == ["AAPLc"]
+
+    def test_every_call_reads_the_provider_anew(self) -> None:
+        """No quote is carried between calls: each read hits the provider."""
+        backend = StubBackend(
+            quotes={
+                "AAPLc": make_quote(
+                    "AAPLc", as_of=NVDA_CLOSE_AS_OF, fetched_at=POST_MARKET_FETCH_AT
+                )
+            }
+        )
+        feed = StockReferenceFeed(
+            backend, underlying_by_symbol={"AAPLc": "AAPL"}, now=lambda: POST_MARKET_FETCH_AT
         )
         first = feed.fetch_quotes(["AAPLc"])
         second = feed.fetch_quotes(["AAPLc"])
-        assert backend.calls == ["AAPL"]
-        # The cached quote is the same evidence, and its as-of age has
-        # advanced honestly with the clock, not reset by the cache hit.
-        assert second.quotes[0] == first.quotes[0]
-        clock["now"] = POST_MARKET_FETCH_AT + timedelta(seconds=30)
-        assert second.age_seconds_by_symbol(clock["now"])["AAPLc"] == 14_279 + 30
-
-    def test_cache_expires_past_the_ttl(self) -> None:
-        """A read past the TTL re-fetches the provider."""
-        backend = StubBackend(
-            quotes={
-                "AAPLc": make_quote(
-                    "AAPLc", as_of=NVDA_CLOSE_AS_OF, fetched_at=POST_MARKET_FETCH_AT
-                )
-            }
-        )
-        clock = {"now": POST_MARKET_FETCH_AT}
-        feed = StockReferenceFeed(
-            backend,
-            underlying_by_symbol={"AAPLc": "AAPL"},
-            now=lambda: clock["now"],
-            cache_ttl_seconds=60.0,
-        )
-        feed.fetch_quotes(["AAPLc"])
-        clock["now"] = POST_MARKET_FETCH_AT + timedelta(seconds=61)
-        feed.fetch_quotes(["AAPLc"])
         assert backend.calls == ["AAPL", "AAPL"]
+        assert second.quotes == first.quotes
+
+    def test_one_corrupt_timestamp_never_blanks_the_board(self) -> None:
+        """A non-finite provider timestamp fails its symbol alone."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            symbol = request.url.path.rsplit("/", 1)[-1]
+            if symbol == "TSLA":
+                meta = dict(NVDA_CHART_META)
+                meta["regularMarketTime"] = float("inf")
+                return yahoo_chart_raw_response(meta)
+            return yahoo_chart_response(NVDA_CHART_META)
+
+        feed = StockReferenceFeed(
+            YahooChartStockReferenceBackend(
+                now=lambda: POST_MARKET_FETCH_AT, transport=httpx.MockTransport(handler)
+            ),
+            underlying_by_symbol={"AAPLc": "AAPL", "TSLAc": "TSLA"},
+            now=lambda: POST_MARKET_FETCH_AT,
+        )
+        result = feed.fetch_quotes(["AAPLc", "TSLAc"])
+        assert [quote.b20_symbol for quote in result.quotes] == ["AAPLc"]
+        assert any(
+            "TSLAc unavailable via yahoo-chart" in line and "failed validation" in line
+            for line in result.diagnostics
+        )
 
     def test_closed_market_quote_reads_hours_old_at_consumption(self) -> None:
         """A Friday close fetched Friday night never passes a 300s bound."""

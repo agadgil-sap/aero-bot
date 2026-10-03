@@ -9,6 +9,7 @@ the 900-second open-position bound, and the 0.15-percent dislocation
 monitor read.
 """
 
+import json
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -40,17 +41,14 @@ FINNHUB_QUOTE_DOCS_URL: str = "https://finnhub.io/docs/api/quote"
 # whose board sweep has already spent minutes on-chain.
 REFERENCE_REQUEST_TIMEOUT_SECONDS = 10.0
 # One MiB is far above one symbol's chart meta while still bounding memory
-# use against a hostile or corrupt response.
+# use against a hostile or corrupt response; the read stops at the first
+# chunk that crosses it instead of downloading the rest.
 REFERENCE_MAX_RESPONSE_BYTES = 1024 * 1024
 # One retry absorbs a single transient 429/5xx/network hiccup per symbol;
 # anything persistent surfaces as explicit fail-closed evidence.
 REFERENCE_FETCH_ATTEMPTS = 2
 # The retry backoff respects a rate-limited provider instead of hammering it.
 REFERENCE_RETRY_BACKOFF_SECONDS = 2.0
-# Quotes fetched once inside one cycle process are reused for sixty
-# seconds; the provider as-of time - not the cache stamp - keeps the age
-# honest, so a cached closed-market close never becomes fresher by reuse.
-REFERENCE_CACHE_TTL_SECONDS = 60.0
 # A provider observation later than the fetch by more than this skew is a
 # clock or data fault, never a fresh quote.
 MAX_AS_OF_FUTURE_SKEW_SECONDS = 30
@@ -323,7 +321,7 @@ class _BoundedHttpQuoteBackend:
         self._retry_backoff_seconds = retry_backoff_seconds
         self._transport = transport
 
-    def _bounded_get(self, url: str, headers: dict[str, str]) -> tuple[httpx.Response, object]:
+    def _bounded_get(self, url: str, headers: dict[str, str]) -> object:
         """Fetch one URL with bounded retries or raise unavailable.
 
         Args:
@@ -331,15 +329,16 @@ class _BoundedHttpQuoteBackend:
             headers: The request headers, including the provider user agent.
 
         Returns:
-            The final response and its JSON-decoded payload.
+            The JSON-decoded payload.
 
         Raises:
             StockReferenceUnavailableError: When every bounded attempt
                 failed, when the final status is not a success, when the
-                body exceeds the size bound, or when it is not valid JSON.
+                body exceeds the size bound while streaming, or when it is
+                not valid JSON.
         """
         last_error = "no attempt was made"
-        response: httpx.Response | None = None
+        body: bytes | None = None
         # One shared client applies the complete per-request timeout and
         # rejects redirects so a moved endpoint surfaces as evidence.
         with httpx.Client(
@@ -348,40 +347,63 @@ class _BoundedHttpQuoteBackend:
             headers=headers,
             transport=self._transport,
         ) as client:
+            request = client.build_request("GET", url)
             for attempt in range(1, self._attempts + 1):
+                response: httpx.Response | None = None
                 try:
-                    response = client.get(url)
-                except httpx.HTTPError as error:
-                    response = None
-                    last_error = f"transport error {type(error).__name__}: {error}"
-                else:
+                    response = client.send(request, stream=True)
                     if response.status_code // 100 == 2:
+                        body = self._read_body_bounded(response)
                         break
                     last_error = f"HTTP {response.status_code}"
+                except httpx.HTTPError as error:
+                    last_error = f"transport error {type(error).__name__}: {error}"
+                finally:
+                    if response is not None:
+                        response.close()
                 # Only the attempts budget bounds the retries, and every
                 # retry waits out the backoff first so a rate-limited
                 # provider is respected rather than hammered.
                 if attempt < self._attempts:
                     self._sleep(self._retry_backoff_seconds)
-        if response is None or response.status_code // 100 != 2:
+        if body is None:
             raise StockReferenceUnavailableError(
                 f"{self.provider_id} request failed after {self._attempts} attempt(s): {last_error}"
-            )
-        response_size = len(response.content)
-        if response_size > self._max_response_bytes:
-            raise StockReferenceUnavailableError(
-                f"{self.provider_id} response contained {response_size} bytes, above the "
-                f"configured {self._max_response_bytes}-byte limit"
             )
         try:
             # parse_float=Decimal preserves the provider's decimal price
             # exactly instead of routing through binary floats.
-            payload = response.json(parse_float=Decimal)
+            return json.loads(body, parse_float=Decimal)
         except ValueError as error:
             raise StockReferenceUnavailableError(
                 f"{self.provider_id} response was not valid JSON"
             ) from error
-        return response, payload
+
+    def _read_body_bounded(self, response: httpx.Response) -> bytes:
+        """Read one streamed body incrementally under the size bound.
+
+        Args:
+            response: The open success response whose body is being read.
+
+        Returns:
+            The complete body, at or under the configured byte bound.
+
+        Raises:
+            StockReferenceUnavailableError: When the body streams past the
+                configured byte bound; the read stops at the first chunk
+                that crosses it instead of downloading the rest.
+        """
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_bytes():
+            total += len(chunk)
+            if total > self._max_response_bytes:
+                raise StockReferenceUnavailableError(
+                    f"{self.provider_id} response streamed {total} bytes, above the "
+                    f"configured {self._max_response_bytes}-byte limit"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 
 class YahooChartStockReferenceBackend(_BoundedHttpQuoteBackend):
@@ -413,9 +435,7 @@ class YahooChartStockReferenceBackend(_BoundedHttpQuoteBackend):
         """
         _require_valid_underlying(underlying_symbol)
         url = YAHOO_CHART_URL_TEMPLATE.format(symbol=underlying_symbol)
-        response, payload = self._bounded_get(
-            url, {"User-Agent": "aero-bot/0.1 read-only-stock-reference"}
-        )
+        payload = self._bounded_get(url, {"User-Agent": "aero-bot/0.1 read-only-stock-reference"})
         # The endpoint reports its own failures as a chart error object.
         chart = _require_mapping(
             payload.get("chart") if isinstance(payload, dict) else None, "chart"
@@ -439,10 +459,12 @@ class YahooChartStockReferenceBackend(_BoundedHttpQuoteBackend):
                 f"{REFERENCE_CURRENCY}; refusing the quote"
             )
         price = meta.get("regularMarketPrice")
-        if not isinstance(price, Decimal) or price <= 0:
+        if isinstance(price, bool) or not isinstance(price, (Decimal, int)) or price <= 0:
             raise StockReferenceUnavailableError(
                 f"yahoo-chart returned no positive price for {underlying_symbol}"
             )
+        if isinstance(price, int):
+            price = Decimal(price)
         as_of_raw = meta.get("regularMarketTime")
         # The provider's own observation time is mandatory: a quote whose
         # as-of is unknown is never relabeled fresh by the fetch.
@@ -452,11 +474,11 @@ class YahooChartStockReferenceBackend(_BoundedHttpQuoteBackend):
                 "refusing to relabel the fetch as an observation time"
             )
         fetched_at = self._now()
-        as_of = datetime.fromtimestamp(as_of_raw, tz=UTC)
-        session = _yahoo_session(meta, fetched_at)
         exchange = meta.get("fullExchangeName")
         exchange_name = exchange if isinstance(exchange, str) and exchange else "unlabeled"
         try:
+            as_of = datetime.fromtimestamp(as_of_raw, tz=UTC)
+            session = _yahoo_session(meta, fetched_at)
             return StockReferenceQuote(
                 provider_id=self.provider_id,
                 b20_symbol=b20_symbol,
@@ -472,7 +494,7 @@ class YahooChartStockReferenceBackend(_BoundedHttpQuoteBackend):
                 exchange_name=exchange_name,
                 source_url=url,
             )
-        except ValueError as error:
+        except (ValueError, ArithmeticError, OSError) as error:
             raise StockReferenceUnavailableError(
                 f"yahoo-chart quote for {underlying_symbol} failed validation: {error}"
             ) from error
@@ -523,7 +545,7 @@ class FinnhubQuoteStockReferenceBackend(_BoundedHttpQuoteBackend):
         """
         _require_valid_underlying(underlying_symbol)
         request_url = f"{FINNHUB_QUOTE_URL}?symbol={underlying_symbol}"
-        response, payload = self._bounded_get(
+        payload = self._bounded_get(
             request_url,
             {
                 "User-Agent": "aero-bot/0.1 read-only-stock-reference",
@@ -532,10 +554,12 @@ class FinnhubQuoteStockReferenceBackend(_BoundedHttpQuoteBackend):
         )
         body = _require_mapping(payload, "quote body")
         price = body.get("c")
-        if not isinstance(price, Decimal) or price <= 0:
+        if isinstance(price, bool) or not isinstance(price, (Decimal, int)) or price <= 0:
             raise StockReferenceUnavailableError(
                 f"finnhub-quote returned no positive current price for {underlying_symbol}"
             )
+        if isinstance(price, int):
+            price = Decimal(price)
         as_of_raw = body.get("t")
         # The documented schema omits "t" while the reference's own sample
         # carries it; without it the quote has no observation time and is
@@ -568,7 +592,7 @@ class FinnhubQuoteStockReferenceBackend(_BoundedHttpQuoteBackend):
                 exchange_name="unlabeled by provider",
                 source_url=FINNHUB_QUOTE_URL,
             )
-        except ValueError as error:
+        except (ValueError, ArithmeticError, OSError) as error:
             raise StockReferenceUnavailableError(
                 f"finnhub-quote quote for {underlying_symbol} failed validation: {error}"
             ) from error
@@ -589,7 +613,6 @@ class StockReferenceFeed:
         *,
         underlying_by_symbol: Mapping[str, str] = UNDERLYING_BY_B20_SYMBOL,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
-        cache_ttl_seconds: float = REFERENCE_CACHE_TTL_SECONDS,
     ) -> None:
         """Configure one feed over one read-only backend.
 
@@ -598,17 +621,10 @@ class StockReferenceFeed:
             underlying_by_symbol: The verified B20-to-underlying mapping;
                 defaults to the reviewed registry table, tests may scope it.
             now: Injected clock producing timezone-aware stamps.
-            cache_ttl_seconds: Reuse window for one symbol's quote inside
-                this feed instance; zero disables caching.
         """
-        if cache_ttl_seconds < 0:
-            raise ValueError("cache_ttl_seconds must not be negative")
         self._backend = backend
         self._underlying_by_symbol = underlying_by_symbol
         self._now = now
-        self._cache_ttl_seconds = cache_ttl_seconds
-        # Cache entries pair the quote with its fetch stamp for TTL checks.
-        self._cache: dict[str, tuple[StockReferenceQuote, datetime]] = {}
 
     def fetch_quotes(self, b20_symbols: Sequence[str]) -> StockReferenceFeedResult:
         """Read one bounded quote per requested B20 symbol, fail-closed.
@@ -637,13 +653,6 @@ class StockReferenceFeed:
                     "quote omitted fail-closed"
                 )
                 continue
-            cached = self._cache.get(underlying)
-            if (
-                cached is not None
-                and (self._now() - cached[1]).total_seconds() < self._cache_ttl_seconds
-            ):
-                quotes.append(cached[0])
-                continue
             try:
                 quote = self._backend.fetch_underlying_quote(b20_symbol, underlying)
             except StockReferenceUnavailableError as error:
@@ -654,7 +663,6 @@ class StockReferenceFeed:
                     f"{self._backend.provider_id}: {error}"
                 )
                 continue
-            self._cache[underlying] = (quote, quote.fetched_at)
             quotes.append(quote)
         fetched_at = self._now()
         diagnostics.insert(

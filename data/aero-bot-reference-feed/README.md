@@ -36,7 +36,7 @@ closed since 20:00 UTC) from this worktree, all unsigned and read-only:
   sample response - plus every fail-closed mode (non-USD, missing price,
   missing provider timestamp, future as-of, persistent 429, transport
   faults, oversized bodies, ticker injection), the feed's per-symbol
-  isolation, cache TTL, and the honest-age math. The keyed Finnhub backend
+  isolation and the honest-age math. The keyed Finnhub backend
   is fixture-proof only: live proof requires the operator to seal a free
   API key (`AERO_BOT_STOCK_REFERENCE_TOKEN`), which no agent may sign up
   for.
