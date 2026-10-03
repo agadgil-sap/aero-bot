@@ -256,8 +256,8 @@ class TestYahooBackend:
             with pytest.raises(StockReferenceUnavailableError, match="failed validation"):
                 backend.fetch_underlying_quote("NVDAc", "NVDA")
 
-    def test_nonfinite_trading_period_window_fails_the_symbol_closed(self) -> None:
-        """Corrupt session windows are evidence, never a crash."""
+    def test_nonfinite_trading_period_window_reads_unknown_not_closed(self) -> None:
+        """Corrupt session windows are evidence, never a crash or a closed label."""
 
         def handler(request: httpx.Request) -> httpx.Response:
             meta = dict(NVDA_CHART_META)
@@ -267,8 +267,86 @@ class TestYahooBackend:
         backend = YahooChartStockReferenceBackend(
             now=lambda: POST_MARKET_FETCH_AT, transport=httpx.MockTransport(handler)
         )
-        with pytest.raises(StockReferenceUnavailableError, match="failed validation"):
-            backend.fetch_underlying_quote("NVDAc", "NVDA")
+        quote = backend.fetch_underlying_quote("NVDAc", "NVDA")
+        # The session is diagnostic-only evidence: a window that does not
+        # parse degrades the label to unknown instead of failing the quote
+        # or asserting a closed market it cannot prove.
+        assert quote.session is StockReferenceSession.UNKNOWN
+        assert quote.as_of == NVDA_CLOSE_AS_OF
+
+    def test_string_epoch_windows_bracketing_fetch_select_regular(self) -> None:
+        """String-serialized windows still place an in-session fetch."""
+        meta = dict(NVDA_CHART_META)
+        # The provider has served exactly this variant live: every window
+        # epoch serialized as a strict decimal-integer string.
+        meta["currentTradingPeriod"] = {
+            "pre": {
+                "timezone": "EDT",
+                "start": "1790928000",
+                "end": "1790947800",
+                "gmtoffset": -14400,
+            },
+            "regular": {
+                "timezone": "EDT",
+                "start": "1790947800",
+                "end": "1790971200",
+                "gmtoffset": -14400,
+            },
+            "post": {
+                "timezone": "EDT",
+                "start": "1790971200",
+                "end": "1790985600",
+                "gmtoffset": -14400,
+            },
+        }
+        # An in-session tick matching the fixture's regular window.
+        meta["regularMarketTime"] = 1790962199
+        backend = fixed_yahoo_backend(
+            yahoo_chart_response(meta),
+            fetched_at=datetime(2026, 10, 2, 17, 30, tzinfo=UTC),
+        )
+        quote = backend.fetch_underlying_quote("NVDAc", "NVDA")
+        assert quote.session is StockReferenceSession.REGULAR
+
+    def test_malformed_window_evidence_reads_unknown_not_closed(self) -> None:
+        """Present-but-corrupt windows never assert a closed market."""
+        malformed_windows = [
+            # Booleans are not epochs, whatever JSON calls them.
+            {"regular": {"start": True, "end": "1790971200"}},
+            # Loose strings are not strict decimal integers.
+            {"regular": {"start": " 1790947800", "end": "1790971200"}},
+            {"regular": {"start": "1790947800.0", "end": "1790971200"}},
+            {"regular": {"start": "1_79_094_7800", "end": "1790971200"}},
+            {"regular": {"start": "0x6AE5B9F0", "end": "1790971200"}},
+            # Nonfinite floats are corrupt evidence.
+            {"regular": {"start": 1790947800, "end": float("nan")}},
+            # Epochs beyond the datetime-representable span.
+            {"regular": {"start": 1790947800, "end": 10**20}},
+            {"regular": {"start": 1790947800, "end": "99999999999999999999"}},
+            # Inverted intervals are structurally broken.
+            {"regular": {"start": 1790971200, "end": 1790947800}},
+            # A window that is not a mapping at all.
+            {"regular": "9:30 to 16:00"},
+            # No window mappings published.
+            {},
+            # One corrupt window among valid ones keeps closed unprovable:
+            # the fetch below sits inside the corrupted post window.
+            {
+                "pre": {"start": 1790928000, "end": 1790947800},
+                "regular": {"start": 1790947800, "end": 1790971200},
+                "post": {"start": 1790971200, "end": "later today"},
+            },
+        ]
+        for windows in malformed_windows:
+            meta = dict(NVDA_CHART_META)
+            meta["currentTradingPeriod"] = windows
+            # The raw builder carries the NaN case httpx's json encoder
+            # refuses; every other case serializes identically through it.
+            backend = fixed_yahoo_backend(
+                yahoo_chart_raw_response(meta), fetched_at=POST_MARKET_FETCH_AT
+            )
+            quote = backend.fetch_underlying_quote("NVDAc", "NVDA")
+            assert quote.session is StockReferenceSession.UNKNOWN, windows
 
     def test_whole_dollar_integer_price_is_accepted(self) -> None:
         """A bare JSON integer last sale is a valid positive price."""

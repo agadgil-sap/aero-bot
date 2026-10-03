@@ -10,6 +10,7 @@ monitor read.
 """
 
 import json
+import math
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -55,6 +56,14 @@ MAX_AS_OF_FUTURE_SKEW_SECONDS = 30
 # Underlying tickers are plain uppercase exchange symbols; anything else is
 # rejected before it can reach a URL.
 UNDERLYING_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z0-9.\-]{0,11}$")
+# Yahoo has served trading-period window epochs as strict decimal-integer
+# strings as well as JSON numbers; fullmatch keeps the string alphabet to
+# plain ASCII digits - no signs, whitespace, underscores, or fractions.
+WINDOW_EPOCH_STRING_PATTERN = re.compile(r"[0-9]+")
+# Window epochs must stay inside the datetime-representable span (year 1
+# through 9999 UTC); anything wider is corrupt evidence, never a window.
+MIN_WINDOW_EPOCH = int(datetime.min.replace(tzinfo=UTC).timestamp())
+MAX_WINDOW_EPOCH = int(datetime.max.replace(tzinfo=UTC).timestamp())
 # The documented contract is US-dollar quotes in USDC-per-share terms.
 REFERENCE_CURRENCY = "USD"
 
@@ -92,7 +101,8 @@ class StockReferenceSession(StrEnum):
     POST_MARKET = "post_market"
     # Outside every published window: overnight, weekend, or holiday.
     CLOSED = "closed"
-    # The provider publishes no session windows; only the as-of time speaks.
+    # The provider publishes no usable session windows - none at all, or
+    # none this parser can trust; only the as-of time speaks.
     UNKNOWN = "unknown"
 
 
@@ -712,22 +722,55 @@ def _require_mapping(node: object, path: str) -> dict[str, object]:
     return node
 
 
+def _parse_window_epoch(value: object) -> int | None:
+    """Parse one trading-period epoch, strict integer strings included.
+
+    Args:
+        value: The provider's raw ``start``/``end`` window field.
+
+    Returns:
+        The whole-second epoch, or None when the evidence is corrupt:
+        booleans, non-numeric or non-strict strings, nonfinite floats, and
+        epochs outside the datetime-representable span.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        epoch = value
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        epoch = int(value)
+    elif isinstance(value, str) and WINDOW_EPOCH_STRING_PATTERN.fullmatch(value):
+        epoch = int(value)
+    else:
+        return None
+    if not MIN_WINDOW_EPOCH <= epoch <= MAX_WINDOW_EPOCH:
+        return None
+    return epoch
+
+
 def _yahoo_session(meta: Mapping[str, object], fetched_at: datetime) -> StockReferenceSession:
     """Derive the session from the provider's trading-period windows.
 
     Args:
         meta: The chart meta mapping, possibly carrying
-            ``currentTradingPeriod`` with pre/regular/post windows.
+            ``currentTradingPeriod`` with pre/regular/post windows whose
+            epochs arrive as JSON numbers or strict decimal-integer
+            strings.
         fetched_at: The fetch instant the windows are judged against.
 
     Returns:
         The session containing the fetch, CLOSED when the fetch sits in no
-        published window, or UNKNOWN when the provider published none.
+        cleanly published window, or UNKNOWN when the provider published
+        none - or published any window this parser cannot trust, which can
+        never prove the market closed.
     """
     periods = meta.get("currentTradingPeriod")
     if not isinstance(periods, Mapping):
         return StockReferenceSession.UNKNOWN
     windows: list[tuple[StockReferenceSession, int, int]] = []
+    corrupt_evidence = False
     session_by_key = {
         "pre": StockReferenceSession.PRE_MARKET,
         "regular": StockReferenceSession.REGULAR,
@@ -737,18 +780,20 @@ def _yahoo_session(meta: Mapping[str, object], fetched_at: datetime) -> StockRef
         window = periods.get(key)
         if not isinstance(window, Mapping):
             continue
-        start, end = window.get("start"), window.get("end")
-        if (
-            isinstance(start, (int, float))
-            and not isinstance(start, bool)
-            and isinstance(end, (int, float))
-            and not isinstance(end, bool)
-            and end > start
-        ):
-            windows.append((session, int(start), int(end)))
+        start = _parse_window_epoch(window.get("start"))
+        end = _parse_window_epoch(window.get("end"))
+        if start is None or end is None or end <= start:
+            # A published window that does not parse is corrupt evidence:
+            # it might have been the one bracketing the fetch, so it can
+            # never support a closed label.
+            corrupt_evidence = True
+            continue
+        windows.append((session, start, end))
     for session, start, end in windows:
         if start <= fetched_at.timestamp() < end:
             return session
-    # Every published window missed: overnight, weekend, holiday, or a
-    # provider whose windows all predate the fetch.
-    return StockReferenceSession.CLOSED
+    if windows and not corrupt_evidence:
+        # Every published window missed cleanly: overnight, weekend,
+        # holiday, or a provider whose windows all predate the fetch.
+        return StockReferenceSession.CLOSED
+    return StockReferenceSession.UNKNOWN
