@@ -370,7 +370,7 @@ def test_assemble_board_carries_per_symbol_honest_ages() -> None:
     # AAAc keeps the injected shared age zero; BBBc carries its own honest
     # as-of measurement straight into the observation the gates read.
     assert ages == {"AAAc": 0, "BBBc": 14_279}
-    assert any("no real-market reference quote reached this board" not in note for note in notes)
+    assert not any("no real-market reference quote reached this board" in note for note in notes)
 
 
 def test_no_reference_note_attributes_the_feed_flag_to_the_cycle() -> None:

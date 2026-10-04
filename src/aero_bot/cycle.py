@@ -3387,7 +3387,7 @@ class CycleRunner:
             pool_depth_usd=decision_option.observation.pool_depth_usd,
             equity_usd=decision_option.observation.equity_usd,
             gas_price_gwei=gas_price,
-            reference_price_usdc=reference_prices_by_symbol.get(decision_option.symbol),
+            reference_price_usdc=merged_references.get(decision_option.symbol),
             event_window=window,
             outcome=outcome,
             input_notes=notes + (summary,),
