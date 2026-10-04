@@ -113,4 +113,9 @@ def build_ranging_evidence(
         trailing_path=points,
         stock_decimals=stock_decimals,
         quote_decimals=quote_decimals,
+        # The verbatim-geometry anchor: the solve's executable bounds derive
+        # from the snapshot's own raw tick and token orientation, carried
+        # exactly as the injected-evidence paths carry them.
+        pool_tick_raw=pool.current_tick,
+        stock_is_token0=stock_is_token0,
     )

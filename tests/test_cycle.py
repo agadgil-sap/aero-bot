@@ -3924,6 +3924,7 @@ class TestCycleConfiguration:
             switch_margin: object,
             parameters: object,
             aero_min: object,
+            reward_posture: object = None,
             portfolio: object = None,
             income_history_cycles: object = None,
             stock_dust_floor: object = None,

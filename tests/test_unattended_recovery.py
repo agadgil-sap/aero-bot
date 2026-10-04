@@ -43,6 +43,7 @@ from pydantic import BaseModel
 
 from aero_bot.audit import AuditEventType, AuditStore
 from aero_bot.cycle import CYCLE_REWARD_POSTURE_ENV, CYCLE_STATE_PATH_ENV
+from aero_bot.history import SWAP_EVENT_TOPIC0, price_usdc_per_stock
 from aero_bot.known_pool import staked_sides_for_gauge_liquidity
 from aero_bot.lp_executor import EXIT_OK
 from aero_bot.lp_plan import _sqrt_price_at_tick, position_amounts_at_sqrt_ratio
@@ -69,14 +70,29 @@ FIXTURE_AERO_PRICE_USDC = Decimal("0.5")
 # The Slipstream AERO/USDC pool the reward conversion routes through.
 FIXTURE_AERO_SLIPSTREAM_POOL_ADDRESS = "0x" + "ef" * 20
 
-# Board pool geometry: the in-range anchor every fixture pool shares.
+# Board pool geometry: the in-range anchor every fixture pool shares. The
+# served ratio prices exactly at the served tick - a real venue's slot0
+# always agrees, and the adaptive width solve's coherence gate checks it.
 POOL_TICK_SPACING = 10
 POOL_CURRENT_TICK = -15
+POOL_RATIO_ANCHOR_TICK = POOL_CURRENT_TICK
 with localcontext() as _ctx:
     _ctx.prec = 60
-    POOL_SQRT_RATIO = int((Decimal("1.0001") ** Decimal(-10) * (1 << 96)).to_integral_value())
+    POOL_SQRT_RATIO = int(_sqrt_price_at_tick(POOL_CURRENT_TICK))
 POOL_ACTIVE_LIQUIDITY = 10**20
 POOL_FEE_GROWTH_GLOBAL = 1 << 128
+
+# The bounded trailing Swap window every fixture pool serves for the live
+# adaptive-width read: prices wiggling two raw ticks around the pool's live
+# ratio, one swap per 300-second step, the newest five minutes under the
+# head block - the healthy measured regime the shared conftest evidence
+# fixture models, held well inside the read's sufficiency and recency
+# bounds (ten points over 1800 seconds, newest at most 1800 seconds old).
+BLOCK_SECONDS = 2
+SWAP_HISTORY_POINTS = 24
+SWAP_HISTORY_BLOCK_STEP = 150
+SWAP_HISTORY_WIGGLE_TICKS = 2
+SWAP_HISTORY_USDC_UNITS = 5_000_000_000
 
 SECONDS_PER_YEAR = 365 * 24 * 3600
 
@@ -484,6 +500,13 @@ class FaithfulChain:
             self._set_balance(pool.stock_address, pool.pool_address, pool.stock_reserve_units)
         self._set_balance(AERO_TOKEN_ADDRESS, FIXTURE_AERO_CLASSIC_POOL_ADDRESS, 10**18)
         self._set_balance(BASE_USDC_ADDRESS, FIXTURE_AERO_CLASSIC_POOL_ADDRESS, 500_000)
+        # Every board pool serves the same healthy trailing Swap window the
+        # live adaptive-width read reconstructs through eth_getLogs and
+        # eth_getBlockByNumber, so the width solve measures a calm regime
+        # around each pool's live ratio exactly as it would on the venue.
+        self.swap_history: dict[str, list[dict[str, Any]]] = {
+            address: self._synthetic_swap_logs(pool) for address, pool in self.pools.items()
+        }
         # Receipts carry the delivering relayer's public address.
         self._relayer = CycleHarness._relayer_address()
 
@@ -632,7 +655,79 @@ class FaithfulChain:
                 return self._send_raw_transaction(str(params[0]))
             if method == "eth_getTransactionReceipt":
                 return self.receipts.get(str(params[0]))
+            if method == "eth_getBlockByNumber":
+                return self._block_header(str(params[0]) if params else "latest")
+            if method == "eth_getLogs":
+                return self._eth_get_logs(params[0])
             raise AssertionError(f"unexpected RPC method {method}")
+
+    def _block_header(self, tag: str) -> dict[str, str] | None:
+        """Serve one block header, wall-clock anchored at the head block.
+
+        The head block's timestamp is the serving instant and earlier blocks
+        step back two seconds each, so the synthesized trailing window stays
+        fresh at the decision instant however long the suite runs.
+        """
+        if tag in ("latest", "pending"):
+            number = self.block_number
+        else:
+            try:
+                number = int(tag, 16)
+            except ValueError:
+                return None
+        if number < 0 or number > self.block_number:
+            return None
+        age_blocks = self.block_number - number
+        return {
+            "number": hex(number),
+            "timestamp": hex(int(time.time()) - BLOCK_SECONDS * age_blocks),
+        }
+
+    def _eth_get_logs(self, query: dict[str, Any]) -> list[dict[str, Any]]:
+        """Answer one bounded eth_getLogs window over the synthesized history."""
+        from_block = int(str(query["fromBlock"]), 16)
+        to_block = int(str(query["toBlock"]), 16)
+        address = str(query["address"]).lower()
+        topics = query.get("topics") or []
+        topic0 = str(topics[0]).lower() if topics else None
+        return [
+            log
+            for log in self.swap_history.get(address, ())
+            if from_block <= int(str(log["blockNumber"]), 16) <= to_block
+            and (topic0 is None or str(log["topics"][0]).lower() == topic0)
+        ]
+
+    def _synthetic_swap_logs(self, pool: FixturePool) -> list[dict[str, Any]]:
+        """Build one pool's trailing Swap-log window around its live ratio.
+
+        The prices wiggle a few raw ticks around the pool's live ratio in the
+        repeating pattern the shared healthy-evidence fixture uses, so every
+        in-band adaptive candidate measures a high dwell share.
+        """
+        logs: list[dict[str, Any]] = []
+        for index in range(SWAP_HISTORY_POINTS):
+            wiggle = (index % (2 * SWAP_HISTORY_WIGGLE_TICKS + 1)) - SWAP_HISTORY_WIGGLE_TICKS
+            tick = POOL_RATIO_ANCHOR_TICK + wiggle
+            ratio = int(_sqrt_price_at_tick(tick))
+            price = price_usdc_per_stock(ratio, False, 8, 6)
+            stock_units = int((Decimal(SWAP_HISTORY_USDC_UNITS).scaleb(-6) / price).scaleb(8))
+            block = self.block_number - SWAP_HISTORY_BLOCK_STEP * (SWAP_HISTORY_POINTS - index)
+            logs.append(
+                {
+                    "address": pool.pool_address,
+                    "topics": [SWAP_EVENT_TOPIC0, _word(1), _word(2)],
+                    "data": "0x"
+                    + _word(SWAP_HISTORY_USDC_UNITS)
+                    + _word(stock_units)
+                    + _word(ratio)
+                    + _word(POOL_ACTIVE_LIQUIDITY)
+                    + _signed_word(tick),
+                    "blockNumber": hex(block),
+                    "logIndex": "0x0",
+                    "removed": False,
+                }
+            )
+        return logs
 
     def _eth_call(self, to: str, data: str, block_tag: str) -> str:
         selector = data[:10]
@@ -1153,9 +1248,16 @@ class FaithfulChain:
 
 
 def make_board_pools(
-    aprs: tuple[Decimal, ...] = (Decimal("3.4"), Decimal("2.0"), Decimal("1.6"), Decimal("1.5")),
+    aprs: tuple[Decimal, ...] = (Decimal("12.0"), Decimal("8.0"), Decimal("1.6"), Decimal("1.5")),
 ) -> list[FixturePool]:
-    """Build the three-name board at the given qualifying APRs."""
+    """Build the three-name board at the given qualifying APRs.
+
+    The default top two clear the adaptive width solve's modeled net with
+    margin (the solve's churn and stop terms are APR-independent, so a
+    low-yield second name would legitimately hold cash instead of funding
+    a second tier), the third sits qualified below the tier band, and the
+    fourth rests at the emissions floor as the switch target.
+    """
     stocks = load_registry_stocks()
     pools = [
         FixturePool(
@@ -1279,11 +1381,25 @@ import sys
 
 import aero_bot.executor as executor_module
 import aero_bot.lp_executor as lp_module
+import aero_bot.strategy as strategy_module
 
 # The politeness pacing exists for public endpoints; the loopback fixture
 # serves instantly, so tests pin it to zero. Every other behavior - the
 # real backends, the real retry ladder, the real CLI assembly - is stock.
 executor_module.REQUEST_PACING_SECONDS = 0.0
+
+# The live ranging-evidence read pages eth_getLogs windows and block
+# headers through the history backend, whose per-request politeness delay
+# exists for public endpoints too; the same zero pin applies.
+_real_history_backend = strategy_module.EventHistoryRpcBackend
+
+
+def _instant_history_backend(*args, **kwargs):
+    kwargs["page_delay_seconds"] = 0.0
+    return _real_history_backend(*args, **kwargs)
+
+
+strategy_module.EventHistoryRpcBackend = _instant_history_backend
 
 # Keep every fallback receipt endpoint on the isolated loopback fixture so
 # the bounded retry ladder can rotate without ever touching a public node.
