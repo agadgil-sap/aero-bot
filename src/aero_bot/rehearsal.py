@@ -71,8 +71,8 @@ PPM_SCALE = Decimal(1_000_000)
 # Basis points scale impact fractions for the per-swap ledger view.
 BPS_SCALE = Decimal(10_000)
 # Live ranging evidence spans the same bounded trailing window the
-# production reader uses (a handful of 2,000-block pages at the public
-# endpoint's cap), so the rehearsal's width solves consume exactly the
+# production reader uses (a handful of 1,000-block pages at the public
+# gateway's cap), so the rehearsal's width solves consume exactly the
 # production inputs: realized volatility, measured band dwell, and the fee
 # flow over one matched window shape.
 RANGING_EVIDENCE_WINDOW = RANGING_READ_LOOKBACK

@@ -5,7 +5,7 @@ already carry: realized volatility, the bounded trailing price path behind
 measured band dwell, the trailing fee flow, and the gauge concentration
 numbers. This module assembles exactly that evidence from one bounded,
 read-only reconstruction of the pool's own Swap logs - a handful of
-2,000-block pages over roughly the last 4.4 hours at Base's two-second
+1,000-block pages over roughly the last 4.4 hours at Base's two-second
 blocks - through the same ``EventHistoryRpcBackend`` the rehearsal uses,
 with the same decode, estimator, and price conversion, so production and
 replay consume matching inputs.
@@ -31,10 +31,14 @@ from aero_bot.venues import PoolCandidate
 
 # Native USDC on Base, the quote side of every verified B20 pool.
 NATIVE_USDC_ADDRESS = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
-# The log-window size for ranging reads: the public endpoint's documented
-# eth_getLogs block-range cap, so the bounded read survives endpoints that
-# reject the history backend's wider default window.
-RANGING_READ_LOG_WINDOW_BLOCKS = 2_000
+# The log-window size for ranging reads: the public gateway's measured
+# eth_getLogs block-span cap. The production unsigned preflight of
+# 52d7846 proved the deployed public Tenderly gateway rejects any span
+# above 1,000 blocks with RPC error -32602 (invalid params) regardless
+# of filter shape, while spans at or below 1,000 succeed, so the window
+# sits exactly at that cap and the bounded pagination covers the full
+# lookback through more, smaller pages.
+RANGING_READ_LOG_WINDOW_BLOCKS = 1_000
 
 
 def build_ranging_evidence(
