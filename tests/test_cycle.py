@@ -1396,6 +1396,165 @@ class TestLiveCycles:
         assert new_book.held_inventory is None
 
 
+class _RecordingPolicyEngine(PolicyEngine):
+    """Record every decide outcome the cycle asks for (parity evidence).
+
+    The recording subclass changes no behavior: it delegates to the real
+    engine and only captures the outcomes the production path produced,
+    giving the parity tests the engine's own selected pair to compare
+    against the bounds the executor received - through an injected test
+    seam, not a product-report field.
+    """
+
+    recorded: list[tuple[PolicyObservation, PolicyOutcome]] = []
+
+    def decide(self, state: PolicyState, observation: PolicyObservation) -> PolicyOutcome:
+        outcome = super().decide(state, observation)
+        _RecordingPolicyEngine.recorded.append((observation, outcome))
+        return outcome
+
+
+class TestSelectedBoundsParity:
+    """The solve's selected pair is the minted pair on every action path."""
+
+    def _mint_bounds(self, executor: FakeExecutor) -> tuple[int, int]:
+        """Return the exact tick pair the single mint call received."""
+        mints = [call for call in executor.calls if call[0] == "mint"]
+        assert len(mints) == 1
+        bounds = cast(tuple[int, int], mints[0][5])
+        assert bounds is not None
+        return bounds
+
+    def _solved_enter_pairs(self, pool_address: str | None = None) -> list[tuple[int, int]]:
+        """Return every solved bounds pair the engine selected for one pool."""
+        pairs = [
+            (
+                outcome.decision.width_solution.lower_bound.tick,
+                outcome.decision.width_solution.upper_bound.tick,
+            )
+            for observation, outcome in _RecordingPolicyEngine.recorded
+            if outcome.decision.action is PolicyActionKind.ENTER
+            and outcome.decision.width_solution is not None
+            and outcome.decision.width_solution.lower_bound is not None
+            and outcome.decision.width_solution.upper_bound is not None
+            and (pool_address is None or observation.pool_address == pool_address)
+        ]
+        assert pairs
+        return pairs
+
+    def test_enter_mints_the_exact_solved_bounds_pair(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The enter mint's exact tick pair IS the solve's selected pair."""
+        monkeypatch.setattr("aero_bot.cycle.PolicyEngine", _RecordingPolicyEngine)
+        _RecordingPolicyEngine.recorded.clear()
+        runner, executor, _, _ = make_runner(tmp_path)
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_price_usdc=Decimal("100"),
+        )
+        assert report.decision_action == "enter"
+        mint_bounds = self._mint_bounds(executor)
+        pairs = self._solved_enter_pairs()
+        assert len(pairs) == 1
+        # Exact pair equality: the minted bounds are the solved bounds,
+        # never a width re-derivation of them.
+        assert mint_bounds == pairs[0]
+
+    def test_recenter_mints_the_exact_solved_bounds_pair(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A grace-expired recenter's replacement mint carries the solve's pair."""
+        above_range = tracked_status(owner=GAUGE_ADDRESS).model_copy(
+            update={
+                "position": SimpleNamespace(
+                    tick_lower=-15,
+                    tick_upper=-5,
+                    token0_address=BASE_USDC_ADDRESS,
+                    token1_address=STOCK_TOKEN_ADDRESS,
+                    liquidity=12_345,
+                )
+            }
+        )
+        reads = FakeReads(inventory_with_ids((TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1)))
+        reads.set_status(TRACKED_TOKEN_ID, above_range)
+        reads.set_status(TRACKED_TOKEN_ID + 1, tracked_status(owner=GAUGE_ADDRESS))
+        book = portfolio_book().model_copy(
+            update={
+                "positions": (
+                    portfolio_book()
+                    .positions[0]
+                    .model_copy(
+                        update={
+                            "out_of_range_since": QUIET_INSTANT - timedelta(minutes=30),
+                            "out_of_range_side": "above",
+                        }
+                    ),
+                    portfolio_book().positions[1],
+                )
+            }
+        )
+        monkeypatch.setattr("aero_bot.cycle.PolicyEngine", _RecordingPolicyEngine)
+        _RecordingPolicyEngine.recorded.clear()
+        runner, executor, _ = selector_runner(
+            tmp_path,
+            book=book,
+            reads=reads,
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "recenter"
+        mint_bounds = self._mint_bounds(executor)
+        recenters = [
+            outcome
+            for _, outcome in _RecordingPolicyEngine.recorded
+            if outcome.decision.action is PolicyActionKind.RECENTER
+        ]
+        assert len(recenters) == 1
+        solution = recenters[0].decision.width_solution
+        assert solution is not None and solution.lower_bound is not None
+        assert solution.upper_bound is not None
+        assert mint_bounds == (solution.lower_bound.tick, solution.upper_bound.tick)
+
+    def test_switch_mints_the_exact_solved_bounds_pair(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pool switch's target mint carries the winning solve's pair."""
+        monkeypatch.setattr("aero_bot.cycle.PolicyEngine", _RecordingPolicyEngine)
+        _RecordingPolicyEngine.recorded.clear()
+        runner, executor, _ = selector_runner(
+            tmp_path,
+            book=tracked_book(symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)),
+            reads=_tracked_reads(staked=True),
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "pool_switch"
+        mints = [call for call in executor.calls if call[0] == "mint"]
+        assert len(mints) == 1
+        assert mints[0][1] == "BBBc"
+        mint_bounds = self._mint_bounds(executor)
+        # The switch's width solution IS the winning pool's entry fold -
+        # the composed POOL_SWITCH decision copies it verbatim - so the
+        # recorded BBBc ENTER folds' pairs must agree on one selected
+        # pair, and the minted pair must be exactly it.
+        pairs = self._solved_enter_pairs(pool_address=SELECTOR_BBB_POOL)
+        assert len(set(pairs)) == 1
+        assert mint_bounds == pairs[0]
+
+
 class TestPostActionVisibility:
     """Final reconciliation waits for the primary RPC to observe confirmed actions."""
 

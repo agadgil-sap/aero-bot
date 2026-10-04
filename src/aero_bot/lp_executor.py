@@ -1816,8 +1816,6 @@ class LpLifecycleExecutor:
                 None refuses until the solver-derived width path lands.
             exact_tick_bounds: The adaptive solve's exact raw aligned bounds,
                 minted verbatim when present.
-            exact_tick_bounds: The adaptive solve's exact raw
-                aligned bounds, minted verbatim when present.
             portfolio_live_positions: The cycle book's tracked live positions
                 as (token id, committed USDC) pairs; their committed values
                 ride the total pilot cap beside this mint.
@@ -1872,7 +1870,12 @@ class LpLifecycleExecutor:
         """
         try:
             report, _ = self._build_mint_attempt(
-                symbol, budget_usdc, width_spacings, key_bytes, ephemeral_key
+                symbol,
+                budget_usdc,
+                width_spacings,
+                key_bytes,
+                ephemeral_key,
+                exact_tick_bounds=exact_tick_bounds,
             )
             return report
         except (LpExecutionRefusalError, LpPlanRefusalError) as error:
@@ -1932,8 +1935,6 @@ class LpLifecycleExecutor:
             token_id: The staked position NFT being unstaked.
             key_bytes: Exactly 32 raw signing-key bytes used for this build.
             ephemeral_key: Whether the key was generated for this dry run.
-            exact_tick_bounds: The adaptive solve's exact raw
-                aligned bounds, minted verbatim when present.
 
         Returns:
             The complete dry-run report; nothing was broadcast.
@@ -2162,6 +2163,7 @@ class LpLifecycleExecutor:
                 ephemeral_key,
                 ExecutionMode.EXECUTE,
                 portfolio_live_positions=portfolio_live_positions,
+                exact_tick_bounds=exact_tick_bounds,
             )
             total_build_ms += initial_build.build_duration_ms
             current_build = initial_build
@@ -2205,6 +2207,7 @@ class LpLifecycleExecutor:
                     inventory_only=True,
                     known_empty_position_count=known_empty_position_count,
                     portfolio_live_positions=portfolio_live_positions,
+                    exact_tick_bounds=exact_tick_bounds,
                 )
                 total_build_ms += current_build.build_duration_ms
                 known_empty_position_count = current_build.empty_nfpm_position_count
@@ -2288,6 +2291,7 @@ class LpLifecycleExecutor:
                     buffer_nfpm_approvals=True,
                     known_empty_position_count=known_empty_position_count,
                     portfolio_live_positions=portfolio_live_positions,
+                    exact_tick_bounds=exact_tick_bounds,
                 )
                 total_build_ms += final_build.build_duration_ms
                 known_empty_position_count = final_build.empty_nfpm_position_count

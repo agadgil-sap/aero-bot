@@ -1227,6 +1227,58 @@ def test_dry_run_mint_encodes_every_inner_call_from_the_plan() -> None:
             assert "0x" + inner.hex() == expected[transaction.role]
 
 
+def test_dry_run_mint_mints_the_exact_adaptive_bounds_verbatim() -> None:
+    """The adaptive solve's exact aligned pair reaches the wire verbatim.
+
+    The pair (-50, -10) is asymmetric around the fixture's current tick
+    -20: thirty ticks below, ten above - a geometry no symmetric width
+    derivation around the anchor can produce, so a re-derived range can
+    never satisfy this test. Every encoded field of the NFPM mint call,
+    ticks and amounts alike, must come from the exact-bound plan.
+    """
+    executor, rpc_script, _ = make_lp_executor()
+
+    report = executor.dry_run_mint(
+        "FIXc",
+        MINT_BUDGET_USDC,
+        MINT_WIDTH_SPACINGS,
+        bytes(Account.create().key),
+        exact_tick_bounds=(-50, -10),
+    )
+
+    plan = report.plan
+    assert plan.position_range.tick_lower == -50
+    assert plan.position_range.tick_upper == -10
+    expected = {
+        LpExecutionRole.MINT: build_lp_mint_calldata(
+            LpMintParams(
+                token0_address=BASE_USDC_ADDRESS,
+                token1_address=B20_ADDRESS,
+                tick_spacing=LP_TICK_SPACING,
+                tick_lower=-50,
+                tick_upper=-10,
+                amount0_desired_units=plan.amounts.amount0_desired_units,
+                amount1_desired_units=plan.amounts.amount1_desired_units,
+                amount0_min_units=plan.amounts.amount0_min_units,
+                amount1_min_units=plan.amounts.amount1_min_units,
+                recipient_address=SAFE_ADDRESS,
+                deadline=fixture_deadline(),
+                sqrt_price_x96=0,
+            )
+        ),
+    }
+    mint_calldata: list[str] = []
+    for transaction, calldata in zip(
+        report.transactions, rpc_script.estimate_requests, strict=True
+    ):
+        inner = decode_inner(calldata)
+        if transaction.role is LpExecutionRole.MINT:
+            assert "0x" + inner.hex() == expected[transaction.role]
+            mint_calldata.append(inner.hex())
+    # Exactly one mint step, byte-identical to the exact-bound encoding.
+    assert len(mint_calldata) == 1
+
+
 def test_dry_run_mint_skips_satisfied_allowances_and_the_swap() -> None:
     """Held stock and standing allowances collapse the sequence to the mint."""
     executor, rpc_script, _ = make_lp_executor(
@@ -4043,6 +4095,51 @@ def test_execute_mint_broadcasts_every_step_in_nonce_order(tmp_path: Path) -> No
     assert first_receipt["outcome"] == "confirmed"
     assert first_receipt["gas_used"] == 80_000
     assert AuditStore(audit_path).verify_chain().status.value == "verified"
+
+
+def test_execute_mint_broadcasts_the_exact_adaptive_bounds(tmp_path: Path) -> None:
+    """The adaptive solve's exact pair survives every rebuild to the wire.
+
+    The execute path rebuilds the mint up to three times - initial,
+    post-swap, and final after the approvals confirm. The exact aligned
+    pair must thread through every rebuild and land in the broadcast
+    mint's estimated calldata verbatim, never a width re-derivation.
+    """
+    executor, rpc_script, _ = make_lp_executor(
+        audit_path=tmp_path / "audit.sqlite3",
+        rpc_script=LpRpcScript(
+            allow_broadcasts=True,
+            post_swap_stock_balance_units=10**12,
+        ),
+        safe_script=SafeRpcScript(nonce_reads=[4, 6, 8], signature_verdicts=[True] * 20),
+    )
+
+    report = executor.execute_mint(
+        "FIXc",
+        MINT_BUDGET_USDC,
+        MINT_WIDTH_SPACINGS,
+        bytes(Account.create().key),
+        exact_tick_bounds=(-50, -10),
+        confirm_broadcast=True,
+    )
+
+    assert report.completed is True
+    # The final rebuilt plan still carries the exact pair.
+    final_build = cast(LpMintDryRunReport, report.build)
+    assert final_build.plan.position_range.tick_lower == -50
+    assert final_build.plan.position_range.tick_upper == -10
+    # Every mint-selector estimate - one per rebuild phase that planned a
+    # mint - encodes the exact pair's signed tick words.
+    mint_estimates = [
+        decode_inner(calldata)
+        for calldata in rpc_script.estimate_requests
+        if decode_inner(calldata).hex().startswith("b5007d1f")
+    ]
+    assert mint_estimates
+    for inner in mint_estimates:
+        tick_lower = int.from_bytes(inner[4 + 32 * 3 : 4 + 32 * 4], "big", signed=True)
+        tick_upper = int.from_bytes(inner[4 + 32 * 4 : 4 + 32 * 5], "big", signed=True)
+        assert (tick_lower, tick_upper) == (-50, -10)
 
 
 def test_execute_mint_rebuilds_after_execute_time_psc(tmp_path: Path) -> None:
