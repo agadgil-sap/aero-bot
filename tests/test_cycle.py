@@ -310,6 +310,10 @@ class FakeBalances:
         """Serve one scripted receipt when present."""
         return self.receipts.get(transaction_hash)
 
+    def fetch_chain_id(self) -> int:
+        """Serve the fixture Base mainnet chain id."""
+        return 8453
+
     def fetch_block_number(self) -> int:
         """Serve the primary RPC block used by the post-action visibility gate."""
         return self.block_number
@@ -3453,8 +3457,8 @@ class TestSelectorCycles:
         # not bind (the captain's 2026-09-28 ruling): each tier takes its
         # full weight share of the 500 USDC book - two-thirds to the top
         # name, one-third to the second, quantized down to USDC's grid.
-        assert book.positions[0].committed_usd == Decimal("333.328996")
-        assert book.positions[1].committed_usd == Decimal("166.671003")
+        assert book.positions[0].committed_usd == Decimal("332.9959990")
+        assert book.positions[1].committed_usd == Decimal("166.504498000")
 
     def test_selector_holds_a_funded_pool_inside_the_margin_while_cash_deploys(
         self, tmp_path: Path
@@ -3995,6 +3999,7 @@ class TestCycleConfiguration:
             switch_margin: object,
             parameters: object,
             aero_min: object,
+            reward_posture: object = None,
             portfolio: PortfolioParameters | None = None,
             income_history_cycles: object = None,
             stock_dust_floor: object = None,
@@ -4060,6 +4065,7 @@ class TestCycleConfiguration:
             switch_margin: object,
             parameters: object,
             aero_min: object,
+            reward_posture: object = None,
             portfolio: PortfolioParameters | None = None,
             income_history_cycles: object = None,
             stock_dust_floor: object = None,

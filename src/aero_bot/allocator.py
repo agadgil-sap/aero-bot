@@ -52,7 +52,7 @@ breached even transiently and exactly one position is funded per step.
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from enum import StrEnum
 from typing import Annotated, Self
 
@@ -60,6 +60,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, NonNegativeDecimal
 from aero_bot.emissions_apr import format_apr_percent
+from aero_bot.lp_plan import DEFAULT_MINT_SLIPPAGE_TOLERANCE, DEFAULT_SWAP_BUFFER_FRACTION
 from aero_bot.policy import (
     PolicyActionKind,
     PolicyDecision,
@@ -1050,6 +1051,31 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
     # also guarantees a single-pool board's share never exceeds its
     # deployable budget.
     total_weight = sum((weight for _, weight in slotted), Decimal("0"))
+    # The executable-cost reserve: every entry's on-chain spend is its
+    # tranche plus the balancing swap's acquisition buffer over the stock
+    # side (the planner buys the shortfall times one-plus-buffer in
+    # DEFAULT_SWAP_BUFFER_FRACTION - the single authoritative value shared
+    # with planning), so tier targets normalize over the deployable budget
+    # divided by one-plus-buffer and the remaining-cash ledger decrements
+    # each tranche's executable cost. Without this reserve a plan whose
+    # shares fill the whole deployable deterministically starves its last
+    # entry - the planner's live-balance preflight refuses it and the cycle
+    # halts instead of leaving that tier as cash (the 2026-10-03 fixture
+    # reproduction: needs 148.222222 against 147.972223 held).
+    executable_multiplier = Decimal(1) + DEFAULT_SWAP_BUFFER_FRACTION
+    # The net distributable budget: the deployable budget minus each funded
+    # tranche's raw-unit ceiling allowance (one money-grid quantum per
+    # planned tranche, the bound on the share floor plus the executable
+    # cost's ceiling), all divided by one-plus-buffer. Without the up-front
+    # allowance the ceiled executable costs can strand a profitable final
+    # tier by a single raw USDC unit - a numerical artifact that discarded
+    # an otherwise affordable tranche wholesale (the reviewer's 500-USDC
+    # evidence: executable 185.185186 against 185.185185 remaining).
+    tranche_allowance = TIER_SHARE_QUANTUM * Decimal(len(slotted))
+    tier_budget = max(
+        (deployable - tranche_allowance) / executable_multiplier,
+        Decimal("0"),
+    )
     # The coherent per-name entry minimum (the gnhf 36 rule over the
     # activated cap): whichever of the configured minimum and the engaged
     # concentration clamp binds, over the hard floor - the two bounds can
@@ -1062,8 +1088,13 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
     days_per_year = Decimal(365)
     tranches: list[PortfolioTranche] = []
     remaining = deployable
+    # Each funded tranche's executable cost (its engine-sized budget plus
+    # the acquisition-buffer reserve, ceiled on the money grid), so the
+    # reported residual is the honest expected post-execution cash rather
+    # than the pre-swap budget sum.
+    executable_costs: list[Decimal] = []
     for rank, (evaluation, weight) in enumerate(slotted, start=1):
-        target = (deployable * weight / total_weight).quantize(
+        target = (tier_budget * weight / total_weight).quantize(
             TIER_SHARE_QUANTUM, rounding=ROUND_DOWN
         )
         # The effective minimum position size floors the tranche - a
@@ -1092,17 +1123,30 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
             f"income forgone about {forgone_per_day} USDC per day at the conservative "
             f"income APR {format_apr_percent(evaluation.observation.income_expectation_apr)}"
         )
-        if target > remaining:
+        # The executable cost reserves the acquisition buffer over the
+        # tranche: rounded UP on the money grid so raw-unit rounding can
+        # never leave the ledger a fraction of a cent short.
+        executable_cost = (target * executable_multiplier).quantize(
+            TIER_SHARE_QUANTUM, rounding=ROUND_UP
+        )
+        if executable_cost > remaining:
             excluded.append(
                 ExcludedPool(
                     symbol=evaluation.symbol,
                     reason=PortfolioExclusionReason.INSUFFICIENT_CASH,
-                    cause=f"tier target {target} exceeds the {remaining} deployable left",
+                    cause=(
+                        f"tier target {target} plus the "
+                        f"{DEFAULT_SWAP_BUFFER_FRACTION} acquisition buffer costs "
+                        f"{executable_cost}, above the {remaining} deployable left"
+                    ),
                     emissions_apr=evaluation.emissions_apr,
                     detail=(
-                        f"the tier target {target} USDC exceeds the {remaining} USDC of "
-                        f"deployable budget left by earlier tiers; cash stays cash; "
-                        f"{forgone_line}"
+                        f"the tier target {target} USDC needs {executable_cost} USDC of "
+                        f"executable entry cost (tranche plus the "
+                        f"{DEFAULT_SWAP_BUFFER_FRACTION} acquisition buffer the "
+                        "balancing swap adds over its stock side) but only "
+                        f"{remaining} USDC of deployable budget remains after earlier "
+                        f"tiers' executable costs; cash stays cash; {forgone_line}"
                     ),
                     forgone_income_usdc_per_day=forgone_per_day,
                 )
@@ -1179,7 +1223,14 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                 )
             )
             continue
-        remaining -= tranche.budget_usd
+        remaining -= (tranche.budget_usd * executable_multiplier).quantize(
+            TIER_SHARE_QUANTUM, rounding=ROUND_UP
+        )
+        executable_costs.append(
+            (tranche.budget_usd * executable_multiplier).quantize(
+                TIER_SHARE_QUANTUM, rounding=ROUND_UP
+            )
+        )
         tranches.append(tranche)
         if clamped and concentration_bound is not None:
             excluded.append(
@@ -1199,7 +1250,10 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                 )
             )
     funded = sum((tranche.budget_usd for tranche in tranches), Decimal("0"))
-    residual = cash_usdc - funded
+    # The residual names the cash the executed plan is honestly expected to
+    # leave: every funded tranche spends its budget plus its acquisition
+    # buffer, so the pre-swap budget sum would overstate leftover cash.
+    residual = cash_usdc - sum(executable_costs, Decimal("0"))
     projected = committed + funded
     tier_text = ", ".join(f"{tranche.symbol} {tranche.budget_usd}" for tranche in tranches)
     excluded_text = (
@@ -1354,14 +1408,27 @@ def _reallocation_tranche(
     # The share quantizes down to USDC's six-decimal grid for the same
     # reason the tier targets do: the engine's scaled-basis round-trip is
     # exact only on a finite money grid, and rounding down never pushes a
-    # freed-capital replacement past its bound.
+    # freed-capital replacement past its bound. The share base carries the
+    # same executable-cost reserve the tier targets do (the acquisition
+    # buffer over the replacement's stock side), so a replacement funded
+    # from the whole remaining deployable can always pay its own swap.
     if total_weight > 0:
-        weight_share = (deployable * weight / total_weight).quantize(
-            TIER_SHARE_QUANTUM, rounding=ROUND_DOWN
-        )
+        weight_share = (
+            deployable / (Decimal(1) + DEFAULT_SWAP_BUFFER_FRACTION) * weight / total_weight
+        ).quantize(TIER_SHARE_QUANTUM, rounding=ROUND_DOWN)
     else:
         weight_share = Decimal("0")
-    budget = max(weight_share, held_value)
+    # The proven per-position scale carries the executable-cost reserve
+    # the tier targets do, plus the switch preflight's own conservative
+    # sale haircut: the preflight projects the freed stock's USDC proceeds
+    # at one-minus the mint slippage tolerance, so the replacement must
+    # fit the projected post-exit inventory under both shared bounds or
+    # the reallocation never fires on a fully funded book.
+    executable_bounds = (Decimal(1) - DEFAULT_MINT_SLIPPAGE_TOLERANCE) / (
+        Decimal(1) + DEFAULT_SWAP_BUFFER_FRACTION
+    )
+    held_floor = (held_value * executable_bounds).quantize(TIER_SHARE_QUANTUM, rounding=ROUND_DOWN)
+    budget = max(weight_share, held_floor)
     if concentration_bound is not None:
         budget = min(budget, concentration_bound)
     budget = min(budget, cap_after_exit)
