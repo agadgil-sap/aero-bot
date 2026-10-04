@@ -1,0 +1,111 @@
+{
+  "started_at": "2026-10-03T06:05:12.497437Z",
+  "mode": "dry_run",
+  "symbol": "AAPLc",
+  "reconciliation": {
+    "symbol": "AAPLc",
+    "safe_usdc_units": 99637642,
+    "relayer_eth_wei": 0,
+    "safe_stock_units": 0,
+    "safe_aero_units": 6669772288208446430,
+    "inventory_live_token_ids": [],
+    "inventory_empty_count": 199,
+    "position_statuses": [],
+    "tracked_status": null,
+    "tracked_token_id": null,
+    "tracked_staked": false,
+    "empty_tracked_token_ids": [],
+    "recovered_positions": [],
+    "held_stock_quantity": "0",
+    "held_symbol": null,
+    "out_of_band": "",
+    "diagnostics": [
+      "relayer ETH unread: no relayer address configured for this run",
+      "Safe holds 99.637642 USDC, Safe holds 0 stock, Safe holds 6.669772288208446430 unclaimed AERO"
+    ]
+  },
+  "decision_reconciliation": {
+    "symbol": "AAPLc",
+    "safe_usdc_units": 99637642,
+    "relayer_eth_wei": 0,
+    "safe_stock_units": 0,
+    "safe_aero_units": 6669772288208446430,
+    "inventory_live_token_ids": [],
+    "inventory_empty_count": 199,
+    "position_statuses": [],
+    "tracked_status": null,
+    "tracked_token_id": null,
+    "tracked_staked": false,
+    "empty_tracked_token_ids": [],
+    "recovered_positions": [],
+    "held_stock_quantity": "0",
+    "held_symbol": null,
+    "out_of_band": "",
+    "diagnostics": [
+      "relayer ETH unread: no relayer address configured for this run",
+      "Safe holds 99.637642 USDC, Safe holds 0 stock, Safe holds 6.669772288208446430 unclaimed AERO"
+    ]
+  },
+  "final_reconciliation_verified": true,
+  "decision_action": "enter",
+  "decision_reason": "entry_threshold_met",
+  "decision_diagnostics": [
+    "Raw emissions APR 2.10603258313605115768550879700745389336557272501157128956575 (about 211 percent) meets the entry threshold 1.5 (about 150 percent).",
+    "Size 83.93675759779745921783788160 USDC is min(equity cap 83.93675759779745921783788160, depth cap 7607.101250161907564848070557).",
+    "Range 332.190871991176270694460229501161320758850616548280049741108..334.524248719300087953813523640147353790558998840654819704035 USDC per stock around pool price 333.416934192942716717669689828756778553559980901022000709328 aligned to tick spacing 10.",
+    "Range half width 0.00290406365637628802517612093146700834702480272216716516555 (29 ticks per side) derived against the target net daily yield 0.01; solve resolved as fallback_ceiling.",
+    "Width solver inputs are unusable - the observation carries no ranging evidence; failing toward the locked ceiling half width 0.00290406365637628802517612093146700834702480272216716516555 (29 ticks per side).",
+    "Estimated batch gas 750000 units at 0.0135000 USDC under the 3000 USDC-per-ETH assumption."
+  ],
+  "event_window": "No scheduled or session event window is active.",
+  "actions": [],
+  "pnl_vs_entry_usdc": null,
+  "pnl_diagnostic": "no tracked position",
+  "positions": [],
+  "equity_usd": "104.9209469972468240222973520",
+  "day_start_equity_usd": "104.9209469972468240222973520",
+  "day_pnl_usdc": "0E-25",
+  "day_diagnostic": "",
+  "peak_equity_usd": "104.9209469972468240222973520",
+  "yield_attribution": {
+    "day_pnl_usdc": "0E-25",
+    "aero_rewards_usdc": "0E-78",
+    "fees_earned_usdc": null,
+    "stock_mark_to_market_usdc": null,
+    "unattributed_usdc": null,
+    "positions": [],
+    "method": [
+      "AERO rewards: unclaimed units (Safe balance plus staked earned, plus any converted today) minus the day-start baseline, valued at the last observed AERO price.",
+      "Fees earned: liquidity times the delta of the pool's feeGrowthInside accumulators since the day-start (or position-adoption) baseline - computed, never the stale checkpoint; pre-share pool-side entitlement.",
+      "Stock mark-to-market: each row's day-opening stock quantity times the change in its own pool's price; quantity flows land in the residual.",
+      "Unattributed: the day P&L minus the three components - actions, gas, collections, and every marking the components do not price.",
+      "Per position: one row per funded name at its own pool's price, so the allocator's tier decisions are judged by measured income daily."
+    ],
+    "diagnostic": "fees earned unmeasured: no tracked position spans the baseline and now (a position change resets its fee baseline at adoption); stock mark-to-market unmeasured: no baseline price or quote"
+  },
+  "idle_cash": null,
+  "unclaimed_aero_units": 6669772288208446430,
+  "unclaimed_aero_value_usdc": "5.283304997246824022297351986",
+  "fee_evidence": {
+    "token_id": null,
+    "claimable_pool_fees_usdc": null,
+    "claimable_aero_units": null,
+    "measured_fee_usdc_per_day": null,
+    "measured_fee_apr": null,
+    "claimable_pool_fees_computed_usdc": null,
+    "fee_method_diagnostic": "",
+    "diagnostic": "no tracked position; no fee evidence this cycle"
+  },
+  "fee_wei": 0,
+  "halted_reason": "",
+  "input_notes": [
+    "equity defaulted to the Safe's live 99.63764200000000000000000000 USDC (99.637642 USDC plus stock valued at the snapshot price)",
+    "policy decisions keep a conservative zero fee APR; the live claimable pool fees and the measured accrual window ride the cycle report as evidence",
+    "oracle staleness is not yet wired live; the oracle-health layer is post-reassessment scope",
+    "reference feed yahoo-chart quoted 1 of 1 requested symbol(s)",
+    "reference AAPLc=333.69 USD via yahoo-chart as-of 2026-10-02T20:00:01+00:00 (age 36653s, session closed, delay unlabeled by provider, exchange NasdaqGS, fetched 2026-10-03T06:10:54.237124+00:00)",
+    "reference market is outside the regular session (AAPLc=closed); the 24/7 ruling keeps the cycle trading on pool authority with references diagnostic-only - closed-market reference availability versus 24/7 operation stays exposed for captain reassessment (docs/oracle-health.md)",
+    "external reference is diagnostic-only; scheduled actions use the resolved Aerodrome pool's on-chain price and state",
+    "equity includes 5.283304997246824022297351986 USDC of unclaimed AERO at the observed price"
+  ]
+}

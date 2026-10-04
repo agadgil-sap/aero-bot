@@ -1,0 +1,113 @@
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (transport error: The read operation timed out); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 3 of 5 failed (HTTP status 429); backing off 1.0s
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 3 of 5 failed (HTTP status 429); backing off 1.0s
+[aero-bot-cycle] known-board fast path fell back to full discovery: RPC request failed with unexpected HTTP status 410
+[aero-bot-cycle] lp sugar enumeration: 500 pools enumerated at block 52107145
+[aero-bot-cycle] lp sugar enumeration: 1000 pools enumerated at block 52107145
+[aero-bot-cycle] lp sugar enumeration: 1500 pools enumerated at block 52107145
+[aero-bot-cycle] lp sugar enumeration: 2000 pools enumerated at block 52107145
+[aero-bot-cycle] lp sugar enumeration: 2500 pools enumerated at block 52107145
+[aero-bot-cycle] lp sugar enumeration: 3000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (transport error: The read operation timed out); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 3500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 4000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 4500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 5000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 5500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 6000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 6500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 7000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 7500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 8000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 8500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 3 of 5 failed (transport error: The read operation timed out); backing off 1.0s
+[aero-bot-cycle] lp sugar enumeration: 9000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 9500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 10000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 10500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 11000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 11500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 12000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 12500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 13000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 13500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 14000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 14500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 15000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 15500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (transport error: The read operation timed out); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 16000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 16500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 17000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 17500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 18000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 18500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 19000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 19500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 20000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 20500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 21000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 21500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] rpc eth_call attempt 3 of 5 failed (transport error: [Errno 54] Connection reset by peer); backing off 1.0s
+[aero-bot-cycle] lp sugar enumeration: 22000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (transport error: [Errno 54] Connection reset by peer); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 22500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 23000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 23500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 24000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 24500 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 25000 pools enumerated at block 52107145
+[aero-bot-cycle] rpc eth_call attempt 2 of 5 failed (HTTP status 403); backing off 0.5s
+[aero-bot-cycle] lp sugar enumeration: 25026 pools enumerated at block 52107145

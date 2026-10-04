@@ -41,7 +41,7 @@ The condition-driven flats - a stale oracle observation or a paused registry - s
 
 Both gaps are visible in every report's `input_notes` rather than hidden, because hiding them would let an incomplete observation masquerade as a complete verdict:
 
-- **The real-market reference quote is not wired live yet.** Without `--reference-price`, every entry blocks fail-closed as `reference_stale`; the quote can be injected for complete verdicts because the policy consumes injected observations by design. Wiring the live reference feed is the oracle-health layer's scope, which is post-reassessment by the captain's order.
+- **The real-market reference quote is live-wired but armed per deployment.** The cycle reads per-symbol underlying quotes through the bounded reference feed (`--reference-feed` or the sealed `AERO_BOT_CYCLE_REFERENCE_FEED`, default `off`; the contract lives in [oracle-health.md](oracle-health.md)) with each quote's age measured from the provider's own as-of time; without the feed armed or `--reference-price` injected, every entry blocks fail-closed as `reference_stale` in enforced contexts. On the decide CLI the quote can still be injected for complete verdicts because the policy consumes injected observations by design.
 - **The fee APR stays at zero** because a live fee-evidence window needs the same price-path machinery the rehearsal reconstructs from history; zero understates expected gross yield, which makes the gas gate defer more, never less - the conservative direction.
 
 ## Live proofs (2026-09-08)
