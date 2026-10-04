@@ -207,6 +207,7 @@ def evaluate_pool_entries(
     base_state: PolicyState,
     options: Sequence[PoolBoardOption],
     reentry_blocked_until_by_symbol: Mapping[str, datetime],
+    dilution_exit_pending_by_symbol: Mapping[str, bool] | None = None,
 ) -> tuple[PoolEntryEvaluation, ...]:
     """Evaluate the complete entry gate chain for every board option.
 
@@ -224,6 +225,8 @@ def evaluate_pool_entries(
             question.
         options: The enumerated board options in deterministic order.
         reentry_blocked_until_by_symbol: The per-pool re-entry cooldowns.
+        dilution_exit_pending_by_symbol: The per-pool dilution re-entry
+            markers, arming the APR margin on re-entry.
 
     Returns:
         One evaluation per option, in the given board order.
@@ -234,7 +237,12 @@ def evaluate_pool_entries(
         # The cooldown applies per pool: an exit from one pool never blocks
         # another pool's entry.
         state = flat_basis.model_copy(
-            update={"reentry_blocked_until": reentry_blocked_until_by_symbol.get(option.symbol)}
+            update={
+                "reentry_blocked_until": reentry_blocked_until_by_symbol.get(option.symbol),
+                "dilution_exit_pending": (dilution_exit_pending_by_symbol or {}).get(
+                    option.symbol, False
+                ),
+            }
         )
         outcome = engine.decide(state, option.observation)
         decision = outcome.decision
@@ -557,6 +565,7 @@ def select_board(
     options: Sequence[PoolBoardOption],
     reentry_blocked_until_by_symbol: Mapping[str, datetime],
     switch_margin_fraction: Decimal = DEFAULT_SWITCH_MARGIN_FRACTION,
+    dilution_exit_pending_by_symbol: Mapping[str, bool] | None = None,
 ) -> BoardSelection:
     """Select the board's verdict for one cycle over every enumerated pool.
 
@@ -571,6 +580,8 @@ def select_board(
         options: The enumerated board options in deterministic order.
         reentry_blocked_until_by_symbol: The per-pool re-entry cooldowns.
         switch_margin_fraction: The relative APR switch margin, as a fraction.
+        dilution_exit_pending_by_symbol: The per-pool dilution re-entry
+            markers, arming the APR margin on re-entry.
 
     Returns:
         The complete selection with its board evidence.
@@ -579,7 +590,9 @@ def select_board(
         ValueError: If a held position or inventory names a pool that is not
             on the board, or the switch margin is negative.
     """
-    evaluations = evaluate_pool_entries(engine, state, options, reentry_blocked_until_by_symbol)
+    evaluations = evaluate_pool_entries(
+        engine, state, options, reentry_blocked_until_by_symbol, dilution_exit_pending_by_symbol
+    )
     if state.held_inventory is not None:
         # Unsold stock resolves before any new exposure; the engine never
         # holds inventory and a position at once, and neither does the board.

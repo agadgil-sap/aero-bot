@@ -19,6 +19,7 @@ The engine never signs, broadcasts, or touches a wallet.
 | Out-of-range grace window | 10 minutes (captain's 2026-09-27 correction; configurable in the sealed cycle environment via `AERO_BOT_CYCLE_OUT_OF_RANGE_GRACE_MINUTES`): once elapsed the policy must act - recenter when the economics pass, otherwise exit - because every minute out of range forgoes emissions income |
 | Downside stop | 0.5 percent below the lower range edge |
 | Re-entry cooldown | 15 minutes after stop or dilution exits |
+| Dilution re-entry margin | floor plus 30 percent after a dilution exit, until the next entry |
 | Entry threshold | raw AERO emissions APR of at least 150 percent |
 | Position cap | 80 percent of current equity per pool (raised from 20 percent by the captain's 2026-09-09 sizing ruling, inside the 1000/1000 USDC hard ceilings of the 2026-09-27 performance ruling) |
 | Depth hard gate | 1 percent of observed pool depth |
@@ -43,28 +44,30 @@ The engine never signs, broadcasts, or touches a wallet.
 The entry threshold reads the pool's raw AERO emissions APR per staked liquidity in the same APR convention Aerodrome displays (150 percent APR equals about 0.41 percent per day simple).
 Fees are credited on top and the conservative haircut is applied inside the P&L forecast, never to this gate.
 
-## Range width derivation
+## Range width derivation (the adaptive executable band)
 
-The range width is not fixed: it is derived from the target net daily yield on deployed capital, default 1 percent per day.
-The high quoted APRs on these pools come from ultra-tight ranges, so a fixed plus-or-minus 0.3 percent width captures only a fraction of the quoted yield; the width must follow the target instead.
+The range width is adaptive and evidence-based (the captain's 2026-10-03 restart direction): live ranges are selected sensibly inside a 0.1 to 0.3 percent per-side band, from measured evidence, with nothing fixed in advance.
+The solver never solves a symmetric centered ideal and rounds it outward; it enumerates the ACTUAL grid-aligned lower and upper bounds around the current price whose REAL per-side price distances fall inside the band, scores that executable geometry exactly as it will be minted, and selects the candidate with the strongest conservative expected net emissions return (argmax of modeled net, never a satisficing rule against the 1-percent-per-day target - the target is reported evidence only).
+Any aligned bound whose realized side distance leaves the band is excluded as infeasible; because the price sits at an arbitrary phase inside its grid cell, the two sides' feasible distances are generally asymmetric and both are reported.
 
 Width derivation happens after the 150 percent raw-APR entry gate passes and after the size caps and gas gate clear, both at entry and at every recenter.
-The observation carries one `RangingEvidence` snapshot with the live observables the decision itself does not already see: gauge staked liquidity and staked value, active in-range liquidity, the fee-evidence window (seconds and swapped notional), the pool fee tier, the realized daily volatility of the reconstructed swap path, and both tokens' decimal counts.
-The engine assembles these with the pool price, emissions APR, executable depth, capped position size, gas price, and every locked width-relevant parameter, and calls the pure solver in `ranging.py`, which scans every tick-aligned candidate from one tick spacing per side up to the 0.3 percent ceiling and returns the tightest whose modeled net yield meets the target.
-Net yield subtracts, per the existing models: expected recenter frequency at the candidate width under realized volatility, per-recenter gas and impact at the capped position size, event-window flat time, and the stop-risk cost basis (the exact composition loss at the stop level plus exit and re-entry batch costs).
+The observation carries one `RangingEvidence` snapshot with the live observables the decision itself does not already see: gauge staked liquidity and the display-APR's current-cell staked value, active in-range liquidity, the fee-evidence window (seconds and swapped notional), the pool fee tier, the realized daily volatility AND the bounded trailing price path from the pool's own Swap logs, and both tokens' decimal counts.
+The engine assembles these with the pool price, the conservative income basis, executable depth, capped position size, gas price, the observation instant, and every locked band parameter, and calls the pure solver in `ranging.py`.
 
-The solve resolves one of three ways, and the decision carries the complete solution - every input, every modeled candidate, and the resolution - as a `width_solution` field plus diagnostics lines, so audit events persist the whole derivation.
+Net yield per candidate: gross emissions follow the position's added liquidity against the gauge denominator AFTER our own stake (a candidate more concentrated than the book dilutes itself more than a dollar-value fraction predicts), gross fees follow the post-stake active-liquidity share, uptime is the MEASURED dwell of the candidate's anchored band over the trailing window (the renewal model's vol-independent uptime floor was measured misestimating dwell in both directions), and the costs subtract the asymmetric-band renewal model's recenter frequency and the stop-risk basis (the exact composition loss at the stop level plus exit and re-entry batches) at realized volatility.
 
-1. Solved: the tightest candidate meeting the target wins, however tight that is.
-2. Target unreachable: even the one-spacing width cannot reach the target, and the engine still enters at that tightest width because the coarse APR gate passed.
-   The solver never widens past its answer to hedge; the user farms one tick either side of price, and the ceiling exists for anomaly protection only.
-3. Fallback ceiling: the solver's inputs are missing (the observation carries no ranging evidence) or internally inconsistent (for example a volatility estimate the reconstructed path could not support), and the width falls back to the 0.3 percent ceiling with an explicit fallback label in the diagnostics.
+The solve resolves one of four ways, and the decision carries the complete solution - every input, every scored candidate, and the resolution - as a `width_solution` field plus diagnostics lines, so audit events persist the whole derivation.
+
+1. Solved: the argmax candidate with strictly positive modeled net is picked and minted exactly as scored - the solution's aligned bounds flow unchanged into the position's range.
+2. Cash hold: every executable candidate nets at or below zero at the conservative income basis, and the engine holds cash with the evidence; a raw APR above the floor never picks a negative candidate.
+3. Deferred: the ranging evidence is missing, insufficient, stale, or internally inconsistent - the shared sufficiency contract requires at least ten measured points over at least eighteen hundred seconds whose newest point is at most eighteen hundred seconds old at the observation instant, and a newest point in the future is time-skewed or corrupt - and new entries and voluntary recenters defer with the explicit reason, never a substituted constant range.
+   Safety exits never consume ranging evidence and stay armed through every deferral.
+4. Fallback ceiling: only for engines explicitly pinned to the v1 comparison baseline (the rehearsal's fixed-width runs); never the adaptive default.
 
 ## Range construction
 
-The entry or recenter range centers on the observed pool AMM price at the derived half width.
-The raw bounds at plus and minus that width are aligned outward onto the pool tick grid (spacing 10): the lower boundary floors to the greatest grid tick at or below the raw lower bound and the upper boundary ceils to the least grid tick at or above the raw upper bound, so the aligned range always contains the raw width.
-Every downstream rule reads the aligned edges, so the downside stop stays exactly 0.5 percent below the aligned lower edge regardless of how tight the derived width is, and the composition math remains the exact v3-style rule below.
+The adaptive solve's chosen range IS the executable geometry: the aligned bounds it scored are the bounds the position mints, verbatim.
+Every downstream rule reads those aligned edges, so the downside stop stays exactly 0.5 percent below the aligned lower edge regardless of how tight the band is, and the composition math remains the exact v3-style rule below (entered at the pool price inside the band, never at a centered ideal).
 
 ## Decision precedence
 
@@ -142,7 +145,9 @@ Condition-driven flat exits carry no re-entry cooldown; re-entry simply requires
 ## Dilution exits and re-entry
 
 A dilution exit uses the same burn-and-swap-to-USDC path as the downside stop and sets the same 15-minute re-entry cooldown.
-Re-entry after the cooldown requires the 150 percent threshold to clear again at the current diluted share, so a pool that lost its emissions yield stays out of the portfolio.
+Re-entry after a dilution exit additionally requires the raw emissions APR to clear the floor by the locked 30 percent relative margin (mirroring the cross-pool switch margin): the floor of 150 percent becomes a re-entry bound of 195 percent until the next successful entry clears the marker.
+The exit threshold itself is unchanged - the 150 percent safety-exit floor never softens - and the marker lives in the persisted cycle book, so a cooldown expiring or a New York day rolling over never silently erases it.
+This margin prevents the measured floor-straddling churn regime: a pool flipping around 150 percent previously converted itself into an exit-reentry churn engine bounded only by the cooldown, at up to three round trips per hour.
 
 ## Daily loss halt
 

@@ -102,8 +102,10 @@ BASE_NOW = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
 STOCK_DECIMALS = 8
 # The fixture pool grids on ten-tick spacings like the live AAPLc pool.
 LP_TICK_SPACING = 10
-# A current tick of -15 anchors at -20, so a one-spacing range spans [-30, -10).
-LP_CURRENT_TICK = -15
+# The current tick sits exactly at the anchor -20 (the sqrt price's own
+# tick), so a one-spacing range spans [-30, -10); the tick and the sqrt
+# ratio are coherent snapshots of one pool state, exactly as live reads are.
+LP_CURRENT_TICK = -20
 LP_ANCHOR_TICK = -20
 LP_RANGE_LOWER = -30
 LP_RANGE_UPPER = -10

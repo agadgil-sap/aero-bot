@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from conftest import healthy_trailing_path
 
 from aero_bot.allocator import (
     DEFAULT_MIN_POSITION_FLOOR_USDC,
@@ -32,7 +33,7 @@ from aero_bot.policy import (
     PolicyReason,
     PolicyState,
 )
-from aero_bot.ranging import RangingEvidence
+from aero_bot.ranging import RangingEvidence, raw_tick_for_human_price
 from aero_bot.selector import PoolBoardOption, PoolEntryEvaluation, evaluate_pool_entries
 
 # Fixture identities: distinct pools and tokens per board symbol.
@@ -48,15 +49,18 @@ BASE_TIME = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
 # over the floor, deep pool, fresh reference, cheap gas.
 RANGING = RangingEvidence.model_validate(
     {
-        "gauge_liquidity_raw": 80_000_000_000_000,
-        "staked_tvl_usd": Decimal("100000"),
+        "gauge_liquidity_raw": 35_000_000_000,
+        "staked_tvl_usd": Decimal("500"),
         "active_liquidity_raw": 80_000_000_000_000,
         "fee_window_seconds": 86_400,
         "fee_window_notional_usd": Decimal("1000000"),
         "pool_fee_ppm": 500,
-        "realized_daily_volatility": Decimal("0.005"),
+        "realized_daily_volatility": Decimal("0.001"),
+        "trailing_path": healthy_trailing_path(Decimal("200"), end_before=BASE_TIME),
         "stock_decimals": 6,
         "quote_decimals": 6,
+        "pool_tick_raw": raw_tick_for_human_price(Decimal("200"), False, 6, 6),
+        "stock_is_token0": False,
     }
 )
 
@@ -1477,19 +1481,21 @@ class TestLiveSndkcNight:
         assert "(about 34,791 percent)" in sndkc.detail
 
     def test_the_full_gate_chain_rides_the_allocation_all_pass(self) -> None:
-        """The eight-gate chain shows every protective gate passing.
+        """The nine-gate chain shows every protective gate passing.
 
         The determination the escalation asked for: no gate refuses on bad
         data - the flat book was the sizing bound conflict alone, and the
         trace proves it cycle over cycle at the exact tranche basis that
-        now funds.
+        now funds, with the adaptive width solve riding as the ninth gate.
         """
         allocation = self.allocation()
         assert allocation.gate_trace_symbol == "SNDKc"
         assert allocation.gate_trace_basis.startswith("entry gate chain for SNDKc at the")
         assert f"{self.LIVE_CASH} USDC tranche basis" in allocation.gate_trace_basis
         assert f"portfolio equity {self.LIVE_EQUITY}" in allocation.gate_trace_basis
-        assert len(allocation.gate_trace) == 8
+        assert len(allocation.gate_trace) == 9
+        assert all(line.split(":")[1].strip().startswith("PASS") for line in allocation.gate_trace)
+        assert allocation.gate_trace[-1].startswith("gate range_width_solve: PASS")
         assert all(": PASS" in line for line in allocation.gate_trace)
         emissions_line = next(
             line for line in allocation.gate_trace if line.startswith("gate emissions_floor:")

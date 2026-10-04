@@ -1,13 +1,14 @@
 """Behavior tests for the pure Slipstream LP mint planning layer."""
 
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 
 import pytest
 
 from aero_bot.concentrated import PositionRangeState
 from aero_bot.domain import normalize_evm_address
+from aero_bot.history import PoolPricePoint
 from aero_bot.lp_calldata import (
     LP_MINT_SELECTOR,
     LpMintParams,
@@ -40,7 +41,13 @@ from aero_bot.lp_plan import (
     position_amounts_for_liquidity,
     position_range_state,
 )
-from aero_bot.ranging import TICK_PRICE_RATIO
+from aero_bot.ranging import (
+    TICK_PRICE_RATIO,
+    RangingObservations,
+    WidthSolveMode,
+    human_price_from_raw_tick,
+    solve_range_width,
+)
 from aero_bot.venues import SLIPSTREAM_GAUGES_V3_FACTORY_ADDRESS
 
 # Native Base USDC, the token-zero side of the AAPLc-like fixture pool.
@@ -594,6 +601,105 @@ def test_balancing_swap_refuses_impact_at_the_ceiling() -> None:
         assert error.code is LpPlanRefusalCode.SWAP_IMPACT_ABOVE_CEILING
     else:
         raise AssertionError("a ceiling-reaching swap did not refuse")
+
+
+class TestExactAdaptiveBoundsMintParity:
+    """The scored raw bounds mint verbatim in both token orientations."""
+
+    def _solved_bounds(
+        self, raw_tick: int, stock_is_token0: bool, stock_decimals: int
+    ) -> tuple[int, int]:
+        """Solve one adaptive range on the given raw grid anchor."""
+        price = human_price_from_raw_tick(raw_tick, stock_is_token0, stock_decimals, 6)
+        window = tuple(
+            PoolPricePoint(
+                timestamp=OBSERVED_AT + timedelta(seconds=60 * index),
+                block_number=index,
+                log_index=0,
+                amount0=0,
+                amount1=5_000_000_000,
+                sqrt_ratio=1 << 96,
+                liquidity=80_000_000_000_000,
+                tick=raw_tick,
+                price_usdc=price,
+            )
+            for index in range(35)
+        )
+        solution = solve_range_width(
+            RangingObservations(
+                pool_price_usdc=price,
+                observed_at=OBSERVED_AT + timedelta(seconds=60 * 35),
+                pool_tick_raw=raw_tick,
+                stock_is_token0=stock_is_token0,
+                emissions_apr=Decimal("30"),
+                gauge_liquidity_raw=35_000_000_000,
+                staked_tvl_usd=Decimal("500"),
+                active_liquidity_raw=80_000_000_000_000,
+                pool_depth_usd=Decimal("20000"),
+                fee_window_seconds=86_400,
+                fee_window_notional_usd=Decimal("1000000"),
+                pool_fee_ppm=500,
+                realized_daily_volatility=Decimal("0.001"),
+                trailing_path=window,
+                stock_decimals=stock_decimals,
+                quote_decimals=6,
+                position_size_usd=Decimal("40"),
+                gas_price_gwei=Decimal("0.006"),
+            )
+        )
+        assert solution.mode is WidthSolveMode.SOLVED
+        assert solution.lower_bound is not None
+        assert solution.upper_bound is not None
+        return solution.lower_bound.tick, solution.upper_bound.tick
+
+    @pytest.mark.parametrize(
+        ("raw_tick", "stock_is_token0", "stock_decimals"),
+        [
+            # Realistic raw anchors at a ~100-USDC human price on both
+            # orientations and both decimal scales, plus neighboring
+            # off-grid phases proving the phase never breaks parity.
+            (-230_270, True, 18),
+            (230_270, False, 18),
+            (-230_273, True, 18),
+            (46_054, True, 6),
+            (-46_054, False, 6),
+            (-46_057, False, 6),
+        ],
+    )
+    def test_scored_bounds_plan_verbatim(
+        self, raw_tick: int, stock_is_token0: bool, stock_decimals: int
+    ) -> None:
+        """The planner's range IS the scored pair, in every orientation."""
+        lower, upper = self._solved_bounds(raw_tick, stock_is_token0, stock_decimals)
+        assert lower < upper
+        assert (upper - lower) % 10 == 0
+        # The observation's price sits at the solved anchor's own raw tick,
+        # a coherent snapshot of the same pool state the solve consumed.
+        observation = pool_observation().model_copy(
+            update={
+                "current_tick": raw_tick,
+                "sqrt_ratio": sqrt_ratio_at_tick(raw_tick),
+                "stock_is_token0": stock_is_token0,
+                "stock_decimals": stock_decimals,
+                # A deeper book keeps the seven-USDC canary budget inside
+                # the one-percent depth gate at these price scales.
+                "pool_active_liquidity": 10**18,
+            }
+        )
+        directive = mint_directive().model_copy(update={"exact_tick_bounds": (lower, upper)})
+        # A marginally funded Safe covers the balancing swap's cost at
+        # these price scales without weakening any entry guard.
+        inventory = safe_inventory(usdc_units=10 * ONE_USDC_UNITS)
+        plan = plan_mint_entry(
+            LpExecutionPolicy(),
+            observation,
+            directive,
+            inventory,
+        )
+        assert plan.position_range.tick_lower == lower
+        assert plan.position_range.tick_upper == upper
+        assert plan.position_range.exact_bounds is True
+        assert plan.position_range.width_source is WidthSource.ADAPTIVE_EXACT_BOUNDS
 
 
 def test_plan_mint_entry_builds_the_canary_plan_end_to_end() -> None:

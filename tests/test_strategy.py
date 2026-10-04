@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from conftest import healthy_ranging_evidence
 from test_lp_executor import (
     B20_ADDRESS,
     POOL_ADDRESS,
@@ -12,6 +13,7 @@ from test_lp_executor import (
 )
 
 from aero_bot.policy import PolicyActionKind, PolicyReason
+from aero_bot.ranging import RangingEvidence
 from aero_bot.strategy import BoardListing, run_decision, run_selection
 from aero_bot.venues import PoolCandidate
 
@@ -60,6 +62,30 @@ class FakeStrategySources:
     def gas_price_gwei(self) -> Decimal | None:
         """Return the fixture gas price."""
         return self._gas_gwei
+
+    def ranging_evidence(
+        self,
+        pool: PoolCandidate,
+        snapshot_price_usdc: Decimal,
+        stock_decimals: int,
+        observed_at: datetime,
+    ) -> RangingEvidence | None:
+        """Serve the healthy measured fixture from the actual pool snapshot.
+
+        The raw grid anchor and orientation derive from the resolved pool
+        exactly as the live reader would, so the solve's bounds sit on the
+        same grid the executor mints.
+        """
+        stock_is_token0 = (
+            pool.token0_address.lower() != "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+        )
+        return healthy_ranging_evidence(
+            snapshot_price_usdc,
+            observed_at=observed_at,
+            pool_tick_raw=pool.current_tick,
+            stock_is_token0=stock_is_token0,
+            stock_decimals=stock_decimals,
+        )
 
     def token_balance(self, token_address: str, owner_address: str) -> int:
         """Record the equity read and serve a flat ten-USDC Safe."""

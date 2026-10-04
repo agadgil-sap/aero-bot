@@ -28,10 +28,12 @@ from pydantic import BaseModel, Field, model_validator
 from aero_bot.domain import IMMUTABLE_MODEL_CONFIG, EvmAddress, NonNegativeDecimal
 from aero_bot.history import (
     AERO_DECIMALS,
+    RANGING_READ_LOOKBACK,
     EmissionsAprHistory,
     EmissionsAprPoint,
     PoolPricePath,
     PoolPricePoint,
+    swap_usd_notional,
 )
 from aero_bot.policy import (
     LOCKED_POLICY_PARAMETERS,
@@ -42,6 +44,7 @@ from aero_bot.policy import (
     PolicyPosition,
     PolicyReason,
     PolicyState,
+    RangeWidthPolicy,
     SwapPlan,
     load_event_calendar,
 )
@@ -67,10 +70,12 @@ DEFAULT_GAS_PRICE_ASSUMPTION_GWEI = Decimal("0.001")
 PPM_SCALE = Decimal(1_000_000)
 # Basis points scale impact fractions for the per-swap ledger view.
 BPS_SCALE = Decimal(10_000)
-# Live ranging evidence spans the trailing day of reconstructed swaps, so the
-# width solver sees the pool's recent fee flow and realized volatility rather
-# than figures averaged over the whole replay window.
-RANGING_EVIDENCE_WINDOW = timedelta(hours=24)
+# Live ranging evidence spans the same bounded trailing window the
+# production reader uses (a handful of 2,000-block pages at the public
+# endpoint's cap), so the rehearsal's width solves consume exactly the
+# production inputs: realized volatility, measured band dwell, and the fee
+# flow over one matched window shape.
+RANGING_EVIDENCE_WINDOW = RANGING_READ_LOOKBACK
 
 
 class WidthSelectionMode(StrEnum):
@@ -230,11 +235,14 @@ class RehearsalActionRecord(BaseModel):
     # Batch gas evidence mirrors the decision's estimates.
     estimated_gas_units: int | None = None
     estimated_gas_cost_usd: NonNegativeDecimal | None = None
-    # Width-solve evidence for enter and recenter actions: how the half width
-    # resolved and which tick-aligned width was committed.
+    # Width-solve evidence for enter and recenter actions: how the range
+    # resolved and which executable aligned bounds were committed, with the
+    # real per-side distances of the minted geometry.
     width_mode: WidthSolveMode | None = None
-    half_width_ticks: Annotated[int, Field(ge=1)] | None = None
-    half_width_fraction: Decimal | None = None
+    range_lower_tick: int | None = None
+    range_upper_tick: int | None = None
+    range_lower_distance_fraction: Decimal | None = None
+    range_upper_distance_fraction: Decimal | None = None
     # Replay books after applying the action, for auditing the fold.
     cash_after_usd: Decimal
     equity_after_usd: Decimal
@@ -517,34 +525,6 @@ def band_depth_usd(
         return +(human_liquidity * (Decimal(2) * sqrt_price - sqrt_lower - sqrt_upper))
 
 
-def swap_usd_notional(
-    point: PoolPricePoint,
-    token_is_token0: bool,
-    stock_decimals: int,
-    quote_decimals: int,
-) -> Decimal:
-    """Value one swap's size in US dollars at the post-swap price.
-
-    Both emitted token deltas are valued at the post-swap price and the
-    larger side wins, a documented proxy for the swapped notional that stays
-    correct for either direction and either token ordering.
-
-    Args:
-        point: The reconstructed swap observation with its signed amounts.
-        token_is_token0: True when the stock token sorts before the quote token.
-        stock_decimals: Decimal count of the stock token.
-        quote_decimals: Decimal count of the USDC quote token.
-
-    Returns:
-        The approximate US-dollar notional of the swap.
-    """
-    stock_value_raw = abs(point.amount0 if token_is_token0 else point.amount1)
-    quote_value_raw = abs(point.amount1 if token_is_token0 else point.amount0)
-    stock_value = Decimal(stock_value_raw) / Decimal(10) ** stock_decimals * point.price_usdc
-    quote_value = Decimal(quote_value_raw) / Decimal(10) ** quote_decimals
-    return max(stock_value, quote_value)
-
-
 def trailing_ranging_evidence(
     points: Sequence[PoolPricePoint],
     squared_log_returns: Sequence[Decimal],
@@ -552,6 +532,7 @@ def trailing_ranging_evidence(
     window_start: int,
     index: int,
     gauge_liquidity_raw: int,
+    token_is_token0: bool,
     anchor_gauge_liquidity: int,
     anchor_staked_tvl_usd: Decimal,
     pool_fee_ppm: int,
@@ -578,6 +559,8 @@ def trailing_ranging_evidence(
             inside the trailing evidence window.
         index: The observation the evidence is assembled for.
         gauge_liquidity_raw: Gauge staked liquidity in effect at this instant.
+        token_is_token0: True when the stock token sorts before USDC,
+            threading the raw-grid orientation into the solve's bounds.
         anchor_gauge_liquidity: Staked liquidity at the anchor block.
         anchor_staked_tvl_usd: Staked value in USDC at the anchor block.
         pool_fee_ppm: The pool's staked fee tier in parts per million.
@@ -633,8 +616,17 @@ def trailing_ranging_evidence(
         fee_window_notional_usd=fee_notional,
         pool_fee_ppm=pool_fee_ppm,
         realized_daily_volatility=realized_volatility,
+        # The trailing path slice rides with the evidence so the adaptive
+        # solve measures band dwell over exactly the same window its
+        # volatility and fees span - the production reader's matched input.
+        trailing_path=tuple(points[window_start : index + 1]),
         stock_decimals=stock_decimals,
         quote_decimals=quote_decimals,
+        # The raw grid anchor and orientation thread from the reconstructed
+        # point, so the replay's scored bounds mint verbatim exactly as
+        # production's do.
+        pool_tick_raw=current.tick,
+        stock_is_token0=token_is_token0,
     )
 
 
@@ -789,11 +781,23 @@ def replay_pool(
     if assumptions.aero_price_assumption_usd != emissions_history.aero_price_assumption_usd:
         raise ValueError("aero_price_assumption_usd must equal the emissions series' assumption")
     # The default engine pins the locked v1 parameters and the bundled calendar.
-    active_engine = (
-        engine
-        if engine is not None
-        else PolicyEngine(parameters=LOCKED_POLICY_PARAMETERS, calendar=load_event_calendar())
-    )
+    # The default engine pins the locked v1 parameters and the bundled
+    # calendar; the fixed-ceiling baseline additionally pins the engine's
+    # width posture to the v1 comparison mode, because the baseline's
+    # evidence-free observations would defer under the adaptive default.
+    if engine is not None:
+        active_engine = engine
+    elif width_selection is WidthSelectionMode.FIXED_CEILING_BASELINE:
+        active_engine = PolicyEngine(
+            parameters=LOCKED_POLICY_PARAMETERS.model_copy(
+                update={"range_width_policy": RangeWidthPolicy.FIXED_CEILING_BASELINE}
+            ),
+            calendar=load_event_calendar(),
+        )
+    else:
+        active_engine = PolicyEngine(
+            parameters=LOCKED_POLICY_PARAMETERS, calendar=load_event_calendar()
+        )
     reference_quotes = build_reference_quotes(price_path, schedule)
     quote_timestamps = [quote.timestamp for quote in reference_quotes]
     points = price_path.points
@@ -884,6 +888,7 @@ def replay_pool(
                 window_start=evidence_window_start,
                 index=observation_index,
                 gauge_liquidity_raw=step.gauge_liquidity,
+                token_is_token0=price_path.token_is_token0,
                 anchor_gauge_liquidity=emissions_history.anchor_gauge_liquidity,
                 anchor_staked_tvl_usd=emissions_history.anchor_staked_tvl_usd,
                 pool_fee_ppm=assumptions.pool_fee_ppm,
@@ -1030,14 +1035,28 @@ def replay_pool(
                         if decision.width_solution is not None
                         else None
                     ),
-                    half_width_ticks=(
-                        decision.width_solution.half_width_ticks
+                    range_lower_tick=(
+                        decision.width_solution.lower_bound.tick
                         if decision.width_solution is not None
+                        and decision.width_solution.lower_bound is not None
                         else None
                     ),
-                    half_width_fraction=(
-                        decision.width_solution.half_width_fraction
+                    range_upper_tick=(
+                        decision.width_solution.upper_bound.tick
                         if decision.width_solution is not None
+                        and decision.width_solution.upper_bound is not None
+                        else None
+                    ),
+                    range_lower_distance_fraction=(
+                        decision.width_solution.lower_bound.distance_fraction
+                        if decision.width_solution is not None
+                        and decision.width_solution.lower_bound is not None
+                        else None
+                    ),
+                    range_upper_distance_fraction=(
+                        decision.width_solution.upper_bound.distance_fraction
+                        if decision.width_solution is not None
+                        and decision.width_solution.upper_bound is not None
                         else None
                     ),
                     cash_after_usd=cash,
@@ -1114,15 +1133,18 @@ def replay_pool(
         )
     if width_selection is WidthSelectionMode.DERIVED_FROM_TARGET:
         labels.append(
-            "range widths derive from the target net daily yield solver over the "
-            "trailing day of fee and volatility evidence, entering at the tightest "
-            "tick-aligned width whose modeled net meets the target and at one tick "
-            "spacing when the target is unreachable"
+            "range widths solve the adaptive executable grid - actual aligned "
+            "bounds whose real per-side distances sit inside the 0.1-to-0.3-"
+            "percent band, scored on the conservative income basis with own-"
+            "stake dilution and measured dwell, argmax of modeled net; missing "
+            "or thin evidence defers entries and voluntary recenters, and a "
+            "nonpositive best candidate holds cash"
         )
         labels.append(
-            "ranging evidence spans the trailing day of reconstructed swaps and "
-            "values staked liquidity at the frozen per-liquidity-unit anchor value, "
-            "matching the emissions series' convention"
+            "ranging evidence spans the shared bounded trailing window (the "
+            "production read's shape) and values staked liquidity at the frozen "
+            "per-liquidity-unit anchor value, matching the emissions series' "
+            "convention"
         )
     else:
         labels.append(

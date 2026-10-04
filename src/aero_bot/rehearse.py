@@ -34,6 +34,7 @@ from aero_bot.executor import (
     ExecutorRpcRevertError,
 )
 from aero_bot.history import (
+    DEFAULT_LOG_WINDOW_BLOCKS,
     MAX_BINARY_SEARCH_PROBES,
     MAX_HEADER_BATCH_SIZE,
     MAX_TOTAL_SWAP_EVENTS,
@@ -233,6 +234,7 @@ class LiveRehearsalSources:
         lookback: timedelta,
         aero_price_assumption_usd: Decimal | None,
         header_batch_size: int = MAX_HEADER_BATCH_SIZE,
+        log_window_blocks: int = DEFAULT_LOG_WINDOW_BLOCKS,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -246,6 +248,9 @@ class LiveRehearsalSources:
             aero_price_assumption_usd: Optional documented AERO price override;
                 absent means the per-run live read at the anchor block sets it.
             header_batch_size: Block-header reads grouped per JSON-RPC batch.
+            log_window_blocks: Maximum block span of one eth_getLogs window,
+                for endpoints that cap block ranges below the backend
+                default.
             transport: Optional injected HTTP transport for deterministic tests.
             sleep: Injected delay function used for backoff and politeness waits.
         """
@@ -258,6 +263,7 @@ class LiveRehearsalSources:
             rpc_url=rpc_url,
             max_block_header_lookups=REHEARSAL_HEADER_LOOKUP_BOUND,
             header_batch_size=header_batch_size,
+            log_window_blocks=log_window_blocks,
             transport=transport,
             sleep=sleep,
         )
@@ -666,6 +672,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
             f"(default: {MAX_HEADER_BATCH_SIZE}, the public endpoint's cap)."
         ),
     )
+    parser.add_argument(
+        "--log-window-blocks",
+        type=int,
+        default=DEFAULT_LOG_WINDOW_BLOCKS,
+        help=(
+            "Maximum block span of one eth_getLogs window "
+            f"(default: {DEFAULT_LOG_WINDOW_BLOCKS}; public endpoints that "
+            "cap block ranges take 2000, which the cycle's bounded ranging "
+            "reads already use)."
+        ),
+    )
     return parser
 
 
@@ -692,6 +709,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--gas-price-gwei must be positive")
     if not 1 <= arguments.header_batch_size <= MAX_HEADER_BATCH_SIZE:
         parser.error(f"--header-batch-size must be between 1 and {MAX_HEADER_BATCH_SIZE}")
+    if arguments.log_window_blocks <= 0:
+        parser.error("--log-window-blocks must be positive")
     lookback = timedelta(days=float(arguments.lookback_days))
     registry = load_official_b20_registry()
     symbols_by_token_address = {
@@ -704,6 +723,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         lookback=lookback,
         aero_price_assumption_usd=arguments.aero_price,
         header_batch_size=arguments.header_batch_size,
+        log_window_blocks=arguments.log_window_blocks,
     )
     try:
         report = run_rehearsal(

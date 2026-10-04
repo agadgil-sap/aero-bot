@@ -73,6 +73,12 @@ GAUGE_STAKE_TOPICS_LAYOUT: tuple[tuple[str, str], ...] = (
 )
 # The rehearsed history window is roughly the last three weeks.
 REHEARSAL_LOOKBACK = timedelta(days=21)
+# The bounded trailing window one live adaptive-width read reconstructs: a
+# handful of pages at the public endpoint's log-window cap (Base's two-second
+# blocks make this about 8,000 blocks or 4.4 hours), the read budget behind
+# every production ranging-evidence fetch. The rehearsal's evidence window
+# matches it so production and replay consume the same input shape.
+RANGING_READ_LOOKBACK = timedelta(hours=4.4)
 # One eth_getLogs window spans at most this many blocks; public endpoints
 # bound both block ranges and response sizes, so windows stay modest.
 DEFAULT_LOG_WINDOW_BLOCKS = 5_000
@@ -473,6 +479,34 @@ def price_usdc_per_stock(
         # Token0 is USDC, so the scaled human price is stock per USDC.
         human_stock_per_usdc = raw_price * Decimal(10) ** (quote_decimals - stock_decimals)
         return +(Decimal(1) / human_stock_per_usdc)
+
+
+def swap_usd_notional(
+    point: PoolPricePoint,
+    token_is_token0: bool,
+    stock_decimals: int,
+    quote_decimals: int,
+) -> Decimal:
+    """Value one swap's size in US dollars at the post-swap price.
+
+    Both emitted token deltas are valued at the post-swap price and the
+    larger side wins, a documented proxy for the swapped notional that stays
+    correct for either direction and either token ordering.
+
+    Args:
+        point: The reconstructed swap observation with its signed amounts.
+        token_is_token0: True when the stock token sorts before the quote token.
+        stock_decimals: Decimal count of the stock token.
+        quote_decimals: Decimal count of the USDC quote token.
+
+    Returns:
+        The approximate US-dollar notional of the swap.
+    """
+    stock_value_raw = abs(point.amount0 if token_is_token0 else point.amount1)
+    quote_value_raw = abs(point.amount1 if token_is_token0 else point.amount0)
+    stock_value = Decimal(stock_value_raw) / Decimal(10) ** stock_decimals * point.price_usdc
+    quote_value = Decimal(quote_value_raw) / Decimal(10) ** quote_decimals
+    return max(stock_value, quote_value)
 
 
 def build_price_path(

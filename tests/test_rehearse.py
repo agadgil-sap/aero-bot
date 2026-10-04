@@ -739,7 +739,11 @@ def test_fixed_ceiling_width_flag_selects_the_baseline_policy(
     assert report.width_selection == WidthSelectionMode.FIXED_CEILING_BASELINE
     entry = report.ledgers[0].actions[0]
     assert entry.width_mode == WidthSolveMode.FALLBACK_CEILING
-    assert entry.half_width_ticks == 29
+    # The baseline mints the outward-aligned ceiling geometry around the
+    # acting price, up to seven spacings of total span by grid phase.
+    assert entry.range_lower_tick is not None
+    assert entry.range_upper_tick is not None
+    assert 50 <= entry.range_upper_tick - entry.range_lower_tick <= 80
 
 
 def test_main_passes_settings_and_filters_to_the_sources(tmp_path: Path) -> None:

@@ -2,7 +2,7 @@
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -74,6 +74,56 @@ def allowance_request_payload(
     }
 
 
+def _healthy_ranging_evidence(spot: str = "200") -> dict[str, object]:
+    """Build the healthy measured ranging evidence for the HTTP fixture.
+
+    Args:
+        spot: The observation's pool price the trailing window wanders around.
+
+    Returns:
+        JSON-compatible evidence - a thin concentrated staked book at the
+        quiet measured regime - whose adaptive solve lands on a clearly
+        positive candidate at the fixture's floor-scale APR.
+    """
+    ratio = Decimal("1.0001")
+    spot_decimal = Decimal(spot)
+    # The window ENDS one step before the fixture's 15:00 observation so the
+    # newest measured point is fresh, never future-skewed.
+    base = datetime.fromisoformat("2026-08-19T15:00:00+00:00") - timedelta(minutes=300)
+    path = []
+    level = 0
+    for index in range(30):
+        if index and index % 20 == 0:
+            level += 1 if level <= 0 else -1
+        path.append(
+            {
+                "timestamp": (base + timedelta(minutes=10 * index)).isoformat(),
+                "block_number": index,
+                "log_index": 0,
+                "amount0": 0,
+                "amount1": 5_000_000_000,
+                "sqrt_ratio": str(1 << 96),
+                "liquidity": 80_000_000_000_000,
+                "tick": 0,
+                "price_usdc": str(spot_decimal * ratio ** Decimal(level)),
+            }
+        )
+    return {
+        "gauge_liquidity_raw": 35_000_000_000,
+        "staked_tvl_usd": "500",
+        "active_liquidity_raw": 80_000_000_000_000,
+        "fee_window_seconds": 86_400,
+        "fee_window_notional_usd": "1000000",
+        "pool_fee_ppm": 500,
+        "realized_daily_volatility": "0.001",
+        "trailing_path": path,
+        "stock_decimals": 6,
+        "quote_decimals": 6,
+        "pool_tick_raw": -52986,  # floor(log_1.0001(1/200)) at token1/6-6
+        "stock_is_token0": False,
+    }
+
+
 def policy_request_payload(
     observed_at: str = "2026-08-19T15:00:00+00:00",
     state: dict[str, object] | None = None,
@@ -102,6 +152,7 @@ def policy_request_payload(
             "reference_price_usdc": "200",
             "reference_age_seconds": 10,
             "gas_price_gwei": "0.002",
+            "ranging": _healthy_ranging_evidence(),
         },
     }
     if state is not None:

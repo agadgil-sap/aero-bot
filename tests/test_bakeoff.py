@@ -68,15 +68,15 @@ def test_width_fixtures_solve_to_distinct_truths() -> None:
     """The three width scenarios discriminate: modes and tick grids differ."""
     fixtures = bakeoff.load_fixtures(FIXTURE_PATH)
     truths = [
-        (truth["mode"], truth["half_width_ticks"])
+        (truth["mode"], truth["lower_tick"], truth["upper_tick"])
         for truth in (
             bakeoff.baseline_width(scenario["observations"]) for scenario in fixtures.width
         )
     ]
     assert truths == [
-        ("solved", 10),
-        ("target_unreachable", 10),
-        ("target_unreachable", 200),
+        ("solved", 46040, 46070),
+        ("cash_hold", None, None),
+        ("deferred", None, None),
     ]
 
 
@@ -172,11 +172,17 @@ def test_width_scoring_scores_mode_and_ticks_separately() -> None:
     perfect = bakeoff.Answer(payload=dict(truth))
     assert bakeoff.score_width(scenario, perfect).points == 2.0
     wrong_mode = bakeoff.Answer(
-        payload={"mode": "target_unreachable", "half_width_ticks": truth["half_width_ticks"]}
+        payload={
+            "mode": "cash_hold",
+            "lower_tick": truth["lower_tick"],
+            "upper_tick": truth["upper_tick"],
+        }
     )
     assert bakeoff.score_width(scenario, wrong_mode).points == 1.0
-    wrong_ticks = bakeoff.Answer(payload={"mode": truth["mode"], "half_width_ticks": 999})
-    assert bakeoff.score_width(scenario, wrong_ticks).points == 1.0
+    wrong_bounds = bakeoff.Answer(
+        payload={"mode": truth["mode"], "lower_tick": 999, "upper_tick": 999}
+    )
+    assert bakeoff.score_width(scenario, wrong_bounds).points == 1.0
 
 
 def test_main_writes_the_baseline_report_and_exits_clean(

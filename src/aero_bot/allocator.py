@@ -656,6 +656,8 @@ def _scaled_entry_observation(
         engine: The locked per-pool policy engine naming the equity cap.
         evaluation: The qualifying evaluation being sized.
         budget_usdc: The tranche target in USDC.
+        dilution_exit_pending_by_symbol: The per-pool dilution re-entry
+            markers, arming the APR margin on re-entry.
 
     Returns:
         The scaled observation for the entry re-derivation.
@@ -675,6 +677,7 @@ def _gate_trace_lines(
     reentry_blocked_until_by_symbol: Mapping[str, datetime],
     evaluation: PoolEntryEvaluation | None,
     budget_usdc: Decimal | None,
+    dilution_exit_pending_by_symbol: Mapping[str, bool] | None = None,
 ) -> tuple[str, str, tuple[str, ...]]:
     """Trace the complete entry gate chain for one pool at one basis.
 
@@ -682,6 +685,8 @@ def _gate_trace_lines(
         engine: The locked per-pool policy engine.
         base_state: The threaded session state.
         reentry_blocked_until_by_symbol: The per-pool re-entry cooldowns.
+        dilution_exit_pending_by_symbol: The per-pool dilution re-entry
+            markers, arming the APR margin on re-entry.
         evaluation: The pool being traced; None yields no evidence.
         budget_usdc: The tranche target the gates judge at, or None to
             trace at the observation's own full-board basis.
@@ -710,6 +715,9 @@ def _gate_trace_lines(
             "position": None,
             "held_inventory": None,
             "reentry_blocked_until": reentry_blocked_until_by_symbol.get(evaluation.symbol),
+            "dilution_exit_pending": (dilution_exit_pending_by_symbol or {}).get(
+                evaluation.symbol, False
+            ),
         }
     )
     return evaluation.symbol, basis, engine.entry_gate_trace(state, observation)
@@ -721,6 +729,7 @@ def _entry_outcome_at_budget(
     reentry_blocked_until_by_symbol: Mapping[str, datetime],
     evaluation: PoolEntryEvaluation,
     budget_usdc: Decimal,
+    dilution_exit_pending_by_symbol: Mapping[str, bool] | None = None,
 ) -> tuple[PolicyOutcome | None, PolicyObservation | None, str, str]:
     """Re-derive one pool's ENTER outcome at exactly the tranche budget.
 
@@ -745,6 +754,8 @@ def _entry_outcome_at_budget(
         reentry_blocked_until_by_symbol: The per-pool re-entry cooldowns.
         evaluation: The qualifying evaluation being sized.
         budget_usdc: The tranche target in USDC.
+        dilution_exit_pending_by_symbol: The per-pool dilution re-entry
+            markers, arming the APR margin on re-entry.
 
     Returns:
         A triple of the ENTER outcome with its tranche-scaled observation
@@ -759,6 +770,9 @@ def _entry_outcome_at_budget(
             "position": None,
             "held_inventory": None,
             "reentry_blocked_until": reentry_blocked_until_by_symbol.get(evaluation.symbol),
+            "dilution_exit_pending": (dilution_exit_pending_by_symbol or {}).get(
+                evaluation.symbol, False
+            ),
         }
     )
     outcome = engine.decide(state, observation)
@@ -783,6 +797,7 @@ def _build_tranche(
     weight: Decimal,
     rank: int,
     budget_usdc: Decimal,
+    dilution_exit_pending_by_symbol: Mapping[str, bool] | None = None,
 ) -> tuple[PortfolioTranche | None, str, str]:
     """Derive one candidate's tranche at its budget, engine-judged.
 
@@ -794,13 +809,20 @@ def _build_tranche(
         weight: The candidate's weighted qualifying APR.
         rank: The candidate's tier rank.
         budget_usdc: The committed USDC value the tranche targets.
+        dilution_exit_pending_by_symbol: The per-pool dilution re-entry
+            markers, arming the APR margin on re-entry.
 
     Returns:
         The derived tranche and empty gate and evidence strings, or None
         with the refusing gate's name and one refusal evidence line.
     """
     outcome, observation, gate, refusal = _entry_outcome_at_budget(
-        engine, base_state, reentry_blocked_until_by_symbol, evaluation, budget_usdc
+        engine,
+        base_state,
+        reentry_blocked_until_by_symbol,
+        evaluation,
+        budget_usdc,
+        dilution_exit_pending_by_symbol,
     )
     if outcome is None or observation is None or outcome.decision.size_usd is None:
         return None, gate, refusal or "the entry gate carried no positive size"
@@ -828,6 +850,7 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
     held: Sequence[HeldPositionFact],
     cash_usdc: Decimal,
     equity_usdc: Decimal,
+    dilution_exit_pending_by_symbol: Mapping[str, bool] | None = None,
     parameters: PortfolioParameters | None = None,
     discipline_by_symbol: Mapping[str, Decimal] | None = None,
     inventory_pending: bool = False,
@@ -850,6 +873,8 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
         evaluations: The board's complete entry-gate evaluations.
         reentry_blocked_until_by_symbol: The per-pool re-entry cooldowns.
         held: The held position facts occupying slots and capital.
+        dilution_exit_pending_by_symbol: The per-pool dilution re-entry
+            markers, arming the APR margin on re-entry.
         cash_usdc: The Safe's live USDC available for deployment.
         equity_usdc: The portfolio equity pricing the concentration cap.
         parameters: The portfolio parameter set; None uses the locked
@@ -1060,6 +1085,7 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
                 reentry_blocked_until_by_symbol,
                 evaluation,
                 target,
+                dilution_exit_pending_by_symbol,
             )
         forgone_per_day = +(target * evaluation.observation.income_expectation_apr / days_per_year)
         forgone_line = (
@@ -1090,6 +1116,7 @@ def allocate_portfolio(  # noqa: PLR0912, PLR0915 - one fixed tier construction
             weight,
             rank,
             target,
+            dilution_exit_pending_by_symbol,
         )
         if tranche is None:
             excluded.append(
