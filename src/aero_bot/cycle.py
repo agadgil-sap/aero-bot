@@ -2435,8 +2435,8 @@ class CycleRunner:
         its pool, the plan's recorded owner being this Safe - and the live
         status read verifies the custody. Only evidence both the audit
         chain and the chain state prove adopts; anything else skips
-        quietly (burned history) or refuses the cycle (proven custody
-        violated). A candidate whose status read cannot complete is
+        quietly (burned or delisted history) or refuses the cycle (proven
+        custody violated). A candidate whose status read cannot complete is
         unknown truth, not absence: the read propagates and fails the
         cycle for the retry, exactly like every other reconcile read.
         Pinned cycles never fold cross-symbol rows into their
@@ -2454,6 +2454,8 @@ class CycleRunner:
         Raises:
             ExecutionUnavailableError: If a candidate's live status read
                 cannot complete.
+            LpExecutionRefusalError: If a candidate's status read refuses
+                for anything but burned or delisted history.
         """
         if self._audit_reader is None:
             return [], ""
@@ -2523,17 +2525,22 @@ class CycleRunner:
             try:
                 status = self._reads.position_status(symbol, token_id)
             except LpExecutionRefusalError as error:
-                if getattr(error, "code", None) == LpExecutionRefusalCode.POSITION_NOT_OWNED:
+                if error.code == LpExecutionRefusalCode.POSITION_NOT_OWNED:
                     return recovered, (
                         f"audit-proven position NFT {token_id} on {symbol} is owned by "
                         f"a stranger ({error}); refusing the cycle"
                     )
-                # Burned or unresolvable history - an exited position's
-                # stale plan, or a pool that left the registry. Nothing
-                # adopts and nothing refuses.
-                continue
-            except ValueError:
-                continue
+                if error.code in (
+                    LpExecutionRefusalCode.POSITION_UNKNOWN,
+                    LpExecutionRefusalCode.SYMBOL_NOT_IN_REGISTRY,
+                    LpExecutionRefusalCode.POOL_NOT_DISCOVERED,
+                    LpExecutionRefusalCode.POOL_MISSING_NFPM_OR_GAUGE,
+                ):
+                    # Burned or delisted history - an exited position's
+                    # burned plan, or a pool the registry or venue no
+                    # longer lists. Nothing adopts and nothing refuses.
+                    continue
+                raise
             owner = normalize_evm_address(status.token_owner_address)
             gauge = normalize_evm_address(status.gauge_address)
             view = getattr(status, "position", None)

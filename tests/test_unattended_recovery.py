@@ -1562,6 +1562,54 @@ class TestEntrySideInterruptions:
         assert chain.count_broadcasts("stake", token_id=staked[0]) == 1
         assert chain.count_broadcasts("mint") == len(chain.staked_token_ids())
 
+    def test_a_transient_status_refusal_halts_the_recovery_without_reentering(
+        self, board_world: tuple[CycleHarness, FaithfulChain, LoopbackRpcServer]
+    ) -> None:
+        """An unreadable gauge-held sibling halts the restart, never re-mints.
+
+        The killed cycle's completed sibling sits staked in its gauge, and
+        the restart's recovery status read refuses on the transient live
+        AERO price read. The cycle must fail for the next tick rather than
+        treat the sibling as absent - a flat reconcile would re-enter the
+        same pool and mint a duplicate - and the healthy retry then
+        recovers the sibling exactly once.
+        """
+        harness, chain, _server = board_world
+        pre_cycle_book = harness.snapshot_book()
+
+        exit_code, _report, _stderr = harness.run(
+            ["--json", *harness.reference_args()],
+            barrier_kill_after=lambda record: record.kind == "stake",
+        )
+        assert exit_code == -signal.SIGTERM, exit_code
+        staked = chain.staked_token_ids()
+        assert len(staked) == 1  # the sibling the restart must prove, not skip
+        harness.restore_book(pre_cycle_book)
+        mints_before = chain.count_broadcasts("mint")
+
+        # The recovery read itself refuses on the transient price read; the
+        # restart must halt before decide rather than mint around the gap.
+        chain.fail_aero_price_reads = 1
+        exit_code, _report, stderr = harness.run(["--json", *harness.reference_args()])
+        assert exit_code != EXIT_OK
+        assert "cycle failed" in stderr
+        assert "the live AERO price read" in stderr
+        assert chain.count_broadcasts("mint") == mints_before
+
+        # The healthy retry recovers the sibling exactly once.
+        exit_code, report, stderr = harness.run(["--json", *harness.reference_args()])
+        assert exit_code == EXIT_OK, stderr
+        assert report is not None
+        assert report["halted_reason"] == "", report["halted_reason"]
+        decision = report.get("decision_reconciliation") or {}
+        recovered = decision.get("recovered_positions") or []
+        assert any(row["token_id"] == staked[0] for row in recovered), recovered
+        book = harness.load_book()
+        token_ids = {position["token_id"] for position in book["positions"]}
+        assert token_ids == set(chain.staked_token_ids())
+        assert chain.count_broadcasts("stake", token_id=staked[0]) == 1
+        assert chain.count_broadcasts("mint") == len(chain.staked_token_ids())
+
     def test_kill_between_mint_and_stake_adopts_without_reming(
         self, board_world: tuple[CycleHarness, FaithfulChain, LoopbackRpcServer]
     ) -> None:
