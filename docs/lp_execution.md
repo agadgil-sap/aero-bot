@@ -200,7 +200,7 @@ These gates run before anything is signed, in order, and each appends its label 
 | --- | --- | --- |
 | Registry verified | official B20 registry validates | `registry_unverified` |
 | Symbol in registry | USDC plus the registry whitelist only | `symbol_not_in_registry` |
-| Pool from live discovery | Sugar-verified pool, or the known-pool fast path below | `pool_not_discovered` |
+| Pool from verified discovery | a verified Sugar sweep names the pool, or the known-pool fast path below; a sweep that does not verify fails as an unavailable read, never as proof the pool is gone | `pool_not_discovered` |
 | Snapshot evidence | observation time and pin block present | `snapshot_evidence_missing` |
 | NFPM and gauge present | Sugar record carries both | `pool_missing_nfpm_or_gauge` |
 | Snapshot staleness | 120 seconds | `snapshot_stale` |
@@ -347,7 +347,7 @@ The scheduled cycle drives this surface inside its act step under the sealed con
 
 ### Audit chain and CLI surface
 
-Every plan, built transaction, and refusal appends to the same append-only hash-chained SQLite store as the swap executor, with these event types: `lp_mint_planned`, `lp_stake_planned`, `lp_unstake_planned`, `lp_exit_planned`, `lp_collect_planned`, `lp_recenter_planned`, `lp_status_reported`, `lp_transaction_built`, `lp_refused`, `lp_aero_swap_planned`, and - on the execute path - `lp_execute_sent`, `lp_execute_confirmed`, and `lp_execute_failed`.
+Every plan, built transaction, and refusal appends to the same append-only hash-chained SQLite store as the swap executor, with these event types: `lp_mint_planned`, `lp_stake_planned`, `lp_unstake_planned`, `lp_exit_planned`, `lp_collect_planned`, `lp_recenter_planned`, `lp_status_reported`, `lp_transaction_built`, `lp_refused`, `lp_aero_swap_planned`, and - on the execute path - `lp_execute_sent`, `lp_execute_confirmed`, `lp_execute_failed`, and `lp_execute_broadcast_unknown` (the send row's sibling appended when the endpoint's response is lost after the node may already have accepted the transaction, carrying the locally derived transaction hash; the cycle's crash-recovery heal proves both row kinds from their on-chain receipts).
 A recenter appends its inner mint plan as `lp_mint_planned` followed by the `lp_recenter_planned` batch record, so the recycled entry stays inspectable as a first-class plan.
 Refusal records carry the executor catalog code plus the planner's own code when the planner refused, and the action name (`mint`, `stake`, `unstake`, `withdraw`, `collect`, `recenter`, `status`), so both layers' decisions stay inspectable offline.
 The CLI exits zero on success, one on failures, and two on any refusal, with the catalog code printed to stderr as `refused [<code>]`.

@@ -226,6 +226,10 @@ class FakeBalances:
         """Serve no receipts; the watchtower decodes none."""
         return None
 
+    def fetch_chain_id(self) -> int:
+        """Serve Base mainnet as the watchtower's read-only chain."""
+        return 8453
+
 
 class FakeCloseExecutor:
     """Record every close invocation shape and serve scripted outcomes."""

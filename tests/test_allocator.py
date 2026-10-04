@@ -1,7 +1,7 @@
 """Behavior tests for the portfolio allocator."""
 
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal
 
 import pytest
 from conftest import healthy_trailing_path
@@ -10,6 +10,7 @@ from aero_bot.allocator import (
     DEFAULT_MIN_POSITION_FLOOR_USDC,
     HARD_MAX_CONCURRENT_POSITIONS,
     PORTFOLIO_TOTAL_EXPOSURE_CAP_USDC,
+    TIER_SHARE_QUANTUM,
     DeferredReallocation,
     HeldPositionFact,
     PortfolioAllocation,
@@ -24,6 +25,13 @@ from aero_bot.allocator import (
     weighted_apr_of,
 )
 from aero_bot.domain import normalize_evm_address
+from aero_bot.lp_plan import (
+    DEFAULT_SWAP_BUFFER_FRACTION,
+    LpExecutionPolicy,
+    LpPlanRefusalError,
+    SafeInventory,
+    plan_mint_entry,
+)
 from aero_bot.policy import (
     PolicyActionKind,
     PolicyDecision,
@@ -290,8 +298,11 @@ class TestParameterCoherence:
             equity_usdc=Decimal("999.99"),
         )
         assert [tranche.symbol for tranche in below.tranches] == ["BBBc"]
-        assert below.tranches[0].budget_usd == Decimal("999.99")
-        assert below.cash_residual_usdc == Decimal("0")
+        # The executable-cost reserve rides inside the tranche: the whole
+        # deployable target divided by one-plus-buffer, so the entry can
+        # always pay its own balancing swap's acquisition buffer.
+        assert below.tranches[0].budget_usd == Decimal("998.9910070000")
+        assert below.cash_residual_usdc <= Decimal("0.000016")
         assert not any(
             item.reason is PortfolioExclusionReason.CONCENTRATION_CAP_CLAMPED
             for item in below.excluded
@@ -307,7 +318,9 @@ class TestParameterCoherence:
         )
         assert [tranche.symbol for tranche in above.tranches] == ["BBBc"]
         assert above.tranches[0].budget_usd == Decimal("350.00")
-        assert above.cash_residual_usdc == Decimal("650.00")
+        # The clamped tranche spends 350 plus its acquisition buffer, so the
+        # honest expected leftover cash is the budget sum minus that cost.
+        assert above.cash_residual_usdc == Decimal("649.650000")
         clamped = next(
             item
             for item in above.excluded
@@ -337,12 +350,15 @@ class TestParameterCoherence:
             equity_usdc=Decimal("105"),
         )
         assert [tranche.symbol for tranche in allocation.tranches] == ["BBBc"]
-        assert allocation.tranches[0].budget_usd == Decimal("105")
+        # The full tier target under the executable-cost reserve: 105 over
+        # one-plus-buffer, floored on the money grid, still comfortably
+        # above the effective minimum below activation.
+        assert allocation.tranches[0].budget_usd == Decimal("104.8951030000")
         assert allocation.tranches[0].budget_usd >= self.PARAMETERS.effective_minimum_position_usdc(
             Decimal("105")
         )
-        assert allocation.cash_residual_usdc == Decimal("0")
-        assert "allocation funds 1 tranche(s) [BBBc 105.000000]" in allocation.summary
+        assert allocation.cash_residual_usdc <= Decimal("0.000016")
+        assert "allocation funds 1 tranche(s) [BBBc 104.8951030000]" in allocation.summary
 
     def test_an_early_activation_override_keeps_the_coherence_regimes(self) -> None:
         """The gnhf 36 machinery survives for a sealed early activation.
@@ -481,13 +497,15 @@ class TestSubActivationDeployment:
         ``insufficient_cash: tier target 80 exceeds the 78.027448
         deployable left`` while the pool qualified and every protective
         gate passed. After it the single qualifying pool takes the whole
-        deployable budget with no floored target, no residual reserve,
-        and no exclusion at all.
+        deployable target under the executable-cost reserve (the full
+        budget over one-plus-buffer, so the entry can always pay its own
+        acquisition buffer) with no floored target and no exclusion at
+        all.
         """
         allocation = self.live_allocation()
         assert [tranche.symbol for tranche in allocation.tranches] == ["MSTRc"]
-        assert allocation.tranches[0].budget_usd == Decimal("78.0274480")
-        assert allocation.cash_residual_usdc == Decimal("0")
+        assert allocation.tranches[0].budget_usd == Decimal("77.9494970000")
+        assert allocation.cash_residual_usdc <= Decimal("0.000016")
         assert allocation.excluded == ()
         assert "dry powder" not in allocation.summary
 
@@ -511,8 +529,8 @@ class TestSubActivationDeployment:
             equity_usdc=Decimal("10.000000"),
         )
         assert [tranche.symbol for tranche in allocation.tranches] == ["BBBc"]
-        assert allocation.tranches[0].budget_usd == Decimal("10.000000")
-        assert allocation.cash_residual_usdc == Decimal("0")
+        assert allocation.tranches[0].budget_usd == Decimal("9.9900080")
+        assert allocation.cash_residual_usdc <= Decimal("0.000016")
         assert allocation.excluded == ()
 
     def test_the_tier_split_never_leaves_a_below_band_stub_reserve(self) -> None:
@@ -533,12 +551,14 @@ class TestSubActivationDeployment:
             equity_usdc=Decimal("105.73"),
         )
         budgets = {tranche.symbol: tranche.budget_usd for tranche in allocation.tranches}
-        # Weights 3/5 and 2/5 of the 78.027448 deployable budget.
-        assert budgets["BBBc"].quantize(Decimal("0.000001")) == Decimal("46.816468")
-        assert budgets["AAAc"].quantize(Decimal("0.000001")) == Decimal("31.210979")
-        # The residual is at most one quantum of tier-share rounding dust,
-        # never a reserve: the summary names it plain cash below activation.
-        assert allocation.cash_residual_usdc <= Decimal("0.000001")
+        # Weights 3/5 and 2/5 of the 78.027448 deployable budget under the
+        # executable-cost reserve.
+        assert budgets["BBBc"].quantize(Decimal("0.000001")) == Decimal("46.769697")
+        assert budgets["AAAc"].quantize(Decimal("0.000001")) == Decimal("31.179798")
+        # The residual is pure chained floor/ceiling rounding - bounded by
+        # the tranche count times the money-grid rounding allowance - never
+        # a held-back reserve: each tranche already carries its own buffer.
+        assert allocation.cash_residual_usdc <= 2 * Decimal("0.000016")
         assert "dry powder" not in allocation.summary
         assert not any(
             item.reason is PortfolioExclusionReason.INSUFFICIENT_CASH
@@ -570,7 +590,8 @@ class TestSubActivationDeployment:
             for item in allocation.excluded
             if item.reason is PortfolioExclusionReason.INSUFFICIENT_CASH
         )
-        assert "tier target 80 exceeds the 78.027448 deployable left" in excluded.cause
+        assert "tier target 80 plus the 0.001 acquisition buffer costs" in excluded.cause
+        assert "above the 78.027448 deployable left" in excluded.cause
 
     def test_small_tranches_still_refuse_on_real_gates(self) -> None:
         """Removing the minimum never loosens the protective gate chain.
@@ -638,11 +659,11 @@ class TestTierConstruction:
         symbols = [tranche.symbol for tranche in allocation.tranches]
         assert symbols == ["BBBc", "AAAc"]  # ranked, CCCc cut by the band
         top, second = allocation.tranches
-        assert top.budget_usd == Decimal("240")  # 3.0/5.0 of 400
-        assert second.budget_usd == Decimal("160")  # 2.0/5.0 of 400
+        assert top.budget_usd == Decimal("239.760238000")  # 3.0/5.0 of 400
+        assert second.budget_usd == Decimal("159.840159000")  # 2.0/5.0 of 400
         assert top.tier_rank == 1 and second.tier_rank == 2
-        assert allocation.cash_residual_usdc == Decimal("0")
-        assert allocation.projected_committed_usdc == Decimal("400")
+        assert allocation.cash_residual_usdc <= 2 * Decimal("0.000016")
+        assert allocation.projected_committed_usdc < Decimal("400")
 
     def test_sparse_board_funds_one_tranche_with_cash_residual(self) -> None:
         """One qualifying pool deploys alone and the rest stays cash."""
@@ -658,8 +679,8 @@ class TestTierConstruction:
         )
         assert len(allocation.tranches) == 1
         assert allocation.tranches[0].symbol == "BBBc"
-        assert allocation.tranches[0].budget_usd == Decimal("500")
-        assert allocation.cash_residual_usdc == Decimal("0")
+        assert allocation.tranches[0].budget_usd == Decimal("499.500498000")
+        assert allocation.cash_residual_usdc <= Decimal("0.000016")
 
     def test_below_band_pool_is_excluded_with_typed_reason(self) -> None:
         """A qualifying pool under half the top's APR earns no tranche."""
@@ -697,7 +718,7 @@ class TestTierConstruction:
         top, second = allocation.tranches
         assert top.budget_usd == Decimal("350.00")  # 0.35 * 1000
         assert second.budget_usd == Decimal("350.00")  # also clamped
-        assert allocation.cash_residual_usdc == Decimal("300.00")
+        assert allocation.cash_residual_usdc == Decimal("299.300000")
         clamped = {item.symbol for item in allocation.excluded}
         assert clamped == {"BBBc", "AAAc"}
         reasons = {item.symbol: item.reason for item in allocation.excluded}
@@ -783,10 +804,10 @@ class TestCountAsOutput:
         # Weights 3/5 and 2/5 of 150: 90 funds the top; the second share
         # floors to 80 but only 60 remains, so it stays cash.
         assert [tranche.symbol for tranche in allocation.tranches] == ["BBBc"]
-        assert allocation.tranches[0].budget_usd == Decimal("90")
+        assert allocation.tranches[0].budget_usd == Decimal("89.9100880")
         excluded = {item.symbol: item.reason for item in allocation.excluded}
         assert excluded["AAAc"] is PortfolioExclusionReason.INSUFFICIENT_CASH
-        assert allocation.cash_residual_usdc == Decimal("60")
+        assert allocation.cash_residual_usdc == Decimal("60.000001")
 
     def test_cash_never_deploys_past_the_budget(self) -> None:
         """A later tier cannot spend cash an earlier tier consumed."""
@@ -813,7 +834,7 @@ class TestCountAsOutput:
         # 3/5 of 180 = 108 funds; the second share floors to 80 but only
         # 72 remains, so it stays cash rather than deploying a stub.
         assert [tranche.symbol for tranche in tight.tranches] == ["BBBc"]
-        assert tight.cash_residual_usdc == Decimal("72")
+        assert tight.cash_residual_usdc == Decimal("72.000001")
 
     def test_total_cap_headroom_bounds_deployment(self) -> None:
         """Committed capital comes off the deployable budget first."""
@@ -960,8 +981,11 @@ class TestRebalanceTriggers:
         assert step.kind is PortfolioStepKind.REALLOCATE
         assert step.symbol == "AAAc" and step.to_symbol == "BBBc"
         assert step.outcome.decision.action is PolicyActionKind.POOL_SWITCH
-        assert step.outcome.decision.size_usd == Decimal("100")  # the freed scale
-        assert plan.projected_committed_usdc == Decimal("100")
+        # The freed scale carries the executable-cost reserve and the
+        # switch preflight's conservative sale haircut, so the replacement
+        # always funds out of the projected post-exit inventory.
+        assert step.outcome.decision.size_usd == Decimal("98.9010980000")
+        assert plan.projected_committed_usdc == Decimal("98.9010980000")
         assert plan.projected_position_count == 1
 
     def test_margin_not_met_keeps_the_held_pool(self) -> None:
@@ -1213,12 +1237,13 @@ class TestEntryGateTransparencyAndScaledLatches:
         assert [tranche.symbol for tranche in allocation.tranches] == ["MSTRc"]
         tranche = allocation.tranches[0]
         # The cap is not engaged at this equity: the tranche takes the
-        # whole deployable target, over the configured eighty minimum.
-        assert tranche.budget_usd == self.LIVE_CASH
+        # whole deployable target under the executable-cost reserve, over
+        # the configured eighty minimum.
+        assert tranche.budget_usd == Decimal("102.1613440")
         assert tranche.budget_usd >= PortfolioParameters().effective_minimum_position_usdc(
             self.LIVE_EQUITY
         )
-        assert allocation.cash_residual_usdc == Decimal("0")
+        assert allocation.cash_residual_usdc <= Decimal("0.000016")
         # No clamp note rides below the activation equity: nothing was
         # clamped, and the summary names the funded shape.
         assert not any(
@@ -1425,11 +1450,11 @@ class TestLiveSndkcNight:
         allocation = self.allocation()
         assert [tranche.symbol for tranche in allocation.tranches] == ["SNDKc"]
         tranche = allocation.tranches[0]
-        assert tranche.budget_usd == self.LIVE_CASH
+        assert tranche.budget_usd == Decimal("102.1613440")
         effective = PortfolioParameters().effective_minimum_position_usdc(self.LIVE_EQUITY)
         assert effective == Decimal("0")
         assert tranche.budget_usd >= effective
-        assert allocation.cash_residual_usdc == Decimal("0")
+        assert allocation.cash_residual_usdc <= Decimal("0.000016")
         assert not any(
             item.reason is PortfolioExclusionReason.CONCENTRATION_CAP_CLAMPED
             for item in allocation.excluded
@@ -1491,7 +1516,7 @@ class TestLiveSndkcNight:
         allocation = self.allocation()
         assert allocation.gate_trace_symbol == "SNDKc"
         assert allocation.gate_trace_basis.startswith("entry gate chain for SNDKc at the")
-        assert f"{self.LIVE_CASH} USDC tranche basis" in allocation.gate_trace_basis
+        assert "102.161344 USDC tranche basis" in allocation.gate_trace_basis
         assert f"portfolio equity {self.LIVE_EQUITY}" in allocation.gate_trace_basis
         assert len(allocation.gate_trace) == 9
         assert all(line.split(":")[1].strip().startswith("PASS") for line in allocation.gate_trace)
@@ -1502,3 +1527,170 @@ class TestLiveSndkcNight:
         )
         assert "(about 34,791 percent)" in emissions_line
         assert "1.5 (about 150 percent)" in emissions_line
+
+
+class TestExecutableCostReserve:
+    """The acquisition-buffer reserve that keeps every funded tier payable.
+
+    The planner's live-balance preflight computes each entry's executable
+    cost as its quote side plus the balancing swap's acquisition buffer
+    (the shortfall times one-plus-``DEFAULT_SWAP_BUFFER_FRACTION``), so an
+    allocation whose tier targets consumed the whole deployable budget
+    deterministically starved its final entry - the 2026-10-03 faithful
+    reproduction refused the third sibling with ``needs 148.222222 against
+    147.972223 held`` and halted the cycle. The reserve rides inside the
+    tier targets: shares derive from the net distributable budget (the
+    deployable minus one money-grid quantum per planned tranche, all over
+    one-plus-buffer), the remaining-cash ledger decrements each funded
+    tranche's ceiled executable cost, and the residual reports the honest
+    expected post-execution cash.
+    """
+
+    THREE_NAME_BOARD = (
+        board_option("AAAc", AAA_POOL, AAA_TOKEN, emissions_apr=Decimal("2.0")),
+        board_option("BBBc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("3.0")),
+        board_option("CCCc", CCC_POOL, CCC_TOKEN, emissions_apr=Decimal("2.5")),
+    )
+
+    def test_a_full_deployment_never_refuses_its_last_entry(
+        self,
+    ) -> None:
+        """The original 500-USDC boundary funds every in-band tier.
+
+        Before the reserve, the third sibling's planner preflight refused
+        on the accumulated buffers; with it, every funded tier's
+        executable cost fits the remaining cash and no tier is stranded.
+        """
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, PolicyState(), self.THREE_NAME_BOARD, {})
+        allocation = allocate_portfolio(
+            engine,
+            PolicyState(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("500"),
+            equity_usdc=Decimal("500"),
+        )
+        assert len(allocation.tranches) == 3
+        assert not any(
+            item.reason is PortfolioExclusionReason.INSUFFICIENT_CASH
+            for item in allocation.excluded
+        )
+        # Every funded tranche's executable cost fits the live cash.
+        cash = Decimal("500")
+        spent = Decimal("0")
+        for tranche in allocation.tranches:
+            executable = (
+                tranche.budget_usd * (Decimal(1) + DEFAULT_SWAP_BUFFER_FRACTION)
+            ).quantize(TIER_SHARE_QUANTUM, rounding=ROUND_UP)
+            assert spent + executable <= cash
+            spent += executable
+        assert spent <= cash
+
+    def test_the_one_unit_ceiling_artifact_never_strands_a_tier(self) -> None:
+        """The reviewer's 500-USDC second-tier exclusion is repaired.
+
+        The naive reserve (shares over deployable/one-plus-buffer with
+        ceiled executables) stranded the second tier by a single raw USDC
+        unit - executable 185.185186 against 185.185185 remaining. The
+        net distributable budget absorbs the per-tranche ceiling
+        allowance up front, so an affordable profitable tier is never
+        discarded wholesale for a rounding artifact.
+        """
+        board = (
+            board_option("BBBc", BBB_POOL, BBB_TOKEN, emissions_apr=Decimal("3.0")),
+            board_option("AAAc", AAA_POOL, AAA_TOKEN, emissions_apr=Decimal("2.0")),
+        )
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, PolicyState(), board, {})
+        allocation = allocate_portfolio(
+            engine,
+            PolicyState(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("500"),
+            equity_usdc=Decimal("500"),
+        )
+        assert [tranche.symbol for tranche in allocation.tranches] == ["BBBc", "AAAc"]
+        assert not any(
+            item.reason is PortfolioExclusionReason.INSUFFICIENT_CASH
+            for item in allocation.excluded
+        )
+
+    def test_the_reserve_covers_the_exact_planner_requirement_across_geometries(
+        self,
+    ) -> None:
+        """The reserved cost never understates what the planner will need.
+
+        For a sweep of budgets, widths, and pre-held stock shapes, the
+        planner's exact executable requirement (quote side plus the
+        buffered balancing swap, at raw-unit precision, from
+        ``plan_mint_entry`` itself) never exceeds the reserved bound
+        budget times one-plus-buffer plus one money-grid quantum.
+        """
+        from test_lp_plan import mint_directive, pool_observation
+
+        policy = LpExecutionPolicy()
+        for budget in (Decimal("7"), Decimal("47"), Decimal("102.263507"), Decimal("500")):
+            for width in (1, 4, 60):
+                for held_stock_fraction in (Decimal("0"), Decimal("0.5"), Decimal("1")):
+                    observation = pool_observation()
+                    stock_side_units = int(
+                        budget
+                        * Decimal("0.5")
+                        * held_stock_fraction
+                        * Decimal(10) ** observation.stock_decimals
+                    )
+                    try:
+                        plan = plan_mint_entry(
+                            policy,
+                            observation,
+                            mint_directive(
+                                budget_usdc=budget,
+                                half_width_spacings=width,
+                            ),
+                            SafeInventory(
+                                usdc_units=int(budget * Decimal(10) ** 6),
+                                stock_units=stock_side_units,
+                            ),
+                        )
+                    except LpPlanRefusalError:
+                        continue
+                    swap_in = Decimal(plan.balancing_swap.usdc_in_units).scaleb(-6)
+                    usdc_side = Decimal(
+                        plan.amounts.amount0_desired_units
+                        if not observation.stock_is_token0
+                        else plan.amounts.amount1_desired_units
+                    ).scaleb(-6)
+                    exact_requirement = usdc_side + swap_in
+                    reserved = budget * (Decimal(1) + DEFAULT_SWAP_BUFFER_FRACTION) + Decimal(
+                        "0.000001"
+                    )
+                    assert exact_requirement <= reserved, (
+                        budget,
+                        width,
+                        held_stock_fraction,
+                        exact_requirement,
+                        reserved,
+                    )
+
+    def test_the_rounding_residual_is_bounded_by_the_tranche_count(self) -> None:
+        """The post-execution residual is rounding, never a held reserve."""
+        engine = PolicyEngine()
+        evaluations = evaluate_pool_entries(engine, PolicyState(), self.THREE_NAME_BOARD, {})
+        allocation = allocate_portfolio(
+            engine,
+            PolicyState(),
+            evaluations,
+            {},
+            held=(),
+            cash_usdc=Decimal("500"),
+            equity_usdc=Decimal("500"),
+        )
+        tranche_count = len(allocation.tranches)
+        # Each tranche contributes at most the share floor, the engine's
+        # basis round-trip, and the executable ceiling - all money-grid
+        # quanta; sixteen quanta per tranche bounds the whole chain.
+        assert allocation.cash_residual_usdc <= Decimal(16) * tranche_count * TIER_SHARE_QUANTUM

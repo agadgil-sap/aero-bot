@@ -167,6 +167,13 @@ CYCLE_OUT_OF_RANGE_GRACE_ENV = "AERO_BOT_CYCLE_OUT_OF_RANGE_GRACE_MINUTES"
 # accumulated unclaimed AERO converts to USDC inside the cycle's act step
 # once its value at the last observed price exceeds it (default 5).
 CYCLE_AERO_CONVERSION_MIN_ENV = "AERO_BOT_CYCLE_AERO_CONVERSION_MIN_USDC"
+# Environment variable carrying the reward posture (the captain's
+# retained-AERO ruling): "convert" (the default) claims and swaps rewards
+# to USDC inside the act step; "retain" keeps claiming through the same
+# audited collect surface but holds the AERO in the Safe as book equity and
+# never invokes the conversion swap - so a restart cannot trip over a
+# failing conversion surface while rewards keep accruing and attributing.
+CYCLE_REWARD_POSTURE_ENV = "AERO_BOT_CYCLE_REWARD_POSTURE"
 # Environment variables carrying the allocator's portfolio bounds (the
 # captain's gnhf 33 ruling): every default is locked and every override
 # stays under the hard ceilings PortfolioParameters enforces.
@@ -314,6 +321,34 @@ class CycleMode(StrEnum):
     DRY_RUN = "dry_run"
     # Execute policy-authorized actions through the audited surfaces.
     LIVE = "live"
+
+
+class RewardPosture(StrEnum):
+    """Identify what the act step does with claimed AERO rewards.
+
+    The captain's retained-AERO ruling (2026-10): the automatic conversion
+    stays the shipped default, but the venue's own AERO accumulation is the
+    strategy's tracked asset, so a sealed posture can retain rewards instead
+    of converting them - claims, accounting, and value attribution keep
+    running identically, and the conversion swap simply never fires. This
+    also keeps a restart from immediately invoking the conversion swap while
+    its routing defect (the 47-of-47 GS013 era) is under reassessment.
+    """
+
+    # Claim rewards and swap the Safe's whole AERO balance to USDC inside
+    # the act step once the value crosses the sealed threshold (the
+    # long-standing default behavior).
+    CONVERT = "convert"
+    # Claim rewards through the same audited collect surface, but retain
+    # the AERO in the Safe as book equity; never invoke the conversion
+    # swap.
+    RETAIN = "retain"
+
+
+# The default reward posture: claim and convert, the shipped behavior.
+DEFAULT_REWARD_POSTURE = RewardPosture.CONVERT
+# Every posture the sealed environment may select.
+REWARD_POSTURE_CHOICES = frozenset({posture.value for posture in RewardPosture})
 
 
 class TrackedPosition(BaseModel):
@@ -889,6 +924,11 @@ class CyclePositionYield(BaseModel):
     # earned delta), valued at the last observed price, None when
     # unmeasurable.
     aero_rewards_usdc: Decimal | None = None
+    # The same reward accrual as raw AERO units (the staked earned delta),
+    # reported beside its mark-to-market so the units themselves stay
+    # visible: a reward balance is never a performance number until it is
+    # priced and decomposed (the captain's retained-AERO ruling).
+    aero_rewards_units: int | None = None
     # The position's fees earned since its baseline, computed from fee
     # growth, None when unmeasurable.
     fees_earned_usdc: Decimal | None = None
@@ -944,6 +984,11 @@ class CycleYieldAttribution(BaseModel):
     # AERO rewards accrued since the day baseline, valued at the last
     # observed price, None when unmeasurable.
     aero_rewards_usdc: Decimal | None = None
+    # The same day's reward accrual as raw AERO units (unclaimed now, plus
+    # anything converted today, minus the day-start baseline), reported
+    # beside its mark-to-market so earned units and their value stay
+    # separately visible.
+    aero_rewards_units: int | None = None
     # Fees earned since the day baseline, computed from fee growth, None
     # when unmeasurable.
     fees_earned_usdc: Decimal | None = None
@@ -1066,6 +1111,10 @@ class CycleReportPayload(BaseModel):
     peak_equity_usdc: str | None = None
     # AERO rewards accrued since the day baseline, else None.
     yield_aero_rewards_usdc: str | None = None
+    # The same reward accrual as raw AERO units, so the audited record
+    # separates earned units from their mark-to-market (the retained-AERO
+    # ruling: no raw reward balance is ever net performance).
+    yield_aero_rewards_units: str | None = None
     # Fees earned since the day baseline, computed, else None.
     yield_fees_earned_usdc: str | None = None
     # Stock mark-to-market since the day baseline, else None.
@@ -1260,6 +1309,10 @@ class CycleBalanceBoundary(Protocol):
 
     def fetch_transaction_receipt(self, transaction_hash: str) -> dict[str, object] | None:
         """Fetch one transaction receipt for mint-event decoding."""
+        ...
+
+    def fetch_chain_id(self) -> int:
+        """Read the endpoint's chain id, proving the expected chain."""
         ...
 
 
@@ -1596,6 +1649,7 @@ class CycleRunner:
         switch_margin_fraction: Decimal = DEFAULT_SWITCH_MARGIN_FRACTION,
         parameters: PolicyParameters = LOCKED_POLICY_PARAMETERS,
         aero_conversion_min_usdc: Decimal = DEFAULT_AERO_CONVERSION_MIN_USDC,
+        reward_posture: RewardPosture = DEFAULT_REWARD_POSTURE,
         portfolio_parameters: PortfolioParameters | None = None,
         income_history_cycles: int | None = None,
         stock_dust_floor_usdc: Decimal = DEFAULT_STOCK_DUST_FLOOR_USDC,
@@ -1627,6 +1681,10 @@ class CycleRunner:
                 out-of-range grace override applied.
             aero_conversion_min_usdc: The unclaimed-AERO value threshold that
                 triggers the reward conversion inside the act step.
+            reward_posture: What the act step does with claimed rewards
+                (the captain's retained-AERO ruling): convert swaps them to
+                USDC once the value crosses the threshold, retain claims but
+                holds the AERO in the Safe and never invokes the swap.
             portfolio_parameters: The portfolio allocation parameter set
                 (the allocator ruling); None builds the locked defaults
                 carrying this runner's switch margin.
@@ -1660,6 +1718,7 @@ class CycleRunner:
         self._switch_margin_fraction = switch_margin_fraction
         self._parameters = parameters
         self._aero_conversion_min_usdc = aero_conversion_min_usdc
+        self._reward_posture = reward_posture
         self._stock_dust_floor_usdc = stock_dust_floor_usdc
         self._stock_dust_aggregate_usdc = stock_dust_aggregate_usdc
         self._portfolio_parameters_value = portfolio_parameters
@@ -1808,6 +1867,15 @@ class CycleRunner:
         unclaimed_aero_units: int | None = None
         unclaimed_aero_value: Decimal | None = None
         book = self._state_store.load()
+        # A crashed act can die between a broadcast's durable send record
+        # and its receipt row - chain truth confirmed, journal evidence one
+        # row short - which left the position permanently unprovable and
+        # every later cycle refused out-of-band (the 2026-10-03 gap
+        # reproduction). The heal proves those deliveries from their
+        # on-chain receipts and appends the truthful outcome rows before
+        # anything reconciles; unprovable deliveries stay exactly as
+        # fail-closed as before.
+        self._heal_unconfirmed_sent_deliveries()
         reconciliation = self._reconcile(book)
         decision_reconciliation = reconciliation
         final_reconciliation_verified = True
@@ -1831,7 +1899,11 @@ class CycleRunner:
                 # position_empty refusal loop (2026-09-28 live wedge).
                 for empty_token_id in reconciliation.empty_tracked_token_ids:
                     book = _book_with_position_removed(book, empty_token_id)
-            book = self._adopt_into_book(book, reconciliation)
+            book, reconciliation = self._adopt_into_book(book, reconciliation)
+            decision_reconciliation = reconciliation
+            # The decide phase reads the runner's cached reconciliation:
+            # the adopted row's freshly folded status must be visible to it.
+            self._last_reconciliation = reconciliation
             book = self._fold_recovered_positions(book, reconciliation)
             decision_report = self._decide(
                 book,
@@ -2363,8 +2435,8 @@ class CycleRunner:
         its pool, the plan's recorded owner being this Safe - and the live
         status read verifies the custody. Only evidence both the audit
         chain and the chain state prove adopts; anything else skips
-        quietly (burned history) or refuses the cycle (proven custody
-        violated). A candidate whose status read cannot complete is
+        quietly (burned or delisted history) or refuses the cycle (proven
+        custody violated). A candidate whose status read cannot complete is
         unknown truth, not absence: the read propagates and fails the
         cycle for the retry, exactly like every other reconcile read.
         Pinned cycles never fold cross-symbol rows into their
@@ -2382,6 +2454,8 @@ class CycleRunner:
         Raises:
             ExecutionUnavailableError: If a candidate's live status read
                 cannot complete.
+            LpExecutionRefusalError: If a candidate's status read refuses
+                for anything but burned or delisted history.
         """
         if self._audit_reader is None:
             return [], ""
@@ -2451,17 +2525,22 @@ class CycleRunner:
             try:
                 status = self._reads.position_status(symbol, token_id)
             except LpExecutionRefusalError as error:
-                if getattr(error, "code", None) == LpExecutionRefusalCode.POSITION_NOT_OWNED:
+                if error.code == LpExecutionRefusalCode.POSITION_NOT_OWNED:
                     return recovered, (
                         f"audit-proven position NFT {token_id} on {symbol} is owned by "
                         f"a stranger ({error}); refusing the cycle"
                     )
-                # Burned or unresolvable history - an exited position's
-                # stale plan, or a pool that left the registry. Nothing
-                # adopts and nothing refuses.
-                continue
-            except ValueError:
-                continue
+                if error.code in (
+                    LpExecutionRefusalCode.POSITION_UNKNOWN,
+                    LpExecutionRefusalCode.SYMBOL_NOT_IN_REGISTRY,
+                    LpExecutionRefusalCode.POOL_NOT_DISCOVERED,
+                    LpExecutionRefusalCode.POOL_MISSING_NFPM_OR_GAUGE,
+                ):
+                    # Burned or delisted history - an exited position's
+                    # burned plan, or a pool the registry or venue no
+                    # longer lists. Nothing adopts and nothing refuses.
+                    continue
+                raise
             owner = normalize_evm_address(status.token_owner_address)
             gauge = normalize_evm_address(status.gauge_address)
             view = getattr(status, "position", None)
@@ -2599,6 +2678,199 @@ class CycleRunner:
         pool, _ = self._sources.resolve_pool(symbol)
         return pool
 
+    # The Safe contract's ExecutionSuccess event topic, the inner-success
+    # proof a delivery receipt must carry before crash-recovery may grant
+    # it successful provenance (keccak of ExecutionSuccess(bytes32,uint256)).
+    SAFE_EXECUTION_SUCCESS_TOPIC0 = (
+        "0x442e715f626346e8c54381002da614f62bee8d27386535b2521ec8540898556e"
+    )
+
+    def _heal_unconfirmed_sent_deliveries(self) -> None:
+        """Prove sent-but-unrecorded deliveries from their on-chain receipts.
+
+        The executor appends one durable send record before every broadcast -
+        the sent row, or its broadcast-unknown sibling when the endpoint's
+        acknowledgement was lost after the node may already have accepted the
+        transaction - and its receipt row after inclusion. A process death
+        between the two leaves chain truth confirmed but the journal one row
+        short, so the crashed entry could never prove itself and every later
+        cycle refused out-of-band forever. The heal closes exactly that gap:
+        for every send record of this runner's Safe that carries no receipt
+        row, the on-chain receipt is fetched and its truthful outcome row
+        appended - nothing more. Unknown or still-pending deliveries stay
+        unproven (the fail-closed refusals stand), reverted deliveries
+        record their failure, and no delivery is ever re-broadcast or
+        guessed. The appended rows carry the posthumous provenance so the
+        journal never misattributes them to a live execution.
+
+        Raises:
+            ExecutionUnavailableError: If a gap's receipt cannot be read -
+                unknown truth fails the cycle for the retry, exactly like
+                every other reconcile read.
+        """
+        if self._audit_reader is None or self._audit_sink is None:
+            return
+        records = self._audit_reader.recent_records()
+        receipted_hashes: set[str] = set()
+        sent_rows: list[tuple[str, str, str, str, str]] = []
+        for record in records:
+            payload = json.loads(record.payload_json)
+            if record.event_type in (
+                AuditEventType.LP_EXECUTE_SENT,
+                AuditEventType.LP_EXECUTE_BROADCAST_UNKNOWN,
+            ):
+                # The audit store is shared by every Safe that executes
+                # through it: only this runner's own sends heal here. A
+                # malformed send row - missing its action, role, hashes, or
+                # nonce - is ambiguous evidence and stays unproven.
+                if str(payload.get("safe_address", "")).lower() != self._safe_address:
+                    continue
+                if not all(
+                    str(payload.get(field, ""))
+                    for field in ("action", "role", "safe_tx_hash", "transaction_hash")
+                ):
+                    continue
+                sent_rows.append(
+                    (
+                        str(payload.get("action", "")),
+                        str(payload.get("role", "")),
+                        str(payload.get("relayer_address", "")),
+                        str(payload.get("safe_tx_hash", "")),
+                        str(payload.get("transaction_hash", "")),
+                    )
+                )
+            elif record.event_type in (
+                AuditEventType.LP_EXECUTE_CONFIRMED,
+                AuditEventType.LP_EXECUTE_FAILED,
+            ):
+                receipted_hashes.add(str(payload.get("transaction_hash", "")))
+        from aero_bot.lp_executor import LpExecuteReceiptPayload, LpExecutionRole
+        from aero_bot.safe_tx import SAFE_CHAIN_ID
+
+        # Receipt-derived provenance describes exactly one chain: verify
+        # the endpoint serves the expected Base mainnet before anything is
+        # appended, so a foreign-chain endpoint can never lend its truth
+        # to this Safe's journal. The refusal appends nothing and
+        # broadcasts nothing.
+        if sent_rows:
+            chain_id = self._balances.fetch_chain_id()
+            if chain_id != SAFE_CHAIN_ID:
+                raise ValueError(
+                    "refusing to recover sent deliveries: the RPC endpoint reports "
+                    f"chain {chain_id}, not Base mainnet {SAFE_CHAIN_ID}; recovered "
+                    "provenance would describe a foreign chain"
+                )
+
+        for action, role, relayer, safe_tx_hash, transaction_hash in sent_rows:
+            if transaction_hash in receipted_hashes:
+                continue
+            try:
+                execution_role = LpExecutionRole(role)
+            except ValueError as error:
+                # A corrupt role is corrupt evidence: refuse the cycle with
+                # a typed message - never crash, never heal, never guess.
+                raise ValueError(
+                    f"corrupt audit evidence: the sent row's role {role!r} is not a "
+                    "known execution role; refusing to recover it"
+                ) from error
+            # Receipt lookups stay bounded to the unresolved gaps: every
+            # already-receipted send is skipped above, so a healthy journal
+            # costs this pass one local scan and zero RPC calls.
+            receipt = self._balances.fetch_transaction_receipt(transaction_hash)
+            if receipt is None:
+                # Still pending or unknown: nothing is proven, nothing is
+                # appended - the fail-closed refusal path stands.
+                continue
+            receipt_hash = str(receipt.get("transactionHash", transaction_hash))
+            receipt_to = str(receipt.get("to", "")).lower()
+            receipt_from = str(receipt.get("from", "")).lower()
+            if (
+                receipt_hash.lower() != transaction_hash.lower()
+                or (receipt_to and receipt_to != self._safe_address)
+                or (receipt_from and relayer and receipt_from != relayer.lower())
+            ):
+                # The receipt does not describe this Safe's own send through
+                # its relayer: foreign evidence never gains provenance.
+                continue
+            status_word = receipt.get("status")
+            try:
+                status = (
+                    int(str(status_word), 16)
+                    if isinstance(status_word, str)
+                    else int(status_word)
+                    if isinstance(status_word, int)
+                    else 0
+                )
+                block_number = int(str(receipt.get("blockNumber", "0x0")), 16)
+                gas_used = int(str(receipt.get("gasUsed", "0x0")), 16)
+                effective_gas_price = int(str(receipt.get("effectiveGasPrice", "0x0")), 16)
+            except (TypeError, ValueError) as error:
+                raise ExecutionUnavailableError(
+                    f"the recovery receipt for {transaction_hash} was malformed: {error}"
+                ) from error
+            raw_logs = receipt.get("logs")
+            logs = raw_logs if isinstance(raw_logs, list) else []
+            topics = [
+                str(topic).lower()
+                for log in logs
+                if isinstance(log, dict)
+                for topic in (log.get("topics") or [])
+            ]
+            # The inner-success proof is the Safe's own ExecutionSuccess
+            # event naming THIS submitted call's safe_tx_hash - not merely
+            # an outer status word, and never an unrelated success event.
+            safe_inner_success = any(
+                str(log.get("topics", [""])[0]).lower() == self.SAFE_EXECUTION_SUCCESS_TOPIC0
+                and len(log.get("topics") or []) > 1
+                and str(log["topics"][1]).lower() == safe_tx_hash.lower()
+                for log in logs
+                if isinstance(log, dict)
+            )
+            # The mint's financial effect is the IncreaseLiquidity event
+            # naming the position it created; without it a status-one
+            # receipt still proves no mint happened. Adoption and accounting
+            # keep consuming the existing reconciliation's custody and
+            # balance effects - this proof only closes the journal gap.
+            effect_proof = NFPM_INCREASE_LIQUIDITY_TOPIC0 in topics if role == "mint" else True
+            confirmed = status == 1 and safe_inner_success and effect_proof
+            failure_diagnostic = ""
+            if status == 1 and not confirmed:
+                failure_diagnostic = (
+                    "the outer delivery reports success but the Safe's "
+                    "ExecutionSuccess proof is missing"
+                    if not safe_inner_success
+                    else "the mint delivery carries no IncreaseLiquidity effect"
+                )
+            self._audit_sink.append(
+                AuditEventType.LP_EXECUTE_CONFIRMED
+                if confirmed
+                else AuditEventType.LP_EXECUTE_FAILED,
+                LpExecuteReceiptPayload(
+                    outcome="confirmed" if confirmed else "failed",
+                    action=action,
+                    role=execution_role,
+                    safe_tx_hash=safe_tx_hash,
+                    transaction_hash=transaction_hash,
+                    block_number=block_number,
+                    gas_used=gas_used,
+                    effective_gas_price_wei=effective_gas_price,
+                    inclusion_ms=0,
+                    diagnostic=(
+                        (failure_diagnostic + "; " if failure_diagnostic else "")
+                        + "recovered posthumously by crash-recovery: the durable send "
+                        "record outlived its process before the receipt row landed; "
+                        "the on-chain receipt proves this delivery's outcome"
+                    ),
+                ),
+                self._now(),
+            )
+            receipted_hashes.add(transaction_hash)
+            _cycle_progress(
+                f"crash-recovery proved the sent {action} delivery {transaction_hash} "
+                f"from its on-chain receipt ({'confirmed' if confirmed else 'failed'}); "
+                "the truthful outcome row now closes the journal gap"
+            )
+
     def _adoption_evidence(self, live_ids: tuple[int, ...]) -> int | None:
         """Prove one live untracked position is ours from the audit chain.
 
@@ -2635,9 +2907,20 @@ class CycleRunner:
 
     def _adopt_into_book(
         self, book: CycleStateBook, reconciliation: CycleReconciliation
-    ) -> CycleStateBook:
-        """Fold reconciliation adoptions into the book before deciding."""
+    ) -> tuple[CycleStateBook, CycleReconciliation]:
+        """Fold reconciliation adoptions into the book before deciding.
+
+        The adopted row must also enter the reconciliation's own status
+        rows: every status-driven surface - the per-position policy folds,
+        the allocator's held facts, the equity's LP value - reads the
+        reconciliation, and an adopted position without a status row is
+        invisible to the decision that must steward it (the 2026-10-03
+        gap-repair evidence: the allocator re-entered the adopted symbol,
+        the fresh row replaced the adopted one, and the orphaned NFT
+        refused the final reconciliation).
+        """
         updates: dict[str, object] = {}
+        adopted_reconciliation = reconciliation
         if (
             not book.positions
             and reconciliation.tracked_token_id is not None
@@ -2655,14 +2938,34 @@ class CycleRunner:
                 )
             else:
                 adopted_symbol, committed = proven
+                adopted_token = reconciliation.tracked_token_id
                 updates["positions"] = (
                     TrackedPosition(
                         symbol=adopted_symbol,
-                        token_id=reconciliation.tracked_token_id,
+                        token_id=adopted_token,
                         pool_address=self._pool_for_symbol(adopted_symbol).pool_address,
                         committed_usd=committed,
                         entered_at=self._now(),
                     ),
+                )
+                adopted_status = self._adopted_position_status(
+                    adopted_symbol, adopted_token, committed
+                )
+                adopted_reconciliation = reconciliation.model_copy(
+                    update={
+                        "position_statuses": (
+                            *reconciliation.position_statuses,
+                            PositionStatusRecord(
+                                symbol=adopted_symbol,
+                                token_id=adopted_token,
+                                pool_address=self._pool_for_symbol(adopted_symbol).pool_address,
+                                committed_usd=committed,
+                                staked=normalize_evm_address(adopted_status.token_owner_address)
+                                == normalize_evm_address(adopted_status.gauge_address),
+                                status=adopted_status,
+                            ),
+                        )
+                    }
                 )
         if (
             book.held_inventory is None
@@ -2678,8 +2981,27 @@ class CycleRunner:
                 held_since=self._now(),
             )
         if not updates:
-            return book
-        return book.model_copy(update=updates)
+            return book, adopted_reconciliation
+        return book.model_copy(update=updates), adopted_reconciliation
+
+    def _adopted_position_status(
+        self, symbol: str, token_id: int, committed: Decimal
+    ) -> LpPositionStatusReport:
+        """Read one adopted position's live custody for this cycle's folds.
+
+        The adoption happened after the reconciliation enumerated statuses,
+        so the row would otherwise be invisible to the decision; the read
+        is the same audited status surface the reconcile itself uses, and a
+        refusal fails the cycle for the next tick's retry exactly like the
+        reconcile's own status reads - never a guessed custody, and never a
+        book-only adoption the decision cannot see and the allocator would
+        re-enter.
+
+        Raises:
+            LpExecutionRefusalError: If any status gate refuses.
+            ExecutionUnavailableError: If the read cannot complete.
+        """
+        return self._reads.position_status(symbol, token_id, entry_cost_usdc=committed)
 
     def _fold_recovered_positions(
         self, book: CycleStateBook, reconciliation: CycleReconciliation
@@ -4987,6 +5309,18 @@ class CycleRunner:
         safe_units = self._balances.fetch_token_balance(AERO_TOKEN_ADDRESS, self._safe_address)
         if safe_units <= 0:
             return records, halted, book, 0
+        if self._reward_posture is RewardPosture.RETAIN:
+            # The retain posture (the captain's retained-AERO ruling): the
+            # claim above already moved the earned rewards into the Safe,
+            # and the AERO stays there as priced book equity. The conversion
+            # swap never fires - so a restart cannot trip over a failing
+            # conversion surface - while claims, accounting, and value
+            # attribution keep running exactly as under convert.
+            _cycle_progress(
+                f"retained {Decimal(safe_units).scaleb(-AERO_DECIMALS)} AERO in the Safe "
+                "under the retain reward posture; the conversion swap did not run"
+            )
+            return records, halted, book, 0
         swap_report = run(
             "aero_swap", lambda: executor.execute_aero_swap(key_bytes, confirm_broadcast=True)
         )
@@ -5285,11 +5619,15 @@ class CycleRunner:
                     row_diagnostic + "; " if row_diagnostic else ""
                 ) + "stock mark-to-market unmeasured: no baseline price or quote"
             row_aero: Decimal | None = None
+            row_aero_units: int | None = None
             earned_now = status.accrued_aero_earned_units or 0
-            if row is not None and aero_price is not None:
-                row_aero = +(
-                    Decimal(earned_now - row.aero_earned_units).scaleb(-AERO_DECIMALS) * aero_price
-                )
+            if row is not None:
+                # Raw earned units report independently of the price: the
+                # units are the reward accrual itself, never a performance
+                # number until priced and decomposed (retained-AERO ruling).
+                row_aero_units = earned_now - row.aero_earned_units
+                if aero_price is not None:
+                    row_aero = +(Decimal(row_aero_units).scaleb(-AERO_DECIMALS) * aero_price)
             if row_fees is not None:
                 fees_total = (fees_total or Decimal("0")) + row_fees
             if row_mtm is not None:
@@ -5299,6 +5637,7 @@ class CycleRunner:
                     symbol=record.symbol,
                     token_id=record.token_id,
                     aero_rewards_usdc=row_aero,
+                    aero_rewards_units=row_aero_units,
                     fees_earned_usdc=row_fees,
                     stock_mark_to_market_usdc=row_mtm,
                     diagnostic=row_diagnostic,
@@ -5327,13 +5666,17 @@ class CycleRunner:
                     )
                 )
         aero_rewards: Decimal | None = None
+        aero_rewards_units: int | None = None
         earned = sum(
             (record.status.accrued_aero_earned_units or 0 for record in statuses.values()),
             0,
         )
         unclaimed_now = reconciliation.safe_aero_units + earned
+        delta_units = unclaimed_now + baseline.aero_converted_units - baseline.aero_units
+        # The unit count is measurable whenever the baseline exists, even
+        # without a price; only the value line needs the observed price.
+        aero_rewards_units = delta_units
         if aero_price is not None:
-            delta_units = unclaimed_now + baseline.aero_converted_units - baseline.aero_units
             aero_rewards = +(Decimal(delta_units).scaleb(-AERO_DECIMALS) * aero_price)
         else:
             diagnostics.append("AERO rewards unmeasured: no AERO price was observed")
@@ -5355,6 +5698,7 @@ class CycleRunner:
         return CycleYieldAttribution(
             day_pnl_usdc=day_pnl_usdc,
             aero_rewards_usdc=aero_rewards,
+            aero_rewards_units=aero_rewards_units,
             fees_earned_usdc=fees_total,
             stock_mark_to_market_usdc=mtm_total,
             unattributed_usdc=unattributed,
@@ -5362,7 +5706,8 @@ class CycleRunner:
             method=(
                 "AERO rewards: unclaimed units (Safe balance plus staked earned, plus any "
                 "converted today) minus the day-start baseline, valued at the last "
-                "observed AERO price.",
+                "observed AERO price; the raw unit count rides beside the value so "
+                "earned units never masquerade as net performance.",
                 "Fees earned: liquidity times the delta of the pool's feeGrowthInside "
                 "accumulators since the day-start (or position-adoption) baseline - "
                 "computed, never the stale checkpoint; pre-share pool-side entitlement.",
@@ -5565,6 +5910,10 @@ def record_cycle_report(audit_sink: AuditStore, report: CycleReport, created_at:
             if report.yield_attribution is not None
             and report.yield_attribution.aero_rewards_usdc is not None
             else None,
+            yield_aero_rewards_units=str(report.yield_attribution.aero_rewards_units)
+            if report.yield_attribution is not None
+            and report.yield_attribution.aero_rewards_units is not None
+            else None,
             yield_fees_earned_usdc=str(report.yield_attribution.fees_earned_usdc)
             if report.yield_attribution is not None
             and report.yield_attribution.fees_earned_usdc is not None
@@ -5699,6 +6048,16 @@ def _print_report(report: CycleReport) -> None:
             return f"  {label}: {value if value is not None else 'unmeasured'} USDC"
 
         print(component("aero rewards accrued", attribution.aero_rewards_usdc))
+        units_line = "unmeasured"
+        if attribution.aero_rewards_units is not None:
+            units_line = (
+                f"{Decimal(attribution.aero_rewards_units).scaleb(-AERO_DECIMALS)} AERO "
+                f"({attribution.aero_rewards_units} raw units)"
+            )
+        print(
+            f"  aero rewards earned units: {units_line} - units beside their "
+            "mark-to-market, never a net-performance number by themselves"
+        )
         print(component("fees earned (computed)", attribution.fees_earned_usdc))
         print(component("stock mark-to-market", attribution.stock_mark_to_market_usdc))
         print(component("unattributed residual", attribution.unattributed_usdc))
@@ -5819,6 +6178,29 @@ def _aero_conversion_min_from_environment(environ: Mapping[str, str]) -> Decimal
     if value < 0:
         raise ValueError(f"{CYCLE_AERO_CONVERSION_MIN_ENV} must be non-negative, not {raw!r}")
     return value
+
+
+def _reward_posture_from_environment(environ: Mapping[str, str]) -> RewardPosture:
+    """Read the reward posture from the sealed environment.
+
+    Args:
+        environ: The environment mapping carrying the optional posture.
+
+    Returns:
+        The configured posture, or the claim-and-convert default.
+
+    Raises:
+        ValueError: If the configured posture is not one of the choices.
+    """
+    raw = environ.get(CYCLE_REWARD_POSTURE_ENV, "").strip()
+    if not raw:
+        return DEFAULT_REWARD_POSTURE
+    if raw not in REWARD_POSTURE_CHOICES:
+        raise ValueError(
+            f"{CYCLE_REWARD_POSTURE_ENV} must be one of "
+            f"{','.join(sorted(REWARD_POSTURE_CHOICES))}, not {raw!r}"
+        )
+    return RewardPosture(raw)
 
 
 def _stock_dust_floor_from_environment(environ: Mapping[str, str]) -> Decimal:
@@ -6012,6 +6394,7 @@ def build_cycle_runner(
     switch_margin_fraction: Decimal = DEFAULT_SWITCH_MARGIN_FRACTION,
     parameters: PolicyParameters = LOCKED_POLICY_PARAMETERS,
     aero_conversion_min_usdc: Decimal = DEFAULT_AERO_CONVERSION_MIN_USDC,
+    reward_posture: RewardPosture = DEFAULT_REWARD_POSTURE,
     portfolio_parameters: PortfolioParameters | None = None,
     income_history_cycles: int | None = None,
     stock_dust_floor_usdc: Decimal = DEFAULT_STOCK_DUST_FLOOR_USDC,
@@ -6031,6 +6414,10 @@ def build_cycle_runner(
         parameters: The policy parameters decisions run under.
         aero_conversion_min_usdc: The unclaimed-AERO value threshold that
             triggers the reward conversion inside the act step.
+        reward_posture: What the act step does with claimed rewards
+            (the captain's retained-AERO ruling): convert swaps them to
+            USDC once the value crosses the threshold, retain claims but
+            holds the AERO in the Safe and never invokes the swap.
         portfolio_parameters: The allocator's portfolio bounds; None keeps
             the locked defaults carrying the switch margin.
         income_history_cycles: The conservative income window in cycles;
@@ -6115,6 +6502,7 @@ def build_cycle_runner(
         switch_margin_fraction=switch_margin_fraction,
         parameters=parameters,
         aero_conversion_min_usdc=aero_conversion_min_usdc,
+        reward_posture=reward_posture,
         portfolio_parameters=portfolio_parameters,
         income_history_cycles=income_history_cycles,
         stock_dust_floor_usdc=stock_dust_floor_usdc,
@@ -6306,6 +6694,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--reward-posture",
+        choices=sorted(REWARD_POSTURE_CHOICES),
+        default=None,
+        help=(
+            "What the act step does with claimed AERO rewards: convert "
+            "(default) claims and swaps them to USDC once the value crosses "
+            "the sealed threshold; retain claims through the same audited "
+            "collect surface but holds the AERO in the Safe as book equity "
+            "and never invokes the conversion swap (the sealed "
+            "AERO_BOT_CYCLE_REWARD_POSTURE variable supplies the same value "
+            "when the flag is absent)."
+        ),
+    )
+    parser.add_argument(
         "--stock-dust-floor-usdc",
         type=Decimal,
         default=None,
@@ -6459,6 +6861,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if arguments.aero_conversion_min_usdc is not None
             else _aero_conversion_min_from_environment(os.environ)
         )
+        reward_posture = (
+            RewardPosture(arguments.reward_posture)
+            if arguments.reward_posture is not None
+            else _reward_posture_from_environment(os.environ)
+        )
         stock_dust_floor = (
             arguments.stock_dust_floor_usdc
             if arguments.stock_dust_floor_usdc is not None
@@ -6583,6 +6990,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             switch_margin,
             parameters,
             aero_conversion_min,
+            reward_posture,
             portfolio_parameters,
             income_history_cycles,
             stock_dust_floor,

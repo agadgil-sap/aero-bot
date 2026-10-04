@@ -1231,6 +1231,19 @@ class ExecutorRpcBackend:
         )
         return self._decode_hex_quantity(result, "eth_getBalance")
 
+    def fetch_chain_id(self) -> int:
+        """Read the endpoint's chain id.
+
+        Returns:
+            The EIP-155 chain id the endpoint serves.
+
+        Raises:
+            ExecutionUnavailableError: If the read cannot complete or is
+                malformed.
+        """
+        result = cast("str", self._rpc_call("eth_chainId", []))
+        return self._decode_hex_quantity(result, "eth_chainId")
+
     def fetch_gas_price(self) -> int:
         """Read the endpoint's suggested gas price in wei.
 

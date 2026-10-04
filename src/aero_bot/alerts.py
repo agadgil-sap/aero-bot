@@ -33,7 +33,7 @@ from typing import Protocol, TextIO, runtime_checkable
 import httpx
 
 from aero_bot.cycle import CycleReport
-from aero_bot.emissions_apr import format_apr_percent
+from aero_bot.emissions_apr import AERO_DECIMALS, format_apr_percent
 
 # Environment variable selecting the alert transport: smtp, resend, or none.
 ALERT_PROVIDER_ENV = "AERO_BOT_ALERT_PROVIDER"
@@ -709,6 +709,14 @@ def compose_cycle_email(report: CycleReport, alerts: tuple[str, ...]) -> tuple[s
             return f"  {label:<20}{rendered}"
 
         lines.append(component("aero rewards", attribution.aero_rewards_usdc))
+        units_line = "unmeasured"
+        if attribution.aero_rewards_units is not None:
+            units_line = (
+                f"{Decimal(attribution.aero_rewards_units).scaleb(-AERO_DECIMALS)} AERO "
+                "earned units (raw balance beside its mark-to-market, never "
+                "net performance)"
+            )
+        lines.append(f"  {'aero units earned':<20}{units_line}")
         lines.append(component("fees (computed)", attribution.fees_earned_usdc))
         lines.append(component("stock mark-to-mkt", attribution.stock_mark_to_market_usdc))
         lines.append(component("unattributed", attribution.unattributed_usdc))
