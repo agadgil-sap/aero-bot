@@ -140,6 +140,12 @@ AERO_BOT_BASE_RPC_URL=https://base.publicnode.com
 # Trading authority comes from the exact resolved Aerodrome pool. Manual
 # --reference-price remains available for research and diagnostic runs.
 # Never seal a static reference as unattended trading authority.
+# The live underlying-equity reference feed: off (the default) keeps the
+# injected-constant behavior, yahoo reads the credential-free chart
+# endpoint, and finnhub reads the keyed /quote endpoint (requires sealing
+# AERO_BOT_STOCK_REFERENCE_TOKEN, a free finnhub.io key). Every feed quote
+# carries the provider's own as-of age and stays diagnostic-only.
+#AERO_BOT_CYCLE_REFERENCE_FEED=off
 # The cycle's symbol scope: unset or "auto" runs the cross-board selector
 # over every verified B20 pool (the default); an explicit symbol pins one
 # pool for operator runs. The systemd template's instance name (--symbol %i)

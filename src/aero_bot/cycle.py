@@ -119,6 +119,11 @@ from aero_bot.selector import (
     closest_call_evaluation,
     evaluate_pool_entries,
 )
+from aero_bot.stock_reference import (
+    FinnhubQuoteStockReferenceBackend,
+    StockReferenceFeed,
+    YahooChartStockReferenceBackend,
+)
 from aero_bot.strategy import (
     SELECTOR_SYMBOL,
     BoardListing,
@@ -136,6 +141,13 @@ from aero_bot.venues import AERO_TOKEN_ADDRESS, BASE_USDC_ADDRESS, PoolCandidate
 CYCLE_STATE_PATH_ENV = "AERO_BOT_CYCLE_STATE_PATH"
 # Environment variable carrying an optional injected reference quote.
 CYCLE_REFERENCE_PRICE_ENV = "AERO_BOT_CYCLE_REFERENCE_PRICE_USDC"
+# Environment variable selecting the live underlying-equity reference feed
+# (off, yahoo, or finnhub); the default off keeps production unchanged
+# until the operator arms the feed in the sealed cycle environment.
+CYCLE_REFERENCE_FEED_ENV = "AERO_BOT_CYCLE_REFERENCE_FEED"
+# Environment variable carrying the sealed provider API token for keyed
+# reference-feed backends (Finnhub today); never displayed or logged.
+STOCK_REFERENCE_TOKEN_ENV = "AERO_BOT_STOCK_REFERENCE_TOKEN"  # noqa: S105 - a name, not a secret
 # Environment variable carrying the relayer's public address for dry runs.
 RELAYER_ADDRESS_ENV = "AERO_BOT_RELAYER_ADDRESS"
 # Environment variable optionally pinning one registry symbol for the cycle.
@@ -1558,6 +1570,7 @@ class CycleRunner:
         income_history_cycles: int | None = None,
         stock_dust_floor_usdc: Decimal = DEFAULT_STOCK_DUST_FLOOR_USDC,
         stock_dust_aggregate_usdc: Decimal = DEFAULT_STOCK_DUST_AGGREGATE_USDC,
+        reference_feed: StockReferenceFeed | None = None,
     ) -> None:
         """Configure one cycle runner over every injectable boundary.
 
@@ -1597,6 +1610,10 @@ class CycleRunner:
             stock_dust_aggregate_usdc: The bound the sum of every ignored
                 dust balance must stay at or below, so many-token splitting
                 cannot hide meaningful exposure behind the floor.
+            reference_feed: The optional live underlying-equity reference
+                feed whose per-symbol quotes and honest as-of ages join the
+                decision observations; None keeps injected-constant
+                behavior exactly as shipped.
         """
         self._symbol = symbol.strip() if symbol is not None else None
         self._safe_address = normalize_evm_address(safe_address)
@@ -1617,6 +1634,7 @@ class CycleRunner:
         self._stock_dust_aggregate_usdc = stock_dust_aggregate_usdc
         self._portfolio_parameters_value = portfolio_parameters
         self._income_history_cycles_value = income_history_cycles
+        self._reference_feed = reference_feed
         self._last_reconciliation: CycleReconciliation | None = None
         # One cycle process enumerates the board at most once; reconcile and
         # decide share the cached listing and its snapshot block.
@@ -2925,6 +2943,32 @@ class CycleRunner:
         """
         return {cooldown.symbol: cooldown.blocked_until for cooldown in book.reentry_cooldowns}
 
+    def _reference_inputs_from_feed(
+        self, b20_symbols: Sequence[str]
+    ) -> tuple[dict[str, Decimal], dict[str, int], tuple[str, ...]]:
+        """Read live reference quotes for the given symbols, fail-closed.
+
+        Args:
+            b20_symbols: The board symbols needing quotes; symbols the feed
+                cannot quote are simply absent from the returned maps and
+                carry explicit diagnostic notes instead.
+
+        Returns:
+            The per-symbol prices, the per-symbol honest ages measured from
+            each provider's own as-of time at the decision instant, and the
+            provenance/evidence notes for the report; no feed configured
+            returns three empty containers.
+        """
+        if self._reference_feed is None or not b20_symbols:
+            return {}, {}, ()
+        result = self._reference_feed.fetch_quotes(b20_symbols)
+        decided_at = self._now()
+        return (
+            result.price_by_symbol(),
+            result.age_seconds_by_symbol(decided_at),
+            result.notes(decided_at),
+        )
+
     def _decide(
         self,
         book: CycleStateBook,
@@ -2961,6 +3005,16 @@ class CycleRunner:
         state = self._policy_state(book, self._last_reconciliation).model_copy(
             update={"reentry_blocked_until": _cooldown_until(book, self._symbol)}
         )
+        # The live reference feed fills the pinned symbol only when the
+        # operator did not inject an explicit constant; an injected quote
+        # keeps its operator-owned age, a feed quote carries the honest
+        # as-of age instead.
+        feed_notes: tuple[str, ...] = ()
+        if reference_price_usdc is None:
+            feed_prices, feed_ages, feed_notes = self._reference_inputs_from_feed((self._symbol,))
+            if self._symbol in feed_prices:
+                reference_price_usdc = feed_prices[self._symbol]
+                reference_age_seconds = feed_ages[self._symbol]
         observation, _, aero_price, notes = assemble_observation(
             self._sources,
             self._symbol,
@@ -2972,6 +3026,7 @@ class CycleRunner:
             reference_age_seconds,
             self._safe_address,
         )
+        notes = notes + feed_notes
         # Production actions are authoritative to the exact resolved Aerodrome
         # pool. External equity references remain report-only diagnostics and
         # can never directly trigger a buy, sell, mint, burn, or defensive exit.
@@ -3073,16 +3128,42 @@ class CycleRunner:
         snapshot_block = self._board_block
         if not listings or snapshot_block is None:
             raise ValueError("no verified B20 pools were enumerated for the board")
+        # The feed reads at decide time - after the board sweep - so quote
+        # ages never silently absorb the sweep's minutes; injected
+        # constants still win for their own symbols, and every feed quote
+        # carries its provider's own as-of age into the per-symbol gate.
+        uninjected = tuple(
+            listing.symbol
+            for listing in listings
+            if listing.symbol not in reference_prices_by_symbol
+        )
+        feed_prices, feed_ages, feed_notes = self._reference_inputs_from_feed(uninjected)
+        if feed_notes and len(uninjected) < len(listings):
+            # Explicit precedence evidence: an injected constant excluded
+            # these symbols from the feed read.
+            injected_symbols = ", ".join(
+                listing.symbol
+                for listing in listings
+                if listing.symbol in reference_prices_by_symbol
+            )
+            feed_notes = feed_notes + (
+                f"reference feed skipped the injected symbol(s) {injected_symbols}; "
+                "an injected constant wins over the live feed for its own symbols",
+            )
+        merged_references: dict[str, Decimal] = dict(reference_prices_by_symbol)
+        merged_references.update(feed_prices)
         options, aero_price, gas_price, notes = assemble_board(
             self._sources,
             listings,
             snapshot_block,
             self._now(),
             None,
-            reference_prices_by_symbol,
+            merged_references,
             reference_age_seconds,
             self._safe_address,
+            reference_ages_by_symbol=feed_ages or None,
         )
+        notes = notes + feed_notes
         # Apply the same pool-authoritative doctrine to every selector option.
         # Selector sizing also reserves ten percent of the observed depth cap
         # so a few-percent live-depth move during a multi-step switch cannot
@@ -3306,7 +3387,7 @@ class CycleRunner:
             pool_depth_usd=decision_option.observation.pool_depth_usd,
             equity_usd=decision_option.observation.equity_usd,
             gas_price_gwei=gas_price,
-            reference_price_usdc=reference_prices_by_symbol.get(decision_option.symbol),
+            reference_price_usdc=merged_references.get(decision_option.symbol),
             event_window=window,
             outcome=outcome,
             input_notes=notes + (summary,),
@@ -5828,6 +5909,7 @@ def build_cycle_runner(
     income_history_cycles: int | None = None,
     stock_dust_floor_usdc: Decimal = DEFAULT_STOCK_DUST_FLOOR_USDC,
     stock_dust_aggregate_usdc: Decimal = DEFAULT_STOCK_DUST_AGGREGATE_USDC,
+    reference_feed: StockReferenceFeed | None = None,
 ) -> CycleRunner:
     """Assemble the live cycle runner from the application settings.
 
@@ -5850,6 +5932,9 @@ def build_cycle_runner(
             stock is dust, retained in the Safe and never swapped.
         stock_dust_aggregate_usdc: The bound the sum of ignored dust must
             stay at or below.
+        reference_feed: The optional live underlying-equity reference feed
+            whose quotes join the decision observations; None keeps the
+            injected-constant behavior exactly as shipped.
 
     Returns:
         The fully wired runner; nothing has been read yet.
@@ -5927,6 +6012,7 @@ def build_cycle_runner(
         income_history_cycles=income_history_cycles,
         stock_dust_floor_usdc=stock_dust_floor_usdc,
         stock_dust_aggregate_usdc=stock_dust_aggregate_usdc,
+        reference_feed=reference_feed,
     )
 
 
@@ -5977,7 +6063,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "one price for the pinned symbol or per-symbol SYMBOL=PRICE "
             "pairs (AAPLc=318.5,FIXc=100) for selector mode; the "
             "AERO_BOT_CYCLE_REFERENCE_PRICE_USDC variable supplies the same "
-            "value when the flag is absent."
+            "value when the flag is absent. An injected constant wins over "
+            "the live reference feed for its own symbols, and its age stays "
+            "operator-owned through --reference-age-seconds."
         ),
     )
     parser.add_argument(
@@ -5985,6 +6073,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=int,
         default=0,
         help="Age of the injected reference quote in seconds (default: 0).",
+    )
+    parser.add_argument(
+        "--reference-feed",
+        default=None,
+        choices=("off", "yahoo", "finnhub"),
+        help=(
+            "Arm the live underlying-equity reference feed: off keeps the "
+            "injected-constant behavior, yahoo reads the credential-free "
+            "public chart endpoint, and finnhub reads the documented "
+            "API-key /quote endpoint (requires the sealed "
+            "AERO_BOT_STOCK_REFERENCE_TOKEN). Every quote carries its "
+            "provider's own as-of time as its age - a delayed or "
+            "closed-market last price is never relabeled fresh because a "
+            "poll ran (default: off; the sealed "
+            "AERO_BOT_CYCLE_REFERENCE_FEED variable supplies the same value "
+            "when the flag is absent)."
+        ),
     )
     parser.add_argument(
         "--switch-margin",
@@ -6307,6 +6412,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             single_reference = configured_reference
     elif configured_reference is not None:
         reference_map = configured_reference
+    # The live reference feed selection: the flag wins, the sealed cycle
+    # environment supplies the default, and off keeps production exactly
+    # as shipped until the operator arms the feed.
+    raw_feed_selection = (
+        arguments.reference_feed
+        if arguments.reference_feed is not None
+        else os.environ.get(CYCLE_REFERENCE_FEED_ENV, "off")
+    )
+    feed_selection = raw_feed_selection.strip().lower()
+    if feed_selection not in ("off", "", "yahoo", "finnhub"):
+        parser.error(f"--reference-feed must be off, yahoo, or finnhub, not {raw_feed_selection!r}")
+    reference_feed: StockReferenceFeed | None = None
+    if feed_selection == "yahoo":
+        reference_feed = StockReferenceFeed(YahooChartStockReferenceBackend())
+    elif feed_selection == "finnhub":
+        # The keyed provider fails closed at startup when its sealed token
+        # is missing; the setup requirement is spelled out rather than
+        # silently degrading to no quotes.
+        finnhub_token = os.environ.get(STOCK_REFERENCE_TOKEN_ENV, "").strip()
+        if not finnhub_token:
+            parser.error(
+                "--reference-feed finnhub requires the sealed "
+                f"{STOCK_REFERENCE_TOKEN_ENV} variable: create a free "
+                "Finnhub API key at finnhub.io/register and seal it in the "
+                "cycle environment; no other setup is required"
+            )
+        reference_feed = StockReferenceFeed(FinnhubQuoteStockReferenceBackend(finnhub_token))
     safe_address = os.environ.get(SAFE_ADDRESS_ENV, DEFAULT_CANARY_SAFE_ADDRESS)
     raw_relayer = os.environ.get(RELAYER_ADDRESS_ENV, "").strip()
     # Both sides normalize before comparison: a checksummed environment
@@ -6348,6 +6480,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             income_history_cycles,
             stock_dust_floor,
             stock_dust_aggregate,
+            reference_feed,
         )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"the cycle runner is unavailable: {error}", file=sys.stderr)

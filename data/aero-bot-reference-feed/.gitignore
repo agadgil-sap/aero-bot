@@ -1,0 +1,5 @@
+# Worktree-local runtime state from the unsigned live-proof smoke runs; the
+# committed evidence is the JSON report, its stderr log, and the README.
+audit.sqlite3
+pins.json
+cycle_state.json

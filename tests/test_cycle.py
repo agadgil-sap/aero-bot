@@ -34,6 +34,7 @@ from aero_bot.cycle import (
     CYCLE_MIN_POSITION_FLOOR_USDC_ENV,
     CYCLE_MIN_POSITION_USDC_ENV,
     CYCLE_OUT_OF_RANGE_GRACE_ENV,
+    CYCLE_REFERENCE_FEED_ENV,
     CYCLE_REFERENCE_PRICE_ENV,
     CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV,
     CYCLE_STOCK_DUST_FLOOR_USDC_ENV,
@@ -84,6 +85,12 @@ from aero_bot.policy import (
     PolicyParameters,
     PolicyReason,
     PolicyState,
+)
+from aero_bot.stock_reference import (
+    StockReferenceFeed,
+    StockReferenceQuote,
+    StockReferenceSession,
+    StockReferenceUnavailableError,
 )
 from aero_bot.strategy import BoardListing
 from aero_bot.venues import AERO_TOKEN_ADDRESS, BASE_USDC_ADDRESS, PoolCandidate
@@ -724,6 +731,7 @@ def make_runner(
     income_history_cycles: int | None = None,
     dust_floor_usdc: Decimal | None = None,
     dust_aggregate_usdc: Decimal | None = None,
+    reference_feed: object | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, AuditStore, CycleStateStore]:
     """Assemble one cycle runner over fully scripted boundaries."""
     store_path = tmp_path / "cycle_state.json"
@@ -799,6 +807,7 @@ def make_runner(
             if dust_aggregate_usdc is not None
             else DEFAULT_STOCK_DUST_AGGREGATE_USDC
         ),
+        reference_feed=cast("StockReferenceFeed | None", reference_feed),
     )
     return runner, fake_executor, audit, state_store
 
@@ -1945,6 +1954,7 @@ def selector_runner(
     sources: SelectorCycleSources | None = None,
     balances: FakeBalances | None = None,
     aero_conversion_min_usdc: Decimal | None = None,
+    reference_feed: object | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, CycleStateStore]:
     """Assemble one selector-mode cycle runner over the scripted board."""
     runner, fake_executor, _, state_store = make_runner(
@@ -1960,6 +1970,7 @@ def selector_runner(
         if balances is not None
         else FakeBalances(usdc_units=SELECTOR_BOOK_USDC_UNITS),
         aero_conversion_min_usdc=aero_conversion_min_usdc,
+        reference_feed=reference_feed,
     )
     return runner, fake_executor, state_store
 
@@ -3321,6 +3332,211 @@ def _tracked_reads(*, staked: bool = False) -> FakeReads:
     return reads
 
 
+class _FeedQuoteBackend:
+    """Serve deterministic feed quotes or per-symbol failures for cycles."""
+
+    provider_id = "stub"
+
+    def __init__(
+        self,
+        *,
+        quotes: dict[str, StockReferenceQuote] | None = None,
+        failures: dict[str, Exception] | None = None,
+    ) -> None:
+        """Configure the scripted per-symbol quotes and failures."""
+        self._quotes = quotes or {}
+        self._failures = failures or {}
+
+    def fetch_underlying_quote(
+        self, b20_symbol: str, underlying_symbol: str
+    ) -> StockReferenceQuote:
+        """Serve one scripted quote or raise its scripted failure."""
+        failure = self._failures.get(b20_symbol)
+        if failure is not None:
+            raise failure
+        return self._quotes[b20_symbol]
+
+
+def feed_quote(
+    b20_symbol: str,
+    *,
+    as_of: datetime,
+    price: Decimal | None = None,
+    session: StockReferenceSession = StockReferenceSession.REGULAR,
+) -> StockReferenceQuote:
+    """Build one valid stub quote stamped at the fixed cycle clock."""
+    return StockReferenceQuote(
+        provider_id="stub",
+        b20_symbol=b20_symbol,
+        underlying_symbol=b20_symbol.removesuffix("c"),
+        price_usd=price if price is not None else FIXTURE_AMM_PRICE,
+        currency="USD",
+        as_of=as_of,
+        fetched_at=QUIET_INSTANT,
+        session=session,
+        delay_label="stub delay",
+        exchange_name="Stub Exchange",
+        source_url="https://stub.invalid/quote",
+    )
+
+
+# The two-pool selector board's feed mapping: the stub resolves every
+# board symbol so cycle tests exercise the wiring, not the registry table.
+SELECTOR_FEED_MAPPING = {"AAAc": "AAA", "BBBc": "BBB", "FIXc": "FIX"}
+
+
+class TestLiveReferenceFeedCycles:
+    """The armed live underlying-equity reference feed inside the cycle."""
+
+    def test_fresh_feed_quotes_reach_the_board_with_honest_ages(self, tmp_path: Path) -> None:
+        """Feed quotes land per symbol with as-of ages, provenance in notes."""
+        backend = _FeedQuoteBackend(
+            quotes={
+                "AAAc": feed_quote("AAAc", as_of=QUIET_INSTANT - timedelta(seconds=5)),
+                "BBBc": feed_quote("BBBc", as_of=QUIET_INSTANT - timedelta(seconds=7)),
+            }
+        )
+        runner, _, _ = selector_runner(
+            tmp_path,
+            reference_feed=StockReferenceFeed(
+                backend, underlying_by_symbol=SELECTOR_FEED_MAPPING, now=lambda: QUIET_INSTANT
+            ),
+        )
+        report = runner.run(CycleMode.DRY_RUN)
+        notes = report.input_notes
+        # Each symbol's provenance line carries its own honest as-of age
+        # measured at the decision instant, not one shared fetch stamp.
+        assert any(note.startswith("reference AAAc=") and "age 5s" in note for note in notes)
+        assert any(note.startswith("reference BBBc=") and "age 7s" in note for note in notes)
+        assert any(note.startswith("reference feed stub quoted 2 of 2") for note in notes)
+        # The pool stays the trading authority: references stay diagnostic.
+        assert any("diagnostic-only" in note for note in notes)
+        assert report.decision_action == "enter"
+
+    def test_closed_market_quote_keeps_its_honest_age_and_flags_the_247_conflict(
+        self, tmp_path: Path
+    ) -> None:
+        """A session-close quote reads hours old and exposes the conflict."""
+        backend = _FeedQuoteBackend(
+            quotes={
+                "AAAc": feed_quote(
+                    "AAAc",
+                    as_of=QUIET_INSTANT - timedelta(seconds=14_279),
+                    session=StockReferenceSession.CLOSED,
+                ),
+                "BBBc": feed_quote(
+                    "BBBc",
+                    as_of=QUIET_INSTANT - timedelta(seconds=14_279),
+                    session=StockReferenceSession.CLOSED,
+                ),
+            }
+        )
+        runner, _, _ = selector_runner(
+            tmp_path,
+            reference_feed=StockReferenceFeed(
+                backend, underlying_by_symbol=SELECTOR_FEED_MAPPING, now=lambda: QUIET_INSTANT
+            ),
+        )
+        report = runner.run(CycleMode.DRY_RUN)
+        # The fetch just ran, yet each provenance line honestly reads an
+        # age of 14,279 seconds: no poll can relabel a closed-market close
+        # as fresh, and the 900-second open-position bound would read
+        # blind long before this.
+        assert any(
+            note.startswith("reference AAAc=") and "age 14279s" in note
+            for note in report.input_notes
+        )
+        assert any(
+            "outside the regular session" in note and "24/7" in note for note in report.input_notes
+        )
+        # The 24/7 ruling is untouched: the cycle still decides on pool
+        # authority with the references carried as diagnostics.
+        assert report.decision_action == "enter"
+
+    def test_a_degraded_feed_degrades_to_no_references_with_explicit_evidence(
+        self, tmp_path: Path
+    ) -> None:
+        """A fully failed feed reads exactly like the unarmed behavior."""
+        backend = _FeedQuoteBackend(
+            failures={
+                "AAAc": StockReferenceUnavailableError("HTTP 429 after 2 attempt(s)"),
+                "BBBc": StockReferenceUnavailableError("transport error"),
+            }
+        )
+        runner, _, _ = selector_runner(
+            tmp_path,
+            reference_feed=StockReferenceFeed(
+                backend, underlying_by_symbol=SELECTOR_FEED_MAPPING, now=lambda: QUIET_INSTANT
+            ),
+        )
+        report = runner.run(CycleMode.DRY_RUN)
+        assert any(
+            note.startswith("reference feed stub quoted 0 of 2") for note in report.input_notes
+        )
+        assert any("AAAc unavailable via stub" in note for note in report.input_notes)
+        assert any("BBBc unavailable via stub" in note for note in report.input_notes)
+        # Degraded references never block the pool-authoritative selector.
+        assert report.decision_action == "enter"
+
+    def test_an_injected_constant_wins_over_the_feed_for_its_own_symbol(
+        self, tmp_path: Path
+    ) -> None:
+        """Explicit injection keeps operator-owned age semantics per symbol."""
+        backend = _FeedQuoteBackend(
+            quotes={
+                "AAAc": feed_quote("AAAc", as_of=QUIET_INSTANT - timedelta(seconds=5)),
+                "BBBc": feed_quote("BBBc", as_of=QUIET_INSTANT - timedelta(seconds=9)),
+            }
+        )
+        runner, _, _ = selector_runner(
+            tmp_path,
+            reference_feed=StockReferenceFeed(
+                backend, underlying_by_symbol=SELECTOR_FEED_MAPPING, now=lambda: QUIET_INSTANT
+            ),
+        )
+        injected_price = FIXTURE_AMM_PRICE * Decimal("1.5")
+        report = runner.run(
+            CycleMode.DRY_RUN,
+            reference_prices_by_symbol={"AAAc": injected_price},
+            reference_age_seconds=0,
+        )
+        notes = report.input_notes
+        # AAAc carries the injected constant: the feed is skipped for it
+        # and no provenance line is fabricated; BBBc carries the feed's
+        # honest as-of age.
+        assert not any(note.startswith("reference AAAc=") for note in notes)
+        assert any(note.startswith("reference BBBc=") and "age 9s" in note for note in notes)
+        assert any(note.startswith("reference feed stub quoted 1 of 1") for note in notes)
+        assert any("skipped the injected symbol(s) AAAc" in note for note in notes)
+
+    def test_a_pinned_cycle_fills_its_symbol_from_the_feed(self, tmp_path: Path) -> None:
+        """Pinned mode adopts the feed quote only absent an injection."""
+        backend = _FeedQuoteBackend(
+            quotes={"FIXc": feed_quote("FIXc", as_of=QUIET_INSTANT - timedelta(seconds=4))}
+        )
+        runner, _, _, _ = make_runner(
+            tmp_path,
+            reference_feed=StockReferenceFeed(
+                backend, underlying_by_symbol=SELECTOR_FEED_MAPPING, now=lambda: QUIET_INSTANT
+            ),
+        )
+        report = runner.run(CycleMode.DRY_RUN)
+        # The pinned cycle stays pool-authoritative; the feed quote rides
+        # the report as provenance with its honest as-of age.
+        assert report.decision_action == "enter"
+        assert any(
+            note.startswith("reference FIXc=") and "age 4s" in note for note in report.input_notes
+        )
+        # The injected quote still wins for the pinned symbol: the feed is
+        # skipped entirely and no provenance line is fabricated for it.
+        injected_price = FIXTURE_AMM_PRICE * Decimal("2")
+        overridden = runner.run(
+            CycleMode.DRY_RUN, reference_price_usdc=injected_price, reference_age_seconds=0
+        )
+        assert not any(note.startswith("reference FIXc=") for note in overridden.input_notes)
+        assert overridden.decision_action == "enter"
+
+
 class TestCycleConfiguration:
     """The sealed-environment symbol, margin, and reference configuration."""
 
@@ -3360,6 +3576,82 @@ class TestCycleConfiguration:
         assert captured.get("reference_price_usdc") is None
         assert captured.get("reference_prices_by_symbol") is None
 
+    def test_the_reference_feed_flag_and_environment_arm_the_runner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Yahoo arms a real feed; off keeps the unarmed default."""
+        from aero_bot import cycle as cycle_module
+        from aero_bot.stock_reference import StockReferenceFeed
+
+        built: dict[str, object] = {}
+
+        class FakeRunner:
+            def run(self, mode: CycleMode, **kwargs: object) -> object:
+                raise RuntimeError("selector reached runner")
+
+        def fake_build(
+            settings: object,
+            symbol: object,
+            safe_address: object,
+            relayer: object,
+            switch_margin: object,
+            parameters: object,
+            aero_min: object,
+            portfolio: object = None,
+            income_history_cycles: object = None,
+            stock_dust_floor: object = None,
+            stock_dust_aggregate: object = None,
+            reference_feed: object = None,
+        ) -> object:
+            built["reference_feed"] = reference_feed
+            return FakeRunner()
+
+        monkeypatch.setattr(cycle_module, "build_cycle_runner", fake_build)
+        # The sealed environment arms the feed without any flag.
+        monkeypatch.setenv(CYCLE_REFERENCE_FEED_ENV, "yahoo")
+        exit_code = cycle_module.main(["--symbol", "auto", "--dry-run"])
+        assert exit_code == 1
+        feed = built["reference_feed"]
+        assert isinstance(feed, StockReferenceFeed)
+        assert feed._backend.provider_id == "yahoo-chart"
+        # The flag overrides the environment and off disarms it again.
+        exit_code = cycle_module.main(["--symbol", "auto", "--dry-run", "--reference-feed", "off"])
+        assert exit_code == 1
+        assert built["reference_feed"] is None
+
+    def test_finnhub_without_a_sealed_token_refuses_at_the_cli_boundary(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The keyed provider names its concrete setup requirement."""
+        from aero_bot import cycle as cycle_module
+
+        monkeypatch.setattr(
+            cycle_module,
+            "build_cycle_runner",
+            lambda *args, **kwargs: pytest.fail("the runner must not build"),
+        )
+        monkeypatch.delenv(cycle_module.STOCK_REFERENCE_TOKEN_ENV, raising=False)
+        with pytest.raises(SystemExit) as excinfo:
+            cycle_module.main(["--symbol", "auto", "--dry-run", "--reference-feed", "finnhub"])
+        assert excinfo.value.code == 2
+        stderr = capsys.readouterr().err
+        assert cycle_module.STOCK_REFERENCE_TOKEN_ENV in stderr
+        assert "finnhub.io/register" in stderr
+
+    def test_an_unknown_reference_feed_value_refuses(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A mistyped provider selection never falls back silently."""
+        from aero_bot import cycle as cycle_module
+
+        monkeypatch.setattr(
+            cycle_module,
+            "build_cycle_runner",
+            lambda *args, **kwargs: pytest.fail("the runner must not build"),
+        )
+        monkeypatch.setenv(CYCLE_REFERENCE_FEED_ENV, "stooq")
+        with pytest.raises(SystemExit) as excinfo:
+            cycle_module.main(["--symbol", "auto", "--dry-run"])
+        assert excinfo.value.code == 2
+
     def test_the_allocator_flags_parse_and_reach_the_runner(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3384,11 +3676,13 @@ class TestCycleConfiguration:
             income_history_cycles: object = None,
             stock_dust_floor: object = None,
             stock_dust_aggregate: object = None,
+            reference_feed: object = None,
         ) -> object:
             built["portfolio"] = portfolio
             built["income_history_cycles"] = income_history_cycles
             built["stock_dust_floor"] = stock_dust_floor
             built["stock_dust_aggregate"] = stock_dust_aggregate
+            built["reference_feed"] = reference_feed
             return FakeRunner()
 
         monkeypatch.setattr(cycle_module, "build_cycle_runner", fake_build)
@@ -3419,6 +3713,9 @@ class TestCycleConfiguration:
         assert portfolio.concentration_cap_fraction == Decimal("0.3")
         assert built["stock_dust_floor"] == DEFAULT_STOCK_DUST_FLOOR_USDC
         assert built["stock_dust_aggregate"] == DEFAULT_STOCK_DUST_AGGREGATE_USDC
+        # The default reference feed stays off: production behavior is
+        # unchanged until the operator arms the feed.
+        assert built["reference_feed"] is None
 
     def test_the_dust_flags_reach_the_runner_and_bound_each_other(
         self, monkeypatch: pytest.MonkeyPatch
@@ -3444,6 +3741,7 @@ class TestCycleConfiguration:
             income_history_cycles: object = None,
             stock_dust_floor: object = None,
             stock_dust_aggregate: object = None,
+            reference_feed: object = None,
         ) -> object:
             built["stock_dust_floor"] = stock_dust_floor
             built["stock_dust_aggregate"] = stock_dust_aggregate
