@@ -22,6 +22,7 @@ from aero_bot.ranging import (
     RangingEvidence,
     RangingObservations,
     WidthSolution,
+    WidthSolveMode,
     ceiling_width_solution,
     solve_range_width,
 )
@@ -249,11 +250,17 @@ class AlignedPriceRange(BaseModel):
     lower_price: Decimal
     # Upper price is the pool price at the upper tick in USDC per stock.
     upper_price: Decimal
+    # True when the range carries the adaptive solve's exact raw bounds:
+    # under token1 orientation the RAW ticks invert against the ordered
+    # human prices (the raw-lower bound holds the higher price), so the
+    # tick-order invariant is exempt and every price-space consumer - the
+    # stop, the composition, the in-range checks - reads the prices.
+    exact_bounds: bool = False
 
     @model_validator(mode="after")
     def require_ordered_nonempty_range(self) -> Self:
         """Reject a collapsed or inverted aligned range."""
-        if self.lower_tick >= self.upper_tick:
+        if not self.exact_bounds and self.lower_tick >= self.upper_tick:
             raise ValueError("lower_tick must be less than upper_tick")
         if self.lower_price >= self.upper_price:
             raise ValueError("lower_price must be less than upper_price")
@@ -316,21 +323,49 @@ class SwapPlan(BaseModel):
         return self
 
 
+class RangeWidthPolicy(StrEnum):
+    """Select the engine's range-width posture.
+
+    The adaptive band (the captain's 2026-10-03 restart direction) is the
+    production default: widths solve on the executable grid inside the
+    per-side band from measured evidence, missing evidence defers entries
+    and voluntary recenters, and a nonpositive best candidate holds cash.
+    The fixed-ceiling baseline reproduces the v1 posture for comparison
+    runs and engines explicitly pinned to it.
+    """
+
+    # Solve the adaptive executable range from measured evidence.
+    ADAPTIVE_BAND = "adaptive_band"
+    # Always mint the locked ceiling width outward-aligned, the v1 posture.
+    FIXED_CEILING_BASELINE = "fixed_ceiling_baseline"
+
+
 class PolicyParameters(BaseModel):
     """Lock the v1 emissions-farming parameters as one immutable decision input."""
 
     # Frozen strict fields make the locked parameter set reproducible in audits.
     model_config = IMMUTABLE_MODEL_CONFIG
 
-    # The target net daily yield per deployed dollar the range width is
-    # derived against; the tightest width meeting it wins and the tightest
-    # candidate enters anyway when the target proves unreachable.
+    # The target net daily yield per deployed dollar reported beside every
+    # width solve; a reported target only - selection is argmax of modeled
+    # net and a negative candidate is never picked to chase it.
     target_net_daily_yield: Annotated[Decimal, Field(gt=0)] = Decimal("0.01")
-    # The maximum half width on each side of the reference price: the safety
-    # ceiling the derived width never exceeds and the fallback when the width
-    # solver's inputs are missing or inconsistent, never the entered value
-    # itself. The minimum width is exactly one tick spacing per side.
+    # The adaptive band's per-side bounds on the REAL price distances of
+    # grid-aligned range bounds from the current price (the captain's 0.1
+    # to 0.3 percent restart direction): the floor keeps every minted side
+    # at least this far from the price, the ceiling at most this far. The
+    # scored object is the minted object - aligned bounds are enumerated
+    # and scored exactly as minted, never a centered ideal rounded outward.
+    min_range_half_width_fraction: Decimal = Decimal("0.001")
     max_range_half_width_fraction: Decimal = Decimal("0.003")
+    # The range-width posture: the adaptive band by default; the fixed
+    # ceiling only for explicit comparison baselines.
+    range_width_policy: RangeWidthPolicy = RangeWidthPolicy.ADAPTIVE_BAND
+    # Re-entry after a dilution exit additionally requires the emissions
+    # APR to clear the floor by this relative margin (mirroring the
+    # cross-pool switch margin), so a pool straddling the floor cannot
+    # churn exit-reentry round trips bounded only by the cooldown.
+    dilution_reentry_margin_fraction: Decimal = Decimal("0.30")
     # Range boundaries are aligned to the pool tick grid of spacing ten.
     tick_spacing: Annotated[int, Field(ge=1)] = 10
     # Any non-urgent out-of-range recenter waits fifteen minutes before the
@@ -409,8 +444,14 @@ class PolicyParameters(BaseModel):
     @model_validator(mode="after")
     def require_unit_fractions(self) -> Self:
         """Reject fraction parameters outside their meaningful intervals."""
+        if not Decimal(0) < self.min_range_half_width_fraction < Decimal(1):
+            raise ValueError("min_range_half_width_fraction must be between zero and one")
         if not Decimal(0) < self.max_range_half_width_fraction < Decimal(1):
             raise ValueError("max_range_half_width_fraction must be between zero and one")
+        if self.min_range_half_width_fraction >= self.max_range_half_width_fraction:
+            raise ValueError("min_range_half_width_fraction must sit below the ceiling")
+        if not Decimal(0) < self.dilution_reentry_margin_fraction < Decimal(1):
+            raise ValueError("dilution_reentry_margin_fraction must be between zero and one")
         if not Decimal(0) < self.stop_buffer_fraction < Decimal(1):
             raise ValueError("stop_buffer_fraction must be between zero and one")
         if not Decimal(0) < self.max_position_equity_fraction <= Decimal(1):
@@ -629,6 +670,10 @@ class PolicyState(BaseModel):
     held_inventory: HeldInventory | None = None
     # Re-entry stays blocked until this instant after stop or dilution exits.
     reentry_blocked_until: datetime | None = None
+    # The last exit for this posture was a dilution exit: re-entry then
+    # additionally requires the emissions APR to clear the floor by the
+    # locked relative margin until the next successful entry clears it.
+    dilution_exit_pending: bool = False
 
 
 class PolicyActionKind(StrEnum):
@@ -747,6 +792,20 @@ class PolicyReason(StrEnum):
     INVENTORY_UNWIND_PENDING = "inventory_unwind_pending"
     # A non-urgent entry or recenter is deferred by the gas sense-check gate.
     GAS_GATE_DEFERRED = "gas_gate_deferred"
+    # The ranging evidence is missing, stale, or too thin to score an
+    # executable range: new entries and voluntary recenters defer with the
+    # reason instead of substituting a constant range (the captain's
+    # adaptive-width restart direction); safety exits stay armed.
+    RANGE_EVIDENCE_DEFERRED = "range_evidence_deferred"
+    # Every executable range candidate inside the band nets at or below
+    # zero at the conservative income basis: the engine holds cash and
+    # reports the evidence rather than entering on a raw APR that clears
+    # the floor.
+    RANGE_NET_NONPOSITIVE = "range_net_nonpositive"
+    # Re-entry after a dilution exit waits for the emissions APR to clear
+    # the floor by the locked relative margin, so a pool straddling the
+    # floor cannot churn exit-reentry round trips.
+    DILUTION_REENTRY_MARGIN_ACTIVE = "dilution_reentry_margin_active"
     # Another pool's qualifying emissions APR exceeded the held pool's by
     # the relative switch margin and the exit-plus-entry gas economics
     # passed. Composed only by the cross-board selector
@@ -1009,13 +1068,28 @@ class PolicyEngine:
                 "gate reference_freshness: PASS (measured not enforced, the resolved "
                 "Aerodrome pool is the trading authority; bound advisory only)"
             )
-        # Gate 5: the raw emissions floor (the displayed convention).
+        # Gate 5: the raw emissions floor (the displayed convention), raised
+        # by the dilution re-entry margin when the last exit from this pool
+        # was a dilution exit.
         emissions_pass = observation.emissions_apr >= self._parameters.min_entry_emissions_apr
+        floor_text = format_apr_percent(self._parameters.min_entry_emissions_apr)
+        margin_note = ""
+        if flat_basis.dilution_exit_pending:
+            margin_bound = self._parameters.min_entry_emissions_apr * (
+                Decimal(1) + self._parameters.dilution_reentry_margin_fraction
+            )
+            emissions_pass = observation.emissions_apr >= margin_bound
+            floor_text = (
+                f"{format_apr_percent(margin_bound)} - the floor plus the "
+                f"{self._parameters.dilution_reentry_margin_fraction} dilution re-entry "
+                "margin after a dilution exit"
+            )
+            margin_note = " (a dilution exit is on record for this pool)"
         lines.append(
             "gate emissions_floor: "
             + ("PASS" if emissions_pass else "FAIL")
             + f" (measured raw APR {format_apr_percent(observation.emissions_apr)}; "
-            f"bound >= {format_apr_percent(self._parameters.min_entry_emissions_apr)})"
+            + (f"bound >= {floor_text}{margin_note})")
         )
         # Gate 6: the equity and depth caps leaving a positive size.
         equity_cap = observation.equity_usd * self._parameters.max_position_equity_fraction
@@ -1073,6 +1147,60 @@ class PolicyEngine:
                 + f" (measured batch cost {cost_usd} vs allowed {allowed}; bound cost <= "
                 f"{self._parameters.gas_cost_max_gross_yield_fraction} of the expected "
                 f"daily gross yield {expected_daily_yield} USDC)"
+            )
+        # Gate 9: the adaptive range-width solve at exactly the sized
+        # position - the executable-geometry verdict behind every entry:
+        # solved picks a range inside the per-side band, deferred holds the
+        # entry on missing evidence, and cash-hold refuses on a nonpositive
+        # best candidate (the captain's 2026-10-03 adaptive-width direction).
+        if size_usd > 0 and gas_price is not None:
+            solution = self._solve_range_width(observation, size_usd)
+            if solution.mode is WidthSolveMode.SOLVED:
+                assert solution.lower_bound is not None  # noqa: S101 - validator guarantees
+                assert solution.upper_bound is not None  # noqa: S101 - validator guarantees
+                best_net = next(
+                    (
+                        row.net_yield_per_day
+                        for row in solution.evaluations
+                        if row.lower_bound == solution.lower_bound
+                        and row.upper_bound == solution.upper_bound
+                    ),
+                    None,
+                )
+                lines.append(
+                    "gate range_width_solve: PASS (measured executable range ["
+                    f"{solution.lower_bound.tick},{solution.upper_bound.tick}] inside the "
+                    f"{self._parameters.min_range_half_width_fraction} to "
+                    f"{self._parameters.max_range_half_width_fraction} per-side band; bound "
+                    f"best modeled net > 0, measured {best_net})"
+                )
+            elif solution.mode is WidthSolveMode.CASH_HOLD:
+                best_net = max(
+                    (row.net_yield_per_day for row in solution.evaluations), default=None
+                )
+                lines.append(
+                    "gate range_width_solve: FAIL (measured best modeled net "
+                    f"{best_net}; bound best modeled net > 0 - every executable "
+                    "candidate nets nonpositive, so the book holds cash)"
+                )
+            elif solution.mode is WidthSolveMode.DEFERRED:
+                reason_line = solution.diagnostics[-1]
+                lines.append(
+                    "gate range_width_solve: FAIL (measured range evidence unusable; "
+                    f"bound evidence sufficient to score an executable range - "
+                    f"{reason_line})"
+                )
+            else:
+                lines.append(
+                    "gate range_width_solve: PASS (measured the engine's fixed-ceiling "
+                    "baseline posture; bound advisory only - the adaptive band is "
+                    "not the pinned policy)"
+                )
+        else:
+            lines.append(
+                "gate range_width_solve: FAIL (measured cost unreadable at an "
+                "unavailable gas price or a nonpositive size; bound a solvable "
+                "observation)"
             )
         return tuple(lines)
 
@@ -1137,12 +1265,17 @@ class PolicyEngine:
         observation: PolicyObservation,
         position_size_usd: Decimal,
     ) -> WidthSolution:
-        """Derive the range half width from the target net daily yield.
+        """Solve the range width for one entry or recenter.
 
-        The solve consumes the observation's ranging evidence plus every
-        parameter the locked set already carries. Missing evidence, or a gas
-        reading the gate would have deferred on, fails toward the locked
-        ceiling with the fallback label rather than guessing a width.
+        The adaptive posture consumes the observation's ranging evidence
+        plus every parameter the locked set already carries: the solve
+        enumerates executable grid-aligned bounds whose real per-side
+        distances sit inside the band, scores that geometry on the
+        conservative income basis with own-stake dilution and measured
+        dwell, and argmaxes the modeled net - deferring on missing evidence
+        and resolving cash-hold when every candidate nets nonpositive. The
+        fixed-ceiling baseline posture reproduces the v1 outward-aligned
+        ceiling range for comparison runs.
 
         Args:
             observation: The passing observation whose entry or recenter
@@ -1152,27 +1285,41 @@ class PolicyEngine:
         Returns:
             The immutable width solution with its complete evidence.
         """
-        evidence = observation.ranging
-        gas_price = observation.gas_price_gwei
-        if evidence is None or gas_price is None:
-            # The gas gate defers before any solve, so an absent reading here
-            # is unreachable in practice; both absences fail toward the
-            # ceiling with the same explicit fallback label.
-            missing = (
-                "the observation carries no ranging evidence"
-                if evidence is None
-                else "the gas price reading is unavailable"
-            )
+        if self._parameters.range_width_policy is RangeWidthPolicy.FIXED_CEILING_BASELINE:
             return ceiling_width_solution(
                 pool_price_usdc=observation.amm_price_usdc,
                 tick_spacing=self._parameters.tick_spacing,
                 max_range_half_width_fraction=self._parameters.max_range_half_width_fraction,
                 target_net_daily_yield=self._parameters.target_net_daily_yield,
-                reason=missing,
+                reason=(
+                    "the engine is pinned to the v1 comparison posture, the adaptive band default"
+                ),
+            )
+        evidence = observation.ranging
+        gas_price = observation.gas_price_gwei
+        if evidence is None or gas_price is None:
+            # The gas gate defers before any solve, so an absent gas reading
+            # here is unreachable in practice; both absences defer with the
+            # same explicit reason under the adaptive posture.
+            missing = (
+                "the observation carries no ranging evidence"
+                if evidence is None
+                else "the gas price reading is unavailable"
+            )
+            return WidthSolution(
+                mode=WidthSolveMode.DEFERRED,
+                tick_spacing=self._parameters.tick_spacing,
+                target_net_daily_yield=self._parameters.target_net_daily_yield,
+                diagnostics=(
+                    f"Range evidence is unusable - {missing}; deferring the entry or "
+                    "voluntary recenter with no substituted constant range (safety "
+                    "exits stay armed).",
+                ),
             )
         return solve_range_width(
             RangingObservations(
                 pool_price_usdc=observation.amm_price_usdc,
+                observed_at=observation.observed_at,
                 # The width solve sizes the range against an expected daily
                 # yield: it reads the conservative income basis when one is
                 # carried (the captain's 2026-09-28 correction), so a
@@ -1187,15 +1334,20 @@ class PolicyEngine:
                 fee_window_notional_usd=evidence.fee_window_notional_usd,
                 pool_fee_ppm=evidence.pool_fee_ppm,
                 realized_daily_volatility=evidence.realized_daily_volatility,
+                trailing_path=evidence.trailing_path,
                 stock_decimals=evidence.stock_decimals,
                 quote_decimals=evidence.quote_decimals,
+                pool_tick_raw=evidence.pool_tick_raw,
+                stock_is_token0=evidence.stock_is_token0,
                 position_size_usd=position_size_usd,
                 gas_price_gwei=gas_price,
                 target_net_daily_yield=self._parameters.target_net_daily_yield,
+                min_range_half_width_fraction=self._parameters.min_range_half_width_fraction,
                 max_range_half_width_fraction=self._parameters.max_range_half_width_fraction,
                 tick_spacing=self._parameters.tick_spacing,
                 stop_buffer_fraction=self._parameters.stop_buffer_fraction,
                 recenter_wait_seconds=int(self._parameters.recenter_wait.total_seconds()),
+                out_of_range_grace_seconds=int(self._parameters.out_of_range_grace.total_seconds()),
                 reentry_cooldown_seconds=int(self._parameters.reentry_cooldown.total_seconds()),
                 enter_batch_gas_units=self._parameters.enter_batch_gas_units,
                 recenter_batch_gas_units=self._parameters.recenter_batch_gas_units,
@@ -1203,6 +1355,39 @@ class PolicyEngine:
                 safe_overhead_gas_per_batch=self._parameters.safe_overhead_gas_per_batch,
                 eth_price_assumption_usd=self._parameters.eth_price_assumption_usd,
             )
+        )
+
+    def _range_for_solution(self, solution: WidthSolution) -> AlignedPriceRange:
+        """Convert one solved width solution into its exact price range.
+
+        The range's prices are the scored bounds' human prices, verbatim.
+        Under token1 orientation the raw-lower bound carries the HIGHER
+        human price, so the range orders by price and its tick fields carry
+        each price's own bound tick (raw ticks may therefore invert against
+        the price order - the mint reads the width solution's raw bounds,
+        never these ticks).
+
+        Args:
+            solution: A width solution carrying its chosen aligned bounds.
+
+        Returns:
+            The price-ordered range exactly as the solve scored it.
+
+        Raises:
+            ValueError: If the solution carries no chosen bounds.
+        """
+        if solution.lower_bound is None or solution.upper_bound is None:
+            raise ValueError("the solution carries no chosen aligned bounds")
+        if solution.lower_bound.price <= solution.upper_bound.price:
+            low, high = solution.lower_bound, solution.upper_bound
+        else:
+            low, high = solution.upper_bound, solution.lower_bound
+        return AlignedPriceRange(
+            lower_tick=low.tick,
+            upper_tick=high.tick,
+            lower_price=low.price,
+            upper_price=high.price,
+            exact_bounds=True,
         )
 
     def observe_day(self, state: PolicyState, observation: PolicyObservation) -> PolicyState:
@@ -1497,6 +1682,7 @@ class PolicyEngine:
                     "Exit path burns the position and swaps all inventory back to USDC.",
                 ),
                 with_cooldown=True,
+                dilution_exit=True,
             )
         # Condition-driven flat events require being flat in USDC.
         if flat_description is not None:
@@ -1595,13 +1781,38 @@ class PolicyEngine:
                     PolicyReason.GAS_GATE_DEFERRED,
                     defer_diagnostics + lost_yield,
                 )
-            # The recenter width is re-derived from the target net daily
-            # yield at the current observables, then the range is rebuilt
-            # around the current pool price.
+            # The recenter range solves on the executable grid inside the
+            # per-side band at the current observables: missing evidence
+            # defers the voluntary recenter (the wait anchor persists so the
+            # elapsed wait stays elapsed), a cash-hold verdict converts to
+            # the grace exit only once the grace window forces action, and a
+            # solved pick re-mints exactly the scored aligned bounds.
             width_solution = self._solve_range_width(observation, recenter_size)
-            new_range = self.build_aligned_range(
-                observation.amm_price_usdc, width_solution.half_width_fraction
-            )
+            if width_solution.mode is WidthSolveMode.DEFERRED:
+                waiting_position = position.model_copy(
+                    update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
+                )
+                return self._hold(
+                    state.model_copy(update={"position": waiting_position}),
+                    PolicyReason.RANGE_EVIDENCE_DEFERRED,
+                    width_solution.diagnostics + lost_yield,
+                )
+            if width_solution.mode is WidthSolveMode.CASH_HOLD and must_act:
+                return self._out_of_range_grace_exit(
+                    state,
+                    observation,
+                    width_solution.diagnostics + lost_yield,
+                )
+            if width_solution.mode is WidthSolveMode.CASH_HOLD:
+                waiting_position = position.model_copy(
+                    update={"out_of_range_since": wait_anchor, "out_of_range_side": "above"}
+                )
+                return self._hold(
+                    state.model_copy(update={"position": waiting_position}),
+                    PolicyReason.RANGE_NET_NONPOSITIVE,
+                    width_solution.diagnostics + lost_yield,
+                )
+            new_range = self._range_for_solution(width_solution)
             gas_units, gas_cost_usd = self._batch_gas(
                 observation, self._parameters.recenter_batch_gas_units
             )
@@ -1619,12 +1830,8 @@ class PolicyEngine:
                     f"{attempt_window} (recenter wait {self._parameters.recenter_wait}, "
                     f"grace {grace}).",
                     f"New range {new_range.lower_price}..{new_range.upper_price} "
-                    f"USDC per stock around pool price {observation.amm_price_usdc}.",
-                    f"Range half width {width_solution.half_width_fraction} "
-                    f"({width_solution.half_width_ticks} ticks per side) derived "
-                    f"against the target net daily yield "
-                    f"{self._parameters.target_net_daily_yield}; solve resolved as "
-                    f"{width_solution.mode.value}.",
+                    f"USDC per stock around pool price {observation.amm_price_usdc}; "
+                    f"solve resolved as {width_solution.mode.value}.",
                 )
                 + width_solution.diagnostics
                 + self._gas_diagnostics(gas_units, gas_cost_usd)
@@ -1672,9 +1879,12 @@ class PolicyEngine:
             )
             waiting_state = state.model_copy(update={"position": waiting_position})
             # The grace window bounds the whole hold exactly as above: once
-            # waited >= grace the policy must act, and every recenter gate
-            # that would have kept holding - wait, distance, depth, gas,
-            # payback - becomes an exit instead.
+            # waited >= grace the policy must act. The displacement minimum
+            # is a PRE-grace noise filter only - past the grace window the
+            # recenter economics, never the displacement minimum, decide,
+            # because the gate meant to prevent thoughtless chasing instead
+            # converted a barred cheap recenter into a costlier
+            # exit-sell-reentry round trip (the measured churn defect).
             grace = self._parameters.out_of_range_grace
             attempt_window = min(grace, self._parameters.recenter_wait)
             must_act = waited >= grace
@@ -1692,24 +1902,12 @@ class PolicyEngine:
                     f"with the {grace} out-of-range grace window bounding the hold.",
                 ) + lost_yield
                 return self._hold(waiting_state, PolicyReason.OPEN_BELOW_EDGE_HOLDING, diagnostics)
-            if waited < attempt_window or distance_fraction < (
-                self._parameters.downside_recenter_min_distance_fraction
-            ):
-                # Only reachable once the grace window elapsed while the
-                # wait or distance gate still blocks the recenter.
-                return self._out_of_range_grace_exit(
-                    state,
-                    observation,
-                    (
-                        f"Pool price {observation.amm_price_usdc} stayed below the lower "
-                        f"range edge {position.price_range.lower_price} for {waited}, "
-                        f"past the {grace} out-of-range grace window, with displacement "
-                        f"{distance_fraction} still under the locked "
-                        f"{self._parameters.downside_recenter_min_distance_fraction} "
-                        "recenter minimum; the recenter economics do not pass.",
-                    )
-                    + lost_yield,
-                )
+            # Past the grace window the displacement minimum no longer bars
+            # the recenter: the gate is a pre-grace noise filter, and once
+            # the grace has elapsed every blocking condition left - depth,
+            # gas, payback economics, the adaptive solve - decides between
+            # recenter and exit on its own merits, never the displacement
+            # minimum alone.
             recenter_size, resize_diagnostics = self._recenter_size(position, observation)
             if recenter_size <= 0:
                 if must_act:
@@ -1774,10 +1972,31 @@ class PolicyEngine:
                     PolicyReason.DOWNSIDE_RECENTER_UNECONOMIC,
                     economics_diagnostics + lost_yield,
                 )
+            # The recenter range solves on the executable grid inside the
+            # per-side band: missing evidence defers the voluntary recenter
+            # (the wait anchor persists), a cash-hold verdict converts to
+            # the grace exit only once the grace window forces action, and
+            # a solved pick re-mints exactly the scored aligned bounds.
             width_solution = self._solve_range_width(observation, recenter_size)
-            new_range = self.build_aligned_range(
-                observation.amm_price_usdc, width_solution.half_width_fraction
-            )
+            if width_solution.mode is WidthSolveMode.DEFERRED:
+                return self._hold(
+                    waiting_state,
+                    PolicyReason.RANGE_EVIDENCE_DEFERRED,
+                    width_solution.diagnostics + lost_yield,
+                )
+            if width_solution.mode is WidthSolveMode.CASH_HOLD and must_act:
+                return self._out_of_range_grace_exit(
+                    state,
+                    observation,
+                    width_solution.diagnostics + lost_yield,
+                )
+            if width_solution.mode is WidthSolveMode.CASH_HOLD:
+                return self._hold(
+                    waiting_state,
+                    PolicyReason.RANGE_NET_NONPOSITIVE,
+                    width_solution.diagnostics + lost_yield,
+                )
+            new_range = self._range_for_solution(width_solution)
             next_position = position.model_copy(
                 update={
                     "price_range": new_range,
@@ -1791,9 +2010,19 @@ class PolicyEngine:
                 resize_diagnostics
                 + (
                     f"Downside out-of-range wait {waited} and displacement "
-                    f"{distance_fraction} passed the locked recenter gates.",
+                    f"{distance_fraction} passed the locked recenter gates"
+                    + (
+                        " (the displacement minimum is a pre-grace noise filter; past "
+                        "the grace window the economics alone decided)"
+                        if must_act
+                        and distance_fraction
+                        < self._parameters.downside_recenter_min_distance_fraction
+                        else ""
+                    )
+                    + ".",
                     f"New range {new_range.lower_price}..{new_range.upper_price} "
-                    f"USDC per stock around pool price {observation.amm_price_usdc}.",
+                    f"USDC per stock around pool price {observation.amm_price_usdc}; "
+                    f"solve resolved as {width_solution.mode.value}.",
                 )
                 + economics_diagnostics
                 + width_solution.diagnostics
@@ -2063,6 +2292,7 @@ class PolicyEngine:
         reason: PolicyReason,
         diagnostics: tuple[str, ...],
         with_cooldown: bool,
+        dilution_exit: bool = False,
     ) -> PolicyOutcome:
         """Build one burn-and-swap-to-USDC safety exit with execution models.
 
@@ -2073,6 +2303,8 @@ class PolicyEngine:
             reason: Stable trigger reason for the exit.
             diagnostics: Trigger evidence; gas evidence is appended.
             with_cooldown: Whether the exit arms the re-entry cooldown.
+            dilution_exit: Whether the exit arms the dilution re-entry
+                margin on top of the cooldown.
 
         Returns:
             The exit decision plus the successor flat state.
@@ -2106,6 +2338,7 @@ class PolicyEngine:
                     if with_cooldown
                     else None
                 ),
+                "dilution_exit_pending": dilution_exit,
             }
         )
         return PolicyOutcome(
@@ -2510,6 +2743,27 @@ class PolicyEngine:
                     f"{format_apr_percent(self._parameters.min_entry_emissions_apr)}.",
                 ),
             )
+        # Re-entry after a dilution exit additionally clears the floor by the
+        # locked relative margin, so a pool straddling the floor cannot churn
+        # exit-reentry round trips bounded only by the cooldown.
+        if state.dilution_exit_pending:
+            margin_bound = self._parameters.min_entry_emissions_apr * (
+                Decimal(1) + self._parameters.dilution_reentry_margin_fraction
+            )
+            if observation.emissions_apr < margin_bound:
+                return self._hold(
+                    hold_state,
+                    PolicyReason.DILUTION_REENTRY_MARGIN_ACTIVE,
+                    (
+                        f"Raw emissions APR {format_apr_percent(observation.emissions_apr)} "
+                        "is below the dilution re-entry margin "
+                        f"{format_apr_percent(margin_bound)} - the floor "
+                        f"{format_apr_percent(self._parameters.min_entry_emissions_apr)} "
+                        f"plus the {self._parameters.dilution_reentry_margin_fraction} "
+                        "relative margin (mirroring the cross-pool switch margin) - "
+                        "after a dilution exit from this pool.",
+                    ),
+                )
         # Size is the smaller of the equity cap and the pool depth hard gate.
         equity_cap = observation.equity_usd * self._parameters.max_position_equity_fraction
         depth_cap = observation.pool_depth_usd * self._parameters.max_position_depth_fraction
@@ -2529,12 +2783,24 @@ class PolicyEngine:
         )
         if deferred:
             return self._hold(hold_state, PolicyReason.GAS_GATE_DEFERRED, defer_diagnostics)
-        # The entry width is derived from the target net daily yield behind the
-        # coarse APR gate, then the range is built around the observed price.
+        # The entry range solves on the executable grid inside the per-side
+        # band behind the coarse gates: missing evidence defers the entry,
+        # a nonpositive best candidate holds cash, and a solved pick mints
+        # exactly the scored aligned bounds.
         width_solution = self._solve_range_width(observation, size_usd)
-        entry_range = self.build_aligned_range(
-            observation.amm_price_usdc, width_solution.half_width_fraction
-        )
+        if width_solution.mode is WidthSolveMode.DEFERRED:
+            return self._hold(
+                hold_state,
+                PolicyReason.RANGE_EVIDENCE_DEFERRED,
+                width_solution.diagnostics,
+            )
+        if width_solution.mode is WidthSolveMode.CASH_HOLD:
+            return self._hold(
+                hold_state,
+                PolicyReason.RANGE_NET_NONPOSITIVE,
+                width_solution.diagnostics,
+            )
+        entry_range = self._range_for_solution(width_solution)
         gas_units, gas_cost_usd = self._batch_gas(
             observation, self._parameters.enter_batch_gas_units
         )
@@ -2550,7 +2816,8 @@ class PolicyEngine:
             committed_usd=size_usd,
             entered_at=observation.observed_at,
         )
-        next_state = state.model_copy(update={"position": position})
+        # A successful entry clears the dilution re-entry margin.
+        next_state = state.model_copy(update={"position": position, "dilution_exit_pending": False})
         return PolicyOutcome(
             decision=PolicyDecision(
                 action=PolicyActionKind.ENTER,
@@ -2562,12 +2829,8 @@ class PolicyEngine:
                     f"Size {size_usd} USDC is min(equity cap {equity_cap}, depth cap {depth_cap}).",
                     f"Range {entry_range.lower_price}..{entry_range.upper_price} "
                     f"USDC per stock around pool price {observation.amm_price_usdc} "
-                    f"aligned to tick spacing {self._parameters.tick_spacing}.",
-                    f"Range half width {width_solution.half_width_fraction} "
-                    f"({width_solution.half_width_ticks} ticks per side) derived "
-                    f"against the target net daily yield "
-                    f"{self._parameters.target_net_daily_yield}; solve resolved as "
-                    f"{width_solution.mode.value}.",
+                    f"aligned to tick spacing {self._parameters.tick_spacing}; solve "
+                    f"resolved as {width_solution.mode.value}.",
                 )
                 + width_solution.diagnostics
                 + self._gas_diagnostics(gas_units, gas_cost_usd),

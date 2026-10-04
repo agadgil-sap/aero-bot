@@ -7,9 +7,20 @@ from decimal import Decimal, localcontext
 import pytest
 from pydantic import ValidationError
 
-from aero_bot.history import EmissionsAprHistory, EmissionsAprPoint, PoolPricePath, PoolPricePoint
+from aero_bot.history import (
+    EmissionsAprHistory,
+    EmissionsAprPoint,
+    PoolPricePath,
+    PoolPricePoint,
+    swap_usd_notional,
+)
 from aero_bot.policy import PolicyActionKind, PolicyReason
-from aero_bot.ranging import RangingEvidence, WidthSolveMode, realized_daily_volatility
+from aero_bot.ranging import (
+    RangingEvidence,
+    WidthSolveMode,
+    position_liquidity_at_price,
+    realized_daily_volatility,
+)
 from aero_bot.rehearsal import (
     DEFAULT_SYNTHETIC_DISLOCATION_SCHEDULE,
     PoolRehearsalLedger,
@@ -24,7 +35,6 @@ from aero_bot.rehearsal import (
     band_depth_usd,
     build_reference_quotes,
     replay_pool,
-    swap_usd_notional,
     trailing_ranging_evidence,
 )
 
@@ -44,9 +54,82 @@ DEFAULT_POOL_LIQUIDITY = 80_000_000_000_000
 # Every fixture swap moves a five-thousand USDC notional.
 DEFAULT_SWAP_NOTIONAL_RAW = 5_000_000_000
 # The fixture gauge shares the pool's liquidity so staking shares stay readable.
-DEFAULT_GAUGE_LIQUIDITY = DEFAULT_POOL_LIQUIDITY
+# The fixture book follows the live thin-pool thesis regime: a small
+# concentrated staked book whose displayed APR genuinely pays a floor-scale
+# position, rather than a hundred-thousand-dollar book our size cannot
+# meaningfully share.
+DEFAULT_GAUGE_LIQUIDITY = 35_000_000_000
+DEFAULT_STAKED_TVL_USD = Decimal("500")
+# Every adaptive-width session opens with a gentle wander long enough to
+# satisfy the shared evidence-sufficiency bound (at least ten points over
+# at least thirty minutes): two-tick oscillation around the opening price.
+# Every adaptive-width session opens with a sparse quiet meander long
+# enough to satisfy the shared evidence-sufficiency bound (at least ten
+# points over at least thirty minutes): the measured weekend-regime shape
+# (the 2026-10-03 bounded reads - one to two ticks of total wander over
+# hours), one single-tick move every twenty observations alternating
+# direction so the path stays within two ticks of its anchor.
+WARMUP_POINTS = 32
+WARMUP_MOVE_EVERY = 20
+
+
+def quiet_wander(spot: Decimal, count: int = WARMUP_POINTS) -> list[Decimal]:
+    """Build one sparse quiet-regime meander around a spot price.
+
+    Args:
+        spot: The anchor price the meander stays within two ticks of.
+        count: The number of warmup points.
+
+    Returns:
+        Prices holding flat with a single-tick move every twenty
+        observations alternating direction - the measured quiet-regime
+        shape whose realized volatility stays far inside one percent a day.
+    """
+    ratio = Decimal("1.0001")
+    prices: list[Decimal] = []
+    level = 0
+    for index in range(count):
+        if index > 0 and index % WARMUP_MOVE_EVERY == 0:
+            level += 1 if level <= 0 else -1
+        prices.append(spot * ratio ** Decimal(level))
+    return prices
+
+
+def episode_start(session_minute: float, session_len: int) -> Decimal:
+    """Convert one session-relative minute into a path-fraction episode start.
+
+    Args:
+        session_minute: Minutes after the session proper begins (fractional
+            allowed, matching the schedule's half-minute convention).
+        session_len: Number of observations in the session proper.
+
+    Returns:
+        The start fraction over the whole warmed path landing the episode at
+        the requested session-relative minute.
+    """
+    total_minutes = WARMUP_POINTS + session_len - 1
+    return Decimal(str((WARMUP_POINTS + session_minute) / total_minutes))
+
+
+def session_time(index: int, step_seconds: int = 60) -> datetime:
+    """Return one session-relative instant after the sufficiency warmup.
+
+    Args:
+        index: Observation index after the session proper begins.
+        step_seconds: Wall-clock seconds between observations.
+
+    Returns:
+        The warmup-shifted absolute instant for readable timeline asserts.
+    """
+    return BASE_TIME + timedelta(seconds=step_seconds * (WARMUP_POINTS + index))
+
+
 # The fixture reward rate is one whole AERO per second.
-DEFAULT_EMISSIONS_PER_SECOND = 10**18
+# The emissions stream is coherent with the fixture book's displayed APR:
+# one whole AERO per second implied a thirty-thousand-percent APR on the
+# five-hundred-dollar book, so the rate is the exact value whose displayed
+# APR at the 0.50 AERO price anchor lands at three (three hundred percent).
+DEFAULT_EMISSIONS_PER_SECOND = 95_129_375_950_720
 # Two fractional comparisons below need a shared high-precision context.
 MATH_PRECISION = 60
 
@@ -166,7 +249,7 @@ def make_apr_history(
         anchor_block=10_000,
         observed_at=BASE_TIME,
         anchor_gauge_liquidity=DEFAULT_GAUGE_LIQUIDITY,
-        anchor_staked_tvl_usd=Decimal("100000"),
+        anchor_staked_tvl_usd=DEFAULT_STAKED_TVL_USD,
         emissions_per_second=DEFAULT_EMISSIONS_PER_SECOND,
         aero_price_assumption_usd=aero_price_assumption_usd,
         reconstruction_mode="event_fold",
@@ -197,9 +280,17 @@ def run_rehearsal(
     Returns:
         The deterministic ledger for the synthetic session.
     """
+    # The sufficiency warmup: a gentle wander around the opening price
+    # runs before the session proper so the fold's first entries measure a
+    # real window, exactly as production's bounded reads do.
+    warmed = quiet_wander(prices[0]) + list(prices) if prices else prices
+    shifted_steps = [
+        step.model_copy(update={"timestamp": step.timestamp + timedelta(minutes=WARMUP_POINTS)})
+        for step in apr_steps
+    ]
     return replay_pool(
-        price_path=make_path(prices, liquidity, step_seconds),
-        emissions_history=make_apr_history(apr_steps),
+        price_path=make_path(warmed, liquidity, step_seconds),
+        emissions_history=make_apr_history(shifted_steps),
         symbol="AAPLc/USDC",
         assumptions=assumptions or RehearsalAssumptions(pool_fee_ppm=500),
         schedule=schedule,
@@ -377,7 +468,7 @@ class TestReplayLifecycle:
         prices = [Decimal("100")] * 10 + [Decimal("99.5"), Decimal("98.5")]
         ledger = run_rehearsal(prices, high_apr_steps(len(prices)))
 
-        assert ledger.observation_count == 12
+        assert ledger.observation_count == 12 + WARMUP_POINTS
         assert ledger.action_counts.entries == 1
         assert ledger.action_counts.stop_outs == 1
         assert ledger.actions[0].action == PolicyActionKind.ENTER
@@ -391,10 +482,12 @@ class TestReplayLifecycle:
         assert ledger.actions[1].swap_impact_cost_usd > 0
         # The stop batch burns, unstakes, and swaps at the documented assumptions.
         assert ledger.actions[1].estimated_gas_cost_usd == Decimal("0.00135")
-        # Exposure spans twelve minutes minus the cooldown tail, in range until
-        # the price left the band one observation before the stop.
-        assert ledger.time_open_seconds == 660
-        assert ledger.time_in_range_seconds == 600
+        # Exposure spans the entry (warmup minute thirty, once the shared
+        # sufficiency bound is met) through the stop, in range until the
+        # price left the tighter adaptive band one observation earlier than
+        # the retired ceiling's geometry did.
+        assert ledger.time_open_seconds == 780
+        assert ledger.time_in_range_seconds == 720
         assert ledger.final_open_position_committed_usd is None
         assert ledger.pnl_usd < 0
         assert ledger.aero_accrued_units > 0
@@ -413,15 +506,19 @@ class TestReplayLifecycle:
         assert ledger.action_counts.dilution_exits == 1
         assert ledger.actions[1].action == PolicyActionKind.DILUTION_EXIT
         assert ledger.actions[1].reason == PolicyReason.DILUTION_EXIT_TRIGGERED
-        assert ledger.actions[1].timestamp == BASE_TIME + timedelta(minutes=5)
+        assert ledger.actions[1].timestamp == session_time(5)
         # The cooldown runs fifteen minutes and the APR stays below threshold,
         # so no re-entry appears for the rest of the session.
         assert all(a.action != PolicyActionKind.ENTER for a in ledger.actions[2:])
 
     def test_upside_recenter_after_the_fifteen_minute_wait(self) -> None:
         """A sustained move above the range recenters once the acting window elapses."""
-        prices = [Decimal("100")] + [Decimal("101")] * 16
-        ledger = run_rehearsal(prices, high_apr_steps(len(prices)))
+        # The 0.2-percent move leaves the entered adaptive band; the session's
+        # APR follows the live thin-pool thesis regime, whose income genuinely
+        # covers the measured post-jump churn.
+        prices = [Decimal("100")] + [Decimal("100.2")] * 16
+        steps = [make_apr_step(0, Decimal("30"))]
+        ledger = run_rehearsal(prices, steps)
 
         assert ledger.action_counts.entries == 1
         assert ledger.action_counts.recenters == 1
@@ -431,20 +528,17 @@ class TestReplayLifecycle:
         # The ten-minute out-of-range grace window (the captain's 2026-09-27
         # correction) pulls the recenter attempt earlier than the locked
         # fifteen-minute wait, so the first past-grace observation recenters.
-        assert recenter.timestamp == BASE_TIME + timedelta(minutes=11)
-        # The recenter re-derives its width from live evidence: the fixture's
-        # economics cannot reach the one-percent target, so the solve enters
-        # at the one-spacing tightest width rather than widening to hedge.
-        assert recenter.width_mode == WidthSolveMode.TARGET_UNREACHABLE
-        assert recenter.half_width_ticks == 10
-        with localcontext() as decimal_context:
-            decimal_context.prec = MATH_PRECISION
-            expected_fraction = Decimal("1.0001") ** Decimal(10) - Decimal(1)
-        assert recenter.half_width_fraction == expected_fraction
-        # The aligned new range spans roughly that width around 101.
+        assert recenter.timestamp == session_time(11)
+        # The recenter re-solves the executable geometry from live evidence
+        # around the new price: real in-band per-side distances.
+        assert recenter.width_mode == WidthSolveMode.SOLVED
+        assert recenter.range_lower_price is not None
         assert recenter.range_upper_price is not None
-        assert Decimal("101") * Decimal("1.0010") < recenter.range_upper_price
-        assert recenter.range_upper_price < Decimal("101") * Decimal("1.0021")
+        assert recenter.range_lower_price < Decimal("100.2") < recenter.range_upper_price
+        assert recenter.range_upper_distance_fraction is not None
+        assert Decimal("0.001") <= recenter.range_upper_distance_fraction <= Decimal("0.003")
+        assert recenter.range_lower_distance_fraction is not None
+        assert Decimal("0.001") <= recenter.range_lower_distance_fraction <= Decimal("0.003")
 
     def test_stale_high_episode_exits_on_the_amm(self) -> None:
         """A synthetic stale-high spell sells into the pool while it is high."""
@@ -453,7 +547,7 @@ class TestReplayLifecycle:
             episodes=(
                 SyntheticEpisode(
                     kind=SyntheticEpisodeKind.STALE_HIGH,
-                    start_fraction=Decimal("0.5"),
+                    start_fraction=episode_start(3.5, 11),
                     duration=timedelta(minutes=2),
                 ),
             )
@@ -465,7 +559,7 @@ class TestReplayLifecycle:
         exit_record = next(
             a for a in ledger.actions if a.action == PolicyActionKind.DISLOCATION_EXIT
         )
-        assert exit_record.timestamp == BASE_TIME + timedelta(minutes=5)
+        assert exit_record.timestamp == session_time(4)
         assert exit_record.reason == PolicyReason.DISLOCATION_STALE_HIGH_TRIGGERED
 
     def test_stale_low_burn_then_convergence_sell(self) -> None:
@@ -475,7 +569,7 @@ class TestReplayLifecycle:
             episodes=(
                 SyntheticEpisode(
                     kind=SyntheticEpisodeKind.STALE_LOW,
-                    start_fraction=Decimal("0.5"),
+                    start_fraction=episode_start(3.5, 8),
                     duration=timedelta(minutes=2),
                 ),
             )
@@ -488,8 +582,8 @@ class TestReplayLifecycle:
         sell = next(a for a in ledger.actions if a.action == PolicyActionKind.SELL_INVENTORY)
         # The episode covers 12:03:30 through 12:05:30, so the burn lands on
         # the 12:04 observation and convergence releases at 12:06.
-        assert burn.timestamp == BASE_TIME + timedelta(minutes=4)
-        assert sell.timestamp == BASE_TIME + timedelta(minutes=6)
+        assert burn.timestamp == session_time(4)
+        assert sell.timestamp == session_time(6)
         assert sell.reason == PolicyReason.INVENTORY_CONVERGENCE_REACHED
         # The stale-low burn performs no swap; the sell converts the tokens.
         assert burn.swap_total_usd is None
@@ -502,7 +596,7 @@ class TestReplayLifecycle:
             episodes=(
                 SyntheticEpisode(
                     kind=SyntheticEpisodeKind.STALE_LOW,
-                    start_fraction=Decimal("0.5"),
+                    start_fraction=episode_start(5.5, 12),
                     duration=timedelta(minutes=8),
                 ),
             )
@@ -515,8 +609,8 @@ class TestReplayLifecycle:
         sell = next(a for a in ledger.actions if a.action == PolicyActionKind.SELL_INVENTORY)
         # The episode starts at 12:05:30, so the burn lands on the 12:06
         # observation and the five-minute timeout releases at 12:11.
-        assert burn.timestamp == BASE_TIME + timedelta(minutes=6)
-        assert sell.timestamp == BASE_TIME + timedelta(minutes=11)
+        assert burn.timestamp == session_time(6)
+        assert sell.timestamp == session_time(11)
         assert sell.reason == PolicyReason.INVENTORY_CONVERGENCE_TIMEOUT
 
     def test_stale_feed_exits_defensively_then_blocks_and_reenters(self) -> None:
@@ -526,7 +620,9 @@ class TestReplayLifecycle:
             episodes=(
                 SyntheticEpisode(
                     kind=SyntheticEpisodeKind.STALE_FEED,
-                    start_fraction=Decimal("0.4"),
+                    # Ten-minute observation steps: the episode starts at
+                    # session minute zero and runs thirty minutes.
+                    start_fraction=Decimal(320) / Decimal(360),
                     duration=timedelta(minutes=30),
                 ),
             )
@@ -541,15 +637,15 @@ class TestReplayLifecycle:
         assert ledger.action_counts.defensive_exits == 1
         assert ledger.action_counts.entries == 2
         defensive = next(a for a in ledger.actions if a.action == PolicyActionKind.DEFENSIVE_EXIT)
-        # The outage starts at 12:20; the reference ages past the
-        # fifteen-minute open-position bound at the 12:30 observation.
-        assert defensive.timestamp == BASE_TIME + timedelta(minutes=30)
+        # The outage starts with the session proper; the reference ages
+        # past the fifteen-minute open-position bound at the third
+        # ten-minute observation.
+        assert defensive.timestamp == session_time(2, step_seconds=600)
         assert defensive.reason == PolicyReason.REFERENCE_STALE_DEFENSIVE_EXIT
-        # The 12:40 observation stays flat with a stale reference, and the
-        # outage clears in time for the 12:50 re-entry.
+        # The outage clears in time for a re-entry before the session ends.
         reentry = ledger.actions[-1]
         assert reentry.action == PolicyActionKind.ENTER
-        assert reentry.timestamp == BASE_TIME + timedelta(minutes=50)
+        assert reentry.timestamp == session_time(4, step_seconds=600)
 
     def test_gas_gate_defers_entries_at_a_high_gas_price(self) -> None:
         """A gas assumption over the ceiling defers every entry."""
@@ -562,7 +658,10 @@ class TestReplayLifecycle:
             assumptions=assumptions,
         )
 
-        assert ledger.action_counts.gas_deferrals == 3
+        # Every observation - warmup and session alike - defers at the
+        # over-ceiling gas price.
+        assert ledger.action_counts.gas_deferrals == 3 + WARMUP_POINTS
+        assert ledger.observation_count == 3 + WARMUP_POINTS
         assert ledger.action_counts.entries == 0
         assert all(a.reason == PolicyReason.GAS_GATE_DEFERRED for a in ledger.actions)
         # Nothing executed, so the books close exactly where they opened.
@@ -576,7 +675,7 @@ class TestReplayLifecycle:
 
         assert ledger.action_counts.entries == 0
         assert ledger.actions == ()
-        assert ledger.observation_count == 3
+        assert ledger.observation_count == 3 + WARMUP_POINTS
         assert ledger.pnl_usd == 0
 
     def test_empty_price_path_emits_an_empty_ledger(self) -> None:
@@ -604,29 +703,55 @@ class TestReplayAccounting:
         assert entry.size_usd is not None
         assert entry.range_lower_price is not None
         assert entry.range_upper_price is not None
+        entry_index = int((entry.timestamp - BASE_TIME).total_seconds()) // 60
+        # Fees credit at every post-decision in-range observation INCLUDING
+        # the entry's own swap; emissions accrue over the elapsed intervals.
+        post_entry_points = ledger.observation_count - entry_index
+        post_entry_seconds = (ledger.observation_count - 1 - entry_index) * 60
         with localcontext() as decimal_context:
             decimal_context.prec = MATH_PRECISION
-            sqrt_lower = entry.range_lower_price.sqrt()
-            sqrt_upper = entry.range_upper_price.sqrt()
-            sqrt_center = (sqrt_lower * sqrt_upper).sqrt()
-            human_liquidity = entry.size_usd / (Decimal(2) * (sqrt_center - sqrt_lower))
-            raw_liquidity = human_liquidity * Decimal(10) ** (
-                (Decimal(FIXTURE_STOCK_DECIMALS) + Decimal(FIXTURE_QUOTE_DECIMALS)) / Decimal(2)
+            # The exact executable geometry: liquidity bought per deployed
+            # dollar entering at the pool price inside the aligned bounds -
+            # the same composition rule the executor mints with, never the
+            # retired centered-ideal shortcut.
+            human_liquidity = position_liquidity_at_price(
+                Decimal("100"), entry.range_lower_price, entry.range_upper_price
             )
-            share = raw_liquidity / Decimal(DEFAULT_GAUGE_LIQUIDITY)
+            raw_liquidity = (
+                human_liquidity
+                * entry.size_usd
+                * Decimal(10)
+                ** (
+                    (Decimal(FIXTURE_STOCK_DECIMALS) + Decimal(FIXTURE_QUOTE_DECIMALS)) / Decimal(2)
+                )
+            )
+            # Fees share the ACTIVE pool liquidity (the swap-fee
+            # denominator); emissions share the GAUGE liquidity.
+            fee_share = raw_liquidity / Decimal(DEFAULT_POOL_LIQUIDITY)
+            gauge_share = raw_liquidity / Decimal(DEFAULT_GAUGE_LIQUIDITY)
             expected_fees = (
-                Decimal("5000") * Decimal("500") / Decimal(1_000_000) * share * Decimal(len(prices))
+                Decimal("5000")
+                * Decimal("500")
+                / Decimal(1_000_000)
+                * fee_share
+                * Decimal(post_entry_points)
             )
-            expected_aero = share * Decimal(1) * Decimal(4 * 60)
+            expected_aero = (
+                gauge_share
+                * Decimal(DEFAULT_EMISSIONS_PER_SECOND)
+                / Decimal(10) ** 18
+                * Decimal(post_entry_seconds)
+            )
 
-        # The replay accumulates each accrual in the default context while the
-        # expectation runs at full precision, so tails below one attodollar
-        # are compared by tolerance rather than exact Decimal equality.
-        assert abs(ledger.fees_accrued_usd - expected_fees) < Decimal("1e-18")
-        assert abs(ledger.aero_accrued_units - expected_aero) < Decimal("1e-18")
-        assert abs(ledger.aero_accrued_usd - expected_aero * Decimal("0.5")) < Decimal("1e-18")
-        assert ledger.time_in_range_seconds == 240
-        assert ledger.time_open_seconds == 240
+        # The replay accumulates each fee accrual in the default context
+        # while the expectation runs at full precision, so the summed
+        # per-step rounding is compared by a sub-cent tolerance rather than
+        # exact Decimal equality.
+        assert abs(ledger.fees_accrued_usd - expected_fees) < Decimal("1e-6")
+        assert abs(ledger.aero_accrued_units - expected_aero) < Decimal("1e-6")
+        assert abs(ledger.aero_accrued_usd - expected_aero * Decimal("0.5")) < Decimal("1e-6")
+        assert ledger.time_in_range_seconds == post_entry_seconds
+        assert ledger.time_open_seconds == post_entry_seconds
 
     def test_entry_costs_use_the_documented_gas_assumption(self) -> None:
         """The entry batch cost follows the constant gas and ETH assumptions."""
@@ -670,7 +795,7 @@ class TestReplayAccounting:
         ledger = run_rehearsal(
             [Decimal("100"), Decimal("97")],
             high_apr_steps(2),
-            liquidity=[DEFAULT_POOL_LIQUIDITY, 0],
+            liquidity=[DEFAULT_POOL_LIQUIDITY] * (WARMUP_POINTS + 2 - 1) + [0],
         )
 
         assert ledger.action_counts.stop_outs == 1
@@ -774,8 +899,9 @@ class TestTrailingRangingEvidence:
             window_start=window_start,
             index=index,
             gauge_liquidity_raw=DEFAULT_GAUGE_LIQUIDITY,
+            token_is_token0=True,
             anchor_gauge_liquidity=DEFAULT_GAUGE_LIQUIDITY,
-            anchor_staked_tvl_usd=Decimal("100000"),
+            anchor_staked_tvl_usd=DEFAULT_STAKED_TVL_USD,
             pool_fee_ppm=500,
             stock_decimals=FIXTURE_STOCK_DECIMALS,
             quote_decimals=FIXTURE_QUOTE_DECIMALS,
@@ -799,15 +925,16 @@ class TestTrailingRangingEvidence:
             window_start=0,
             index=1,
             gauge_liquidity_raw=DEFAULT_GAUGE_LIQUIDITY // 2,
+            token_is_token0=True,
             anchor_gauge_liquidity=DEFAULT_GAUGE_LIQUIDITY,
-            anchor_staked_tvl_usd=Decimal("100000"),
+            anchor_staked_tvl_usd=DEFAULT_STAKED_TVL_USD,
             pool_fee_ppm=500,
             stock_decimals=FIXTURE_STOCK_DECIMALS,
             quote_decimals=FIXTURE_QUOTE_DECIMALS,
         )
 
         assert evidence.gauge_liquidity_raw == DEFAULT_GAUGE_LIQUIDITY // 2
-        assert evidence.staked_tvl_usd == Decimal("50000")
+        assert evidence.staked_tvl_usd == DEFAULT_STAKED_TVL_USD / Decimal(2)
 
     def test_single_observation_window_carries_no_volatility(self) -> None:
         """A one-point window cannot estimate volatility and says so with None."""
@@ -819,8 +946,9 @@ class TestTrailingRangingEvidence:
             window_start=0,
             index=0,
             gauge_liquidity_raw=DEFAULT_GAUGE_LIQUIDITY,
+            token_is_token0=True,
             anchor_gauge_liquidity=DEFAULT_GAUGE_LIQUIDITY,
-            anchor_staked_tvl_usd=Decimal("100000"),
+            anchor_staked_tvl_usd=DEFAULT_STAKED_TVL_USD,
             pool_fee_ppm=500,
             stock_decimals=FIXTURE_STOCK_DECIMALS,
             quote_decimals=FIXTURE_QUOTE_DECIMALS,
@@ -859,8 +987,9 @@ class TestTrailingRangingEvidence:
             window_start=window_start,
             index=index,
             gauge_liquidity_raw=DEFAULT_GAUGE_LIQUIDITY,
+            token_is_token0=True,
             anchor_gauge_liquidity=anchor_gauge_liquidity,
-            anchor_staked_tvl_usd=Decimal("100000"),
+            anchor_staked_tvl_usd=DEFAULT_STAKED_TVL_USD,
             pool_fee_ppm=500,
             stock_decimals=FIXTURE_STOCK_DECIMALS,
             quote_decimals=FIXTURE_QUOTE_DECIMALS,
@@ -881,50 +1010,88 @@ class TestTrailingRangingEvidence:
 
 
 class TestDerivedWidthReplay:
-    """Tests for target-yield-derived widths inside the replay fold."""
+    """Tests for adaptive executable-range widths inside the replay fold."""
 
-    def test_window_opening_entry_fails_toward_the_labeled_ceiling(self) -> None:
-        """The first observation carries no volatility evidence yet."""
+    def test_window_opening_defers_then_solves(self) -> None:
+        """The first observation carries no measurable evidence and defers."""
         ledger = run_rehearsal([Decimal("100")] * 5, high_apr_steps(5))
 
         entry = ledger.actions[0]
+        # The opening observations hold deferred until the shared sufficiency
+        # bound is met - at the sixty-second cadence, the thirty-first point
+        # is the first spanning the required eighteen hundred seconds - and
+        # that first sufficient observation solves and enters.
         assert entry.action == PolicyActionKind.ENTER
-        assert entry.width_mode == WidthSolveMode.FALLBACK_CEILING
-        assert entry.half_width_ticks == 29
-        assert entry.half_width_fraction is not None
-        assert entry.half_width_fraction < Decimal("0.003")
+        assert entry.timestamp == BASE_TIME + timedelta(minutes=30)
+        assert entry.width_mode == WidthSolveMode.SOLVED
+        assert entry.range_lower_tick is not None
+        assert entry.range_upper_tick is not None
+        assert entry.range_lower_distance_fraction is not None
+        assert entry.range_upper_distance_fraction is not None
+        assert Decimal("0.001") <= entry.range_lower_distance_fraction <= Decimal("0.003")
+        assert Decimal("0.001") <= entry.range_upper_distance_fraction <= Decimal("0.003")
 
-    def test_derived_entry_solves_when_evidence_supports_the_target(self) -> None:
-        """A later entry with rich evidence solves at the tightest meeting width."""
+    def test_derived_entry_solves_when_evidence_supports_the_income(self) -> None:
+        """A later entry with rich evidence solves inside the band."""
         steps = [
             make_apr_step(0, Decimal("1.2")),
-            make_apr_step(2, Decimal("20")),
+            make_apr_step(2, Decimal("900")),
         ]
         ledger = run_rehearsal([Decimal("100")] * 5, steps)
 
         entry = ledger.actions[0]
-        assert entry.timestamp == BASE_TIME + timedelta(minutes=2)
+        assert entry.timestamp == session_time(2)
         assert entry.width_mode == WidthSolveMode.SOLVED
-        assert entry.half_width_ticks == 10
         assert entry.range_lower_price is not None
         assert entry.range_upper_price is not None
         assert entry.range_lower_price < Decimal("100") < entry.range_upper_price
+        # The minted geometry is a spacing multiple on each side.
+        assert entry.range_lower_tick is not None
+        assert entry.range_upper_tick is not None
+        assert (entry.range_upper_tick - entry.range_lower_tick) % 10 == 0
 
     def test_derived_recenter_re_solves_at_the_new_price(self) -> None:
-        """A recenter derives its width again from the evidence at that instant."""
-        prices = [Decimal("100")] + [Decimal("101")] * 16
-        ledger = run_rehearsal(prices, high_apr_steps(len(prices)))
+        """A recenter derives its geometry again from the evidence at that instant."""
+        # A quiet warmup around 100 seeds the measured evidence, then a
+        # sustained 0.2-percent move leaves the entered range: the recenter
+        # re-solves the executable geometry around the new price.
+        prices = [Decimal("100")] * 8 + [Decimal("100.2")] * 12
+        ledger = run_rehearsal(
+            prices,
+            [make_apr_step(0, Decimal("900"))],
+        )
         recenter = ledger.actions[1]
 
-        assert recenter.width_mode == WidthSolveMode.TARGET_UNREACHABLE
-        assert recenter.half_width_ticks == 10
-        # The unreachable target never widens past the solver's tightest pick.
-        assert recenter.half_width_fraction is not None
-        assert recenter.half_width_fraction < Decimal("0.003")
+        assert recenter.action == PolicyActionKind.RECENTER
+        assert recenter.width_mode == WidthSolveMode.SOLVED
+        assert recenter.range_lower_price is not None
+        assert recenter.range_upper_price is not None
+        assert recenter.range_lower_price < Decimal("100.2") < recenter.range_upper_price
+        assert (
+            Decimal("0.001")
+            <= (recenter.range_upper_distance_fraction or Decimal(0))
+            <= Decimal("0.003")
+        )
+
+    def test_a_wild_window_holds_cash_instead_of_entering(self) -> None:
+        """A session whose measured regime nets negative never enters."""
+        # A violently alternating path, wild from its own first point so no
+        # quiet warmup can mask the regime: once the shared sufficiency bound
+        # is met the measured volatility makes every candidate net negative.
+        prices = [Decimal("101"), Decimal("99")] * 24
+        ledger = replay_pool(
+            price_path=make_path(prices),
+            emissions_history=make_apr_history([make_apr_step(0, Decimal("3.0"))]),
+            symbol="AAPLc/USDC",
+            assumptions=RehearsalAssumptions(pool_fee_ppm=500),
+        )
+
+        assert ledger.action_counts.entries == 0
+        assert ledger.actions == ()
 
     def test_baseline_replay_keeps_the_fixed_ceiling_width_everywhere(self) -> None:
         """Baseline mode reproduces the v1 fixed-width policy at every action."""
-        prices = [Decimal("100")] + [Decimal("101")] * 16
+        prices = [Decimal("100")] * 8 + [Decimal("101")] * 12
         ledger = replay_pool(
             price_path=make_path(prices),
             emissions_history=make_apr_history([make_apr_step(0, Decimal("3.0"))]),
@@ -939,8 +1106,16 @@ class TestDerivedWidthReplay:
             for action in ledger.actions
             if action.action in (PolicyActionKind.ENTER, PolicyActionKind.RECENTER)
         ]
+        assert width_actions
         assert {action.width_mode for action in width_actions} == {WidthSolveMode.FALLBACK_CEILING}
-        assert {action.half_width_ticks for action in width_actions} == {29}
+        for action in width_actions:
+            # The baseline mints the outward-aligned ceiling: up to seven
+            # spacings of total span around the acting price depending on
+            # the price's grid phase.
+            assert action.range_lower_tick is not None
+            assert action.range_upper_tick is not None
+            span = action.range_upper_tick - action.range_lower_tick
+            assert 50 <= span <= 80
         recenter = ledger.actions[1]
         # The baseline range spans the locked ceiling width around 101.
         assert recenter.range_upper_price is not None
@@ -960,12 +1135,8 @@ class TestDerivedWidthReplay:
         )
 
         assert derived.width_selection == WidthSelectionMode.DERIVED_FROM_TARGET
-        assert any(
-            "derive from the target net daily yield" in label for label in derived.assumption_labels
-        )
-        assert any(
-            "trailing day of reconstructed swaps" in label for label in derived.assumption_labels
-        )
+        assert any("adaptive executable grid" in label for label in derived.assumption_labels)
+        assert any("shared bounded trailing window" in label for label in derived.assumption_labels)
         assert baseline.width_selection == WidthSelectionMode.FIXED_CEILING_BASELINE
         assert any("baseline replay" in label for label in baseline.assumption_labels)
 
@@ -977,8 +1148,8 @@ class TestDerivedWidthReplay:
         exit_record = ledger.actions[1]
         assert exit_record.action == PolicyActionKind.STOP_OUT
         assert exit_record.width_mode is None
-        assert exit_record.half_width_ticks is None
-        assert exit_record.half_width_fraction is None
+        assert exit_record.range_lower_tick is None
+        assert exit_record.range_upper_tick is None
 
 
 class TestLedgerModels:
@@ -1060,8 +1231,9 @@ def test_trailing_evidence_same_block_window_leaves_volatility_unset() -> None:
         window_start=0,
         index=1,
         gauge_liquidity_raw=DEFAULT_GAUGE_LIQUIDITY,
+        token_is_token0=True,
         anchor_gauge_liquidity=DEFAULT_GAUGE_LIQUIDITY,
-        anchor_staked_tvl_usd=Decimal("100000"),
+        anchor_staked_tvl_usd=DEFAULT_STAKED_TVL_USD,
         pool_fee_ppm=500,
         stock_decimals=FIXTURE_STOCK_DECIMALS,
         quote_decimals=FIXTURE_QUOTE_DECIMALS,

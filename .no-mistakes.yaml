@@ -1,0 +1,11 @@
+# Per-repo no-mistakes overrides.
+
+# Pin the pipeline's automated steps to the repository's own canonical
+# validation gates (AGENTS.md "Validation gates before every commit") so
+# test execution is bounded and reproducible - the full offline unit suite
+# over the fakes, never an open-ended investigation that reaches the public
+# RPC - and lint runs the same formatter, linter, and strict type gate the
+# project's own CI owns.
+commands:
+  test: 'uv run pytest -q'
+  lint: 'uv run ruff format --check . && uv run ruff check . && uv run mypy src tests'

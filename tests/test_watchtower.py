@@ -258,6 +258,7 @@ class FakeCloseExecutor:
         key_bytes: bytes,
         ephemeral_key: bool = False,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> object:
         """The watchtower never recenters; refuse if asked."""
         raise AssertionError("the watchtower must never recenter")
@@ -272,6 +273,7 @@ class FakeCloseExecutor:
         key_bytes: bytes,
         ephemeral_key: bool = False,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> object:
         """The watchtower never switches pools; refuse if asked."""
         raise AssertionError("the watchtower must never switch pools")
@@ -349,6 +351,7 @@ class FakeCloseExecutor:
         confirm_broadcast: bool,
         ephemeral_key: bool = False,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> LpActionExecutionReport:
         """The watchtower never mints; refuse if asked."""
         raise AssertionError("the watchtower must never mint")

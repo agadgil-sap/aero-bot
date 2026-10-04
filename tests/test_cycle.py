@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from conftest import healthy_ranging_evidence
 from pydantic import BaseModel
 from test_lp_executor import (
     B20_ADDRESS,
@@ -81,11 +82,14 @@ from aero_bot.policy import (
     AlignedPriceRange,
     PolicyActionKind,
     PolicyDecision,
+    PolicyEngine,
+    PolicyObservation,
     PolicyOutcome,
     PolicyParameters,
     PolicyReason,
     PolicyState,
 )
+from aero_bot.ranging import RangingEvidence
 from aero_bot.stock_reference import (
     StockReferenceFeed,
     StockReferenceQuote,
@@ -114,7 +118,10 @@ FIXTURE_RANGE_UPPER = LP_RANGE_UPPER
 # equity: the 80-percent equity cap (the captain's 2026-09-09 sizing
 # ruling) and the ceiling-rounded spacing width.
 EXPECTED_ENTER_SIZE = Decimal("8")
-EXPECTED_ENTER_WIDTH = 4
+# The adaptive solve's committed geometry at the fixture price: two tick
+# spacings of total span (about twenty ticks, inside the 0.1-to-0.3-percent
+# per-side band), replacing the retired ceiling's four-spacing mint.
+EXPECTED_ENTER_WIDTH = 2
 # The fixture AMM price doubles as a neutral reference quote: equal to the
 # pool price, no dislocation can trigger in either direction.
 with localcontext():
@@ -156,21 +163,29 @@ class FakeCycleSources:
         usdc_units: int = 10_000_000,
         stock_units: int = 0,
         listings: tuple[BoardListing, ...] | None = None,
+        emissions_per_second: int | None = None,
     ) -> None:
         """Configure the fixture pool and the Safe's live balances."""
         self._usdc_units = usdc_units
         self._stock_units = stock_units
         self._listings = listings
+        self._emissions_per_second = emissions_per_second
+
+    def _candidate(self) -> PoolCandidate:
+        """Return the fixture pool, optionally with an overridden reward rate."""
+        if self._emissions_per_second is None:
+            return make_candidate()
+        return make_candidate(emissions_per_second=self._emissions_per_second)
 
     def resolve_pool(self, symbol: str) -> tuple[PoolCandidate, int]:
         """Return the verified fixture pool and its snapshot block."""
-        return make_candidate(), 123
+        return self._candidate(), 123
 
     def enumerate_pools(self) -> tuple[tuple[BoardListing, ...], int]:
         """Return the scripted board and its snapshot block."""
         if self._listings is not None:
             return self._listings, 123
-        return (BoardListing(symbol="FIXc", pool=make_candidate()),), 123
+        return (BoardListing(symbol="FIXc", pool=self._candidate()),), 123
 
     def registry_paused(self) -> bool:
         """The fixture registry is verified."""
@@ -197,6 +212,30 @@ class FakeCycleSources:
         if token_address.lower() == BASE_USDC_ADDRESS.lower():
             return self._usdc_units
         return self._stock_units
+
+    def ranging_evidence(
+        self,
+        pool: PoolCandidate,
+        snapshot_price_usdc: Decimal,
+        stock_decimals: int,
+        observed_at: datetime,
+    ) -> RangingEvidence | None:
+        """Serve the healthy measured fixture from the actual pool snapshot.
+
+        The raw grid anchor and orientation derive from the resolved pool
+        exactly as the live reader would, so the solve's bounds sit on the
+        same grid the executor mints.
+        """
+        stock_is_token0 = (
+            pool.token0_address.lower() != "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+        )
+        return healthy_ranging_evidence(
+            snapshot_price_usdc,
+            observed_at=observed_at,
+            pool_tick_raw=pool.current_tick,
+            stock_is_token0=stock_is_token0,
+            stock_decimals=stock_decimals,
+        )
 
 
 class FakeReads:
@@ -347,6 +386,7 @@ class FakeExecutor:
         key_bytes: bytes,
         ephemeral_key: bool = False,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> object:
         """Preflight one replacement without mutating the scripted chain state."""
         self.calls.append(("recenter_preflight", symbol, token_id, width_spacings, budget_usdc))
@@ -367,6 +407,7 @@ class FakeExecutor:
         key_bytes: bytes,
         ephemeral_key: bool = False,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> object:
         """Preflight one cross-pool replacement without mutating chain state."""
         self.calls.append(
@@ -389,9 +430,10 @@ class FakeExecutor:
         confirm_broadcast: bool,
         ephemeral_key: bool = False,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> LpActionExecutionReport:
         """Complete one mint, minting the scripted token id on-chain."""
-        self.calls.append(("mint", symbol, budget_usdc, width_spacings))
+        self.calls.append(("mint", symbol, budget_usdc, width_spacings, None, exact_tick_bounds))
         self._mint_calls += 1
         if self.interrupt_on_mint is not None and self._mint_calls >= self.interrupt_on_mint:
             raise KeyboardInterrupt("simulated service timeout")
@@ -1023,6 +1065,114 @@ class TestDryRunCycles:
         assert "market open" in report.event_window
 
 
+class TestDilutionReentryMarginPersistence:
+    """The dilution re-entry margin survives the book, reloads, and rollover."""
+
+    def _dilution_book(self, now: datetime) -> CycleStateBook:
+        """Build one book whose FIXc cooldown carries the dilution marker."""
+        return CycleStateBook(
+            reentry_cooldowns=(
+                ReentryCooldown(
+                    symbol="FIXc",
+                    blocked_until=now - timedelta(minutes=30),
+                    dilution=True,
+                ),
+            ),
+            updated_at=now,
+        )
+
+    def test_book_round_trip_preserves_the_marker(self, tmp_path: Path) -> None:
+        """A serialized reload keeps the marker past its blocked_until instant."""
+        store = CycleStateStore(tmp_path / "cycle_state.json")
+        book = self._dilution_book(QUIET_INSTANT)
+        store.save(book)
+        reloaded = CycleStateStore(tmp_path / "cycle_state.json").load()
+        assert reloaded.reentry_cooldowns[0].dilution is True
+        # The cooldown itself has expired; the marker must persist anyway.
+        assert reloaded.reentry_cooldowns[0].blocked_until < reloaded.updated_at
+
+    def test_pinned_cycle_refuses_between_floor_and_margin_after_cooldown(
+        self, tmp_path: Path
+    ) -> None:
+        """Past the cooldown, a floor-passing APR under the margin still waits."""
+        # The scripted reward rate reads a displayed APR of 1.6: above the
+        # 1.5 floor, below the 1.95 margin bound.
+        runner, _, _, _ = make_runner(
+            tmp_path,
+            book=self._dilution_book(QUIET_INSTANT),
+            sources=FakeCycleSources(emissions_per_second=46_558_478_804_510),
+        )
+        report = runner.run(CycleMode.DRY_RUN)
+        assert report.decision_action == "hold"
+        assert report.decision_reason == "dilution_reentry_margin_active"
+
+    def test_pinned_cycle_admits_at_and_above_the_margin(self, tmp_path: Path) -> None:
+        """An APR clearing the margin bound re-enters and clears the marker."""
+        # An APR of three (three hundred percent) clears the margin bound
+        # and the gas cost-versus-yield gate at the fixture's small size.
+        sources = FakeCycleSources(emissions_per_second=87_297_147_758_457)
+        runner, _, _, state_store = make_runner(
+            tmp_path,
+            book=self._dilution_book(QUIET_INSTANT),
+            sources=sources,
+        )
+        report = runner.run(CycleMode.DRY_RUN)
+        assert report.decision_action == "enter"
+        # The successful entry cleared the cooldown record and its marker.
+        saved = state_store.load()
+        assert all(not cooldown.dilution for cooldown in saved.reentry_cooldowns)
+
+    def test_day_rollover_does_not_erase_the_marker(self, tmp_path: Path) -> None:
+        """A New York day rollover keeps the persisted marker armed."""
+        later = QUIET_INSTANT + timedelta(days=2)
+        sources = FakeCycleSources(emissions_per_second=46_558_478_804_510)
+        runner, _, _, _ = make_runner(
+            tmp_path,
+            book=self._dilution_book(QUIET_INSTANT),
+            sources=sources,
+            now=later,
+        )
+        report = runner.run(CycleMode.DRY_RUN)
+        assert report.decision_action == "hold"
+        assert report.decision_reason == "dilution_reentry_margin_active"
+
+    def test_selector_board_refuses_the_marked_pool_under_the_margin(self, tmp_path: Path) -> None:
+        """The cross-board qualification applies the same margin per pool."""
+        from aero_bot.selector import PoolBoardOption, evaluate_pool_entries
+
+        engine = PolicyEngine()
+        observation = PolicyObservation(
+            observed_at=QUIET_INSTANT,
+            pool_address=POOL_ADDRESS,
+            token_address=B20_ADDRESS,
+            amm_price_usdc=Decimal("100"),
+            emissions_apr=Decimal("1.6"),
+            fee_apr=Decimal("0"),
+            pool_depth_usd=Decimal("10000"),
+            equity_usd=Decimal("200"),
+            reference_price_usdc=Decimal("100"),
+            reference_age_seconds=10,
+            gas_price_gwei=Decimal("0.001"),
+            ranging=healthy_ranging_evidence(Decimal("100"), observed_at=QUIET_INSTANT),
+        )
+        options = (
+            PoolBoardOption(
+                symbol="FIXc",
+                pool_address=POOL_ADDRESS,
+                token_address=B20_ADDRESS,
+                observation=observation,
+            ),
+        )
+        evaluations = evaluate_pool_entries(
+            engine,
+            PolicyState(),
+            options,
+            {"FIXc": QUIET_INSTANT - timedelta(minutes=30)},
+            {"FIXc": True},
+        )
+        assert evaluations[0].blocked_reason is PolicyReason.DILUTION_REENTRY_MARGIN_ACTIVE
+
+
 class TestLiveCycles:
     """Live cycles act only through the audited fake executor."""
 
@@ -1039,6 +1189,19 @@ class TestLiveCycles:
         budget = cast(Decimal, executor.calls[0][2])
         assert budget == EXPECTED_ENTER_SIZE
         assert cast(int, executor.calls[0][3]) == EXPECTED_ENTER_WIDTH
+        # The exact-bounds parity proof: the mint received the adaptive
+        # solve's raw aligned bounds verbatim - spacing multiples on the
+        # pool's raw grid containing its current tick - never a
+        # spacing-only re-derivation.
+        mint_bounds = cast(tuple[int, int], executor.calls[0][5])
+        assert mint_bounds is not None
+        from test_lp_executor import LP_CURRENT_TICK, LP_TICK_SPACING
+
+        lower_bound, upper_bound = mint_bounds
+        assert lower_bound % LP_TICK_SPACING == 0
+        assert upper_bound % LP_TICK_SPACING == 0
+        assert lower_bound <= LP_CURRENT_TICK < upper_bound
+        assert (upper_bound - lower_bound) <= 6 * LP_TICK_SPACING
         assert cast(int, executor.calls[1][2]) == TRACKED_TOKEN_ID
         assert [action.status for action in report.actions] == ["completed", "completed"]
         assert report.fee_wei == 2 * 90_000
@@ -1240,6 +1403,165 @@ class TestLiveCycles:
         assert [record.action for record in actions] == ["exit_swap"]
         assert halted == ""
         assert new_book.held_inventory is None
+
+
+class _RecordingPolicyEngine(PolicyEngine):
+    """Record every decide outcome the cycle asks for (parity evidence).
+
+    The recording subclass changes no behavior: it delegates to the real
+    engine and only captures the outcomes the production path produced,
+    giving the parity tests the engine's own selected pair to compare
+    against the bounds the executor received - through an injected test
+    seam, not a product-report field.
+    """
+
+    recorded: list[tuple[PolicyObservation, PolicyOutcome]] = []
+
+    def decide(self, state: PolicyState, observation: PolicyObservation) -> PolicyOutcome:
+        outcome = super().decide(state, observation)
+        _RecordingPolicyEngine.recorded.append((observation, outcome))
+        return outcome
+
+
+class TestSelectedBoundsParity:
+    """The solve's selected pair is the minted pair on every action path."""
+
+    def _mint_bounds(self, executor: FakeExecutor) -> tuple[int, int]:
+        """Return the exact tick pair the single mint call received."""
+        mints = [call for call in executor.calls if call[0] == "mint"]
+        assert len(mints) == 1
+        bounds = cast(tuple[int, int], mints[0][5])
+        assert bounds is not None
+        return bounds
+
+    def _solved_enter_pairs(self, pool_address: str | None = None) -> list[tuple[int, int]]:
+        """Return every solved bounds pair the engine selected for one pool."""
+        pairs = [
+            (
+                outcome.decision.width_solution.lower_bound.tick,
+                outcome.decision.width_solution.upper_bound.tick,
+            )
+            for observation, outcome in _RecordingPolicyEngine.recorded
+            if outcome.decision.action is PolicyActionKind.ENTER
+            and outcome.decision.width_solution is not None
+            and outcome.decision.width_solution.lower_bound is not None
+            and outcome.decision.width_solution.upper_bound is not None
+            and (pool_address is None or observation.pool_address == pool_address)
+        ]
+        assert pairs
+        return pairs
+
+    def test_enter_mints_the_exact_solved_bounds_pair(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The enter mint's exact tick pair IS the solve's selected pair."""
+        monkeypatch.setattr("aero_bot.cycle.PolicyEngine", _RecordingPolicyEngine)
+        _RecordingPolicyEngine.recorded.clear()
+        runner, executor, _, _ = make_runner(tmp_path)
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_price_usdc=Decimal("100"),
+        )
+        assert report.decision_action == "enter"
+        mint_bounds = self._mint_bounds(executor)
+        pairs = self._solved_enter_pairs()
+        assert len(pairs) == 1
+        # Exact pair equality: the minted bounds are the solved bounds,
+        # never a width re-derivation of them.
+        assert mint_bounds == pairs[0]
+
+    def test_recenter_mints_the_exact_solved_bounds_pair(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A grace-expired recenter's replacement mint carries the solve's pair."""
+        above_range = tracked_status(owner=GAUGE_ADDRESS).model_copy(
+            update={
+                "position": SimpleNamespace(
+                    tick_lower=-15,
+                    tick_upper=-5,
+                    token0_address=BASE_USDC_ADDRESS,
+                    token1_address=STOCK_TOKEN_ADDRESS,
+                    liquidity=12_345,
+                )
+            }
+        )
+        reads = FakeReads(inventory_with_ids((TRACKED_TOKEN_ID, TRACKED_TOKEN_ID + 1)))
+        reads.set_status(TRACKED_TOKEN_ID, above_range)
+        reads.set_status(TRACKED_TOKEN_ID + 1, tracked_status(owner=GAUGE_ADDRESS))
+        book = portfolio_book().model_copy(
+            update={
+                "positions": (
+                    portfolio_book()
+                    .positions[0]
+                    .model_copy(
+                        update={
+                            "out_of_range_since": QUIET_INSTANT - timedelta(minutes=30),
+                            "out_of_range_side": "above",
+                        }
+                    ),
+                    portfolio_book().positions[1],
+                )
+            }
+        )
+        monkeypatch.setattr("aero_bot.cycle.PolicyEngine", _RecordingPolicyEngine)
+        _RecordingPolicyEngine.recorded.clear()
+        runner, executor, _ = selector_runner(
+            tmp_path,
+            book=book,
+            reads=reads,
+            sources=SelectorCycleSources(),
+            balances=FakeBalances(),
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "recenter"
+        mint_bounds = self._mint_bounds(executor)
+        recenters = [
+            outcome
+            for _, outcome in _RecordingPolicyEngine.recorded
+            if outcome.decision.action is PolicyActionKind.RECENTER
+        ]
+        assert len(recenters) == 1
+        solution = recenters[0].decision.width_solution
+        assert solution is not None and solution.lower_bound is not None
+        assert solution.upper_bound is not None
+        assert mint_bounds == (solution.lower_bound.tick, solution.upper_bound.tick)
+
+    def test_switch_mints_the_exact_solved_bounds_pair(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pool switch's target mint carries the winning solve's pair."""
+        monkeypatch.setattr("aero_bot.cycle.PolicyEngine", _RecordingPolicyEngine)
+        _RecordingPolicyEngine.recorded.clear()
+        runner, executor, _ = selector_runner(
+            tmp_path,
+            book=tracked_book(symbol="AAAc", entered_at=QUIET_INSTANT - timedelta(hours=2)),
+            reads=_tracked_reads(staked=True),
+        )
+        assert executor is not None
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+        assert report.decision_action == "pool_switch"
+        mints = [call for call in executor.calls if call[0] == "mint"]
+        assert len(mints) == 1
+        assert mints[0][1] == "BBBc"
+        mint_bounds = self._mint_bounds(executor)
+        # The switch's width solution IS the winning pool's entry fold -
+        # the composed POOL_SWITCH decision copies it verbatim - so the
+        # recorded BBBc ENTER folds' pairs must agree on one selected
+        # pair, and the minted pair must be exactly it.
+        pairs = self._solved_enter_pairs(pool_address=SELECTOR_BBB_POOL)
+        assert len(set(pairs)) == 1
+        assert mint_bounds == pairs[0]
 
 
 class TestPostActionVisibility:
@@ -3248,6 +3570,7 @@ class TestSelectorCycles:
             confirm_broadcast: bool,
             ephemeral_key: bool = False,
             portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+            exact_tick_bounds: tuple[int, int] | None = None,
         ) -> LpActionExecutionReport:
             executor.calls.append(("mint", symbol, budget_usdc, width_spacings))
             cast(FakeBalances, runner._balances).stock_units = 3_000_000

@@ -118,13 +118,16 @@ class LpPlanRefusalCode(StrEnum):
 
 
 class WidthSource(StrEnum):
-    """Identify how a mint's half width was chosen."""
+    """Identify how a mint's range was chosen."""
 
     # An explicit operator override in tick spacings per side.
     EXPLICIT_OVERRIDE = "explicit_override"
     # The ranging solver's derived width under the corrected emissions-APR
     # convention.
     SOLVER_DERIVED_APR = "solver_derived_apr"
+    # The adaptive solve's exact executable geometry: both aligned bounds
+    # flow unchanged from the scored candidate into the mint.
+    ADAPTIVE_EXACT_BOUNDS = "adaptive_exact_bounds"
 
 
 class PositionTickRange(BaseModel):
@@ -151,6 +154,11 @@ class PositionTickRange(BaseModel):
     width_source: WidthSource
     # Whether the requested width was clamped down to the ceiling.
     clamped_to_ceiling: bool
+    # True when the range is the adaptive solve's exact asymmetric geometry:
+    # the half-width evidence fields then carry the SPAN's half (the two
+    # sides differ by the price's grid phase), and the half-width-in-spacings
+    # invariant is exempt because there is no symmetric half.
+    exact_bounds: bool = False
 
     @model_validator(mode="after")
     def require_coherent_range(self) -> Self:
@@ -159,7 +167,7 @@ class PositionTickRange(BaseModel):
             raise ValueError("tick_lower must be below tick_upper")
         if self.tick_lower % self.tick_spacing or self.tick_upper % self.tick_spacing:
             raise ValueError("both range boundaries must be multiples of the tick spacing")
-        if self.half_width_ticks % self.tick_spacing:
+        if not self.exact_bounds and self.half_width_ticks % self.tick_spacing:
             raise ValueError("half_width_ticks must be a whole number of spacings")
         if not self.tick_lower <= self.current_tick < self.tick_upper:
             raise ValueError("the range must contain the current tick")
@@ -364,6 +372,9 @@ class MintDirective(BaseModel):
     budget_usdc: Annotated[Decimal, Field(gt=0)]
     # The half width in tick spacings per side.
     half_width_spacings: Annotated[int, Field(gt=0)]
+    # The adaptive solve's exact aligned bounds, minted verbatim when
+    # present; the symmetric spacing count is then evidence only.
+    exact_tick_bounds: tuple[int, int] | None = None
     # How the half width was chosen.
     width_source: WidthSource
     # The locked ceiling half width; directives never widen past it.
@@ -613,6 +624,62 @@ def position_amounts_at_sqrt_ratio(
         amount0 = liquidity * X96_SCALE * (sqrt_upper - sqrt_current) / (sqrt_current * sqrt_upper)
         amount1 = liquidity * (sqrt_current - sqrt_lower) / X96_SCALE
         return +amount0, +amount1
+
+
+def derive_exact_position_range(
+    current_tick: int,
+    tick_spacing: int,
+    tick_lower: int,
+    tick_upper: int,
+) -> PositionTickRange:
+    """Build one range from the adaptive solve's exact aligned bounds.
+
+    The bounds arrive as RAW pool ticks - the executor's own grid - and are
+    minted verbatim: no symmetric re-derivation, no rounding, no clamping
+    beyond the int24 bounds. The only validations are the ones the chain
+    itself would enforce: spacing alignment, ordering, and containing the
+    current tick.
+
+    Args:
+        current_tick: The snapshot's current raw pool tick.
+        tick_spacing: The pool's positive tick grid spacing.
+        tick_lower: The scored lower raw bound.
+        tick_upper: The scored upper raw bound.
+
+    Returns:
+        The derived range with its complete derivation evidence.
+
+    Raises:
+        ValueError: If the bounds are off-grid, inverted, leave the int24
+            range, or fail to contain the current tick.
+    """
+    if tick_spacing <= 0:
+        raise ValueError("tick_spacing must be positive")
+    if tick_lower >= tick_upper:
+        raise ValueError("tick_lower must be below tick_upper")
+    if tick_lower % tick_spacing or tick_upper % tick_spacing:
+        raise ValueError("both exact bounds must be multiples of the tick spacing")
+    if not tick_lower <= current_tick < tick_upper:
+        raise ValueError("the exact bounds must contain the current tick")
+    if not tick_lower >= INT24_MIN or not tick_upper <= INT24_MAX:
+        raise ValueError("the exact bounds leave the int24 tick range")
+    with localcontext() as decimal_context:
+        decimal_context.prec = MATH_PRECISION
+        span_ticks = tick_upper - tick_lower
+        half_width_ticks = span_ticks // 2
+        half_width_fraction = +(TICK_PRICE_RATIO**half_width_ticks - Decimal(1))
+    return PositionTickRange(
+        tick_spacing=tick_spacing,
+        current_tick=current_tick,
+        requested_half_width_spacings=max(1, -(-span_ticks // (2 * tick_spacing))),
+        half_width_ticks=half_width_ticks,
+        half_width_fraction=half_width_fraction,
+        tick_lower=tick_lower,
+        tick_upper=tick_upper,
+        width_source=WidthSource.ADAPTIVE_EXACT_BOUNDS,
+        clamped_to_ceiling=False,
+        exact_bounds=True,
+    )
 
 
 def derive_position_range(
@@ -1147,13 +1214,28 @@ def plan_mint_entry(
         f"budget at or below the remaining {remaining_exposure} USDC of the "
         f"{policy.max_total_pilot_exposure_usdc} USDC total pilot cap"
     )
-    position_range = derive_position_range(
-        observation.current_tick,
-        observation.tick_spacing,
-        directive.half_width_spacings,
-        directive.width_source,
-        directive.max_range_half_width_fraction,
-    )
+    if directive.exact_tick_bounds is not None:
+        # The adaptive solve's exact aligned bounds mint verbatim - the
+        # scored geometry IS the minted geometry, with no symmetric
+        # re-derivation in between.
+        position_range = derive_exact_position_range(
+            observation.current_tick,
+            observation.tick_spacing,
+            directive.exact_tick_bounds[0],
+            directive.exact_tick_bounds[1],
+        )
+        caps.append(
+            "exact adaptive bounds "
+            f"[{position_range.tick_lower},{position_range.tick_upper}] minted verbatim"
+        )
+    else:
+        position_range = derive_position_range(
+            observation.current_tick,
+            observation.tick_spacing,
+            directive.half_width_spacings,
+            directive.width_source,
+            directive.max_range_half_width_fraction,
+        )
     width_label = (
         "explicit override"
         if position_range.width_source is WidthSource.EXPLICIT_OVERRIDE

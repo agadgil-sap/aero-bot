@@ -374,6 +374,12 @@ class ReentryCooldown(BaseModel):
     symbol: str
     # Re-entry into this pool stays blocked until this instant.
     blocked_until: datetime
+    # A dilution exit also arms the re-entry margin: re-entry then requires
+    # the emissions APR to clear the floor by the locked relative margin
+    # until the next successful entry clears the record. The marker lives in
+    # the persisted book, so a cooldown expiring - or a day rolling over -
+    # never silently erases it.
+    dilution: bool = False
 
 
 class CycleFeeSampleRecord(BaseModel):
@@ -1118,6 +1124,7 @@ class CycleExecutorBoundary(Protocol):
         key_bytes: bytes,
         ephemeral_key: bool = False,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> object:
         """Preflight one same-pool recenter without broadcasting."""
         ...
@@ -1132,6 +1139,7 @@ class CycleExecutorBoundary(Protocol):
         key_bytes: bytes,
         ephemeral_key: bool = False,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> object:
         """Preflight a cross-pool replacement without broadcasting."""
         ...
@@ -1146,6 +1154,7 @@ class CycleExecutorBoundary(Protocol):
         confirm_broadcast: bool,
         ephemeral_key: bool = False,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> LpActionExecutionReport:
         """Broadcast one capped mint and stake sequence through the executor."""
         ...
@@ -1374,6 +1383,24 @@ def _price_at_tick(
     )
 
 
+def _dilution_pending(book: CycleStateBook, symbol: str) -> bool:
+    """Read one pool's pending dilution re-entry margin from the book.
+
+    Args:
+        book: The persisted cycle book.
+        symbol: The registry-matched stock symbol being read.
+
+    Returns:
+        True when the pool's cooldown record carries the dilution marker -
+        the record persists past its blocked_until instant, so the margin
+        applies until a successful entry clears the record.
+    """
+    for cooldown in book.reentry_cooldowns:
+        if cooldown.symbol.lower() == symbol.lower():
+            return cooldown.dilution
+    return False
+
+
 def _cooldown_until(book: CycleStateBook, symbol: str) -> datetime | None:
     """Read one pool's re-entry cooldown from the book.
 
@@ -1459,26 +1486,29 @@ def _idle_cash_state(
 
 
 def _book_with_cooldowns(
-    book: CycleStateBook, updates: Mapping[str, datetime | None]
+    book: CycleStateBook, updates: Mapping[str, tuple[datetime | None, bool]]
 ) -> CycleStateBook:
     """Merge per-pool cooldown updates into the book.
 
-    A None update clears its pool's cooldown; pools not named keep theirs.
+    A None update clears its pool's cooldown record - and with it any
+    dilution re-entry marker, exactly what a successful entry does; pools
+    not named keep theirs, markers included.
 
     Args:
         book: The book being updated.
-        updates: The per-symbol blocked-until instants to merge.
+        updates: The per-symbol (blocked-until instant, dilution marker)
+            pairs to merge.
 
     Returns:
         The book carrying the merged cooldown map.
     """
-    lowered = {symbol.lower(): until for symbol, until in updates.items()}
+    lowered = {symbol.lower(): update for symbol, update in updates.items()}
     kept = tuple(
         cooldown for cooldown in book.reentry_cooldowns if cooldown.symbol.lower() not in lowered
     )
     fresh = tuple(
-        ReentryCooldown(symbol=symbol, blocked_until=until)
-        for symbol, until in lowered.items()
+        ReentryCooldown(symbol=symbol, blocked_until=until, dilution=dilution)
+        for symbol, (until, dilution) in lowered.items()
         if until is not None
     )
     return book.model_copy(update={"reentry_cooldowns": kept + fresh})
@@ -2851,6 +2881,7 @@ class CycleRunner:
                         update={
                             "position": self._policy_position_of(tracked, status),
                             "reentry_blocked_until": _cooldown_until(book, tracked.symbol),
+                            "dilution_exit_pending": _dilution_pending(book, tracked.symbol),
                         }
                     ),
                 )
@@ -2943,6 +2974,22 @@ class CycleRunner:
         """
         return {cooldown.symbol: cooldown.blocked_until for cooldown in book.reentry_cooldowns}
 
+    def _dilution_map(self, book: CycleStateBook) -> dict[str, bool]:
+        """Read the book's per-pool dilution re-entry markers as a mapping.
+
+        Args:
+            book: The persisted cycle book.
+
+        Returns:
+            Every marked pool's True keyed by symbol; unmarked pools are
+            absent so lookups default to no marker.
+        """
+        return {
+            cooldown.symbol: cooldown.dilution
+            for cooldown in book.reentry_cooldowns
+            if cooldown.dilution
+        }
+
     def _reference_inputs_from_feed(
         self, b20_symbols: Sequence[str]
     ) -> tuple[dict[str, Decimal], dict[str, int], tuple[str, ...]]:
@@ -3003,7 +3050,10 @@ class CycleRunner:
             return self._decide_selector(book, reference_prices_by_symbol, reference_age_seconds)
         pool, snapshot_block = self._sources.resolve_pool(self._symbol)
         state = self._policy_state(book, self._last_reconciliation).model_copy(
-            update={"reentry_blocked_until": _cooldown_until(book, self._symbol)}
+            update={
+                "reentry_blocked_until": _cooldown_until(book, self._symbol),
+                "dilution_exit_pending": _dilution_pending(book, self._symbol),
+            }
         )
         # The live reference feed fills the pinned symbol only when the
         # operator did not inject an explicit constant; an injected quote
@@ -3302,7 +3352,8 @@ class CycleRunner:
         # The board evaluation stays exactly the selector's: the complete
         # entry gate chain per pool over the flat session posture, over the
         # conservatively-stamped observations.
-        evaluations = evaluate_pool_entries(engine, session_state, options, cooldowns)
+        dilutions = self._dilution_map(book)
+        evaluations = evaluate_pool_entries(engine, session_state, options, cooldowns, dilutions)
         cash_usdc = Decimal(self._last_reconciliation.safe_usdc_units).scaleb(-6)
         equity_usdc = options[0].observation.equity_usd if options else cash_usdc + lp_value
         portfolio_parameters = self._portfolio_parameters()
@@ -3312,6 +3363,7 @@ class CycleRunner:
             evaluations,
             cooldowns,
             held=held_facts,
+            dilution_exit_pending_by_symbol=dilutions,
             cash_usdc=cash_usdc,
             equity_usdc=equity_usdc,
             parameters=portfolio_parameters,
@@ -3603,10 +3655,16 @@ class CycleRunner:
                 return records, halted, book
             budget: Decimal = size
             mint_width: int = width
+            mint_bounds = self._exact_bounds_from_decision(decision)
             if not run(
                 "mint",
                 lambda: executor.execute_mint(
-                    decision_symbol, budget, mint_width, key_bytes, confirm_broadcast=True
+                    decision_symbol,
+                    budget,
+                    mint_width,
+                    key_bytes,
+                    confirm_broadcast=True,
+                    exact_tick_bounds=mint_bounds,
                 ),
             ):
                 held_quantity = self._live_stock_quantity(decision_symbol)
@@ -3690,6 +3748,7 @@ class CycleRunner:
                     switch_width,
                     switch_budget,
                     key_bytes,
+                    exact_tick_bounds=self._exact_bounds_from_decision(decision),
                 )
             except (LpExecutionRefusalError, LpPlanRefusalError) as error:
                 code = str(getattr(error, "code", "plan_refused"))
@@ -3720,7 +3779,12 @@ class CycleRunner:
             if not run(
                 "mint",
                 lambda: executor.execute_mint(
-                    switch.to_symbol, switch_budget, switch_width, key_bytes, confirm_broadcast=True
+                    switch.to_symbol,
+                    switch_budget,
+                    switch_width,
+                    key_bytes,
+                    confirm_broadcast=True,
+                    exact_tick_bounds=self._exact_bounds_from_decision(decision),
                 ),
             ):
                 held_quantity = self._live_stock_quantity(switch.to_symbol)
@@ -3793,6 +3857,7 @@ class CycleRunner:
                         preflight_width,
                         decision.size_usd,
                         key_bytes,
+                        exact_tick_bounds=self._exact_bounds_from_decision(decision),
                     )
                 except (LpExecutionRefusalError, LpPlanRefusalError) as error:
                     code = str(getattr(error, "code", "plan_refused"))
@@ -3863,6 +3928,7 @@ class CycleRunner:
                     )
                 recenter_budget: Decimal = size
                 recenter_width: int = width
+                recenter_bounds = self._exact_bounds_from_decision(decision)
                 if not run(
                     "mint",
                     lambda: executor.execute_mint(
@@ -3871,6 +3937,7 @@ class CycleRunner:
                         recenter_width,
                         key_bytes,
                         confirm_broadcast=True,
+                        exact_tick_bounds=recenter_bounds,
                     ),
                 ):
                     held_quantity = self._live_stock_quantity(tracked_symbol)
@@ -4062,6 +4129,7 @@ class CycleRunner:
             live_positions = tuple(
                 (position.token_id, position.committed_usd) for position in working.positions
             )
+            step_bounds = self._exact_bounds_from_decision(decision)
             if not run(
                 "mint",
                 lambda: executor.execute_mint(
@@ -4071,6 +4139,7 @@ class CycleRunner:
                     key_bytes,
                     confirm_broadcast=True,
                     portfolio_live_positions=live_positions,
+                    exact_tick_bounds=step_bounds,
                 ),
             ):
                 held_quantity = self._live_stock_quantity(symbol)
@@ -4151,6 +4220,7 @@ class CycleRunner:
                                 (position.token_id, position.committed_usd)
                                 for position in book.positions
                             ),
+                            exact_tick_bounds=self._exact_bounds_from_decision(decision),
                         )
                     except (LpExecutionRefusalError, LpPlanRefusalError) as error:
                         code = str(getattr(error, "code", "plan_refused"))
@@ -4252,6 +4322,7 @@ class CycleRunner:
                             (position.token_id, position.committed_usd)
                             for position in book.positions
                         ),
+                        exact_tick_bounds=self._exact_bounds_from_decision(decision),
                     )
                 except (LpExecutionRefusalError, LpPlanRefusalError) as error:
                     code = str(getattr(error, "code", "plan_refused"))
@@ -4412,6 +4483,28 @@ class CycleRunner:
         units = self._balances.fetch_token_balance(stock_address, self._safe_address)
         return Decimal(units).scaleb(-self._sources.token_decimals(stock_address))
 
+    def _exact_bounds_from_decision(self, decision: PolicyDecision) -> tuple[int, int] | None:
+        """Extract the adaptive solve's exact raw bounds from one decision.
+
+        The scored bounds are the minted bounds: the width solution carries
+        the raw-grid pair verbatim and the executor mints it with no
+        symmetric re-derivation. None when the decision carries no solved
+        bounds (the legacy width fallback then applies).
+
+        Args:
+            decision: An enter, recenter, or switch decision.
+
+        Returns:
+            The raw (lower, upper) tick pair, or None.
+        """
+        solution = decision.width_solution
+        if solution is None or solution.lower_bound is None or solution.upper_bound is None:
+            return None
+        lower, upper = solution.lower_bound.tick, solution.upper_bound.tick
+        if lower > upper:
+            lower, upper = upper, lower
+        return (lower, upper)
+
     def _width_from_range(
         self, price_range: AlignedPriceRange | None, symbol: str | None
     ) -> int | None:
@@ -4420,12 +4513,15 @@ class CycleRunner:
         The engine's grid alignment can leave a non-integral spacing half
         width (a 70-tick span on a spacing-10 pool), so the mapping rounds
         up: the executed range always carries at least the policy's width,
-        and the planner's own ceiling clamps anything wider.
+        and the planner's own ceiling clamps anything wider. Exact-bound
+        ranges order by PRICE, so under token1 orientation the raw ticks
+        invert; the span's absolute value carries the width either way, and
+        the adaptive path mints the exact bounds regardless.
         """
         if price_range is None or symbol is None:
             return None
         pool = self._pool_for_symbol(symbol)
-        half_ticks = (price_range.upper_tick - price_range.lower_tick) // 2
+        half_ticks = abs(price_range.upper_tick - price_range.lower_tick) // 2
         if half_ticks < 1:
             return None
         return -(-half_ticks // pool.tick_spacing)
@@ -4509,9 +4605,16 @@ class CycleRunner:
         cooldown_symbol = decision_symbol or (position.symbol if position is not None else None)
         rebuilt = _book_with_cooldowns(
             book,
-            {cooldown_symbol: next_state.reentry_blocked_until}
-            if cooldown_symbol is not None
-            else {},
+            (
+                {
+                    cooldown_symbol: (
+                        next_state.reentry_blocked_until,
+                        next_state.dilution_exit_pending,
+                    )
+                }
+                if cooldown_symbol is not None
+                else {}
+            ),
         )
         return rebuilt.model_copy(
             update={
@@ -4552,7 +4655,7 @@ class CycleRunner:
         statuses = {record.token_id: record.status for record in reconciliation.position_statuses}
         folds = decision_report.held_folds
         positions: list[TrackedPosition] = []
-        cooldown_updates: dict[str, datetime | None] = {}
+        cooldown_updates: dict[str, tuple[datetime | None, bool]] = {}
         for tracked in book.positions:
             updated = tracked
             status = statuses.get(tracked.token_id)
@@ -4572,7 +4675,10 @@ class CycleRunner:
                     PolicyActionKind.STOP_OUT,
                     PolicyActionKind.DILUTION_EXIT,
                 ):
-                    cooldown_updates[updated.symbol] = fold.next_state.reentry_blocked_until
+                    cooldown_updates[updated.symbol] = (
+                        fold.next_state.reentry_blocked_until,
+                        fold.decision.action is PolicyActionKind.DILUTION_EXIT,
+                    )
             positions.append(updated)
         # Reallocation and grace exits arm their own pools' cooldowns when
         # the engine's successor names one; voluntary switches arm none.
@@ -4591,7 +4697,8 @@ class CycleRunner:
                         and step.outcome.next_state.reentry_blocked_until is not None
                     ):
                         cooldown_updates[step.symbol] = (
-                            step.outcome.next_state.reentry_blocked_until
+                            step.outcome.next_state.reentry_blocked_until,
+                            action is PolicyActionKind.DILUTION_EXIT,
                         )
         held = book.held_inventory
         if held is not None and reconciliation.held_stock_quantity == 0:

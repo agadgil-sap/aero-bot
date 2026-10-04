@@ -4,6 +4,8 @@ import inspect
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from conftest import healthy_trailing_path
+
 from aero_bot.domain import normalize_evm_address
 from aero_bot.policy import (
     HeldInventory,
@@ -13,7 +15,7 @@ from aero_bot.policy import (
     PolicyReason,
     PolicyState,
 )
-from aero_bot.ranging import RangingEvidence
+from aero_bot.ranging import RangingEvidence, raw_tick_for_human_price
 from aero_bot.selector import (
     DEFAULT_SWITCH_MARGIN_FRACTION,
     PoolBoardOption,
@@ -36,15 +38,18 @@ BASE_TIME = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
 # emissions over the floor, deep pool, fresh reference, cheap gas.
 RANGING = RangingEvidence.model_validate(
     {
-        "gauge_liquidity_raw": 80_000_000_000_000,
-        "staked_tvl_usd": Decimal("100000"),
+        "gauge_liquidity_raw": 35_000_000_000,
+        "staked_tvl_usd": Decimal("500"),
         "active_liquidity_raw": 80_000_000_000_000,
         "fee_window_seconds": 86_400,
         "fee_window_notional_usd": Decimal("1000000"),
         "pool_fee_ppm": 500,
-        "realized_daily_volatility": Decimal("0.005"),
+        "realized_daily_volatility": Decimal("0.001"),
+        "trailing_path": healthy_trailing_path(Decimal("200"), end_before=BASE_TIME),
         "stock_decimals": 6,
         "quote_decimals": 6,
+        "pool_tick_raw": raw_tick_for_human_price(Decimal("200"), False, 6, 6),
+        "stock_is_token0": False,
     }
 )
 

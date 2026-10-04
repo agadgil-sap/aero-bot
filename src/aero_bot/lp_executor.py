@@ -1675,6 +1675,7 @@ class _LpMintContext:
         width_spacings: int,
         caps: list[str],
         empty_position_count: int,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> None:
         """Bind the resolved context fields.
 
@@ -1686,6 +1687,8 @@ class _LpMintContext:
             caps: The enforced-cap labels accumulated so far.
             empty_position_count: Safe-held NFPM NFTs proven to carry no
                 liquidity or owed tokens.
+            exact_tick_bounds: The adaptive solve's exact raw aligned bounds,
+                minted verbatim when present.
         """
         self.listing = listing
         self.observation = observation
@@ -1693,6 +1696,7 @@ class _LpMintContext:
         self.width_spacings = width_spacings
         self.caps = caps
         self.empty_position_count = empty_position_count
+        self.exact_tick_bounds = exact_tick_bounds
 
 
 class _LpPositionContext:
@@ -1801,6 +1805,7 @@ class LpLifecycleExecutor:
         budget_usdc: Decimal,
         width_spacings: int | None,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> LpMintPlan:
         """Plan one capped mint against live discovery and inventory.
 
@@ -1809,6 +1814,8 @@ class LpLifecycleExecutor:
             budget_usdc: The total USDC value the position commits.
             width_spacings: The explicit half width in tick spacings per side;
                 None refuses until the solver-derived width path lands.
+            exact_tick_bounds: The adaptive solve's exact raw aligned bounds,
+                minted verbatim when present.
             portfolio_live_positions: The cycle book's tracked live positions
                 as (token id, committed USDC) pairs; their committed values
                 ride the total pilot cap beside this mint.
@@ -1822,7 +1829,10 @@ class LpLifecycleExecutor:
         """
         try:
             context = self._resolve_mint_context(
-                symbol, width_spacings, portfolio_live_positions=portfolio_live_positions
+                symbol,
+                width_spacings,
+                portfolio_live_positions=portfolio_live_positions,
+                exact_tick_bounds=exact_tick_bounds,
             )
             plan = self._plan_from_context(context, budget_usdc)
             self._record_mint_plan(ExecutionMode.DRY_RUN, plan)
@@ -1838,6 +1848,7 @@ class LpLifecycleExecutor:
         width_spacings: int | None,
         key_bytes: bytes,
         ephemeral_key: bool = False,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> LpMintDryRunReport:
         """Fully build and validate one capped mint sequence without broadcasting.
 
@@ -1847,6 +1858,8 @@ class LpLifecycleExecutor:
             width_spacings: The explicit half width in tick spacings per side.
             key_bytes: Exactly 32 raw signing-key bytes used for this build.
             ephemeral_key: Whether the key was generated for this dry run.
+            exact_tick_bounds: The adaptive solve's exact raw aligned bounds,
+                minted verbatim when present.
 
         Returns:
             The complete dry-run report; nothing was broadcast.
@@ -1857,7 +1870,12 @@ class LpLifecycleExecutor:
         """
         try:
             report, _ = self._build_mint_attempt(
-                symbol, budget_usdc, width_spacings, key_bytes, ephemeral_key
+                symbol,
+                budget_usdc,
+                width_spacings,
+                key_bytes,
+                ephemeral_key,
+                exact_tick_bounds=exact_tick_bounds,
             )
             return report
         except (LpExecutionRefusalError, LpPlanRefusalError) as error:
@@ -1882,6 +1900,8 @@ class LpLifecycleExecutor:
             token_id: The position NFT being staked.
             key_bytes: Exactly 32 raw signing-key bytes used for this build.
             ephemeral_key: Whether the key was generated for this dry run.
+            exact_tick_bounds: The adaptive solve's exact raw aligned bounds,
+                minted verbatim when present.
 
         Returns:
             The complete dry-run report; nothing was broadcast.
@@ -1947,6 +1967,8 @@ class LpLifecycleExecutor:
             token_id: The unstaked position NFT being exited.
             key_bytes: Exactly 32 raw signing-key bytes used for this build.
             ephemeral_key: Whether the key was generated for this dry run.
+            exact_tick_bounds: The adaptive solve's exact raw
+                aligned bounds, minted verbatim when present.
 
         Returns:
             The complete dry-run report; nothing was broadcast.
@@ -1980,6 +2002,8 @@ class LpLifecycleExecutor:
             token_id: The position NFT being collected.
             key_bytes: Exactly 32 raw signing-key bytes used for this build.
             ephemeral_key: Whether the key was generated for this dry run.
+            exact_tick_bounds: The adaptive solve's exact raw
+                aligned bounds, minted verbatim when present.
 
         Returns:
             The complete dry-run report; nothing was broadcast.
@@ -2003,6 +2027,7 @@ class LpLifecycleExecutor:
         key_bytes: bytes,
         ephemeral_key: bool = False,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> LpRecenterDryRunReport:
         """Fully build and validate one recenter batch without broadcasting.
 
@@ -2023,6 +2048,8 @@ class LpLifecycleExecutor:
                 position's snapshot value.
             key_bytes: Exactly 32 raw signing-key bytes used for this build.
             ephemeral_key: Whether the key was generated for this dry run.
+            exact_tick_bounds: The adaptive solve's exact raw
+                aligned bounds, minted verbatim when present.
             portfolio_live_positions: The cycle book's tracked live positions
                 as (token id, committed USDC) pairs; their committed values
                 ride the total pilot cap beside the recentered replacement.
@@ -2043,6 +2070,7 @@ class LpLifecycleExecutor:
                 key_bytes,
                 ephemeral_key,
                 portfolio_live_positions,
+                exact_tick_bounds,
             )
         except (LpExecutionRefusalError, LpPlanRefusalError) as error:
             self._record_refusal("recenter", ExecutionMode.DRY_RUN, error, symbol)
@@ -2058,6 +2086,7 @@ class LpLifecycleExecutor:
         key_bytes: bytes,
         ephemeral_key: bool = False,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> LpMintPlan:
         """Preflight a cross-pool switch without touching the live position.
 
@@ -2078,6 +2107,7 @@ class LpLifecycleExecutor:
                 key_bytes,
                 ephemeral_key,
                 portfolio_live_positions,
+                exact_tick_bounds,
             )
         except (LpExecutionRefusalError, LpPlanRefusalError) as error:
             self._record_refusal("switch", ExecutionMode.DRY_RUN, error, to_symbol)
@@ -2090,6 +2120,7 @@ class LpLifecycleExecutor:
         width_spacings: int | None,
         key_bytes: bytes,
         *,
+        exact_tick_bounds: tuple[int, int] | None = None,
         confirm_broadcast: bool,
         ephemeral_key: bool = False,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
@@ -2132,6 +2163,7 @@ class LpLifecycleExecutor:
                 ephemeral_key,
                 ExecutionMode.EXECUTE,
                 portfolio_live_positions=portfolio_live_positions,
+                exact_tick_bounds=exact_tick_bounds,
             )
             total_build_ms += initial_build.build_duration_ms
             current_build = initial_build
@@ -2175,6 +2207,7 @@ class LpLifecycleExecutor:
                     inventory_only=True,
                     known_empty_position_count=known_empty_position_count,
                     portfolio_live_positions=portfolio_live_positions,
+                    exact_tick_bounds=exact_tick_bounds,
                 )
                 total_build_ms += current_build.build_duration_ms
                 known_empty_position_count = current_build.empty_nfpm_position_count
@@ -2258,6 +2291,7 @@ class LpLifecycleExecutor:
                     buffer_nfpm_approvals=True,
                     known_empty_position_count=known_empty_position_count,
                     portfolio_live_positions=portfolio_live_positions,
+                    exact_tick_bounds=exact_tick_bounds,
                 )
                 total_build_ms += final_build.build_duration_ms
                 known_empty_position_count = final_build.empty_nfpm_position_count
@@ -2587,6 +2621,8 @@ class LpLifecycleExecutor:
             symbol: The registry-matched B20 stock symbol.
             key_bytes: Exactly 32 raw signing-key bytes used for this build.
             ephemeral_key: Whether the key was generated for this dry run.
+            exact_tick_bounds: The adaptive solve's exact raw
+                aligned bounds, minted verbatim when present.
 
         Returns:
             The complete dry-run report; nothing was broadcast.
@@ -2887,6 +2923,8 @@ class LpLifecycleExecutor:
         Args:
             key_bytes: Exactly 32 raw signing-key bytes used for this build.
             ephemeral_key: Whether the key was generated for this dry run.
+            exact_tick_bounds: The adaptive solve's exact raw
+                aligned bounds, minted verbatim when present.
 
         Returns:
             The complete dry-run report; nothing was broadcast.
@@ -2993,6 +3031,7 @@ class LpLifecycleExecutor:
         buffer_nfpm_approvals: bool = True,
         known_empty_position_count: int | None = None,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> tuple[LpMintDryRunReport, tuple[_BuiltLpStep, ...]]:
         """Build, sign, validate, and estimate the complete mint sequence."""
         build_started = self._timer()
@@ -3001,6 +3040,7 @@ class LpLifecycleExecutor:
             width_spacings,
             known_empty_position_count=known_empty_position_count,
             portfolio_live_positions=portfolio_live_positions,
+            exact_tick_bounds=exact_tick_bounds,
         )
         plan = self._plan_from_context(context, budget_usdc)
         if inventory_only and plan.balancing_swap.required:
@@ -3901,6 +3941,7 @@ class LpLifecycleExecutor:
         key_bytes: bytes,
         ephemeral_key: bool,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> LpMintPlan:
         """Project a full source exit and prove the target mint can be funded."""
         if from_symbol.strip().lower() == to_symbol.strip().lower():
@@ -4008,7 +4049,12 @@ class LpLifecycleExecutor:
         directive = MintDirective(
             budget_usdc=budget_usdc,
             half_width_spacings=width_spacings,
-            width_source=WidthSource.EXPLICIT_OVERRIDE,
+            exact_tick_bounds=exact_tick_bounds,
+            width_source=(
+                WidthSource.ADAPTIVE_EXACT_BOUNDS
+                if exact_tick_bounds is not None
+                else WidthSource.EXPLICIT_OVERRIDE
+            ),
         )
         plan = plan_mint_entry(self._plan_policy, target_observation, directive, inventory)
         if plan.balancing_swap.required and plan.balancing_swap.tranche_count > 1:
@@ -4038,6 +4084,7 @@ class LpLifecycleExecutor:
         key_bytes: bytes,
         ephemeral_key: bool,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> LpRecenterDryRunReport:
         """Build, sign, validate, and estimate the complete recenter batch."""
         build_started = self._timer()
@@ -4116,7 +4163,12 @@ class LpLifecycleExecutor:
         directive = MintDirective(
             budget_usdc=recycled_budget,
             half_width_spacings=width_spacings,
-            width_source=WidthSource.EXPLICIT_OVERRIDE,
+            exact_tick_bounds=exact_tick_bounds,
+            width_source=(
+                WidthSource.ADAPTIVE_EXACT_BOUNDS
+                if exact_tick_bounds is not None
+                else WidthSource.EXPLICIT_OVERRIDE
+            ),
         )
         plan = plan_mint_entry(self._plan_policy, observation, directive, inventory)
         self._record_mint_plan(ExecutionMode.DRY_RUN, plan)
@@ -5018,6 +5070,7 @@ class LpLifecycleExecutor:
         *,
         known_empty_position_count: int | None = None,
         portfolio_live_positions: Sequence[tuple[int, Decimal]] | None = None,
+        exact_tick_bounds: tuple[int, int] | None = None,
     ) -> _LpMintContext:
         """Resolve one mint to its observation, inventory, and shared gates.
 
@@ -5033,6 +5086,8 @@ class LpLifecycleExecutor:
                 as (token id, committed USDC) pairs (the allocator ruling):
                 these NFTs are expected exposure, not strangers, and their
                 committed values ride the total pilot cap beside this mint.
+            exact_tick_bounds: The adaptive solve's exact raw aligned bounds,
+                minted verbatim when present.
 
         Returns:
             The resolved context carrying every gate label enforced so far.
@@ -5137,6 +5192,7 @@ class LpLifecycleExecutor:
             width_spacings,
             caps,
             empty_position_count,
+            exact_tick_bounds,
         )
 
     def _plan_from_context(self, context: _LpMintContext, budget_usdc: Decimal) -> LpMintPlan:
@@ -5155,7 +5211,12 @@ class LpLifecycleExecutor:
         directive = MintDirective(
             budget_usdc=budget_usdc,
             half_width_spacings=context.width_spacings,
-            width_source=WidthSource.EXPLICIT_OVERRIDE,
+            exact_tick_bounds=context.exact_tick_bounds,
+            width_source=(
+                WidthSource.ADAPTIVE_EXACT_BOUNDS
+                if context.exact_tick_bounds is not None
+                else WidthSource.EXPLICIT_OVERRIDE
+            ),
         )
         return plan_mint_entry(self._plan_policy, context.observation, directive, context.inventory)
 

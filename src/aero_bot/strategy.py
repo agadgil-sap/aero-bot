@@ -45,7 +45,11 @@ from aero_bot.executor import (
     ExecutorRpcBackend,
     LiveExecutionSources,
 )
-from aero_bot.history import price_usdc_per_stock
+from aero_bot.history import (
+    EventHistoryRpcBackend,
+    HistoryUnavailableError,
+    price_usdc_per_stock,
+)
 from aero_bot.known_pool import (
     persist_decision_pool_pin,
     resolve_known_pool_candidate,
@@ -61,6 +65,11 @@ from aero_bot.policy import (
     PolicyState,
     evaluate_event_window,
     load_event_calendar,
+)
+from aero_bot.ranging import RangingEvidence
+from aero_bot.ranging_reads import (
+    RANGING_READ_LOG_WINDOW_BLOCKS,
+    build_ranging_evidence,
 )
 from aero_bot.registry import RegistryStatus
 from aero_bot.selector import (
@@ -295,6 +304,30 @@ class StrategySources(Protocol):
         """Read one ERC20 balance."""
         ...
 
+    def ranging_evidence(
+        self,
+        pool: PoolCandidate,
+        snapshot_price_usdc: Decimal,
+        stock_decimals: int,
+        observed_at: datetime,
+    ) -> RangingEvidence | None:
+        """Assemble one pool's bounded live ranging evidence, or None.
+
+        Args:
+            pool: The verified pool whose Swap logs are read.
+            snapshot_price_usdc: The snapshot price the observation carries.
+            stock_decimals: Decimal count of the stock token.
+            observed_at: The observation instant the evidence is judged
+                against; evidence whose newest point is not fresh at this
+                instant defers the solve.
+
+        Returns:
+            The complete ranging evidence for the adaptive width solve, or
+            None when the bounded read cannot complete (the decision then
+            defers fail-closed under the adaptive policy).
+        """
+        ...
+
 
 class LiveStrategySources:
     """Compose the live reads one decision-only run consumes."""
@@ -332,6 +365,8 @@ class LiveStrategySources:
             transport=transport,
             progress=progress,
         )
+        self._rpc_url = rpc_url
+        self._transport = transport
         self._rpc = ExecutorRpcBackend(
             rpc_url=rpc_url,
             fallback_rpc_urls=fallback_rpc_urls,
@@ -342,6 +377,10 @@ class LiveStrategySources:
         )
         self._pool_pin_store = pool_pin_store
         self._progress = progress
+        # The bounded ranging-evidence backend is built lazily on first use
+        # so decision runs that never solve a width pay no history reads.
+        self._ranging_backend: EventHistoryRpcBackend | None = None
+        self._sleep = sleep
 
     def resolve_pool(self, symbol: str) -> tuple[PoolCandidate, int]:
         """Return the symbol's verified pool with its snapshot block.
@@ -572,6 +611,56 @@ class LiveStrategySources:
         """Read one ERC20 balance for the equity default."""
         return self._rpc.fetch_token_balance(token_address, owner_address)
 
+    def ranging_evidence(
+        self,
+        pool: PoolCandidate,
+        snapshot_price_usdc: Decimal,
+        stock_decimals: int,
+        observed_at: datetime,
+    ) -> RangingEvidence | None:
+        """Assemble one pool's bounded live ranging evidence, or None.
+
+        The read reconstructs the pool's trailing Swap window through the
+        shared history backend at the public endpoint's log-window cap. Any
+        read failure returns None - never a partial or stale evidence set -
+        and the failure surfaces through the progress channel so a
+        rate-limited or unavailable endpoint is visible while the decision
+        defers fail-closed.
+
+        Args:
+            pool: The verified pool whose Swap logs are read.
+            snapshot_price_usdc: The snapshot price the observation carries.
+            stock_decimals: Decimal count of the stock token.
+            observed_at: The observation instant the evidence is judged
+                against; evidence whose newest point is not fresh at this
+                instant defers the solve.
+
+        Returns:
+            The complete ranging evidence, or None when the bounded read
+            cannot complete.
+        """
+        if self._ranging_backend is None:
+            self._ranging_backend = EventHistoryRpcBackend(
+                rpc_url=self._rpc_url,
+                log_window_blocks=RANGING_READ_LOG_WINDOW_BLOCKS,
+                transport=self._transport,
+                sleep=self._sleep,
+            )
+        try:
+            return build_ranging_evidence(
+                self._ranging_backend,
+                pool,
+                snapshot_price_usdc=snapshot_price_usdc,
+                stock_decimals=stock_decimals,
+            )
+        except HistoryUnavailableError as failure:
+            if self._progress is not None:
+                self._progress(
+                    f"ranging evidence read failed for {pool.pool_address}: {failure}; "
+                    "entries and voluntary recenters defer fail-closed"
+                )
+            return None
+
 
 def assemble_observation(
     sources: StrategySources,
@@ -671,6 +760,37 @@ def assemble_observation(
     notes.append(
         "oracle staleness is not yet wired live; the oracle-health layer is post-reassessment scope"
     )
+    # The bounded live ranging evidence feeds the adaptive width solve;
+    # a missing evidence set (read failure or a legacy source without the
+    # reader) defers entries and voluntary recenters fail-closed under the
+    # adaptive policy - never a substituted constant range.
+    ranging_reader = getattr(sources, "ranging_evidence", None)
+    ranging = (
+        ranging_reader(pool, price, decimals, observed_at) if callable(ranging_reader) else None
+    )
+    if ranging is None:
+        notes.append(
+            "no ranging evidence attached - the bounded trailing read failed or "
+            "is unavailable; entries and voluntary recenters defer fail-closed "
+            "(safety exits stay armed)"
+        )
+    else:
+        points = ranging.trailing_path
+        notes.append(
+            f"ranging evidence attached from a bounded trailing read: "
+            f"{len(points)} points"
+            + (
+                f" over {(points[-1].timestamp - points[0].timestamp).total_seconds():.0f} seconds"
+                if len(points) >= 2
+                else ""
+            )
+            + ", measured volatility "
+            + (
+                str(ranging.realized_daily_volatility)
+                if ranging.realized_daily_volatility is not None
+                else "unavailable"
+            )
+        )
     observation = PolicyObservation(
         observed_at=observed_at,
         pool_address=pool.pool_address,
@@ -687,7 +807,7 @@ def assemble_observation(
             registry_paused if registry_paused is not None else sources.registry_paused()
         ),
         gas_price_gwei=(gas_price_gwei if gas_price_gwei is not None else sources.gas_price_gwei()),
-        ranging=None,
+        ranging=ranging,
     )
     return observation, emissions_apr, aero_price, tuple(notes)
 

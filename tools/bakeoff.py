@@ -199,7 +199,11 @@ def baseline_width(observations: Mapping[str, Any]) -> dict[str, Any]:
         The solver's mode and selected half width in ticks.
     """
     solution = solve_range_width(RangingObservations.model_validate(dict(observations)))
-    return {"mode": solution.mode.value, "half_width_ticks": solution.half_width_ticks}
+    return {
+        "mode": solution.mode.value,
+        "lower_tick": solution.lower_bound.tick if solution.lower_bound is not None else None,
+        "upper_tick": solution.upper_bound.tick if solution.upper_bound is not None else None,
+    }
 
 
 def _decimal_or_none(value: object) -> Decimal | None:
@@ -314,11 +318,25 @@ def score_width(scenario: Mapping[str, Any], answer: Answer) -> ScenarioScore:
         points += 1.0
     else:
         notes.append(f"mode {mode!r} != {truth['mode']!r}")
-    ticks = _decimal_or_none(answer.payload.get("half_width_ticks"))
-    if ticks is not None and ticks == Decimal(truth["half_width_ticks"]):
+    bounds = (
+        _decimal_or_none(answer.payload.get("lower_tick")),
+        _decimal_or_none(answer.payload.get("upper_tick")),
+    )
+    truth_bounds = (truth["lower_tick"], truth["upper_tick"])
+    if truth_bounds[0] is None or truth_bounds[1] is None:
+        # A boundless truth (deferred or cash hold) scores only on the
+        # boundless answer.
+        bounds_match = bounds == (None, None)
+    else:
+        bounds_match = (
+            bounds[0] is not None
+            and bounds[1] is not None
+            and (int(bounds[0]), int(bounds[1])) == tuple(int(tick) for tick in truth_bounds)
+        )
+    if bounds_match:
         points += 1.0
     else:
-        notes.append(f"half_width_ticks {ticks!r} != {truth['half_width_ticks']!r}")
+        notes.append(f"bounds {bounds!r} != {truth_bounds!r}")
     return ScenarioScore(scenario["name"], points, 2.0, tuple(notes))
 
 
@@ -346,14 +364,17 @@ WIDTH_SYSTEM_PROMPT = (
     "You are judging a concentrated-liquidity range-width solve for an "
     "emissions-farming bot. Answer with exactly one JSON object and no "
     "other text: "
-    '{"mode": string, "half_width_ticks": integer}. mode is "solved" when '
-    "the tightest tick-aligned candidate (one spacing per side) meets the "
-    'target net daily yield, else "target_unreachable". half_width_ticks '
-    "is the selected half width in whole ticks - read the pool's "
-    "tick_spacing from the inputs; the tightest candidate is exactly one "
-    "spacing. Judge the economics from the provided observables: emissions "
-    "APR is per staked liquidity, and a tighter range earns a larger share "
-    "of it."
+    '{"mode": string, "lower_tick": integer|null, '
+    '"upper_tick": integer|null}. mode is "solved" when a positive-net '
+    'executable candidate exists (argmax of modeled net), "cash_hold" when '
+    'every candidate nets nonpositive, and "deferred" when the measured '
+    "evidence is insufficient. lower_tick and upper_tick are the chosen "
+    "grid-aligned bounds - multiples of the pool's tick_spacing whose REAL "
+    "per-side price distances from the current price sit inside the 0.1-to-"
+    "0.3-percent band - or null unless mode is solved. Judge the economics "
+    "from the provided observables: emissions APR is per staked liquidity, "
+    "a tighter range earns a larger share of it, and the position's own "
+    "added liquidity dilutes the gauge denominator."
 )
 
 
