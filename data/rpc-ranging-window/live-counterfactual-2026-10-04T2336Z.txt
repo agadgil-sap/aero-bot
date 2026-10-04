@@ -1,0 +1,12 @@
+# exit=0 (uv run python, captured without pipes)
+# run from worktree at fixed constant RANGING_READ_LOG_WINDOW_BLOCKS=1000, branch fm/aero-bot-rpc-ranging-window
+host https://gateway.tenderly.co/public/base
+pool 0xa3b1e3f9747065e2073722ff4c9027d3ea4994f0 (MSTRc) window constant 1000
+head 52183586
+span=2000 addr+topics -> code -32602 invalid params
+span=1000 addr+topics -> code 0 0
+token0 0x833589fcd6edb6e08f4c7c32d4f71b54bda02913 d6; token1 0xb200000000000000000000c2e324d24d7eecd1fb d8
+fetch_price_path OK: 252 points over 52175667..52183587 (7921 blocks, lookback 4.4h)
+getlogs windows 8; widest span 1000; gap-free/overlap-free consecutive pages: True
+ordered unique points 252; first block 52175988; last block 52183574
+VERDICT: production ranging read completes at the capped window
