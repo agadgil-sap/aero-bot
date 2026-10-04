@@ -371,3 +371,28 @@ def test_assemble_board_carries_per_symbol_honest_ages() -> None:
     # as-of measurement straight into the observation the gates read.
     assert ages == {"AAAc": 0, "BBBc": 14_279}
     assert any("no real-market reference quote reached this board" not in note for note in notes)
+
+
+def test_no_reference_note_attributes_the_feed_flag_to_the_cycle() -> None:
+    """The shared no-reference note never advises a flag this CLI lacks.
+
+    ``--reference-feed`` arms the cycle, not ``aero-bot-decide``; the note
+    this decision-only surface emits must attribute that flag to the cycle
+    instead of telling the operator to pass it here.
+    """
+    sources = FakeStrategySources()
+
+    report = run_decision(
+        sources,
+        "FIXc",
+        equity_usd=Decimal("200"),
+        reference_price_usdc=None,
+        reference_age_seconds=None,
+        safe_address="0xb69ab6c7e73f711d5f2d10fed8f0d09b1d028c28",
+        observed_at=QUIET_INSTANT,
+    )
+
+    note = next(n for n in report.input_notes if "no real-market reference quote" in n)
+    assert "--reference-price" in note
+    assert "the cycle's --reference-feed" in note
+    assert "with --reference-feed" not in note

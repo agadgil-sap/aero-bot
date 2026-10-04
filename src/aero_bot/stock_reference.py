@@ -99,10 +99,12 @@ class StockReferenceSession(StrEnum):
     REGULAR = "regular"
     # The post-market window after the regular session close.
     POST_MARKET = "post_market"
-    # Outside every published window: overnight, weekend, or holiday.
+    # Outside every window of a complete, valid pre/regular/post set:
+    # overnight, weekend, or holiday.
     CLOSED = "closed"
-    # The provider publishes no usable session windows - none at all, or
-    # none this parser can trust; only the as-of time speaks.
+    # The provider publishes no usable session windows - none at all,
+    # none this parser can trust, or an incomplete pre/regular/post set;
+    # only the as-of time speaks.
     UNKNOWN = "unknown"
 
 
@@ -761,10 +763,12 @@ def _yahoo_session(meta: Mapping[str, object], fetched_at: datetime) -> StockRef
         fetched_at: The fetch instant the windows are judged against.
 
     Returns:
-        The session containing the fetch, CLOSED when the fetch sits in no
-        cleanly published window, or UNKNOWN when the provider published
-        none - or published any window this parser cannot trust, which can
-        never prove the market closed.
+        The session containing the fetch. CLOSED requires the complete
+        pre/regular/post window set published and valid with none of it
+        bracketing the fetch; UNKNOWN when the provider published none -
+        or published any window this parser cannot trust or left any of
+        the three unpublished - because incomplete evidence can never
+        prove the market closed.
     """
     periods = meta.get("currentTradingPeriod")
     if not isinstance(periods, Mapping):
@@ -778,11 +782,11 @@ def _yahoo_session(meta: Mapping[str, object], fetched_at: datetime) -> StockRef
     }
     for key, session in session_by_key.items():
         if key not in periods:
-            if key == "regular":
-                # Published windows without the required regular one are
-                # incomplete evidence: the missing window might have been
-                # the one bracketing the fetch, so closed stays unproven.
-                corrupt_evidence = True
+            # A published trading-period mapping that omits any of the
+            # pre/regular/post windows is incomplete evidence: the missing
+            # window might have been the one bracketing the fetch, so
+            # closed stays unproven.
+            corrupt_evidence = True
             continue
         window = periods[key]
         if not isinstance(window, Mapping):
@@ -802,8 +806,9 @@ def _yahoo_session(meta: Mapping[str, object], fetched_at: datetime) -> StockRef
     for session, start, end in windows:
         if start <= fetched_at.timestamp() < end:
             return session
-    if windows and not corrupt_evidence:
-        # Every published window missed cleanly: overnight, weekend,
-        # holiday, or a provider whose windows all predate the fetch.
+    if not corrupt_evidence:
+        # The complete pre/regular/post set published cleanly and none of
+        # it brackets the fetch: overnight, weekend, holiday, or windows
+        # that all predate the fetch.
         return StockReferenceSession.CLOSED
     return StockReferenceSession.UNKNOWN

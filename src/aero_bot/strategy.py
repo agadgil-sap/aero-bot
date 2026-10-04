@@ -7,12 +7,13 @@ estimates the executor surfaces use - and folds it through the locked
 Nothing is built, signed, estimated for broadcast, or executed: the command's
 product is the decision itself plus one ``policy_decision`` audit record.
 
-Two honest gaps are visible by design rather than hidden: the real-market
-reference quote is not wired live yet (pass ``--reference-price`` to exercise
-complete verdicts; without it every entry blocks fail-closed as
+Two honest gaps are visible by design rather than hidden: this command's
+real-market reference quote is injected-only (pass ``--reference-price`` to
+exercise complete verdicts - the live feed arms the cycle CLI, not this
+decision-only surface; without a quote every entry blocks fail-closed as
 ``reference_stale``), and the fee APR stays at zero because a live fee-evidence
-window needs the same price-path machinery the rehearsal reconstructs. Both are
-post-reassessment scope.
+window needs the same price-path machinery the rehearsal reconstructs - the
+remaining post-reassessment scope.
 """
 
 import argparse
@@ -661,7 +662,7 @@ def assemble_observation(
         notes.append(
             "no real-market reference quote reached this decision; entries block "
             "fail-closed as reference_stale wherever enforcement applies - inject "
-            "one with --reference-price or arm the live feed with --reference-feed"
+            "one with --reference-price, or arm the cycle's --reference-feed"
         )
     notes.append(
         "policy decisions keep a conservative zero fee APR; the live claimable "

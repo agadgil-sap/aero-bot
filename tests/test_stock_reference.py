@@ -388,6 +388,42 @@ class TestYahooBackend:
         quote = backend.fetch_underlying_quote("NVDAc", "NVDA")
         assert quote.session is StockReferenceSession.POST_MARKET
 
+    def test_missing_sibling_windows_read_unknown_not_closed(self) -> None:
+        """An incomplete pre/regular/post set never proves a closed market."""
+        regular = {"start": 1790947800, "end": 1790971200}
+        post = {"start": 1790971200, "end": 1790985600}
+        incomplete_periods = [
+            # Only the regular window published: pre and post absent.
+            {"regular": regular},
+            # The pre window absent while regular and post publish.
+            {"regular": regular, "post": post},
+        ]
+        # A Sunday fetch outside every published window: a closed label
+        # could only come from trusting the absent windows to have missed
+        # the fetch too, which is exactly what incomplete evidence cannot
+        # prove.
+        meta = dict(NVDA_CHART_META)
+        for periods in incomplete_periods:
+            meta["currentTradingPeriod"] = periods
+            backend = fixed_yahoo_backend(
+                yahoo_chart_response(meta), fetched_at=datetime(2026, 10, 4, 12, 0, tzinfo=UTC)
+            )
+            quote = backend.fetch_underlying_quote("NVDAc", "NVDA")
+            assert quote.session is StockReferenceSession.UNKNOWN, periods
+
+    def test_valid_bracket_survives_missing_sibling_windows(self) -> None:
+        """A cleanly published bracketing window still establishes OPEN."""
+        meta = dict(NVDA_CHART_META)
+        meta["currentTradingPeriod"] = {"regular": {"start": 1790947800, "end": 1790971200}}
+        # The fetch sits inside the valid regular window, so the session is
+        # known open even though pre and post never published.
+        meta["regularMarketTime"] = 1790962199
+        backend = fixed_yahoo_backend(
+            yahoo_chart_response(meta), fetched_at=datetime(2026, 10, 2, 17, 30, tzinfo=UTC)
+        )
+        quote = backend.fetch_underlying_quote("NVDAc", "NVDA")
+        assert quote.session is StockReferenceSession.REGULAR
+
     def test_whole_dollar_integer_price_is_accepted(self) -> None:
         """A bare JSON integer last sale is a valid positive price."""
         meta = dict(NVDA_CHART_META)
