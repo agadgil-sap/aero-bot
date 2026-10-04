@@ -5233,6 +5233,7 @@ class LpLifecycleExecutor:
         Raises:
             LpExecutionRefusalError: If any registry, discovery, snapshot, or
                 pool-shape gate refuses.
+            ExecutionUnavailableError: If discovery cannot verify.
         """
         caps: list[str] = []
         registry = self._sources.load_registry()
@@ -5287,6 +5288,10 @@ class LpLifecycleExecutor:
                 )
                 return listing, observation, caps
         discovery = self._sources.discover_pools()
+        if discovery.status is not PoolDiscoveryStatus.VERIFIED:
+            raise ExecutionUnavailableError(
+                "pool discovery did not verify: " + " ".join(discovery.diagnostics)
+            )
         pool = next(
             (
                 candidate
@@ -5295,12 +5300,11 @@ class LpLifecycleExecutor:
             ),
             None,
         )
-        if pool is None or discovery.status is not PoolDiscoveryStatus.VERIFIED:
+        if pool is None:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.POOL_NOT_DISCOVERED,
                 f"no live Sugar-verified B20/USDC pool exists for {listing.symbol!r} "
-                f"(discovery status {discovery.status.value}); execution requires a pool from "
-                "live discovery",
+                "in verified discovery; execution requires a pool from live discovery",
             )
         if discovery.observed_at is None or discovery.snapshot_block is None:
             raise LpExecutionRefusalError(

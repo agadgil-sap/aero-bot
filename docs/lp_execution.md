@@ -200,7 +200,7 @@ These gates run before anything is signed, in order, and each appends its label 
 | --- | --- | --- |
 | Registry verified | official B20 registry validates | `registry_unverified` |
 | Symbol in registry | USDC plus the registry whitelist only | `symbol_not_in_registry` |
-| Pool from live discovery | Sugar-verified pool, or the known-pool fast path below | `pool_not_discovered` |
+| Pool from verified discovery | a verified Sugar sweep names the pool, or the known-pool fast path below; a sweep that does not verify fails as an unavailable read, never as proof the pool is gone | `pool_not_discovered` |
 | Snapshot evidence | observation time and pin block present | `snapshot_evidence_missing` |
 | NFPM and gauge present | Sugar record carries both | `pool_missing_nfpm_or_gauge` |
 | Snapshot staleness | 120 seconds | `snapshot_stale` |

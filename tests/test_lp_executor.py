@@ -2434,6 +2434,27 @@ def test_exit_side_actions_refuse_a_foreign_owner() -> None:
         assert raised.value.code is LpExecutionRefusalCode.POSITION_NOT_OWNED
 
 
+def test_an_unverified_discovery_fails_the_read_as_unavailable() -> None:
+    """A sweep that did not verify is a failed read, never proof of absence."""
+    for status in (PoolDiscoveryStatus.UNAVAILABLE, PoolDiscoveryStatus.REJECTED):
+        executor, _, _ = make_lp_executor(
+            sources=FakeSources(discovery=make_discovery(status=status))
+        )
+
+        with pytest.raises(ExecutionUnavailableError):
+            executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC)
+
+
+def test_a_verified_absent_pool_refuses_as_delisted() -> None:
+    """Only a verified sweep genuinely lacking the pool is the delisting."""
+    executor, _, _ = make_lp_executor(sources=FakeSources(discovery=make_discovery(pools=())))
+
+    with pytest.raises(LpExecutionRefusalError) as raised:
+        executor.position_status("FIXc", 77, FIXTURE_AERO_PRICE_USDC)
+
+    assert raised.value.code is LpExecutionRefusalCode.POOL_NOT_DISCOVERED
+
+
 # ---------------------------------------------------------------------------
 # Withdraw dry-run composition
 # ---------------------------------------------------------------------------

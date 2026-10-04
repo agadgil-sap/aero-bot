@@ -454,6 +454,13 @@ class FaithfulChain:
         # Scripted classic-pool read failures, consumed per eth_call, so a
         # live AERO price read can refuse transiently and nothing else.
         self.fail_aero_price_reads = 0
+        # Scripted Sugar-page read failures, consumed per eth_call, so one
+        # discovery sweep can refuse transiently and nothing else.
+        self.fail_sugar_reads = 0
+        # Scripted per-pool view read failures, consumed per eth_call per
+        # pool address, so one pool's known-pool fast path can fall through
+        # to the full sweep without touching any other pool's reads.
+        self.fail_pool_reads: dict[str, int] = {}
         self.rpc_error_after_request: tuple[int, str] | None = None
         self.request_count = 0
         self.estimate_revert_message: str | None = None
@@ -629,6 +636,10 @@ class FaithfulChain:
 
     def _eth_call(self, to: str, data: str, block_tag: str) -> str:
         selector = data[:10]
+        remaining_pool_faults = self.fail_pool_reads.get(to, 0)
+        if remaining_pool_faults > 0:
+            self.fail_pool_reads[to] = remaining_pool_faults - 1
+            raise ChainFaultError("the fixture refuses the pool view read")
         if to == FIXTURE_SAFE_ADDRESS.lower():
             if selector == _SELECTORS["safe_nonce"]:
                 return _word(self.safe_nonce)
@@ -688,6 +699,9 @@ class FaithfulChain:
         if selector == _SELECTORS["pool_factory_get_pool"]:
             return _address_word(FIXTURE_AERO_CLASSIC_POOL_ADDRESS)
         if selector == _SELECTORS["sugar_all"]:
+            if self.fail_sugar_reads > 0:
+                self.fail_sugar_reads -= 1
+                raise ChainFaultError("the fixture refuses the Sugar sweep")
             return self._sugar_page(data)
         raise AssertionError(f"unexpected eth_call to {to}: {selector}")
 
@@ -1609,6 +1623,72 @@ class TestEntrySideInterruptions:
         assert token_ids == set(chain.staked_token_ids())
         assert chain.count_broadcasts("stake", token_id=staked[0]) == 1
         assert chain.count_broadcasts("mint") == len(chain.staked_token_ids())
+
+    def test_an_unverified_discovery_sweep_halts_the_recovery_without_reentering(
+        self, board_world: tuple[CycleHarness, FaithfulChain, LoopbackRpcServer]
+    ) -> None:
+        """A sibling whose sweep cannot verify is unknown, never delisted.
+
+        The killed cycle's completed sibling sits staked in its gauge, and
+        the restart's recovery read falls off the known-pool fast path onto
+        a Sugar sweep that cannot verify. A sweep that did not verify is a
+        failed read, never evidence the pool left the venue: the cycle must
+        halt for the next tick rather than skip the sibling - a flat
+        reconcile would re-enter the same pool and mint a duplicate - and
+        the healthy retry then recovers it exactly once.
+        """
+        harness, chain, _server = board_world
+        TestExitSideInterruptions._seed_funded_book(harness)
+        TestExitSideInterruptions._arm_switch(chain)
+
+        exit_code, _report, _stderr = harness.run(
+            ["--json", *harness.reference_args()],
+            barrier_kill_after=lambda record: record.kind == "stake" and record.detail == "GOOGLc",
+        )
+        assert exit_code == -signal.SIGTERM, exit_code
+        siblings = [
+            token
+            for token in chain.staked_token_ids()
+            if chain.positions[token].pool.symbol == "GOOGLc"
+        ]
+        assert len(siblings) == 1, siblings
+        # The checkpoint never landed: the seed book still stands on disk,
+        # minus the row whose exit completed on-chain before the kill, so
+        # the restart tracks only what still exists and must prove the
+        # sibling from the audit chain instead.
+        seed_book = json.loads(harness.snapshot_book())
+        surviving = set(chain.staked_token_ids()) | set(chain.safe_token_ids())
+        seed_book["positions"] = [
+            position for position in seed_book["positions"] if position["token_id"] in surviving
+        ]
+        harness.state_path.write_text(json.dumps(seed_book), encoding="utf-8")
+        mints_before = chain.count_broadcasts("mint")
+
+        # The sibling's status read falls off its pinned fast path and the
+        # Sugar sweep refuses: unknown truth, never delisting.
+        googlc = next(pool for pool in chain.pools.values() if pool.symbol == "GOOGLc")
+        chain.fail_pool_reads[googlc.pool_address.lower()] = 1
+        chain.fail_sugar_reads = 1
+        exit_code, _report, stderr = harness.run(["--json", *harness.reference_args()])
+        assert exit_code != EXIT_OK
+        assert "cycle failed" in stderr
+        assert "pool discovery did not verify" in stderr
+        assert chain.count_broadcasts("mint") == mints_before
+
+        # The healthy retry recovers the sibling exactly once.
+        exit_code, report, stderr = harness.run(["--json", *harness.reference_args()])
+        assert exit_code == EXIT_OK, stderr
+        assert report is not None
+        assert report["halted_reason"] == "", report["halted_reason"]
+        decision = report.get("decision_reconciliation") or {}
+        recovered = decision.get("recovered_positions") or []
+        assert any(row["token_id"] == siblings[0] for row in recovered), recovered
+        book = harness.load_book()
+        assert {position["token_id"] for position in book["positions"]} == set(
+            chain.staked_token_ids()
+        )
+        assert chain.count_broadcasts("stake", token_id=siblings[0]) == 1
+        assert chain.count_broadcasts("mint", token_id=siblings[0]) == 1
 
     def test_kill_between_mint_and_stake_adopts_without_reming(
         self, board_world: tuple[CycleHarness, FaithfulChain, LoopbackRpcServer]
