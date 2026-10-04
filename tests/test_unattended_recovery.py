@@ -445,6 +445,15 @@ class FaithfulChain:
         self.http_status_queue: list[int] = []
         # An optional chain-id override for wrong-chain refusal controls.
         self.chain_id_override: int | None = None
+        # Scripted lost broadcast acknowledgements: the next send whose
+        # inner action kind matches still applies on-chain - keyed under
+        # the keccak hash of its raw bytes, exactly the transaction a node
+        # accepts before losing the response - but its JSON-RPC reply
+        # fails, so the executor journals the broadcast-unknown row.
+        self.lose_send_ack_kind: str | None = None
+        # Scripted classic-pool read failures, consumed per eth_call, so a
+        # live AERO price read can refuse transiently and nothing else.
+        self.fail_aero_price_reads = 0
         self.rpc_error_after_request: tuple[int, str] | None = None
         self.request_count = 0
         self.estimate_revert_message: str | None = None
@@ -667,6 +676,9 @@ class FaithfulChain:
         if selector == _SELECTORS["factory_get_unstaked_fee"]:
             return _word(100_000)
         if to == FIXTURE_AERO_CLASSIC_POOL_ADDRESS.lower():
+            if self.fail_aero_price_reads > 0:
+                self.fail_aero_price_reads -= 1
+                raise ChainFaultError("the fixture refuses the classic-pool price read")
             if selector == _SELECTORS["token0"]:
                 return _address_word(AERO_TOKEN_ADDRESS)
             if selector == _SELECTORS["classic_reserve0"]:
@@ -907,11 +919,24 @@ class FaithfulChain:
         selector = data.hex()[:8]
         if selector != "6a761202":
             raise AssertionError(f"unexpected Safe call {selector}")
+        if self.lose_send_ack_kind is not None:
+            # The node accepted the transaction: state applies under the
+            # keccak hash the executor derives locally from the same signed
+            # bytes, but the acknowledgement never reaches the client.
+            from eth_utils.crypto import keccak
+
+            ack_hash = "0x" + keccak(payload).hex()
+            record = self._apply_safe_execution(to_address, "0x" + data.hex(), ack_hash)
+            self.sent_hashes.append(ack_hash)
+            if record.kind == self.lose_send_ack_kind:
+                self.lose_send_ack_kind = None
+                raise ChainFaultError("the broadcast acknowledgement was lost")
+            return ack_hash
         self._apply_safe_execution(to_address, "0x" + data.hex(), tx_hash)
         self.sent_hashes.append(tx_hash)
         return tx_hash
 
-    def _apply_safe_execution(self, to: str, data: str, tx_hash: str) -> None:
+    def _apply_safe_execution(self, to: str, data: str, tx_hash: str) -> BroadcastRecord:
         """Apply one Safe execTransaction's inner call as chain state."""
         from aero_bot.domain import normalize_evm_address
         from aero_bot.safe_tx import SafeTransaction, build_safe_transaction
@@ -982,6 +1007,7 @@ class FaithfulChain:
             "logs": logs,
         }
         self._cond.notify_all()
+        return record
 
     def _apply_inner(self, to: str, selector: str, calldata: str) -> BroadcastRecord:
         if selector == _INNER_SELECTORS.get("095ea7b3") or selector == "095ea7b3":
@@ -2013,6 +2039,87 @@ class TestHealerNegativeControls:
         finally:
             server.stop()
 
+    def test_a_lost_acknowledgement_mint_gap_heals_the_same_way(self, tmp_path: Path) -> None:
+        """The broadcast-unknown sibling row heals from its on-chain receipt.
+
+        The node accepts the mint but the acknowledgement is lost, the
+        process dies during the bounded receipt wait, and the journal holds
+        only the broadcast-unknown row: the restart must still prove the
+        delivery, adopt its custody exactly once, and never re-enter the
+        adopted symbol.
+        """
+        chain = FaithfulChain(make_board_pools(), safe_usdc_units=500_000_000)
+        server = LoopbackRpcServer(chain)
+        server.start()
+        harness = CycleHarness(tmp_path, chain, server)
+        try:
+            chain.lose_send_ack_kind = "mint"
+            exit_code, _report, _stderr = harness.run(
+                ["--json", *harness.reference_args()],
+                barrier_kill_after=lambda record: record.kind == "mint",
+            )
+            assert exit_code == -signal.SIGTERM, exit_code
+            minted = chain.safe_token_ids()
+            assert len(minted) == 1
+            # The faithful gap shape: exactly one broadcast-unknown send row
+            # for the mint, and no receipt row for its hash anywhere.
+            rows = (
+                sqlite3.connect(harness.audit_path)
+                .execute("SELECT event_type, payload_json FROM audit_records ORDER BY sequence ASC")
+                .fetchall()
+            )
+            unknown = [
+                json.loads(payload)
+                for event_type, payload in rows
+                if event_type == "lp_execute_broadcast_unknown"
+            ]
+            assert len(unknown) == 1, unknown
+            assert unknown[0]["action"] == "mint"
+            gap_hash = unknown[0]["transaction_hash"]
+            assert not any(
+                event_type in ("lp_execute_confirmed", "lp_execute_failed") and gap_hash in payload
+                for event_type, payload in rows
+            ), "a receipted row would mask the broadcast-unknown gap"
+
+            # The restart heals the accepted delivery from its own receipt
+            # and adopts its custody exactly once.
+            exit_code, report, stderr = harness.run(["--json", *harness.reference_args()])
+            assert exit_code == EXIT_OK, stderr
+            assert (report or {}).get("halted_reason", "") == ""
+            healed = (
+                sqlite3.connect(harness.audit_path)
+                .execute(
+                    "SELECT COUNT(*) FROM audit_records WHERE event_type = "
+                    "'lp_execute_confirmed' AND payload_json LIKE ?",
+                    (f"%{gap_hash}%",),
+                )
+                .fetchone()[0]
+            )
+            assert healed == 1, "the heal never proved the broadcast-unknown delivery"
+            book = harness.load_book()
+            adopted = next(
+                position for position in book["positions"] if position["token_id"] == minted[0]
+            )
+            assert (
+                sum(
+                    1
+                    for record in chain.broadcasts
+                    if record.kind == "mint" and record.detail == adopted["symbol"]
+                )
+                == 1
+            ), "the adopted symbol was re-entered"
+            assert minted[0] in chain.safe_token_ids()
+
+            # The unstaked adoption rides the stake-recovery pass: one more
+            # cycle stakes it exactly once.
+            exit_code, followup, stderr = harness.run(["--json", *harness.reference_args()])
+            assert exit_code == EXIT_OK, stderr
+            assert (followup or {}).get("halted_reason", "") == ""
+            assert chain.count_broadcasts("stake", token_id=minted[0]) == 1
+            assert minted[0] in chain.staked_token_ids()
+        finally:
+            server.stop()
+
     def test_a_foreign_receipt_target_never_gains_provenance(self, tmp_path: Path) -> None:
         """A receipt addressed to another contract heals nothing."""
 
@@ -2067,6 +2174,35 @@ class TestHealerNegativeControls:
             exit_code, report, stderr = harness.run(["--json", *harness.reference_args()])
             assert exit_code != EXIT_OK
             assert "corrupt audit evidence" in stderr
+        finally:
+            server.stop()
+
+
+class TestAdoptionStatusReadDiscipline:
+    """The adoption fold's status read is a reconcile-grade read."""
+
+    def test_a_refused_adopted_status_read_halts_rather_than_reenters(self, tmp_path: Path) -> None:
+        """A status-read refusal during adoption fails the cycle for retry.
+
+        The adopted position's status read refuses while everything around
+        it stays healthy: the cycle must halt before decide - never proceed
+        with a book-only adoption the allocator would treat as unheld and
+        re-enter - and the next tick's retry adopts through the same
+        evidence.
+        """
+        harness, chain, server = TestHealerNegativeControls._gap_world(tmp_path)
+        try:
+            chain.fail_aero_price_reads = 1
+            mints_before = chain.count_broadcasts("mint")
+            exit_code, report, stderr = harness.run(["--json", *harness.reference_args()])
+            assert exit_code != EXIT_OK
+            assert "cycle failed" in stderr
+            assert "the live AERO price read" in stderr
+            assert chain.count_broadcasts("mint") == mints_before
+
+            exit_code, report, stderr = harness.run(["--json", *harness.reference_args()])
+            assert exit_code == EXIT_OK, stderr
+            assert (report or {}).get("halted_reason", "") == ""
         finally:
             server.stop()
 

@@ -2681,12 +2681,14 @@ class CycleRunner:
     def _heal_unconfirmed_sent_deliveries(self) -> None:
         """Prove sent-but-unrecorded deliveries from their on-chain receipts.
 
-        The executor appends one durable send record before every broadcast
-        and its receipt row after inclusion. A process death between the
-        two leaves chain truth confirmed but the journal one row short, so
-        the crashed entry could never prove itself and every later cycle
-        refused out-of-band forever. The heal closes exactly that gap: for
-        every send record of this runner's Safe that carries no receipt
+        The executor appends one durable send record before every broadcast -
+        the sent row, or its broadcast-unknown sibling when the endpoint's
+        acknowledgement was lost after the node may already have accepted the
+        transaction - and its receipt row after inclusion. A process death
+        between the two leaves chain truth confirmed but the journal one row
+        short, so the crashed entry could never prove itself and every later
+        cycle refused out-of-band forever. The heal closes exactly that gap:
+        for every send record of this runner's Safe that carries no receipt
         row, the on-chain receipt is fetched and its truthful outcome row
         appended - nothing more. Unknown or still-pending deliveries stay
         unproven (the fail-closed refusals stand), reverted deliveries
@@ -2706,7 +2708,10 @@ class CycleRunner:
         sent_rows: list[tuple[str, str, str, str, str]] = []
         for record in records:
             payload = json.loads(record.payload_json)
-            if record.event_type is AuditEventType.LP_EXECUTE_SENT:
+            if record.event_type in (
+                AuditEventType.LP_EXECUTE_SENT,
+                AuditEventType.LP_EXECUTE_BROADCAST_UNKNOWN,
+            ):
                 # The audit store is shared by every Safe that executes
                 # through it: only this runner's own sends heal here. A
                 # malformed send row - missing its action, role, hashes, or
@@ -2939,23 +2944,22 @@ class CycleRunner:
                 adopted_status = self._adopted_position_status(
                     adopted_symbol, adopted_token, committed
                 )
-                if adopted_status is not None:
-                    adopted_reconciliation = reconciliation.model_copy(
-                        update={
-                            "position_statuses": (
-                                *reconciliation.position_statuses,
-                                PositionStatusRecord(
-                                    symbol=adopted_symbol,
-                                    token_id=adopted_token,
-                                    pool_address=self._pool_for_symbol(adopted_symbol).pool_address,
-                                    committed_usd=committed,
-                                    staked=normalize_evm_address(adopted_status.token_owner_address)
-                                    == normalize_evm_address(adopted_status.gauge_address),
-                                    status=adopted_status,
-                                ),
-                            )
-                        }
-                    )
+                adopted_reconciliation = reconciliation.model_copy(
+                    update={
+                        "position_statuses": (
+                            *reconciliation.position_statuses,
+                            PositionStatusRecord(
+                                symbol=adopted_symbol,
+                                token_id=adopted_token,
+                                pool_address=self._pool_for_symbol(adopted_symbol).pool_address,
+                                committed_usd=committed,
+                                staked=normalize_evm_address(adopted_status.token_owner_address)
+                                == normalize_evm_address(adopted_status.gauge_address),
+                                status=adopted_status,
+                            ),
+                        )
+                    }
+                )
         if (
             book.held_inventory is None
             and reconciliation.held_stock_quantity > 0
@@ -2975,19 +2979,22 @@ class CycleRunner:
 
     def _adopted_position_status(
         self, symbol: str, token_id: int, committed: Decimal
-    ) -> LpPositionStatusReport | None:
+    ) -> LpPositionStatusReport:
         """Read one adopted position's live custody for this cycle's folds.
 
         The adoption happened after the reconciliation enumerated statuses,
         so the row would otherwise be invisible to the decision; the read
-        is the same audited status surface the reconcile itself uses. A
-        refusal here leaves the adoption book-only and the position
-        unstaked for the stake-recovery pass - never a guessed custody.
+        is the same audited status surface the reconcile itself uses, and a
+        refusal fails the cycle for the next tick's retry exactly like the
+        reconcile's own status reads - never a guessed custody, and never a
+        book-only adoption the decision cannot see and the allocator would
+        re-enter.
+
+        Raises:
+            LpExecutionRefusalError: If any status gate refuses.
+            ExecutionUnavailableError: If the read cannot complete.
         """
-        try:
-            return self._reads.position_status(symbol, token_id, entry_cost_usdc=committed)
-        except (LpExecutionRefusalError, ExecutionUnavailableError, ValueError, RuntimeError):
-            return None
+        return self._reads.position_status(symbol, token_id, entry_cost_usdc=committed)
 
     def _fold_recovered_positions(
         self, book: CycleStateBook, reconciliation: CycleReconciliation
