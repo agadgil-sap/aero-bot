@@ -8,10 +8,12 @@ suppresses every immediate email path (see :mod:`aero_bot.alerts`).
 Everything here is derived - never invented: every trading, action, reward,
 and failure line restates a durable audit record inside the window, the
 student's advice block restates the latest ``advisor_reported`` record with
-its provenance and age, and the teacher block states the honest absence:
-the teacher seats run on the operator's Mac and their corpus is not readable
-from the box that sends this email, so no teacher advice is ever summarized
-here. A failed send warns on stderr and never raises, exactly like the
+its provenance and age, and the teacher block restates the bounded
+one-way evidence artifact the Mac-side publisher writes beside the audit
+store (firstmate 028's minimal transfer) - with the publish provenance,
+per-episode timestamps, and an explicit missing, malformed, or stale marker
+whenever the artifact is absent, unparseable, or older than the stale bound.
+A failed send warns on stderr and never raises, exactly like the
 per-cycle hook it replaces for this run.
 """
 
@@ -58,6 +60,21 @@ class DigestRecordSource(Protocol):
         ...
 
 
+class TeacherAdviceView:
+    """Carry the teacher evidence's loaded state for the digest."""
+
+    def __init__(self, document: object | None, state: str) -> None:
+        """Bind the parsed document (when valid) and its state marker.
+
+        Args:
+            document: The validated artifact payload dict, or None.
+            state: One of fresh, stale, missing, malformed - the honest
+                marker the digest renders beside (or instead of) the advice.
+        """
+        self.document = document
+        self.state = state
+
+
 def _format_quantity(value: Decimal | None) -> str:
     """Render one token quantity at the email display precision."""
     if value is None:
@@ -97,6 +114,57 @@ def _payload(record: AuditRecord) -> dict[str, object]:
 def _stamp(moment: datetime) -> str:
     """Render one audit timestamp at minute precision, UTC."""
     return moment.astimezone(UTC).strftime("%Y-%m-%d %H:%MZ")
+
+
+def load_teacher_advice(
+    path: Path,
+    now: datetime,
+    stale_hours: int = 24,
+    max_bytes: int = 16_384,
+) -> TeacherAdviceView:
+    """Load and validate the published teacher-advice artifact.
+
+    Args:
+        path: The artifact path beside the audit store.
+        now: The composition instant, for the stale marker.
+        stale_hours: The age bound past which the advice is stale.
+        max_bytes: The size bound past which the artifact is discarded.
+
+    Returns:
+        The view: a validated document with state fresh or stale, or an
+        empty document with state missing or malformed. Every failure is
+        honest and bounded - nothing raises, and the caller renders the
+        state marker verbatim.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return TeacherAdviceView(None, "missing")
+    if not raw or len(raw) > max_bytes:
+        return TeacherAdviceView(None, "malformed")
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        return TeacherAdviceView(None, "malformed")
+    if not isinstance(document, dict) or document.get("schema_version") != "teacher_advice/1":
+        return TeacherAdviceView(None, "malformed")
+    episodes = document.get("episodes")
+    if not isinstance(episodes, list):
+        return TeacherAdviceView(None, "malformed")
+    stamps: list[datetime] = []
+    for episode in episodes:
+        if not isinstance(episode, dict):
+            return TeacherAdviceView(None, "malformed")
+        stamp = episode.get("created_at")
+        if not isinstance(stamp, str):
+            return TeacherAdviceView(None, "malformed")
+        try:
+            stamps.append(datetime.fromisoformat(stamp.replace("Z", "+00:00")))
+        except ValueError:
+            return TeacherAdviceView(None, "malformed")
+    if stamps and now - max(stamps) > timedelta(hours=stale_hours):
+        return TeacherAdviceView(document, "stale")
+    return TeacherAdviceView(document, "fresh")
 
 
 def collect_digest_records(
@@ -337,10 +405,74 @@ def _compose_student_advice(records: tuple[AuditRecord, ...], now: datetime) -> 
     return lines
 
 
+def _compose_teacher_advice(advice: TeacherAdviceView, now: datetime) -> list[str]:
+    """Restate the published teacher evidence with provenance and markers."""
+    if advice.document is None:
+        reason = {
+            "missing": "no published evidence artifact exists on this box",
+            "malformed": "the published artifact is unparseable or oversized and was discarded",
+        }.get(advice.state, advice.state)
+        return [
+            f"teacher advice: {advice.state.upper()} - {reason}; the Mac-side",
+            "  publisher's next pass replaces it (never invented here)",
+        ]
+    document = advice.document
+    if not isinstance(document, dict):
+        return [
+            "teacher advice: MALFORMED - the published artifact is unparseable "
+            "or oversized and was discarded",
+        ]
+    lines: list[str] = []
+    marker = " (STALE - newest episode beyond the stale bound)" if advice.state == "stale" else ""
+    generated = document.get("generated_at", "unknown")
+    lines.append(f"teacher advice: published artifact generated {generated}{marker}")
+    absences = document.get("absence_counts")
+    if isinstance(absences, dict) and absences:
+        tally = ", ".join(f"{count} {reason}" for reason, count in sorted(absences.items()))
+        lines.append(f"  typed absences across the selected episodes: {tally}")
+    episodes = document.get("episodes")
+    if not isinstance(episodes, list):
+        episodes = []
+    for episode in episodes[-DIGEST_MAX_ACTION_LINES // 10 or 1 :]:
+        if not isinstance(episode, dict):
+            continue
+        stamp = str(episode.get("created_at", "unknown"))[:16].replace("T", " ")
+        lines.append(f"  episode {stamp} ({episode.get('stream', 'unknown')} stream):")
+        seats = episode.get("seats")
+        if not isinstance(seats, list):
+            continue
+        for seat in seats:
+            if not isinstance(seat, dict):
+                continue
+            head = (
+                f"    {seat.get('seat', '?')} ({seat.get('model', '?')}): "
+                f"{seat.get('outcome', 'unknown')}"
+            )
+            lines.append(head)
+            brief = seat.get("brief")
+            if isinstance(brief, str) and brief:
+                lines.append(f"      brief: {_clip_text(brief, DIGEST_BRIEF_MAX_CHARS)}")
+            if isinstance(seat.get("view_verdict"), str) and seat.get("view_verdict"):
+                lines.append(f"      position view: {seat.get('view_verdict')}")
+            elif isinstance(seat.get("view_declined"), str) and seat.get("view_declined"):
+                lines.append(f"      position view: declined ({seat.get('view_declined')})")
+    if not episodes:
+        lines.append("  the artifact carries no episodes (a quiet corpus)")
+    return lines
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """Cap one excerpt with an explicit ellipsis."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
 def compose_daily_digest(
     records: tuple[AuditRecord, ...],
     now: datetime,
     window_hours: int = DIGEST_WINDOW_HOURS,
+    advice: TeacherAdviceView | None = None,
 ) -> tuple[str, str]:
     """Compose the daily digest email from the audit window.
 
@@ -348,6 +480,8 @@ def compose_daily_digest(
         records: The window's audit records, any order (composition sorts).
         now: The timezone-aware composition instant.
         window_hours: The window's length in hours, for the header.
+        advice: The loaded teacher-advice view; None renders the missing
+            marker (no artifact was even attempted).
 
     Returns:
         The (subject, body) pair; every line restates durable audit
@@ -386,14 +520,12 @@ def compose_daily_digest(
     lines.extend(f"  {line}" for line in _compose_rewards(ordered))
     lines.extend(["", "== student advice (shadow advisor) =="])
     lines.extend(f"  {line}" for line in _compose_student_advice(ordered, now))
+    lines.extend(["", "== teacher advice (Mac-side seats) =="])
     lines.extend(
-        [
-            "",
-            "== teacher advice (Mac-side seats) ==",
-            "  MISSING BY DESIGN: the teacher seats run on the operator's Mac and",
-            "  their corpus is not readable from this box, so no teacher advice is",
-            "  summarized here; the Mac-side hindsight and upgrade reports carry it.",
-        ]
+        f"  {line}"
+        for line in _compose_teacher_advice(
+            advice if advice is not None else TeacherAdviceView(None, "missing"), now
+        )
     )
     lines.extend(
         [
@@ -410,6 +542,7 @@ def deliver_daily_digest(
     environ: Mapping[str, str] | None = None,
     error_stream: TextIO | None = None,
     now: datetime | None = None,
+    advice_path: Path | None = None,
 ) -> bool:
     """Deliver one daily digest email; a failure never raises.
 
@@ -419,6 +552,10 @@ def deliver_daily_digest(
             reads the live process environment.
         error_stream: Where delivery warnings land; stderr by default.
         now: The composition instant; None reads the wall clock.
+        advice_path: The published teacher-advice artifact path; None
+            keeps the missing marker. An absent, malformed, or stale
+            artifact renders its honest marker and never suppresses the
+            send.
 
     Returns:
         Whether the digest email was sent. Provider none, digest-mode
@@ -440,7 +577,12 @@ def deliver_daily_digest(
     except (OSError, ValueError) as error:
         print(f"daily digest could not read the audit window: {error}", file=stream)
         return False
-    subject, body = compose_daily_digest(records, moment)
+    advice_view = (
+        load_teacher_advice(advice_path, moment)
+        if advice_path is not None
+        else TeacherAdviceView(None, "missing")
+    )
+    subject, body = compose_daily_digest(records, moment, advice=advice_view)
     try:
         transport.send(subject, body)
     except AlertTransportError as error:
@@ -460,8 +602,10 @@ __all__ = [
     "DIGEST_MAX_PAGES",
     "DIGEST_SUBJECT_PREFIX",
     "DIGEST_WINDOW_HOURS",
+    "TeacherAdviceView",
     "collect_digest_records",
     "compose_daily_digest",
     "deliver_daily_digest",
+    "load_teacher_advice",
     "open_digest_store",
 ]

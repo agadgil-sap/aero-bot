@@ -1,6 +1,7 @@
 """Pin the daily digest: suppression, composition, and the daily tick wiring."""
 
 import io
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -24,6 +25,7 @@ from aero_bot.digest import (
     collect_digest_records,
     compose_daily_digest,
     deliver_daily_digest,
+    load_teacher_advice,
 )
 from aero_bot.executor import ExecutionMode, ExecutionReceiptPayload, ExecutionSentPayload
 from aero_bot.executor import ExecutionRole as SwapRole
@@ -262,8 +264,8 @@ class TestDigestComposition:
         assert "student advice: 1 brief(s) of 1 pass(es)" in body
         assert "qwen3.6:35b-a3b" in body
         assert "Benign wait state" in body
-        assert "MISSING BY DESIGN" in body
-        assert "teacher seats run on the operator's Mac" in body
+        assert "teacher advice: MISSING" in body
+        assert "teacher seats run on the operator's Mac" not in body
         assert "equity:" in body
         assert "exit" not in body.split("== trading ==")[1].split("==")[0]
 
@@ -398,6 +400,108 @@ class TestDigestDelivery:
             builder.return_value = FakeTransport(failure=AlertTransportError("provider refused"))
             assert deliver_daily_digest(store, RESEND_ENV, error_stream=errors, now=NOW) is False
         assert "provider refused" in errors.getvalue()
+
+
+class TestTeacherAdviceEvidence:
+    """The published artifact renders with markers, never inventions."""
+
+    def _artifact(
+        self, tmp_path: Path, episodes: list[dict[str, object]], generated: str | None = None
+    ) -> Path:
+        """Write one teacher-advice artifact with the given episodes."""
+        document = {
+            "schema_version": "teacher_advice/1",
+            "generated_at": generated or "2026-10-06T21:30:00+00:00",
+            "episodes": episodes,
+            "absence_counts": {"timeout": 1},
+        }
+        path = tmp_path / "teacher_advice.json"
+        path.write_text(json.dumps(document))
+        return path
+
+    def test_fresh_advice_renders_provenance_and_briefs(self, tmp_path: Path) -> None:
+        """A fresh artifact renders its seats, briefs, views, and stamp."""
+        episodes: list[dict[str, object]] = [
+            {
+                "created_at": "2026-10-06T20:51:35+00:00",
+                "stream": "tactical",
+                "seats": [
+                    {
+                        "seat": "claude",
+                        "model": "glm-5.3",
+                        "outcome": "brief",
+                        "brief": "Fresh snapshot shows a pool switch; watch it.",
+                        "view_verdict": "hold",
+                        "view_declined": None,
+                        "latency_ms": 9000,
+                    }
+                ],
+            }
+        ]
+        view = load_teacher_advice(self._artifact(tmp_path, episodes), NOW)
+        assert view.state == "fresh"
+        _, body = compose_daily_digest((), NOW, advice=view)
+        assert "published artifact generated 2026-10-06T21:30:00+00:00" in body
+        assert "episode 2026-10-06 20:51 (tactical stream)" in body
+        assert "claude (glm-5.3): brief" in body
+        assert "Fresh snapshot shows a pool switch" in body
+        assert "position view: hold" in body
+        assert "typed absences across the selected episodes: 1 timeout" in body
+
+    def test_an_absent_artifact_renders_missing(self, tmp_path: Path) -> None:
+        """No file means MISSING, and the digest still composes."""
+        view = load_teacher_advice(tmp_path / "absent.json", NOW)
+        assert view.state == "missing"
+        _, body = compose_daily_digest((), NOW, advice=view)
+        assert "teacher advice: MISSING" in body
+        assert "never invented here" in body
+
+    def test_a_malformed_artifact_is_discarded(self, tmp_path: Path) -> None:
+        """Unparseable, wrong-schema, and oversized files all discard."""
+        broken = tmp_path / "broken.json"
+        broken.write_text("{not json")
+        assert load_teacher_advice(broken, NOW).state == "malformed"
+        wrong = tmp_path / "wrong.json"
+        wrong.write_text(json.dumps({"schema_version": "other/1", "episodes": []}))
+        assert load_teacher_advice(wrong, NOW).state == "malformed"
+        oversized = tmp_path / "huge.json"
+        oversized.write_text("x" * 20_000)
+        assert load_teacher_advice(oversized, NOW).state == "malformed"
+        _, body = compose_daily_digest((), NOW, advice=load_teacher_advice(broken, NOW))
+        assert "teacher advice: MALFORMED" in body
+
+    def test_a_stale_artifact_names_its_staleness(self, tmp_path: Path) -> None:
+        """Advice older than the bound renders STALE, still with content."""
+        episodes: list[dict[str, object]] = [
+            {
+                "created_at": "2026-10-04T08:00:00+00:00",
+                "stream": "daily",
+                "seats": [],
+            }
+        ]
+        view = load_teacher_advice(self._artifact(tmp_path, episodes), NOW)
+        assert view.state == "stale"
+        _, body = compose_daily_digest((), NOW, advice=view)
+        assert "STALE - newest episode beyond the stale bound" in body
+
+    def test_marker_states_never_suppress_the_send(self, tmp_path: Path) -> None:
+        """Every evidence state still delivers exactly one digest email."""
+        store = seeded_digest_store(tmp_path)
+        artifact = self._artifact(tmp_path, [])
+        for state_path in (tmp_path / "absent.json", artifact):
+            with patch("aero_bot.digest.build_alert_transport") as builder:
+                transport = FakeTransport()
+                builder.return_value = transport
+                assert (
+                    deliver_daily_digest(
+                        store,
+                        RESEND_ENV,
+                        now=NOW,
+                        advice_path=state_path,
+                    )
+                    is True
+                )
+                assert len(transport.sent) == 1
 
 
 class TestDailyTickWiring:

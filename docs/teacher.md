@@ -80,7 +80,7 @@ Every field fails closed: an invalid file exits one naming the path, never the c
 
 ## Deployment on the Mac
 
-`deploy/launchd/install-mac.sh` generates the eight user agents into `~/Library/LaunchAgents` - `com.aero-bot.teacher-tactical` (StartInterval 1800), `com.aero-bot.teacher-daily` (09:30, after the box's 09:00 Melbourne morning report), `com.aero-bot.teacher-news` (07:10), `com.aero-bot.teacher-sync` (09:40, the repo sync agent below), `com.aero-bot.teacher-hindsight` (09:50, after the daily stream drains), `com.aero-bot.teacher-upgrade` (10:10, after the hindsight report is rewritten), `com.aero-bot.teacher-risk-manager` (10:00, between the scorer and the proposer), and `com.aero-bot.student-ollama` (the student seat's dedicated Ollama plane - RunAtLoad plus KeepAlive, not a scheduled pass; see [the advisor documentation](advisor.md#the-student-plane)) - and never loads any of them, mirroring the Ubuntu kit's posture.
+`deploy/launchd/install-mac.sh` generates the nine user agents into `~/Library/LaunchAgents` - `com.aero-bot.teacher-tactical` (StartInterval 1800), `com.aero-bot.teacher-daily` (09:30, after the box's 09:00 Melbourne morning report), `com.aero-bot.teacher-news` (07:10), `com.aero-bot.teacher-sync` (09:40, the repo sync agent below), `com.aero-bot.teacher-hindsight` (09:50, after the daily stream drains), `com.aero-bot.teacher-upgrade` (10:10, after the hindsight report is rewritten), `com.aero-bot.teacher-risk-manager` (10:00, between the scorer and the proposer), `com.aero-bot.teacher-publish` (StartInterval 1800, the advice-evidence publisher below), and `com.aero-bot.student-ollama` (the student seat's dedicated Ollama plane - RunAtLoad plus KeepAlive, not a scheduled pass; see [the advisor documentation](advisor.md#the-student-plane)) - and never loads any of them, mirroring the Ubuntu kit's posture.
 Arming a stream is the operator's explicit act:
 
 ```
@@ -200,6 +200,14 @@ Auto-sealing stays explicitly out of scope: the email carries proposals, it neve
 5. To un-teach, comment the variable back out; the student reverts to the in-repo prompt alone on the next pass.
 
 The daily launchd agent `com.aero-bot.teacher-upgrade` (10:10, after the 09:50 hindsight report has rewritten its own) makes proposing part of the daily rhythm.
+
+## The advice-evidence publisher (firstmate 028's minimal transfer)
+
+The daily digest needs summarized teacher advice, and the corpus lives on the Mac; the 2026-10-05 inventory (firstmate 027) found no existing route. The `aero-bot-teacher-publish` command is the minimal task-specific fix: one one-way, secret-free, bounded JSON artifact - the most recent episodes (bounded at eight, each seat's brief capped at 400 characters) with the full provenance (episode `created_at`, stream, seat, model, outcome, view, latency) and the typed-absence tally - written beside the box's audit store at `/var/lib/aero-bot/teacher_advice.json` for the digest to read.
+
+The transfer reuses the harness's existing authenticated gcloud channel and its base64-argv discipline: the remote side is one FIXED validation-and-write script (no configured value is ever interpolated into its text; the payload and destination ride base64-encoded on its argv), it validates the schema tag, shape, and a 16-KiB size bound before touching anything, and it publishes atomically (write-temp, fsync, chmod 0644, chown to the service user, rename). The destination is a non-executable data file; nothing on the box ever executes or obeys it - the digest renders it as text. The `com.aero-bot.teacher-publish` agent rides the tactical cadence (every 30 minutes) so the artifact stays fresh; a failed or absent publish never suppresses the daily report - the digest states the honest missing, malformed, or stale marker (stale = newest episode older than 24 hours) instead. No secrets ride along (the corpus carries none), and teacher text never grants or influences execution anywhere.
+
+`--dry-run` prints the document without touching the box; the corpus's own malformed-line skip count is logged, never silently dropped.
 
 ## The risk manager
 

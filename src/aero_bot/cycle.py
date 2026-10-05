@@ -7049,9 +7049,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.daily_digest:
         from aero_bot.digest import deliver_daily_digest
 
+        advice_path = Path(
+            os.environ.get("AERO_BOT_TEACHER_ADVICE_PATH")
+            or settings.audit_database_path.parent / "teacher_advice.json"
+        )
         deliver_daily_digest(
             AuditStore(settings.audit_database_path),
             now=datetime.now(UTC),
+            advice_path=advice_path,
         )
     else:
         deliver_cycle_alerts(report)

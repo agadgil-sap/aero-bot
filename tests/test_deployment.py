@@ -583,7 +583,7 @@ class TestMacTeacherKit:
     def test_the_run_script_serves_the_hindsight_scorer(self) -> None:
         """The hindsight argument runs the scorer, not a teacher stream."""
         text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
-        assert "<tactical|daily|news|hindsight|upgrade|risk-manager>" in text
+        assert "<tactical|daily|news|hindsight|upgrade|risk-manager|publish-advice>" in text
         assert '"$STREAM" == "hindsight"' in text
         assert 'run aero-bot-hindsight >>"$LOG_DIR/${STREAM}.log"' in text
 
@@ -596,7 +596,7 @@ class TestMacTeacherKit:
     def test_the_run_script_serves_the_risk_manager(self) -> None:
         """The risk-manager argument runs the audit, not a teacher stream."""
         text = MAC_RUN_SCRIPT.read_text(encoding="utf-8")
-        assert "<tactical|daily|news|hindsight|upgrade|risk-manager>" in text
+        assert "<tactical|daily|news|hindsight|upgrade|risk-manager|publish-advice>" in text
         assert '"$STREAM" == "risk-manager"' in text
         assert 'run aero-bot-risk-manager >>"$LOG_DIR/${STREAM}.log"' in text
 
