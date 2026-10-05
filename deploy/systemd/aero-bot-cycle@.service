@@ -34,7 +34,13 @@ ReadWritePaths=/var/lib/aero-bot
 # action family; the executor's own bounded waits dominate the budget.
 TimeoutStartSec=1800
 # The JSON report lands in the journal for the smoke checklist and alerts.
-ExecStart=/opt/aero-bot/.venv/bin/aero-bot-cycle --symbol %i --json
+# The invocation passes --reward-posture retain explicitly: claimed AERO
+# stays in the Safe as priced book equity and the conversion swap never
+# fires. The command-line selector wins over the sealed environment's
+# AERO_BOT_CYCLE_REWARD_POSTURE, so the scheduled unit retains regardless
+# of any sealed value; manual CLI runs that omit the flag keep the sealed
+# or default posture.
+ExecStart=/opt/aero-bot/.venv/bin/aero-bot-cycle --symbol %i --reward-posture retain --json
 # A failed cycle exits nonzero and is visible through systemctl and the
 # email hook; it is never restarted automatically - the timer retries at
 # the next tick after reconciling.

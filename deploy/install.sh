@@ -169,6 +169,9 @@ AERO_BOT_BASE_RPC_URL=https://base.publicnode.com
 # same audited collect surface but holds the AERO in the Safe as book
 # equity and never invokes the conversion swap - a restart can never
 # trip over the conversion surface while it is under reassessment.
+# The scheduled cycle unit passes --reward-posture retain on its command
+# line, which wins over this variable: it governs manual CLI runs that
+# omit the flag.
 #AERO_BOT_CYCLE_REWARD_POSTURE=convert
 # The stray-stock dust bounds (the captain's 2026-10-03 ruling): a stray
 # stock balance whose USDC value at its own pool's pinned snapshot price
