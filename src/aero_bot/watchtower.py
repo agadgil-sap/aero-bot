@@ -1229,6 +1229,7 @@ def build_watchtower(
         rpc=rpc,
         safe_rpc=safe_rpc,
         audit_sink=audit_store,
+        progress=_watchtower_progress,
         receipt_backends=receipt_backends,
         pool_pin_store=pin_store,
     )

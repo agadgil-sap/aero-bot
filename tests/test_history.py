@@ -1690,9 +1690,11 @@ def test_batched_prefetch_downgrades_once_on_endpoint_batch_rejection() -> None:
     # Exactly one rejected batch attempt: the wasted-request bound. The
     # rejection itself is never retried with backoff.
     assert len(rejected_transport.batch_rejections) == 1
-    # Exactly one progress line, naming the downgrade.
-    assert len(progress_lines) == 1
-    assert "downgrading this backend to single header reads" in progress_lines[0]
+    # Exactly one downgrade line naming the downgrade; the phase progress
+    # lines may surround it, but the downgrade itself is announced once.
+    downgrade_lines = [line for line in progress_lines if "downgrading this backend" in line]
+    assert len(downgrade_lines) == 1
+    assert "single header reads" in downgrade_lines[0]
     # Every header was still read exactly once: no duplicate, none missing.
     for block_number in (996, 997, 998):
         assert rejected_transport.header_calls_by_block[block_number] == 1
@@ -1736,7 +1738,7 @@ def test_batch_rejection_mid_prefetch_keeps_earlier_batches() -> None:
     # endpoint's one rejection.
     assert len(rejected_transport.batch_calls) == 2
     assert len(rejected_transport.batch_rejections) == 1
-    assert len(progress_lines) == 1
+    assert len([line for line in progress_lines if "downgrading this backend" in line]) == 1
     # Blocks 996 and 998 were read once through the successful batch; block
     # 999 was re-read once through the single-header path.
     for block_number in (996, 998, 999):
@@ -1763,7 +1765,7 @@ def test_batch_rejection_downgrade_is_permanent_across_runs() -> None:
     # Exactly one rejected batch attempt across the backend's whole life.
     assert len(transport.batch_calls) == 1
     assert len(transport.batch_rejections) == 1
-    assert len(progress_lines) == 1
+    assert len([line for line in progress_lines if "downgrading this backend" in line]) == 1
 
 
 def test_batched_prefetch_fails_closed_on_id_substitution() -> None:
@@ -1907,3 +1909,121 @@ def test_batched_prefetch_fails_closed_on_malformed_entries(
 
     with pytest.raises(HistoryUnavailableError, match=pattern):
         fetch_path(backend)
+
+
+def stepped_timer() -> tuple[Callable[[], float], dict[str, float]]:
+    """Build one injected clock advancing five seconds per call.
+
+    Returns:
+        The timer callable and its mutable clock for elapsed assertions.
+    """
+    clock = {"now": 0.0}
+
+    def step() -> float:
+        clock["now"] += 5.0
+        return clock["now"]
+
+    return step, clock
+
+
+def test_fetch_price_path_reports_phase_progress_lines() -> None:
+    """Each reconstruction phase emits one secret-free line naming the pool.
+
+    The lines carry only public pool addresses, request counts, batch sizes,
+    and injected-clock elapsed times - never URLs, keys, or any credential -
+    so a slow production ranging read stays visible on the journal channel.
+    """
+    transport = FixtureRpcTransport(logs=[swap_log(996, 0, 1 << 95), swap_log(999, 0, 1 << 97)])
+    lines: list[str] = []
+    timer, _clock = stepped_timer()
+    fixture = EventHistoryRpcBackend(
+        transport=transport,
+        sleep=no_sleep,
+        page_delay_seconds=0.0,
+        header_batch_size=MAX_HEADER_BATCH_SIZE,
+        progress=lines.append,
+        timer=timer,
+    )
+
+    path = fetch_path(fixture)
+
+    assert [point.block_number for point in path.points] == [996, 999]
+    # One line per phase with the phase's own request shape and elapsed time.
+    assert lines == [
+        f"pool {POOL_ADDRESS}: timestamp search probed 10 block(s) in 5.0s",
+        f"pool {POOL_ADDRESS}: swap logs read 1 window(s) holding 2 event(s) in 5.0s",
+        f"pool {POOL_ADDRESS}: block headers read 2 unique block(s) through "
+        f"1 request(s) at batch size 10 in 5.0s",
+    ]
+
+
+def test_phase_progress_lines_report_the_unbatched_request_shape() -> None:
+    """The unbatched backend reports one header request per unique block."""
+    transport = FixtureRpcTransport(logs=[swap_log(996, 0, 1 << 95)])
+    lines: list[str] = []
+    timer, _clock = stepped_timer()
+    fixture = EventHistoryRpcBackend(
+        transport=transport,
+        sleep=no_sleep,
+        page_delay_seconds=0.0,
+        progress=lines.append,
+        timer=timer,
+    )
+
+    fetch_path(fixture)
+
+    assert lines[-1] == (
+        f"pool {POOL_ADDRESS}: block headers read 1 unique block(s) through "
+        f"1 request(s) at batch size 1 in 5.0s"
+    )
+    # A quiet pool reports an empty event set rather than staying silent.
+    quiet_lines: list[str] = []
+    quiet = EventHistoryRpcBackend(
+        transport=FixtureRpcTransport(),
+        sleep=no_sleep,
+        page_delay_seconds=0.0,
+        progress=quiet_lines.append,
+        timer=timer,
+    )
+    quiet_path = fetch_path(quiet)
+    assert quiet_path.points == ()
+    assert quiet_lines == [
+        f"pool {POOL_ADDRESS}: timestamp search probed 10 block(s) in 5.0s",
+        f"pool {POOL_ADDRESS}: swap logs read 1 window(s) holding 0 event(s) in 5.0s",
+        f"pool {POOL_ADDRESS}: block headers read 0 unique block(s) through "
+        f"0 request(s) at batch size 1 in 5.0s",
+    ]
+
+
+def test_phase_progress_lines_report_the_downgraded_request_shape() -> None:
+    """A rejected batch surfaces in the header phase line, never silently.
+
+    After the endpoint's own batch rejection the header phase line reports
+    the downgraded batch size and the request count including the one wasted
+    batch attempt, so the journal shows exactly what the endpoint forced.
+    """
+    logs = [swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96), swap_log(998, 0, 1 << 96)]
+    transport = FixtureRpcTransport(logs=logs, batch_rejection_after=0)
+    lines: list[str] = []
+    timer, _clock = stepped_timer()
+    fixture = EventHistoryRpcBackend(
+        transport=transport,
+        sleep=no_sleep,
+        page_delay_seconds=0.0,
+        header_batch_size=2,
+        progress=lines.append,
+        timer=timer,
+    )
+
+    path = fetch_path(fixture)
+
+    assert [point.block_number for point in path.points] == [996, 997, 998]
+    downgrade_lines = [line for line in lines if "downgrading this backend" in line]
+    assert len(downgrade_lines) == 1
+    # Block 997 was already cached by the timestamp search, so the prefetch
+    # needed blocks 996 and 998: one rejected batch request, then two single
+    # reads - three header requests in total at the downgraded batch size.
+    assert lines[-1] == (
+        f"pool {POOL_ADDRESS}: block headers read 3 unique block(s) through "
+        f"3 request(s) at batch size 1 in 5.0s"
+    )

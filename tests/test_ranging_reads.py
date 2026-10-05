@@ -307,3 +307,98 @@ def test_ranging_read_covers_the_full_lookback_through_capped_pages() -> None:
     assert evidence.fee_window_notional_usd > 0
     assert evidence.realized_daily_volatility is not None
     assert evidence.realized_daily_volatility > 0
+
+
+def test_live_strategy_sources_reports_per_pool_ranging_progress() -> None:
+    """The live sources journal one completion line per pool read.
+
+    LiveStrategySources passes its progress and timer into the lazily built
+    ranging backend, so the per-pool line lands beside the backend's own
+    phase lines: pool address, trailing point count, and elapsed seconds -
+    all secret-free and all offline through the injected transport.
+    """
+    from test_history import FIXTURE_LATEST_BLOCK, FixtureRpcTransport
+
+    from aero_bot.strategy import LiveStrategySources
+
+    transport = FixtureRpcTransport(
+        logs=[
+            swap_log(996, 0, 1 << 96, pool_address=GATEWAY_POOL_ADDRESS),
+            swap_log(999, 0, 1 << 97, pool_address=GATEWAY_POOL_ADDRESS),
+        ],
+        latest_block=FIXTURE_LATEST_BLOCK,
+    )
+    lines: list[str] = []
+    clock = {"now": 0.0}
+
+    def stepped_timer() -> float:
+        clock["now"] += 5.0
+        return clock["now"]
+
+    sources = LiveStrategySources(
+        rpc_url="https://fixture.example",
+        sugar_address="0x2222222222222222222222222222222222222222",
+        transport=transport,
+        progress=lines.append,
+        sleep=no_sleep,
+        timer=stepped_timer,
+    )
+
+    evidence = sources.ranging_evidence(
+        gateway_candidate(),
+        snapshot_price_usdc=Decimal("2"),
+        stock_decimals=18,
+        observed_at=fixture_block_timestamp(GATEWAY_LATEST_BLOCK),
+    )
+
+    assert evidence is not None
+    assert len(evidence.trailing_path) == 2
+    # The backend's three phase lines, then the strategy's per-pool line.
+    # The production 4.4-hour lookback predates the fixture genesis, so the
+    # reconstruction opens at block 0 and pages 0..999 then 1000..1000 at the
+    # capped 1,000-block window.
+    assert lines == [
+        f"pool {GATEWAY_POOL_ADDRESS}: timestamp search probed 10 block(s) in 5.0s",
+        f"pool {GATEWAY_POOL_ADDRESS}: swap logs read 2 window(s) holding 2 event(s) in 5.0s",
+        f"pool {GATEWAY_POOL_ADDRESS}: block headers read 2 unique block(s) through "
+        f"1 request(s) at batch size 10 in 5.0s",
+        f"ranging evidence for {GATEWAY_POOL_ADDRESS}: 2 point(s) in 35.0s",
+    ]
+
+
+def test_live_strategy_sources_failure_line_carries_elapsed_time() -> None:
+    """A failed ranging read journals the elapsed time beside the reason."""
+    from test_history import FixtureRpcTransport
+
+    from aero_bot.strategy import LiveStrategySources
+
+    transport = FixtureRpcTransport(failure_mode="fatal_rpc_error")
+    lines: list[str] = []
+    clock = {"now": 0.0}
+
+    def stepped_timer() -> float:
+        clock["now"] += 5.0
+        return clock["now"]
+
+    sources = LiveStrategySources(
+        rpc_url="https://fixture.example",
+        sugar_address="0x2222222222222222222222222222222222222222",
+        transport=transport,
+        progress=lines.append,
+        sleep=no_sleep,
+        timer=stepped_timer,
+    )
+
+    evidence = sources.ranging_evidence(
+        gateway_candidate(),
+        snapshot_price_usdc=Decimal("2"),
+        stock_decimals=18,
+        observed_at=fixture_block_timestamp(GATEWAY_LATEST_BLOCK),
+    )
+
+    assert evidence is None
+    assert lines == [
+        f"ranging evidence read failed for {GATEWAY_POOL_ADDRESS} after 5.0s: "
+        "RPC error -32601: method not found; entries and voluntary recenters "
+        "defer fail-closed"
+    ]

@@ -17,6 +17,7 @@ labeled constant-anchor APR instead of fabricating a series.
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 from typing import Annotated, Literal, Protocol, Self, TypeVar, cast
@@ -909,6 +910,25 @@ class OrderedLogRecord(Protocol):
 LogRecordT = TypeVar("LogRecordT", bound=OrderedLogRecord)
 
 
+@dataclass
+class _PhaseCounters:
+    """Mutable per-reconstruction counters backing the phase progress lines.
+
+    One instance is created per public fetch call and threaded through the
+    private helpers so each phase can report its own request shape without
+    any instance-level mutable state.
+    """
+
+    # Binary-search probes the timestamp search consumed.
+    probes: int = 0
+    # eth_getLogs window requests the log paging issued, split halves included.
+    log_windows: int = 0
+    # Decoded event records the log paging collected.
+    log_events: int = 0
+    # Header RPC requests the prefetch phase issued, rejected batches included.
+    header_requests: int = 0
+
+
 class EventHistoryRpcBackend:
     """Reconstruct onchain event histories through read-only logs and header reads."""
 
@@ -1078,6 +1098,7 @@ class EventHistoryRpcBackend:
         if lookback <= timedelta(0):
             raise ValueError("lookback must be positive")
         normalized_pool = normalize_evm_address(pool_address)
+        counters = _PhaseCounters()
         with httpx.Client(
             timeout=self._timeout_seconds,
             transport=self._transport,
@@ -1090,16 +1111,37 @@ class EventHistoryRpcBackend:
             latest_header = self._block_header(client, latest_number, headers)
             # The window opens at the first block at or after the target instant.
             target_timestamp = latest_header.timestamp - lookback
+            phase_started = self._timer()
             start_block = self._first_block_at_or_after(
-                client, target_timestamp, latest_number, headers
+                client, target_timestamp, latest_number, headers, counters
             )
+            self._phase_progress(
+                normalized_pool,
+                f"timestamp search probed {counters.probes} block(s)",
+                phase_started,
+            )
+            phase_started = self._timer()
             records = self._collect_swap_records(
-                client, normalized_pool, start_block, latest_number
+                client, normalized_pool, start_block, latest_number, counters
+            )
+            self._phase_progress(
+                normalized_pool,
+                f"swap logs read {counters.log_windows} window(s) "
+                f"holding {counters.log_events} event(s)",
+                phase_started,
             )
             # Every event block needs its header once; the cache deduplicates and
             # the cumulative lookup bound inside the reader fails closed.
             unique_blocks = {record.block_number for record in records}
-            self._prefetch_block_headers(client, sorted(unique_blocks), headers)
+            phase_started = self._timer()
+            self._prefetch_block_headers(client, sorted(unique_blocks), headers, counters)
+            self._phase_progress(
+                normalized_pool,
+                f"block headers read {len(unique_blocks)} unique block(s) "
+                f"through {counters.header_requests} request(s) at batch size "
+                f"{self._header_batch_size}",
+                phase_started,
+            )
             return build_price_path(
                 pool_address=normalized_pool,
                 token_address=token_address,
@@ -1327,6 +1369,7 @@ class EventHistoryRpcBackend:
         client: httpx.Client,
         numbers: Sequence[int],
         headers: dict[int, BlockHeader],
+        counters: _PhaseCounters | None = None,
     ) -> None:
         """Fill the shared header cache for every missing block number.
 
@@ -1343,6 +1386,8 @@ class EventHistoryRpcBackend:
             client: The bounded read-only HTTP client.
             numbers: Block numbers requiring headers; duplicates are deduplicated.
             headers: Cache shared across one reconstruction.
+            counters: Optional per-reconstruction counters recording the issued
+                header request count for the phase progress line.
 
         Raises:
             HistoryUnavailableError: If the cumulative lookup bound would be
@@ -1351,6 +1396,8 @@ class EventHistoryRpcBackend:
         if self._header_batch_size == 1:
             # The unbatched path preserves the one-request-per-header wire shape.
             for block_number in numbers:
+                if block_number not in headers and counters is not None:
+                    counters.header_requests += 1
                 self._block_header(client, block_number, headers)
             return
         missing = [number for number in dict.fromkeys(numbers) if number not in headers]
@@ -1363,6 +1410,8 @@ class EventHistoryRpcBackend:
                 chunk = missing[chunk_start : chunk_start + self._header_batch_size]
                 # One politeness delay separates batch requests on the shared RPC.
                 self._sleep(self._page_delay_seconds)
+                if counters is not None:
+                    counters.header_requests += 1
                 results = self._rpc_batch_call(
                     client,
                     [
@@ -1398,6 +1447,8 @@ class EventHistoryRpcBackend:
                 )
             for block_number in missing:
                 if block_number not in headers:
+                    if counters is not None:
+                        counters.header_requests += 1
                     self._block_header(client, block_number, headers)
 
     def _rpc_batch_call(
@@ -1504,12 +1555,26 @@ class EventHistoryRpcBackend:
             f"RPC batch failed after {self._max_attempts} attempts: {failure}"
         )
 
+    def _phase_progress(self, pool_address: str, summary: str, phase_started: float) -> None:
+        """Emit one secret-free phase line naming the pool and elapsed time.
+
+        Args:
+            pool_address: The normalized public pool address the phase read.
+            summary: The phase's completed shape, already count-only.
+            phase_started: The injected clock's reading when the phase began.
+        """
+        if self._progress is not None:
+            self._progress(
+                f"pool {pool_address}: {summary} in {self._timer() - phase_started:.1f}s"
+            )
+
     def _first_block_at_or_after(
         self,
         client: httpx.Client,
         target_timestamp: datetime,
         head_block: int,
         headers: dict[int, BlockHeader],
+        counters: _PhaseCounters | None = None,
     ) -> int:
         """Binary-search the first block whose timestamp reaches a target.
 
@@ -1522,6 +1587,8 @@ class EventHistoryRpcBackend:
             head_block: Block number closing the search space, either the chain
                 head or an anchor snapshot block.
             headers: Cache shared across one reconstruction.
+            counters: Optional per-reconstruction counters recording the probe
+                count for the phase progress line.
 
         Returns:
             The smallest block number whose timestamp is at or after the target.
@@ -1545,6 +1612,8 @@ class EventHistoryRpcBackend:
                 high = middle
             else:
                 low = middle + 1
+        if counters is not None:
+            counters.probes = probes
         return low
 
     def _collect_swap_records(
@@ -1553,6 +1622,7 @@ class EventHistoryRpcBackend:
         pool_address: str,
         start_block: int,
         end_block: int,
+        counters: _PhaseCounters | None = None,
     ) -> tuple[SwapEventRecord, ...]:
         """Page the pool's Swap logs through bounded eth_getLogs windows.
 
@@ -1561,6 +1631,8 @@ class EventHistoryRpcBackend:
             pool_address: Normalized Slipstream pool address filter.
             start_block: First block of the reconstruction window.
             end_block: Last block of the reconstruction window.
+            counters: Optional per-reconstruction counters recording the window
+                and event counts for the phase progress line.
 
         Returns:
             Every decoded Swap event ordered by block number then log index.
@@ -1578,6 +1650,7 @@ class EventHistoryRpcBackend:
             decode_swap_log,
             self._max_total_swap_events,
             "Swap",
+            counters=counters,
         )
 
     def _collect_windowed_logs(
@@ -1590,6 +1663,7 @@ class EventHistoryRpcBackend:
         decode_one: Callable[[object], LogRecordT],
         total_event_bound: int,
         label: str,
+        counters: _PhaseCounters | None = None,
     ) -> tuple[LogRecordT, ...]:
         """Page one contract's logs through bounded, refinable eth_getLogs windows.
 
@@ -1609,6 +1683,8 @@ class EventHistoryRpcBackend:
             decode_one: Strict decoder turning one raw log into its record.
             total_event_bound: Runaway guard on the total decoded event count.
             label: Event label used in the fail-closed diagnostics.
+            counters: Optional per-reconstruction counters recording the window
+                and event counts for the phase progress line.
 
         Returns:
             Every decoded event ordered by block number then log index.
@@ -1625,6 +1701,8 @@ class EventHistoryRpcBackend:
         )
         while pending:
             window_start, window_end = pending.popleft()
+            if counters is not None:
+                counters.log_windows += 1
             result = self._rpc_call(
                 client,
                 "eth_getLogs",
@@ -1675,6 +1753,8 @@ class EventHistoryRpcBackend:
             if pending:
                 # A politeness delay separates window reads on the shared RPC.
                 self._sleep(self._page_delay_seconds)
+        if counters is not None:
+            counters.log_events = len(records)
         return tuple(sorted(records, key=lambda item: (item.block_number, item.log_index)))
 
     def _rpc_call(self, client: httpx.Client, method: str, params: list[object]) -> object:

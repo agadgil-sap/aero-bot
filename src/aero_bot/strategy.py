@@ -651,8 +651,9 @@ class LiveStrategySources:
                 progress=self._progress,
                 timer=self._timer,
             )
+        started = self._timer()
         try:
-            return build_ranging_evidence(
+            evidence = build_ranging_evidence(
                 self._ranging_backend,
                 pool,
                 snapshot_price_usdc=snapshot_price_usdc,
@@ -661,10 +662,18 @@ class LiveStrategySources:
         except HistoryUnavailableError as failure:
             if self._progress is not None:
                 self._progress(
-                    f"ranging evidence read failed for {pool.pool_address}: {failure}; "
-                    "entries and voluntary recenters defer fail-closed"
+                    f"ranging evidence read failed for {pool.pool_address} after "
+                    f"{self._timer() - started:.1f}s: {failure}; entries and "
+                    "voluntary recenters defer fail-closed"
                 )
             return None
+        if self._progress is not None:
+            self._progress(
+                f"ranging evidence for {pool.pool_address}: "
+                f"{len(evidence.trailing_path)} point(s) in "
+                f"{self._timer() - started:.1f}s"
+            )
+        return evidence
 
 
 def assemble_observation(
