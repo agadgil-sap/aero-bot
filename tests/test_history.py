@@ -178,6 +178,7 @@ class FixtureRpcTransport(httpx.MockTransport):
         batch_result_override: object | None = None,
         batch_entry_failures_before_success: int = 0,
         batch_failure_mode: str | None = None,
+        batch_rejection_after: int | None = None,
     ) -> None:
         """Configure the fixture endpoint with optional transient failures.
 
@@ -199,11 +200,15 @@ class FixtureRpcTransport(httpx.MockTransport):
             batch_failure_mode: Optional transport-level failure served only on
                 batch requests, one of transport_error, http_429, http_500,
                 http_404, not_json, or oversized.
+            batch_rejection_after: When set, the endpoint answers every batch
+                request after this many successful ones with its own non-list
+                batch-rejection body; zero rejects every batch request.
         """
         # Request counting lets tests assert dedup and retry behavior exactly;
         # batch payloads are lists of the same single-request shapes.
         self.calls: list[dict[str, Any] | list[dict[str, Any]]] = []
         self.batch_calls: list[list[dict[str, Any]]] = []
+        self.batch_rejections: list[list[dict[str, Any]]] = []
         self.header_calls_by_block: dict[int, int] = {}
         self._logs = logs or []
         self._remaining_failures = failures_before_success
@@ -214,6 +219,7 @@ class FixtureRpcTransport(httpx.MockTransport):
         self._batch_result_override = batch_result_override
         self._batch_entry_failures = batch_entry_failures_before_success
         self._batch_failure_mode = batch_failure_mode
+        self._batch_rejection_after = batch_rejection_after
         super().__init__(self._handle)
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
@@ -272,6 +278,21 @@ class FixtureRpcTransport(httpx.MockTransport):
             return httpx.Response(200, content=b"<html>not json</html>")
         if self._batch_failure_mode == "oversized":
             return httpx.Response(200, content=b"x" * 4096)
+        if (
+            self._batch_rejection_after is not None
+            and len(self.batch_calls) > self._batch_rejection_after
+        ):
+            # The endpoint's own batch rejection: a non-list body served over
+            # HTTP 200, exactly like the documented -32014 maximum-batch error.
+            self.batch_rejections.append(entries)
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32014, "message": "maximum 10 calls in 1 batch"},
+                },
+            )
         if self._batch_result_override is not None:
             return httpx.Response(200, json=self._batch_result_override)
         responses: list[dict[str, Any]] = [
@@ -1632,23 +1653,117 @@ def test_batched_prefetch_fails_closed_on_count_mismatch() -> None:
         fetch_path(backend)
 
 
-def test_batched_prefetch_fails_closed_on_endpoint_batch_rejection() -> None:
-    """A non-list batch body is the endpoint's own rejection and fails closed."""
+def test_batched_prefetch_downgrades_once_on_endpoint_batch_rejection() -> None:
+    """A non-list batch body downgrades once and still covers every header.
+
+    The endpoint's own batch rejection - a non-list body served over HTTP
+    200, like the documented maximum-calls-per-batch error - cannot be fixed
+    by retrying. The backend wastes exactly one batch request on the
+    rejection, permanently downgrades to the unbatched wire shape, emits
+    exactly one progress line naming the downgrade, and re-reads every
+    still-missing header through the single-header path, so the
+    reconstruction matches the unbatched run exactly.
+    """
     logs = [swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96), swap_log(998, 0, 1 << 96)]
-    transport = FixtureRpcTransport(
-        logs=logs,
-        batch_result_override={
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32014, "message": "maximum 10 calls in 1 batch"},
-        },
+    unbatched_transport = FixtureRpcTransport(logs=logs)
+    rejected_transport = FixtureRpcTransport(logs=logs, batch_rejection_after=0)
+    progress_lines: list[str] = []
+    unbatched = fetch_path(
+        EventHistoryRpcBackend(
+            transport=unbatched_transport, sleep=no_sleep, page_delay_seconds=0.0
+        )
     )
-    backend = EventHistoryRpcBackend(
-        transport=transport, sleep=no_sleep, page_delay_seconds=0.0, header_batch_size=2
+    downgraded = fetch_path(
+        EventHistoryRpcBackend(
+            transport=rejected_transport,
+            sleep=no_sleep,
+            page_delay_seconds=0.0,
+            header_batch_size=2,
+            progress=progress_lines.append,
+        )
     )
 
-    with pytest.raises(HistoryUnavailableError, match="a non-list body"):
-        fetch_path(backend)
+    # Coverage identical to the unbatched run.
+    assert downgraded.points == unbatched.points
+    assert downgraded.from_block == unbatched.from_block
+    assert downgraded.to_block == unbatched.to_block
+    # Exactly one rejected batch attempt: the wasted-request bound. The
+    # rejection itself is never retried with backoff.
+    assert len(rejected_transport.batch_rejections) == 1
+    # Exactly one progress line, naming the downgrade.
+    assert len(progress_lines) == 1
+    assert "downgrading this backend to single header reads" in progress_lines[0]
+    # Every header was still read exactly once: no duplicate, none missing.
+    for block_number in (996, 997, 998):
+        assert rejected_transport.header_calls_by_block[block_number] == 1
+
+
+def test_batch_rejection_mid_prefetch_keeps_earlier_batches() -> None:
+    """A rejection after successful batches keeps their headers and finishes.
+
+    Batches that already succeeded stay cached when a later batch is
+    rejected: only the still-missing headers are re-read through the
+    single-header path, so no header is ever read twice and coverage stays
+    complete.
+    """
+    logs = [
+        swap_log(996, 0, 1 << 96),
+        swap_log(998, 0, 1 << 96),
+        swap_log(999, 0, 1 << 96),
+    ]
+    unbatched_transport = FixtureRpcTransport(logs=logs)
+    rejected_transport = FixtureRpcTransport(logs=logs, batch_rejection_after=1)
+    progress_lines: list[str] = []
+    unbatched = fetch_path(
+        EventHistoryRpcBackend(
+            transport=unbatched_transport, sleep=no_sleep, page_delay_seconds=0.0
+        )
+    )
+    downgraded = fetch_path(
+        EventHistoryRpcBackend(
+            transport=rejected_transport,
+            sleep=no_sleep,
+            page_delay_seconds=0.0,
+            header_batch_size=2,
+            progress=progress_lines.append,
+        )
+    )
+
+    assert downgraded.points == unbatched.points
+    assert downgraded.from_block == unbatched.from_block
+    assert downgraded.to_block == unbatched.to_block
+    # The first batch (blocks 996 and 998) succeeded; the second was the
+    # endpoint's one rejection.
+    assert len(rejected_transport.batch_calls) == 2
+    assert len(rejected_transport.batch_rejections) == 1
+    assert len(progress_lines) == 1
+    # Blocks 996 and 998 were read once through the successful batch; block
+    # 999 was re-read once through the single-header path.
+    for block_number in (996, 998, 999):
+        assert rejected_transport.header_calls_by_block[block_number] == 1
+
+
+def test_batch_rejection_downgrade_is_permanent_across_runs() -> None:
+    """After one rejection the backend never sends another batch request."""
+    logs = [swap_log(996, 0, 1 << 96), swap_log(997, 0, 1 << 96), swap_log(998, 0, 1 << 96)]
+    transport = FixtureRpcTransport(logs=logs, batch_rejection_after=0)
+    progress_lines: list[str] = []
+    backend = EventHistoryRpcBackend(
+        transport=transport,
+        sleep=no_sleep,
+        page_delay_seconds=0.0,
+        header_batch_size=2,
+        progress=progress_lines.append,
+    )
+
+    first = fetch_path(backend)
+    second = fetch_path(backend)
+
+    assert first.points == second.points
+    # Exactly one rejected batch attempt across the backend's whole life.
+    assert len(transport.batch_calls) == 1
+    assert len(transport.batch_rejections) == 1
+    assert len(progress_lines) == 1
 
 
 def test_batched_prefetch_fails_closed_on_id_substitution() -> None:

@@ -332,6 +332,19 @@ class HistoryUnavailableError(RuntimeError):
     """Signal that a read-only history reconstruction could not complete."""
 
 
+class RpcBatchRejectedError(HistoryUnavailableError):
+    """Signal the endpoint answered a JSON-RPC batch with a non-list body.
+
+    A non-list response body for a batch request is the endpoint's own
+    rejection of batching itself (for example the documented
+    ``-32014 maximum 10 calls in 1 batch`` single error object), which no
+    retry can fix. Subclassing ``HistoryUnavailableError`` keeps every
+    existing fail-closed catch uniform, while the dedicated type lets the
+    batching caller downgrade once to the unbatched wire shape instead of
+    losing the whole reconstruction.
+    """
+
+
 def decode_swap_log(log: object) -> SwapEventRecord:
     """Decode and validate one raw eth_getLogs entry as a Slipstream Swap event.
 
@@ -914,6 +927,8 @@ class EventHistoryRpcBackend:
         header_batch_size: int = 1,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        progress: Callable[[str], None] | None = None,
+        timer: Callable[[], float] = time.monotonic,
     ) -> None:
         """Configure bounded read-only history reconstruction behavior.
 
@@ -936,6 +951,9 @@ class EventHistoryRpcBackend:
                 public-endpoint cap bounds the maximum.
             transport: Optional injected HTTP transport for deterministic tests.
             sleep: Injected delay function used for backoff and politeness waits.
+            progress: Optional callback receiving one secret-free line per
+                long-running phase and on any batch downgrade.
+            timer: Injected monotonic clock used for phase elapsed timings.
 
         Raises:
             ValueError: If any bound is non-positive or out of its documented range.
@@ -974,6 +992,10 @@ class EventHistoryRpcBackend:
         # An injected transport keeps unit tests completely off the network.
         self._transport = transport
         self._sleep = sleep
+        # Progress lines are secret-free (no URLs, no keys) and land on the
+        # operator channel so slow phases never look like stalls.
+        self._progress = progress
+        self._timer = timer
 
     def read_erc20_decimals(self, token_address: str) -> int:
         """Read one ERC20 token's decimal count through a read-only eth_call.
@@ -1311,7 +1333,11 @@ class EventHistoryRpcBackend:
         A batch size above one groups the header reads into bounded JSON-RPC
         batch requests, which keeps multi-week reconstructions feasible
         against the public endpoint while every timestamp stays an exact
-        block-header read rather than an interpolation.
+        block-header read rather than an interpolation. An endpoint that
+        rejects batching itself (a non-list response body) downgrades the
+        backend permanently to the unbatched wire shape after exactly one
+        rejected batch request, re-reading every still-missing header through
+        the single-header path so coverage stays complete.
 
         Args:
             client: The bounded read-only HTTP client.
@@ -1332,26 +1358,47 @@ class EventHistoryRpcBackend:
             raise HistoryUnavailableError(
                 f"Block header lookups exceeded the {self._max_block_header_lookups} bound."
             )
-        for chunk_start in range(0, len(missing), self._header_batch_size):
-            chunk = missing[chunk_start : chunk_start + self._header_batch_size]
-            # One politeness delay separates batch requests on the shared RPC.
-            self._sleep(self._page_delay_seconds)
-            results = self._rpc_batch_call(
-                client,
-                [("eth_getBlockByNumber", [hex(block_number), False]) for block_number in chunk],
-            )
-            for block_number, result in zip(chunk, results, strict=True):
-                try:
-                    header = _block_header_from_result(result)
-                except ValueError as error:
-                    raise HistoryUnavailableError(
-                        f"Block {block_number} header was malformed: {error}"
-                    ) from error
-                if header.number != block_number:
-                    raise HistoryUnavailableError(
-                        f"Block header read for {block_number} returned block {header.number}"
-                    )
-                headers[block_number] = header
+        try:
+            for chunk_start in range(0, len(missing), self._header_batch_size):
+                chunk = missing[chunk_start : chunk_start + self._header_batch_size]
+                # One politeness delay separates batch requests on the shared RPC.
+                self._sleep(self._page_delay_seconds)
+                results = self._rpc_batch_call(
+                    client,
+                    [
+                        ("eth_getBlockByNumber", [hex(block_number), False])
+                        for block_number in chunk
+                    ],
+                )
+                for block_number, result in zip(chunk, results, strict=True):
+                    try:
+                        header = _block_header_from_result(result)
+                    except ValueError as error:
+                        raise HistoryUnavailableError(
+                            f"Block {block_number} header was malformed: {error}"
+                        ) from error
+                    if header.number != block_number:
+                        raise HistoryUnavailableError(
+                            f"Block header read for {block_number} returned block {header.number}"
+                        )
+                    headers[block_number] = header
+        except RpcBatchRejectedError as rejection:
+            # The endpoint answered the batch request with its own rejection,
+            # which no retry can fix. Downgrade this backend instance
+            # permanently to the unbatched wire shape - so at most one batch
+            # request is ever wasted on a rejection - and re-read every
+            # still-missing header through the single-header path, preserving
+            # full coverage. Batches that already succeeded stay cached.
+            self._header_batch_size = 1
+            if self._progress is not None:
+                self._progress(
+                    "RPC endpoint rejected a batched header request "
+                    f"({rejection}); permanently downgrading this backend to "
+                    "single header reads"
+                )
+            for block_number in missing:
+                if block_number not in headers:
+                    self._block_header(client, block_number, headers)
 
     def _rpc_batch_call(
         self,
@@ -1403,13 +1450,18 @@ class EventHistoryRpcBackend:
                 body = cast(object, response.json())
             except ValueError as error:
                 raise HistoryUnavailableError("RPC batch response was not valid JSON") from error
-            if not isinstance(body, list) or len(body) != len(requests):
-                served = len(body) if isinstance(body, list) else "a non-list body"
+            if not isinstance(body, list):
                 # A non-list body is the endpoint's own batch rejection (for
                 # example the maximum-calls-per-batch error), which retrying
-                # cannot fix, so it fails closed immediately.
+                # cannot fix, so it fails closed immediately; the dedicated
+                # subclass lets the batching caller downgrade once instead.
+                raise RpcBatchRejectedError(
+                    "RPC batch response was a non-list body; the endpoint "
+                    "rejected the batch request itself"
+                )
+            if len(body) != len(requests):
                 raise HistoryUnavailableError(
-                    f"RPC batch response held {served} entries for {len(requests)} requests."
+                    f"RPC batch response held {len(body)} entries for {len(requests)} requests."
                 )
             entries_by_id: dict[int, dict[str, object]] = {}
             for entry in body:

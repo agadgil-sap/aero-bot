@@ -46,6 +46,7 @@ from aero_bot.executor import (
     LiveExecutionSources,
 )
 from aero_bot.history import (
+    MAX_HEADER_BATCH_SIZE,
     EventHistoryRpcBackend,
     HistoryUnavailableError,
     price_usdc_per_stock,
@@ -377,6 +378,7 @@ class LiveStrategySources:
         )
         self._pool_pin_store = pool_pin_store
         self._progress = progress
+        self._timer = timer
         # The bounded ranging-evidence backend is built lazily on first use
         # so decision runs that never solve a width pay no history reads.
         self._ranging_backend: EventHistoryRpcBackend | None = None
@@ -643,8 +645,11 @@ class LiveStrategySources:
             self._ranging_backend = EventHistoryRpcBackend(
                 rpc_url=self._rpc_url,
                 log_window_blocks=RANGING_READ_LOG_WINDOW_BLOCKS,
+                header_batch_size=MAX_HEADER_BATCH_SIZE,
                 transport=self._transport,
                 sleep=self._sleep,
+                progress=self._progress,
+                timer=self._timer,
             )
         try:
             return build_ranging_evidence(

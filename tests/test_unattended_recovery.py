@@ -1311,6 +1311,27 @@ class LoopbackRpcServer:
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
+            @staticmethod
+            def _serve_entry(
+                entry: dict[str, Any],
+            ) -> dict[str, Any]:
+                """Answer one JSON-RPC entry, converting chain faults to errors."""
+                try:
+                    result = outer.chain.dispatch(str(entry["method"]), list(entry["params"]))
+                except ChainRevertError as revert:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": entry.get("id"),
+                        "error": {"code": 3, "message": f"execution reverted: {revert}"},
+                    }
+                except ChainFaultError as fault:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": entry.get("id"),
+                        "error": {"code": -32005, "message": str(fault)},
+                    }
+                return {"jsonrpc": "2.0", "id": entry.get("id"), "result": result}
+
             def do_POST(self) -> None:  # noqa: N802 - the stdlib contract
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
@@ -1321,33 +1342,21 @@ class LoopbackRpcServer:
                             self.send_response(status)
                             self.end_headers()
                             return
-                    result = outer.chain.dispatch(str(body["method"]), list(body["params"]))
-                    payload = json.dumps({"jsonrpc": "2.0", "id": 1, "result": result})
-                except ChainRevertError as revert:
+                    if isinstance(body, list):
+                        # A JSON-RPC batch: every entry is answered in place
+                        # with its own id, exactly as a batch-capable endpoint
+                        # serves the ranging read's batched block headers.
+                        payload = json.dumps([self._serve_entry(entry) for entry in body])
+                    else:
+                        payload = json.dumps(self._serve_entry(body))
+                except (KeyError, TypeError, ValueError) as error:
                     payload = json.dumps(
                         {
                             "jsonrpc": "2.0",
                             "id": 1,
-                            "error": {
-                                "code": 3,
-                                "message": f"execution reverted: {revert}",
-                            },
+                            "error": {"code": -32600, "message": f"invalid request: {error}"},
                         }
                     )
-                except ChainFaultError as fault:
-                    payload = json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": 1,
-                            "error": {"code": -32005, "message": str(fault)},
-                        }
-                    )
-                else:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(payload.encode())
-                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
