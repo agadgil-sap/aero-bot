@@ -238,6 +238,9 @@ class TestWindowCollection:
             def __init__(self) -> None:
                 self.reads = 0
 
+            def count_records(self) -> int:
+                return 1_000
+
             def read_records(self, limit: int = 100, *, offset: int = 0) -> tuple[()]:
                 self.reads += 1
                 assert limit == 1000
@@ -246,6 +249,35 @@ class TestWindowCollection:
         source = BoundedSource()
         assert collect_digest_records(source, NOW) == ()
         assert source.reads == 1
+
+    def test_a_long_chain_still_reads_the_newest_window(self, tmp_path: Path) -> None:
+        """The window read starts at the chain's head, not its birth.
+
+        The production chain carries months of history before any given
+        day: paging forward from the first record spends the whole page
+        bound on ancient history and reports a false clean window. The
+        read must walk backwards from the newest record.
+        """
+        from aero_bot.audit import MAX_RECORDS_PER_READ
+
+        store = AuditStore(tmp_path / "audit" / "audit.sqlite3")
+        # An old prefix spanning more than one full page.
+        old = NOW - timedelta(days=30)
+        for index in range(MAX_RECORDS_PER_READ + 5):
+            store.append(
+                AuditEventType.CYCLE_REPORTED,
+                cycle_payload(equity_usdc="99.00"),
+                old + timedelta(seconds=index),
+            )
+        # Then the day the digest must actually report.
+        store.append(
+            AuditEventType.CYCLE_REPORTED,
+            cycle_payload(action="enter", equity_usdc="105.37"),
+            TEN_HOURS_AGO,
+        )
+        records = collect_digest_records(store, NOW)
+        assert len(records) == 1
+        assert records[0].created_at == TEN_HOURS_AGO
 
 
 class TestDigestComposition:
@@ -381,6 +413,9 @@ class TestDigestDelivery:
         """A missing database degrades to one stderr warning."""
 
         class BrokenStore:
+            def count_records(self) -> int:
+                raise OSError("disk unavailable")
+
             def read_records(self, limit: int = 100, *, offset: int = 0) -> tuple[()]:
                 raise OSError("disk unavailable")
 

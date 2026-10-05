@@ -26,11 +26,20 @@ from pathlib import Path
 from typing import Protocol, TextIO
 
 from aero_bot.alerts import (
+    AlertTransportDefiniteError,
     AlertTransportError,
     build_alert_transport,
     parse_alert_config,
 )
 from aero_bot.audit import MAX_RECORDS_PER_READ, AuditEventType, AuditRecord, AuditStore
+from aero_bot.digest_admission import (
+    OUTCOME_ACCEPTED,
+    OUTCOME_AMBIGUOUS,
+    OUTCOME_REJECTED,
+    DigestSendStateError,
+    claim_send_admission,
+    record_send_outcome,
+)
 
 # The digest window: the prior twenty-four hours of audit history.
 DIGEST_WINDOW_HOURS = 24
@@ -54,6 +63,10 @@ _QUANTITY_QUANTUM = Decimal("0.000001")
 
 class DigestRecordSource(Protocol):
     """Define the bounded read surface the digest composes from."""
+
+    def count_records(self) -> int:
+        """Count every durable record in the chain."""
+        ...
 
     def read_records(self, limit: int = 100, *, offset: int = 0) -> tuple[AuditRecord, ...]:
         """Read a bounded ascending window of immutable audit records."""
@@ -181,22 +194,28 @@ def collect_digest_records(
 
     Returns:
         Ascending records whose timestamps fall inside the window; the read
-        stops at the first page fully older than the cutoff or the page
+        walks backwards from the chain's newest record and stops at the
+        first page containing records older than the cutoff or the page
         bound, so a quiet or noisy day costs the same bounded scan.
     """
     cutoff = now - timedelta(hours=window_hours)
-    total = 0
     collected: list[AuditRecord] = []
-    for _ in range(DIGEST_MAX_PAGES):
-        page = store.read_records(limit=MAX_RECORDS_PER_READ, offset=total)
-        if not page:
-            break
-        total += len(page)
+    remaining = store.count_records()
+    pages = 0
+    while remaining > 0 and pages < DIGEST_MAX_PAGES:
+        take = min(MAX_RECORDS_PER_READ, remaining)
+        remaining -= take
+        pages += 1
+        # The page ending at the chain's current head: reading backwards
+        # keeps the window honest on a long chain, where paging forward
+        # from the first record would spend every page on ancient history
+        # and report a false clean window.
+        page = store.read_records(limit=take, offset=remaining)
         in_window = [record for record in page if record.created_at >= cutoff]
         collected.extend(in_window)
         if len(in_window) < len(page):
             break
-    collected.sort(key=lambda record: record.sequence)
+    collected.reverse()
     return tuple(collected)
 
 
@@ -543,6 +562,7 @@ def deliver_daily_digest(
     error_stream: TextIO | None = None,
     now: datetime | None = None,
     advice_path: Path | None = None,
+    state_path: Path | None = None,
 ) -> bool:
     """Deliver one daily digest email; a failure never raises.
 
@@ -556,11 +576,15 @@ def deliver_daily_digest(
             keeps the missing marker. An absent, malformed, or stale
             artifact renders its honest marker and never suppresses the
             send.
+        state_path: The durable rolling-24-hour admission marker's path
+            (see :mod:`aero_bot.digest_admission`); None sends without
+            the durable guard (tests of composition alone). A marker that
+            refuses the window suppresses this send with one honest line.
 
     Returns:
         Whether the digest email was sent. Provider none, digest-mode
-        misrouting, an unreadable window, and failed deliveries all warn
-        (where warranted) and return False.
+        misrouting, an unreadable window, a refused rolling window, and
+        failed deliveries all warn (where warranted) and return False.
     """
     stream = error_stream if error_stream is not None else sys.stderr
     try:
@@ -583,11 +607,49 @@ def deliver_daily_digest(
         else TeacherAdviceView(None, "missing")
     )
     subject, body = compose_daily_digest(records, moment, advice=advice_view)
+    admission = None
+    if state_path is not None:
+        try:
+            admission = claim_send_admission(state_path, moment)
+        except (DigestSendStateError, OSError) as error:
+            print(
+                f"daily digest refused: the rolling-window marker at "
+                f"{state_path} is unreadable: {error}; inspect or remove it "
+                f"to re-admit sends",
+                file=stream,
+            )
+            return False
+        if not admission.admitted:
+            print(f"daily digest deferred: {admission.reason}", file=stream)
+            return False
+
+    def _settle(outcome: str) -> None:
+        if admission is not None and state_path is not None and admission.attempt_at is not None:
+            try:
+                record_send_outcome(state_path, admission.attempt_at, outcome)
+            except (DigestSendStateError, OSError) as error:
+                print(
+                    f"daily digest could not settle its rolling-window marker "
+                    f"(outcome {outcome}; the standing reservation stays "
+                    f"closed for 24 hours): {error}",
+                    file=stream,
+                )
+
     try:
         transport.send(subject, body)
-    except AlertTransportError as error:
+    except AlertTransportDefiniteError as error:
+        _settle(OUTCOME_REJECTED)
         print(f"daily digest delivery failed: {error}", file=stream)
         return False
+    except AlertTransportError as error:
+        _settle(OUTCOME_AMBIGUOUS)
+        print(
+            f"daily digest delivery failed ambiguously (the rolling window "
+            f"stays closed; a possibly delivered digest is never resent): {error}",
+            file=stream,
+        )
+        return False
+    _settle(OUTCOME_ACCEPTED)
     return True
 
 

@@ -458,6 +458,17 @@ class AuditStore:
         # Each row is validated into an immutable public model before leaving the store.
         return tuple(self._record_from_row(row) for row in rows)
 
+    def count_records(self) -> int:
+        """Count every durable record in the chain.
+
+        Returns:
+            The total record count, backing newest-end pagination for
+            bounded window readers like the daily digest.
+        """
+        with closing(self._connect()) as connection:
+            (count,) = connection.execute("SELECT count(*) FROM audit_records").fetchone()
+        return int(count)
+
     def verify_chain(self) -> AuditVerification:
         """Verify every durable sequence, payload, predecessor, and record hash."""
         with closing(self._connect()) as connection:

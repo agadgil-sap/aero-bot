@@ -96,7 +96,23 @@ _SECTION_WIDTH = 66
 
 
 class AlertTransportError(RuntimeError):
-    """Signal that one alert email could not be delivered."""
+    """Signal that one alert email could not be delivered.
+
+    The failure is ambiguous by default: nothing about it proves the
+    provider did not accept the message, so a caller guarding against
+    duplicate sends must keep its reservation standing.
+    """
+
+
+class AlertTransportDefiniteError(AlertTransportError):
+    """Signal a delivery failure that provably never handed a message over.
+
+    Only these failures release the daily digest's rolling send window:
+    the provider answered a nonzero status for the request, or the
+    connection never established, so no email can have been accepted.
+    Everything else stays ambiguous - a timeout or a dropped connection
+    mid-exchange may still have delivered.
+    """
 
 
 class AlertProvider(StrEnum):
@@ -188,6 +204,21 @@ class SmtpEmailTransport:
                 server.starttls(context=ssl.create_default_context())
                 server.login(self._user, self._password)
                 server.send_message(message)
+        except (
+            smtplib.SMTPConnectError,
+            smtplib.SMTPHeloError,
+            smtplib.SMTPAuthenticationError,
+            smtplib.SMTPNotSupportedError,
+            smtplib.SMTPRecipientsRefused,
+            smtplib.SMTPSenderRefused,
+            smtplib.SMTPDataError,
+            smtplib.SMTPResponseException,
+        ) as error:
+            # The server explicitly refused at or before the message
+            # transfer: the email provably never left this side.
+            raise AlertTransportDefiniteError(
+                f"the SMTP alert delivery to {self._host}:{self._port} was refused: {error}"
+            ) from error
         except (smtplib.SMTPException, OSError) as error:
             raise AlertTransportError(
                 f"the SMTP alert delivery to {self._host}:{self._port} failed: {error}"
@@ -248,12 +279,24 @@ class ResendHttpTransport:
             else:
                 with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
                     response = client.send(request)
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+        ) as error:
+            # The connection never established: the request provably never
+            # left the box, so no email can have been accepted.
+            raise AlertTransportDefiniteError(
+                f"the HTTP alert delivery to {self._url} never connected: {error}"
+            ) from error
         except httpx.HTTPError as error:
             raise AlertTransportError(
                 f"the HTTP alert delivery to {self._url} failed: {error}"
             ) from error
         if response.status_code // 100 != 2:
-            raise AlertTransportError(
+            # The provider answered and refused the request: the email was
+            # not accepted (429 rate limits and 4xx/5xx refusals alike).
+            raise AlertTransportDefiniteError(
                 f"the HTTP alert delivery to {self._url} answered {response.status_code}"
             )
 
@@ -811,6 +854,7 @@ __all__ = [
     "AlertConfig",
     "AlertMode",
     "AlertProvider",
+    "AlertTransportDefiniteError",
     "AlertTransportError",
     "EmailTransport",
     "ResendHttpTransport",
