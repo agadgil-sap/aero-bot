@@ -13,6 +13,9 @@ or missing records.
 """
 
 import json
+import math
+from collections import Counter
+from collections.abc import Callable
 from datetime import timedelta
 from decimal import Decimal
 from itertools import pairwise
@@ -27,9 +30,11 @@ from test_history import (
 )
 
 from aero_bot.history import (
+    MAX_HEADER_BATCH_SIZE,
     RANGING_READ_LOOKBACK,
     EventHistoryRpcBackend,
     HistoryUnavailableError,
+    PoolPricePath,
 )
 from aero_bot.ranging_reads import (
     NATIVE_USDC_ADDRESS,
@@ -402,3 +407,304 @@ def test_live_strategy_sources_failure_line_carries_elapsed_time() -> None:
         "RPC error -32601: method not found; entries and voluntary recenters "
         "defer fail-closed"
     ]
+
+
+# ---------------------------------------------------------------------------
+# The operator's deterministic counting reproduction, pinned as a test.
+# ---------------------------------------------------------------------------
+
+# The production-shaped counting fixture the operator measured: two-second
+# synthetic blocks under head 52,187,561 (the block run 2 verified at its
+# +66s journal line) with one swap every 26 blocks for the active shape
+# (AAPLc's observed cadence), driven through the real production constants.
+PROOF_HEAD_BLOCK = 52_187_561
+PROOF_BLOCK_SECONDS = 2
+PROOF_GENESIS_TIMESTAMP = 1_700_000_000 - PROOF_HEAD_BLOCK * PROOF_BLOCK_SECONDS
+PROOF_SWAP_EVERY_BLOCKS = 26
+# The locked 4.4-hour lookback over two-second blocks spans 7,920 seconds of
+# history, so the reconstruction window opens 7,920 blocks below the head and
+# tiles seven full 1,000-block windows plus one 921-block tail window.
+PROOF_RECONSTRUCTION_BLOCKS = RANGING_READ_LOOKBACK / timedelta(seconds=PROOF_BLOCK_SECONDS)
+PROOF_FULL_WINDOW_COUNT = 7
+PROOF_TAIL_WINDOW_SPAN = 921
+PROOF_STOCK_ADDRESS = GATEWAY_STOCK_ADDRESS
+# Native USDC on Base, the quote side of every B20 pool.
+PROOF_QUOTE_ADDRESS = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+# The unbatched baseline the operator's reproduction measured: one head read,
+# one latest header plus one header per binary-search probe, and one
+# eth_getLogs per window - 27 headers and 8 windows at this fixture shape.
+PROOF_QUIET_REQUESTS = 36
+PROOF_HEADER_READS_BEFORE_EVENTS = 27
+PROOF_LOG_WINDOW_REQUESTS = 8
+# The active shape's event-block header reads: 309 unique event blocks, two
+# of which the timestamp search already cached, leave 307 single reads at the
+# unbatched baseline - the amplification this repair removes.
+PROOF_ACTIVE_POINTS = 309
+PROOF_ACTIVE_EVENT_HEADER_READS = 307
+PROOF_ACTIVE_REQUESTS = PROOF_QUIET_REQUESTS + PROOF_ACTIVE_EVENT_HEADER_READS
+
+
+class CountingProductionShapeTransport(httpx.MockTransport):
+    """Serve the operator's counting reproduction while counting HTTP requests.
+
+    The handler answers every method like a healthy read-only endpoint over
+    the synthetic two-second cadence and records, per HTTP round trip rather
+    than per JSON-RPC entry, how many single and batched requests the real
+    backend sends - the exact profile the operator measured against the
+    1,800-second dry-cycle budget. An optional mode answers every batch
+    request with the endpoint's own non-list rejection body, exactly like the
+    documented ``-32014 maximum 10 calls in 1 batch`` refusal.
+    """
+
+    def __init__(self, *, active: bool, reject_batches: bool = False) -> None:
+        """Configure the counting fixture.
+
+        Args:
+            active: Serve one swap every 26 blocks inside every log window,
+                the active pool's observed cadence; False serves no logs.
+            reject_batches: Answer every JSON-RPC batch request with the
+                endpoint's own non-list batch-rejection body.
+        """
+        self.http_requests: Counter[str] = Counter()
+        self.method_entries: Counter[str] = Counter()
+        self.window_spans: Counter[int] = Counter()
+        self.served_header_blocks: set[int] = set()
+        self.event_blocks: set[int] = set()
+        self.rejected_batches: list[list[dict[str, Any]]] = []
+        self._active = active
+        self._reject_batches = reject_batches
+        super().__init__(self._handle)
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        """Answer one HTTP round trip, counting it by batched-ness."""
+        payload: object = json.loads(request.content.decode("utf-8"))
+        entries = payload if isinstance(payload, list) else [payload]
+        assert isinstance(entries, list)
+        is_batch = isinstance(payload, list)
+        self.http_requests["batch" if is_batch else "single"] += 1
+        if is_batch and self._reject_batches:
+            self.rejected_batches.append(entries)
+            # The endpoint's own batch rejection: a non-list body served over
+            # HTTP 200, exactly like the documented maximum-batch error.
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32014, "message": "maximum 10 calls in 1 batch"},
+                },
+            )
+        responses = [self._serve_entry(entry) for entry in entries]
+        if is_batch:
+            return httpx.Response(200, json=responses)
+        return httpx.Response(200, json=responses[0])
+
+    def _serve_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """Serve one JSON-RPC entry against the synthetic production shape."""
+        method = entry["method"]
+        params = entry.get("params", [])
+        self.method_entries[method] += 1
+        if method == "eth_blockNumber":
+            result: object = hex(PROOF_HEAD_BLOCK)
+        elif method == "eth_getBlockByNumber":
+            number = int(params[0], 16)
+            self.served_header_blocks.add(number)
+            result = {
+                "number": hex(number),
+                "timestamp": hex(PROOF_GENESIS_TIMESTAMP + number * PROOF_BLOCK_SECONDS),
+            }
+        elif method == "eth_getLogs":
+            from_block = int(params[0]["fromBlock"], 16)
+            to_block = int(params[0]["toBlock"], 16)
+            self.window_spans[to_block - from_block + 1] += 1
+            logs: list[dict[str, Any]] = []
+            if self._active:
+                for log_index, block in enumerate(
+                    range(from_block, to_block + 1, PROOF_SWAP_EVERY_BLOCKS)
+                ):
+                    self.event_blocks.add(block)
+                    logs.append(
+                        swap_log(block, log_index, 1 << 96, pool_address=GATEWAY_POOL_ADDRESS)
+                    )
+            result = logs
+        else:
+            raise AssertionError(f"unexpected RPC method {method}")
+        return {"jsonrpc": "2.0", "id": entry.get("id"), "result": result}
+
+
+def proof_backend(
+    transport: CountingProductionShapeTransport,
+    *,
+    header_batch_size: int = 1,
+    progress: Callable[[str], None] | None = None,
+) -> EventHistoryRpcBackend:
+    """Build the ranging backend with the real production read constants.
+
+    Args:
+        transport: The counting fixture endpoint.
+        header_batch_size: Header-read batching to exercise; one is the
+            unbatched wire shape the operator's baseline measured.
+        progress: Optional progress collector receiving the backend's lines.
+
+    Returns:
+        The offline backend configured exactly like the production ranging
+        read: the locked log window and the 4.4-hour lookback.
+    """
+    return EventHistoryRpcBackend(
+        log_window_blocks=RANGING_READ_LOG_WINDOW_BLOCKS,
+        transport=transport,
+        sleep=no_sleep,
+        page_delay_seconds=0.0,
+        header_batch_size=header_batch_size,
+        progress=progress,
+    )
+
+
+def fetch_proof_path(backend: EventHistoryRpcBackend) -> PoolPricePath:
+    """Reconstruct the proof pool's path over the production lookback.
+
+    Args:
+        backend: Offline backend serving the counting fixture.
+
+    Returns:
+        The reconstructed path over the locked 4.4-hour lookback.
+    """
+    return backend.fetch_price_path(
+        pool_address=GATEWAY_POOL_ADDRESS,
+        token_address=PROOF_STOCK_ADDRESS,
+        token0_address=PROOF_STOCK_ADDRESS,
+        token1_address=PROOF_QUOTE_ADDRESS,
+        token_decimals=18,
+        quote_decimals=6,
+        lookback=RANGING_READ_LOOKBACK,
+    )
+
+
+def path_fingerprint(path: PoolPricePath) -> dict[str, Any]:
+    """Strip the per-call observation instant so two runs compare equal.
+
+    Args:
+        path: One reconstructed path.
+
+    Returns:
+        Every field of the path except ``observed_at``, which carries the
+        wall clock of the individual run and cannot match across calls.
+    """
+    fingerprint = path.model_dump()
+    fingerprint.pop("observed_at")
+    return fingerprint
+
+
+def test_request_count_proof_pins_the_unbatched_production_baseline() -> None:
+    """The unbatched wire shape sends exactly the operator's measured counts.
+
+    At ``header_batch_size=1`` - the production default the strategy backend
+    historically left untouched - a quiet pool costs exactly 36 HTTP requests
+    (one eth_blockNumber, 27 eth_getBlockByNumber, eight eth_getLogs) and the
+    active shape costs exactly 343 (the same 36 plus 307 one-per-event-block
+    header reads), while the log windows tile the 4.4-hour lookback as seven
+    1,000-block pages plus one 921-block tail. This is the amplification the
+    two timed-out preflight dry cycles paid for.
+    """
+    quiet = CountingProductionShapeTransport(active=False)
+    quiet_path = fetch_proof_path(proof_backend(quiet))
+
+    assert quiet_path.points == ()
+    assert dict(quiet.http_requests) == {"single": PROOF_QUIET_REQUESTS}
+    assert dict(quiet.method_entries) == {
+        "eth_blockNumber": 1,
+        "eth_getBlockByNumber": PROOF_HEADER_READS_BEFORE_EVENTS,
+        "eth_getLogs": PROOF_LOG_WINDOW_REQUESTS,
+    }
+    assert dict(quiet.window_spans) == {
+        RANGING_READ_LOG_WINDOW_BLOCKS: PROOF_FULL_WINDOW_COUNT,
+        PROOF_TAIL_WINDOW_SPAN: 1,
+    }
+    assert sum(quiet.window_spans.values()) == PROOF_LOG_WINDOW_REQUESTS
+
+    active = CountingProductionShapeTransport(active=True)
+    active_path = fetch_proof_path(proof_backend(active))
+
+    assert len(active_path.points) == PROOF_ACTIVE_POINTS
+    assert dict(active.http_requests) == {"single": PROOF_ACTIVE_REQUESTS}
+    # The extra reads over the quiet baseline are exactly the event blocks'
+    # headers: 307 single reads for 309 unique event blocks, two of which the
+    # timestamp search already cached.
+    assert (
+        active.method_entries["eth_getBlockByNumber"] - quiet.method_entries["eth_getBlockByNumber"]
+        == PROOF_ACTIVE_EVENT_HEADER_READS
+    )
+    assert dict(active.window_spans) == dict(quiet.window_spans)
+
+
+def test_request_count_proof_batches_headers_with_identical_results() -> None:
+    """Batched header reads drop the active pool to 67 identical-result requests.
+
+    At the public-endpoint-verified ``MAX_HEADER_BATCH_SIZE`` the quiet pool
+    is unchanged at 36 requests (a quiet pool has no event blocks to batch),
+    and the active pool collapses its 307 single header reads into
+    ceil(307/10) = 31 batched requests for exactly 67 HTTP round trips - while
+    returning an identical ``PoolPricePath``: same points in the same order
+    with the same timestamps, prices, and window bounds.
+    """
+    quiet = CountingProductionShapeTransport(active=False)
+    quiet_path = fetch_proof_path(proof_backend(quiet, header_batch_size=MAX_HEADER_BATCH_SIZE))
+
+    assert quiet_path.points == ()
+    assert dict(quiet.http_requests) == {"single": PROOF_QUIET_REQUESTS}
+
+    unbatched = CountingProductionShapeTransport(active=True)
+    unbatched_path = fetch_proof_path(proof_backend(unbatched))
+    batched = CountingProductionShapeTransport(active=True)
+    batched_path = fetch_proof_path(proof_backend(batched, header_batch_size=MAX_HEADER_BATCH_SIZE))
+
+    batched_header_requests = math.ceil(PROOF_ACTIVE_EVENT_HEADER_READS / MAX_HEADER_BATCH_SIZE)
+    assert dict(batched.http_requests) == {
+        "single": PROOF_QUIET_REQUESTS,
+        "batch": batched_header_requests,
+    }
+    assert sum(batched.http_requests.values()) == (PROOF_QUIET_REQUESTS + batched_header_requests)
+    # Identical history with meaningfully fewer round trips, never less data.
+    assert path_fingerprint(batched_path) == path_fingerprint(unbatched_path)
+    assert [point.timestamp for point in batched_path.points] == [
+        point.timestamp for point in unbatched_path.points
+    ]
+    assert (batched_path.from_block, batched_path.to_block) == (
+        unbatched_path.from_block,
+        unbatched_path.to_block,
+    )
+    # The fixture served the same event headers either way.
+    assert batched.event_blocks == unbatched.event_blocks
+
+
+def test_request_count_proof_bounds_rejection_to_one_wasted_request() -> None:
+    """A rejecting endpoint costs exactly one wasted request, full coverage.
+
+    When the endpoint answers every batch request with its own non-list
+    rejection body, the backend downgrades once, re-reads every still-missing
+    header through the single-header path, and still returns coverage
+    identical to the unbatched run - at the cost of exactly one rejected
+    batch attempt over the whole read, the pinned wasted-request bound.
+    """
+    unbatched = CountingProductionShapeTransport(active=True)
+    unbatched_path = fetch_proof_path(proof_backend(unbatched))
+    lines: list[str] = []
+    rejected = CountingProductionShapeTransport(active=True, reject_batches=True)
+    rejected_path = fetch_proof_path(
+        proof_backend(rejected, header_batch_size=MAX_HEADER_BATCH_SIZE, progress=lines.append)
+    )
+
+    # Identical results: every point, timestamp, and bound survives.
+    assert path_fingerprint(rejected_path) == path_fingerprint(unbatched_path)
+    # Exactly one rejected batch attempt, then only single reads: the total
+    # cost is the unbatched 343 plus the one wasted request.
+    assert len(rejected.rejected_batches) == 1
+    assert dict(rejected.http_requests) == {
+        "single": PROOF_ACTIVE_REQUESTS,
+        "batch": 1,
+    }
+    # Exactly one downgrade line naming the permanent downgrade.
+    downgrade_lines = [line for line in lines if "downgrading this backend" in line]
+    assert len(downgrade_lines) == 1
+    # Every event block's header was still read through the single path.
+    assert rejected.event_blocks <= rejected.served_header_blocks

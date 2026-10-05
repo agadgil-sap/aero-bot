@@ -1895,6 +1895,23 @@ def test_batched_prefetch_fails_closed_on_oversized_responses() -> None:
             ],
             "RPC error -32601 on batched eth_getBlockByNumber",
         ),
+        # A well-formed-length batch with matching ids whose result payload
+        # lacks a parseable timestamp never reaches the header cache.
+        (
+            [
+                {"jsonrpc": "2.0", "id": 1, "result": {"number": hex(996)}},
+                {"jsonrpc": "2.0", "id": 2, "result": {"number": hex(997), "timestamp": "0x1"}},
+            ],
+            "header was malformed",
+        ),
+        # A result that is not an object at all cannot decode as a header.
+        (
+            [
+                {"jsonrpc": "2.0", "id": 1, "result": "0xdeadbeef"},
+                {"jsonrpc": "2.0", "id": 2, "result": {"number": hex(997), "timestamp": "0x1"}},
+            ],
+            "header was malformed",
+        ),
     ],
 )
 def test_batched_prefetch_fails_closed_on_malformed_entries(
