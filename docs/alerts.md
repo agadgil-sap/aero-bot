@@ -2,6 +2,8 @@
 
 The cycle delivers its report by email: the per-cycle performance summary (position state, P&L vs entry, gas spent, actions with transaction hashes) and - always, whatever the summary setting - an alerting email when anything deserves eyes: an out-of-band condition, a halted cycle, a refused or failed action, or a balance below its floor (the relayer's ETH gas tank, the Safe's USDC working capital).
 
+Beyond that default there is one further routing mode, the daily digest (the captain's 2026-10-05 ruling; see [The daily digest](#the-daily-digest) below): every immediate email is suppressed and the 09:00 Melbourne report carries the prior 24 hours in a single bounded email.
+
 Delivery never crashes the cycle it describes: a failed transport exchange or a misconfiguration warns on stderr and the cycle's report, audit record, and exit code stand on their own.
 
 ## Configuration
@@ -11,6 +13,7 @@ Everything is environment-driven; credentials live only in the sealed environmen
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `AERO_BOT_ALERT_PROVIDER` | `smtp`, `resend`, or `none` | `none` (silent) |
+| `AERO_BOT_ALERT_MODE` | `per_cycle` (immediate emails, the shipped default) or `digest` (suppress every immediate email; only the daily digest sends) | `per_cycle` |
 | `AERO_BOT_ALERT_FROM` | The From address for every email | required with a provider |
 | `AERO_BOT_ALERT_TO` | Comma-separated recipients | required with a provider |
 | `AERO_BOT_ALERT_SMTP_HOST` | SMTP server hostname (smtp provider) | required |
@@ -44,4 +47,12 @@ A silent idle book must never happen again: the first allocator night sat 113 cl
 
 ## The daily report
 
-Beyond the per-cycle emails, the kit ships `aero-bot-daily-report.timer`: one dry selector-mode cycle each morning (09:00 Melbourne by default) whose summary email - sent through the same transport, typically Resend with `AERO_BOT_ALERT_PROVIDER=resend` sealed in `/etc/aero-bot/daily-report.env` overlaid on `cycle.env` - serves as the captain's daily portfolio report. The unit runs the identical `aero-bot-cycle --symbol auto --dry-run --json` surface, so the report is exactly what a manual dry run prints, and it stays dark until the overlay file is sealed (`ConditionPathExists`).
+Beyond the per-cycle emails, the kit ships `aero-bot-daily-report.timer`: one dry selector-mode cycle each morning (09:00 Melbourne by default - `OnCalendar=*-*-* 09:00:00 Australia/Melbourne`, so systemd's timezone-aware calendar keeps the local morning across both DST transitions) whose summary email - sent through the same transport, typically Resend with `AERO_BOT_ALERT_PROVIDER=resend` sealed in `/etc/aero-bot/daily-report.env` overlaid on `cycle.env` - serves as the captain's daily portfolio report. The unit runs the identical `aero-bot-cycle --symbol auto --dry-run --json` surface (plus the `--daily-digest` flag below), so the report is exactly what a manual dry run prints, and it stays dark until the overlay file is sealed (`ConditionPathExists`).
+
+## The daily digest
+
+The captain's 2026-10-05 ruling: only one email per day. `AERO_BOT_ALERT_MODE=digest` (sealed in `cycle.env`) suppresses EVERY immediate email path - per-cycle summaries, event alerts, watchtower range trips, and fail-safe notices - while leaving local logging, the audit chain, the watchtower monitor, and every loss/custody/gas protection exactly as they are; no trading behavior changes. The one email that remains is the daily-report tick's digest, composed because the unit's `ExecStart` carries `--daily-digest` (the flag replaces that run's own per-cycle email; without the sealed mode it sends the digest and leaves every other path firing, so the two settings compose safely in either sealing order).
+
+The digest is derived, never invented: every line restates a durable audit record inside the prior 24 hours - the decision flow and equity path (`cycle_reported`), every broadcast with its on-chain outcome (`lp_execute_sent` joined to its receipt), reward claims and the latest yield attribution, and the failure catalog (halted cycles, reverted deliveries, broadcast-unknown submissions, and every `lp_refused` catalog code). The student's advice section restates the latest `advisor_reported` brief with its model, latency, and age, plus the window's typed-absence tally, and says so explicitly when no pass reported. The teacher section restates the bounded one-way evidence artifact the Mac-side publisher writes beside the audit store (see [the teacher documentation](teacher.md#the-advice-evidence-publisher-firstmate-028s-minimal-transfer)): the publish provenance (`generated_at`), per-episode timestamps with each seat's model, outcome, capped brief, and position view - and when the artifact is absent, unparseable, or its newest episode is older than 24 hours, the section states that explicit MISSING, MALFORMED, or STALE marker rather than inventing advice. Sections are line-bounded so one email stays readable on a noisy day.
+
+Composition lives in `src/aero_bot/digest.py` (`aero-bot-cycle --daily-digest`); the bounded window read pages the audit store newest-page-first and stops at the page cap.

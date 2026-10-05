@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Generate the aero-bot teacher harness launchd user agents on macOS.
 #
-# Mirrors the Ubuntu kit's posture: this installer writes the eight job
+# Mirrors the Ubuntu kit's posture: this installer writes the nine job
 # definitions (three teacher streams, the daily hindsight scorer, the
 # daily upgrade proposer, the daily risk-manager audit, the daily repo
 # sync agent, and the student seat's dedicated Ollama plane) into
@@ -208,6 +208,10 @@ generate_plist "com.aero-bot.teacher-news" "news" "$NEWS_BLOCK"
 generate_plist "com.aero-bot.teacher-hindsight" "hindsight" "$HINDSIGHT_BLOCK"
 generate_plist "com.aero-bot.teacher-upgrade" "upgrade" "$UPGRADE_BLOCK"
 generate_plist "com.aero-bot.teacher-risk-manager" "risk-manager" "$RISK_MANAGER_BLOCK"
+# The advice publisher rides the tactical cadence so the box's evidence
+# artifact stays fresh for the 09:00 digest; a failed publish only logs
+# and the digest states the honest missing/malformed/stale marker.
+generate_plist "com.aero-bot.teacher-publish" "publish-advice" "$INTERVAL_BLOCK"
 
 # The repo sync agent keeps the teacher worktree converged with the
 # engine (the deployed SHA when the VM answers, origin/main otherwise),

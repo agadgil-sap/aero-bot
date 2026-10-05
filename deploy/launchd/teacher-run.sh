@@ -12,7 +12,7 @@
 set -euo pipefail
 
 REPO_ROOT="${AERO_BOT_TEACHER_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-STREAM="${1:?usage: teacher-run.sh <tactical|daily|news|hindsight|upgrade|risk-manager>}"
+STREAM="${1:?usage: teacher-run.sh <tactical|daily|news|hindsight|upgrade|risk-manager|publish-advice>}"
 STATE_DIR="${AERO_BOT_TEACHER_STATE_DIR:-$HOME/.local/state/aero-bot/teacher}"
 LOG_DIR="$STATE_DIR/logs"
 
@@ -64,5 +64,12 @@ if [[ "$STREAM" == "risk-manager" ]]; then
     # The risk manager audits posture as the counterparty desk; it is not
     # a teacher stream either.
     exec "$UV_BIN" run aero-bot-risk-manager >>"$LOG_DIR/${STREAM}.log" 2>&1
+fi
+if [[ "$STREAM" == "publish-advice" ]]; then
+    # The publisher writes one bounded advice artifact to the production
+    # box for the daily digest (firstmate 028's minimal one-way transfer);
+    # it is not a teacher stream either. A failed publish only logs - the
+    # digest states the honest missing/malformed/stale marker instead.
+    exec "$UV_BIN" run aero-bot-teacher-publish >>"$LOG_DIR/${STREAM}.log" 2>&1
 fi
 exec "$UV_BIN" run aero-bot-teacher "$STREAM" >>"$LOG_DIR/${STREAM}.log" 2>&1

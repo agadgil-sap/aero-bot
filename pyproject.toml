@@ -81,6 +81,11 @@ aero-bot-upgrade = "aero_bot.upgrade:main"
 # quiet verdict over a flagged posture; the report beside the corpus is
 # the entire effect.
 aero-bot-risk-manager = "aero_bot.risk_manager:main"
+# The teacher-publish command writes one bounded, secret-free advice
+# artifact (the most recent episodes with provenance) to the production
+# box over the existing authenticated channel, for the daily digest to
+# read; one-way advisory evidence only, never executed on the box.
+aero-bot-teacher-publish = "aero_bot.teacher_publish:main"
 
 [tool.hatch.build.targets.wheel]
 # The wheel contains only the application package under the src layout.

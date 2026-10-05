@@ -57,6 +57,12 @@ ALERT_SAFE_USDC_FLOOR_UNITS_ENV = "AERO_BOT_ALERT_SAFE_USDC_FLOOR_UNITS"
 # decimal fraction, default 0.80) past which an idle book with excluded
 # in-band pools alerts on the first cycle of its episode (gnhf 34).
 ALERT_IDLE_CASH_FRACTION_ENV = "AERO_BOT_ALERT_IDLE_CASH_FRACTION"
+# The alert routing mode: per_cycle (the default - every cycle and every
+# trigger emails immediately through the paths below) or digest (every
+# immediate email is suppressed everywhere - cycle summaries, event
+# alerts, watchtower trips and notices - and exactly one daily digest
+# email carries the prior 24 hours; the captain's 2026-10-05 ruling).
+ALERT_MODE_ENV = "AERO_BOT_ALERT_MODE"
 # The default Resend endpoint; any Resend-style API shares the shape.
 DEFAULT_RESEND_URL = "https://api.resend.com/emails"
 # The default SMTP submission port with STARTTLS.
@@ -102,6 +108,19 @@ class AlertProvider(StrEnum):
     SMTP = "smtp"
     # Resend-style HTTP API with a bearer key.
     RESEND = "resend"
+
+
+class AlertMode(StrEnum):
+    """Select when the alert transport is allowed to send."""
+
+    # Every cycle summary, event alert, and watchtower trigger emails
+    # immediately - the shipped default, unchanged since the first seal.
+    PER_CYCLE = "per_cycle"
+    # No immediate email anywhere: cycle summaries, event alerts, watchtower
+    # trips, and fail-safe notices are all suppressed (local logging, the
+    # audit chain, and every protection stay on), and the daily digest
+    # composes the prior 24 hours into the one email that remains.
+    DIGEST = "digest"
 
 
 @runtime_checkable
@@ -253,6 +272,7 @@ class AlertConfig:
         idle_cash_fraction: Decimal = DEFAULT_IDLE_CASH_FRACTION,
         smtp: "SmtpSettings | None" = None,
         resend: "ResendSettings | None" = None,
+        mode: "AlertMode | None" = None,
     ) -> None:
         """Bind the validated alert configuration.
 
@@ -268,6 +288,8 @@ class AlertConfig:
                 cycle of its episode.
             smtp: SMTP settings when the provider is smtp.
             resend: Resend settings when the provider is resend.
+            mode: The routing mode; None keeps per_cycle (the shipped
+                default), digest suppresses every immediate email path.
         """
         self.provider = provider
         self.sender = sender
@@ -278,6 +300,7 @@ class AlertConfig:
         self.idle_cash_fraction = idle_cash_fraction
         self.smtp = smtp
         self.resend = resend
+        self.mode = mode if mode is not None else AlertMode.PER_CYCLE
 
 
 class SmtpSettings:
@@ -362,6 +385,15 @@ def parse_alert_config(environ: Mapping[str, str] | None = None) -> AlertConfig:
             f"{{{','.join(member.value for member in AlertProvider)}}}, "
             f"not {raw_provider!r}"
         ) from None
+    raw_mode = resolved.get(ALERT_MODE_ENV, AlertMode.PER_CYCLE.value).strip().lower()
+    try:
+        mode = AlertMode(raw_mode)
+    except ValueError:
+        raise ValueError(
+            f"{ALERT_MODE_ENV} must be one of "
+            f"{{{','.join(member.value for member in AlertMode)}}}, "
+            f"not {raw_mode!r}"
+        ) from None
     raw_floor_eth = resolved.get(ALERT_RELAYER_ETH_FLOOR_WEI_ENV, "").strip()
     raw_floor_usdc = resolved.get(ALERT_SAFE_USDC_FLOOR_UNITS_ENV, "").strip()
     raw_idle_fraction = resolved.get(ALERT_IDLE_CASH_FRACTION_ENV, "").strip()
@@ -387,6 +419,7 @@ def parse_alert_config(environ: Mapping[str, str] | None = None) -> AlertConfig:
             if raw_floor_usdc
             else DEFAULT_SAFE_USDC_FLOOR_UNITS
         ),
+        mode=mode,
         idle_cash_fraction=(
             _unit_fraction(raw_idle_fraction, ALERT_IDLE_CASH_FRACTION_ENV)
             if raw_idle_fraction
@@ -752,6 +785,11 @@ def deliver_cycle_alerts(
     except ValueError as error:
         print(f"email alerts are misconfigured: {error}", file=stream)
         return False
+    if config.mode is AlertMode.DIGEST:
+        # Digest routing suppresses every immediate email; the audit chain,
+        # stderr diagnostics, and every protection stay exactly as they are,
+        # and the daily digest carries this cycle inside its 24-hour window.
+        return False
     transport = build_alert_transport(config)
     if transport is None:
         return False
@@ -768,8 +806,10 @@ def deliver_cycle_alerts(
 
 
 __all__ = [
+    "ALERT_MODE_ENV",
     "ALERT_PROVIDER_ENV",
     "AlertConfig",
+    "AlertMode",
     "AlertProvider",
     "AlertTransportError",
     "EmailTransport",
