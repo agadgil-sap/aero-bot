@@ -7048,15 +7048,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if arguments.daily_digest:
         from aero_bot.digest import deliver_daily_digest
+        from aero_bot.digest_admission import STATE_FILE_NAME
 
         advice_path = Path(
             os.environ.get("AERO_BOT_TEACHER_ADVICE_PATH")
             or settings.audit_database_path.parent / "teacher_advice.json"
         )
+        # The rolling-24-hour admission marker lives beside the audit store
+        # so every surface (the timer's tick, catch-up after downtime, a
+        # manual run, concurrent starts) shares one durable window.
+        state_path = Path(
+            os.environ.get("AERO_BOT_DIGEST_STATE_PATH")
+            or settings.audit_database_path.parent / STATE_FILE_NAME
+        )
         deliver_daily_digest(
             AuditStore(settings.audit_database_path),
             now=datetime.now(UTC),
             advice_path=advice_path,
+            state_path=state_path,
         )
     else:
         deliver_cycle_alerts(report)
