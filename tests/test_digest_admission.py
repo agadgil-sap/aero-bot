@@ -392,6 +392,9 @@ class TestDeliverIntegration:
         """An unreadable audit window never consumes the admission."""
 
         class BrokenStore:
+            def count_records(self) -> int:
+                raise OSError("disk unavailable")
+
             def read_records(self, limit: int = 100, *, offset: int = 0) -> tuple[()]:
                 raise OSError("disk unavailable")
 

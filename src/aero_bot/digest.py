@@ -64,6 +64,10 @@ _QUANTITY_QUANTUM = Decimal("0.000001")
 class DigestRecordSource(Protocol):
     """Define the bounded read surface the digest composes from."""
 
+    def count_records(self) -> int:
+        """Count every durable record in the chain."""
+        ...
+
     def read_records(self, limit: int = 100, *, offset: int = 0) -> tuple[AuditRecord, ...]:
         """Read a bounded ascending window of immutable audit records."""
         ...
@@ -190,22 +194,28 @@ def collect_digest_records(
 
     Returns:
         Ascending records whose timestamps fall inside the window; the read
-        stops at the first page fully older than the cutoff or the page
+        walks backwards from the chain's newest record and stops at the
+        first page containing records older than the cutoff or the page
         bound, so a quiet or noisy day costs the same bounded scan.
     """
     cutoff = now - timedelta(hours=window_hours)
-    total = 0
     collected: list[AuditRecord] = []
-    for _ in range(DIGEST_MAX_PAGES):
-        page = store.read_records(limit=MAX_RECORDS_PER_READ, offset=total)
-        if not page:
-            break
-        total += len(page)
+    remaining = store.count_records()
+    pages = 0
+    while remaining > 0 and pages < DIGEST_MAX_PAGES:
+        take = min(MAX_RECORDS_PER_READ, remaining)
+        remaining -= take
+        pages += 1
+        # The page ending at the chain's current head: reading backwards
+        # keeps the window honest on a long chain, where paging forward
+        # from the first record would spend every page on ancient history
+        # and report a false clean window.
+        page = store.read_records(limit=take, offset=remaining)
         in_window = [record for record in page if record.created_at >= cutoff]
         collected.extend(in_window)
         if len(in_window) < len(page):
             break
-    collected.sort(key=lambda record: record.sequence)
+    collected.reverse()
     return tuple(collected)
 
 
