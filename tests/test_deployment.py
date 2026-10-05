@@ -312,6 +312,28 @@ class TestDashboardUnit:
         ]
 
 
+class TestCycleUnit:
+    """The scheduled cycle service: one reconcile-decide-act pass per tick."""
+
+    def test_the_unit_selects_the_retain_reward_posture(self) -> None:
+        """The shipped invocation passes the retain selector explicitly.
+
+        The command-line selector wins over the sealed environment, so the
+        scheduled unit retains claimed AERO regardless of any sealed
+        AERO_BOT_CYCLE_REWARD_POSTURE value; manual CLI runs that omit the
+        flag keep the sealed or default posture.
+        """
+        service = Path("deploy/systemd/aero-bot-cycle@.service").read_text(encoding="utf-8")
+        assert (
+            "ExecStart=/opt/aero-bot/.venv/bin/aero-bot-cycle --symbol %i "
+            "--reward-posture retain --json" in service
+        )
+        # The selector rides the command line only: the unit never states
+        # the posture through its own Environment= lines, so precedence
+        # rests on the parser's flag-over-environment rule alone.
+        assert "Environment=AERO_BOT_CYCLE_REWARD_POSTURE" not in service
+
+
 class TestDailyReportUnit:
     """The daily Resend report rides the cycle's alert transport."""
 

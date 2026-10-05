@@ -141,6 +141,8 @@ Idle AERO counts in the book's reconcile and in the equity the halt measures, so
 
 The sealed `AERO_BOT_CYCLE_REWARD_POSTURE` (or `--reward-posture`) selects what the act step does with claimed rewards: `convert` (the default, the behavior above) or `retain`.
 Under `retain` the claim path is untouched - rewards still sweep into the Safe through the same audited collect surface once the threshold crosses - but the conversion swap never fires: the AERO stays in the Safe as priced book equity, one progress line names the retained balance, and a restart can never trip over the conversion surface while it is under reassessment.
+The shipped scheduled unit (`deploy/systemd/aero-bot-cycle@.service`) passes `--reward-posture retain` on its command line explicitly.
+The command-line selector wins over the sealed environment, so the scheduled unit retains regardless of any sealed `AERO_BOT_CYCLE_REWARD_POSTURE` value; the sealed variable governs manual CLI runs that omit the flag.
 Value and units attribution run identically under either posture: the yield decomposition reports the day's earned AERO as raw units beside its mark-to-market (`aero_rewards_units` and `aero_rewards_usdc`, per position and rolled up, riding the report, the email, and the `cycle_reported` audit payload), so a reward balance is never presented as net performance until it is priced and decomposed.
 
 ## Fee evidence (measurement only)

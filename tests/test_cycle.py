@@ -37,12 +37,14 @@ from aero_bot.cycle import (
     CYCLE_OUT_OF_RANGE_GRACE_ENV,
     CYCLE_REFERENCE_FEED_ENV,
     CYCLE_REFERENCE_PRICE_ENV,
+    CYCLE_REWARD_POSTURE_ENV,
     CYCLE_STOCK_DUST_AGGREGATE_USDC_ENV,
     CYCLE_STOCK_DUST_FLOOR_USDC_ENV,
     CYCLE_SWITCH_MARGIN_ENV,
     CYCLE_SYMBOL_ENV,
     CYCLE_TIER_BAND_ENV,
     DEFAULT_AERO_CONVERSION_MIN_USDC,
+    DEFAULT_REWARD_POSTURE,
     DEFAULT_STOCK_DUST_AGGREGATE_USDC,
     DEFAULT_STOCK_DUST_FLOOR_USDC,
     CycleMode,
@@ -51,6 +53,7 @@ from aero_bot.cycle import (
     CycleStateStore,
     HeldInventoryRecord,
     ReentryCooldown,
+    RewardPosture,
     TrackedPosition,
     _aero_conversion_min_from_environment,
     _income_history_cycles_from_environment,
@@ -774,6 +777,7 @@ def make_runner(
     sleep: Callable[[float], None] | None = None,
     parameters: PolicyParameters | None = None,
     aero_conversion_min_usdc: Decimal | None = None,
+    reward_posture: RewardPosture | None = None,
     income_history_cycles: int | None = None,
     dust_floor_usdc: Decimal | None = None,
     dust_aggregate_usdc: Decimal | None = None,
@@ -844,6 +848,7 @@ def make_runner(
             if aero_conversion_min_usdc is not None
             else DEFAULT_AERO_CONVERSION_MIN_USDC
         ),
+        reward_posture=(reward_posture if reward_posture is not None else DEFAULT_REWARD_POSTURE),
         income_history_cycles=income_history_cycles,
         stock_dust_floor_usdc=(
             dust_floor_usdc if dust_floor_usdc is not None else DEFAULT_STOCK_DUST_FLOOR_USDC
@@ -2097,7 +2102,7 @@ class TestSystemdUnits:
         assert "EnvironmentFile=/etc/aero-bot/cycle.env" in service
         assert "NoNewPrivileges=true" in service
         assert "Restart=no" in service
-        assert "aero-bot-cycle --symbol %i --json" in service
+        assert "aero-bot-cycle --symbol %i --reward-posture retain --json" in service
 
 
 class TestLiveRelayerGuard:
@@ -2280,6 +2285,7 @@ def selector_runner(
     sources: SelectorCycleSources | None = None,
     balances: FakeBalances | None = None,
     aero_conversion_min_usdc: Decimal | None = None,
+    reward_posture: RewardPosture | None = None,
     reference_feed: object | None = None,
 ) -> tuple[CycleRunner, FakeExecutor | None, CycleStateStore]:
     """Assemble one selector-mode cycle runner over the scripted board."""
@@ -2296,6 +2302,7 @@ def selector_runner(
         if balances is not None
         else FakeBalances(usdc_units=SELECTOR_BOOK_USDC_UNITS),
         aero_conversion_min_usdc=aero_conversion_min_usdc,
+        reward_posture=reward_posture,
         reference_feed=reference_feed,
     )
     return runner, fake_executor, state_store
@@ -3947,6 +3954,54 @@ class TestCycleConfiguration:
         assert exit_code == 1
         assert built["reference_feed"] is None
 
+    def test_the_reward_posture_flag_wins_over_a_conflicting_sealed_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--reward-posture retain beats a sealed convert posture end to end.
+
+        The scheduled unit rides this precedence: its command line carries
+        the retain selector, so a sealed AERO_BOT_CYCLE_REWARD_POSTURE=convert
+        can never make the scheduled unit swap its AERO.
+        """
+        from aero_bot import cycle as cycle_module
+
+        built: dict[str, object] = {}
+
+        class FakeRunner:
+            def run(self, mode: CycleMode, **kwargs: object) -> object:
+                raise RuntimeError("selector reached runner")
+
+        def fake_build(
+            settings: object,
+            symbol: object,
+            safe_address: object,
+            relayer: object,
+            switch_margin: object,
+            parameters: object,
+            aero_min: object,
+            reward_posture: object = None,
+            portfolio: object = None,
+            income_history_cycles: object = None,
+            stock_dust_floor: object = None,
+            stock_dust_aggregate: object = None,
+            reference_feed: object = None,
+        ) -> object:
+            built["reward_posture"] = reward_posture
+            return FakeRunner()
+
+        monkeypatch.setattr(cycle_module, "build_cycle_runner", fake_build)
+        monkeypatch.setenv(CYCLE_REWARD_POSTURE_ENV, "convert")
+        # Without the flag the sealed value reaches the runner.
+        exit_code = cycle_module.main(["--symbol", "auto", "--dry-run"])
+        assert exit_code == 1
+        assert built["reward_posture"] == RewardPosture.CONVERT
+        # With the flag the command line wins over the conflicting seal.
+        exit_code = cycle_module.main(
+            ["--symbol", "auto", "--dry-run", "--reward-posture", "retain"]
+        )
+        assert exit_code == 1
+        assert built["reward_posture"] == RewardPosture.RETAIN
+
     def test_finnhub_without_a_sealed_token_refuses_at_the_cli_boundary(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -4382,6 +4437,83 @@ class TestRewardConversion:
         saved = state_store.load()
         assert saved.day_baseline is not None
         assert saved.day_baseline.aero_converted_units == 10 * 10**18
+
+    def test_the_retain_posture_claims_but_never_swaps(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Retain keeps the audited claim and skips only the conversion swap."""
+        reads = FakeReads(inventory_with(TRACKED_TOKEN_ID))
+        staked = tracked_status(owner=GAUGE_ADDRESS, accrued_aero_units=10 * 10**18)
+        reads.set_status(TRACKED_TOKEN_ID, staked)
+        balances = FakeBalances()
+        runner, executor, _, state_store = make_runner(
+            tmp_path,
+            book=tracked_book(),
+            reads=reads,
+            balances=balances,
+            reward_posture=RewardPosture.RETAIN,
+        )
+        assert executor is not None
+        executor.collect_aero_units = 10 * 10**18
+
+        report = runner.run(
+            CycleMode.LIVE, key_bytes=b"\x01" * 32, reference_price_usdc=FIXTURE_AMM_PRICE
+        )
+
+        # The claim runs through the same audited surface; the swap does not.
+        assert [action.action for action in report.actions] == ["collect_rewards"]
+        assert all(action.status == "completed" for action in report.actions)
+        assert ("collect_rewards", "FIXc", TRACKED_TOKEN_ID) in executor.calls
+        assert ("aero_swap",) not in executor.calls
+        # The claimed AERO stays in the Safe as priced equity, never broadcast.
+        assert balances.aero_units == 10 * 10**18
+        assert report.reconciliation.safe_aero_units == 10 * 10**18
+        assert report.halted_reason == ""
+        saved = state_store.load()
+        assert saved.day_baseline is not None
+        assert saved.day_baseline.aero_converted_units == 0
+        stderr = capsys.readouterr().err
+        assert "AERO in the Safe" in stderr
+        assert "under the retain reward posture" in stderr
+        assert "the conversion swap did not run" in stderr
+
+    def test_the_retain_posture_preserves_existing_safe_aero_on_a_flat_book(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A flat live book's above-threshold AERO never reaches the swap.
+
+        The flat live book priced above the activation equity with idle AERO
+        worth far more than the conversion threshold is exactly the shape
+        the scheduled unit serves: under retain the act step never
+        broadcasts the conversion, the cycle completes, and the Safe keeps
+        its AERO as measured equity.
+        """
+        balances = FakeBalances(aero_units=1700 * 10**18)
+        runner, executor, _ = selector_runner(
+            tmp_path,
+            sources=SelectorCycleSources(),
+            balances=balances,
+            reward_posture=RewardPosture.RETAIN,
+        )
+        assert executor is not None
+
+        report = runner.run(
+            CycleMode.LIVE,
+            key_bytes=b"\x01" * 32,
+            reference_prices_by_symbol=SELECTOR_REFERENCES,
+        )
+
+        assert report.halted_reason == ""
+        assert report.decision_action == "hold"
+        assert report.actions == ()
+        assert executor.calls == []
+        # The existing Safe AERO is preserved and measured, not converted.
+        assert balances.aero_units == 1700 * 10**18
+        assert report.reconciliation.safe_aero_units == 1700 * 10**18
+        stderr = capsys.readouterr().err
+        assert "AERO in the Safe" in stderr
+        assert "under the retain reward posture" in stderr
+        assert "the conversion swap did not run" in stderr
 
     def test_live_cycle_holds_the_rewards_below_the_threshold(self, tmp_path: Path) -> None:
         """Unclaimed AERO under the threshold never touches the executor."""
