@@ -387,6 +387,7 @@ A dry-run form (`dry-run exit-swap`) builds and validates the same sequence with
 ### Held-position inventory and the relaxed untracked gate
 
 `safe_position_inventory` (the `inventory` action behind the cycle's reconciliation) enumerates every position NFT the Safe holds on one pool's NFPM - `balanceOf`, then `tokenOfOwnerByIndex` per index, then each position's live liquidity and owed fees - and classifies each as live or an empty residual.
+The enumeration reports its progress on the executor's stderr channel: one line after `balanceOf` naming the reported NFT count, one every twenty-five enumerated NFTs, and one completion line with the elapsed time and the live count - the request sequence itself is unchanged (one `balanceOf` plus two reads per NFT, nothing cached), so a large residual set is visible progress rather than silence.
 Accordingly, the mint and recenter gates now refuse only on LIVE untracked positions (nonzero liquidity or owed fees, named by token id in the refusal); empty residual NFTs - like the campaign Safe's leftover 5703026 - carry no exposure and no longer block entry.
 Any mid-enumeration revert refuses fail-closed as `enumeration_unreadable`.
 

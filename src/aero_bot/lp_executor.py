@@ -1752,6 +1752,7 @@ class LpLifecycleExecutor:
         safe_rpc: SafeTransactionRpcBackend,
         audit_sink: ExecutionAuditSink | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        progress: Callable[[str], None] | None = None,
         timer: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         receipt_backends: Sequence[ExecutorRpcBackend] | None = None,
@@ -1768,6 +1769,8 @@ class LpLifecycleExecutor:
             safe_rpc: The Safe read-only backend for nonces and validation.
             audit_sink: Optional append-only audit chain for attempt events.
             now: Injected clock producing timezone-aware event timestamps.
+            progress: Optional callback receiving one secret-free line per
+                long-running inventory phase, like the held-NFT enumeration.
             timer: Injected monotonic clock for duration metrics and the
                 bounded receipt wait.
             sleep: Injected delay used by bounded estimate retries and receipt
@@ -1787,6 +1790,7 @@ class LpLifecycleExecutor:
         self._safe_rpc = safe_rpc
         self._audit_sink = audit_sink
         self._now = now
+        self._progress = progress
         self._timer = timer
         self._sleep = sleep
         self._receipt_backends: tuple[ExecutorRpcBackend, ...] = (
@@ -5028,12 +5032,18 @@ class LpLifecycleExecutor:
             LpExecutionRefusalError: If any enumeration read reverts, because
                 the held inventory cannot be established honestly.
         """
+        enumeration_started = self._timer()
         try:
             held_count = self._read_word(
                 observation.nfpm_address,
                 self._erc20_balance_calldata(self._safe_address),
                 "NFPM balanceOf()",
             )
+            if self._progress is not None:
+                self._progress(
+                    f"held-position inventory: balanceOf reported {held_count} "
+                    f"NFT(s) on NFPM {observation.nfpm_address}"
+                )
             held: list[LpHeldPosition] = []
             for index in range(held_count):
                 token_id = self._read_word(
@@ -5054,6 +5064,11 @@ class LpLifecycleExecutor:
                         tokens_owed1_units=view.tokens_owed1_units,
                     )
                 )
+                if self._progress is not None and (index + 1) % 25 == 0:
+                    self._progress(
+                        f"held-position inventory: enumerated {index + 1} of "
+                        f"{held_count} NFT(s) on NFPM {observation.nfpm_address}"
+                    )
         except (ExecutorRpcRevertError, ValueError) as error:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.ENUMERATION_UNREADABLE,
@@ -5061,6 +5076,13 @@ class LpLifecycleExecutor:
                 f"{observation.nfpm_address} could not complete ({error}); the total "
                 "pilot exposure cannot be evaluated honestly, so the attempt refuses",
             ) from error
+        if self._progress is not None:
+            live_count = sum(1 for position in held if position.live)
+            self._progress(
+                f"held-position inventory: enumerated {len(held)} NFT(s) on NFPM "
+                f"{observation.nfpm_address} ({live_count} live) in "
+                f"{self._timer() - enumeration_started:.1f}s"
+            )
         return tuple(held)
 
     def _resolve_mint_context(
@@ -7501,6 +7523,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         rpc=rpc,
         safe_rpc=safe_rpc,
         audit_sink=audit_store,
+        progress=_lp_progress,
         receipt_backends=receipt_backends,
         pool_pin_store=pool_pin_store,
     )

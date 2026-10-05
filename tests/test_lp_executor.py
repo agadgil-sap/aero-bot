@@ -1026,6 +1026,7 @@ def make_lp_executor(
     audit_path: Path | None = None,
     sleep: Callable[[float], None] | None = None,
     timer: Callable[[], float] | None = None,
+    progress: Callable[[str], None] | None = None,
     receipt_script: LpRpcScript | None = None,
     pool_pin_store: LpPoolPinStore | None = None,
     now: Callable[[], datetime] | None = None,
@@ -1040,6 +1041,8 @@ def make_lp_executor(
         sleep: Optional injected delay for the execute path's bounded waits.
         timer: Optional injected monotonic clock for the execute path's
             bounded receipt wait.
+        progress: Optional progress collector for the executor's long-running
+            inventory enumeration lines.
         receipt_script: Optional second RPC script polled for receipts; when
             present it joins the receipt-backend rotation behind the primary.
         pool_pin_store: Optional pin store arming the known-pool fast path.
@@ -1093,6 +1096,7 @@ def make_lp_executor(
         audit_sink=audit_sink,
         now=now if now is not None else (lambda: BASE_NOW),
         sleep=sleep if sleep is not None else (lambda _seconds: None),
+        progress=progress,
         **({"timer": timer} if timer is not None else {}),
         receipt_backends=receipt_backends,
         pool_pin_store=pool_pin_store,
@@ -1693,6 +1697,63 @@ def test_safe_position_inventory_classifies_live_and_empty() -> None:
     empty_snapshot = empty_executor.safe_position_inventory("FIXc")
     assert empty_snapshot.live_positions == ()
     assert empty_snapshot.empty_count == 1
+
+
+def test_safe_position_inventory_reports_progress_lines() -> None:
+    """The held-NFT enumeration journals its count, cadence, and completion.
+
+    One line lands after balanceOf naming the NFT count, one every 25
+    enumerated NFTs so a 199-NFT residual sweep never looks like a stall, and
+    one completion line with the elapsed time and live count - all through
+    the injected collector and injected clock, fully offline.
+    """
+    lines: list[str] = []
+    clock = {"now": 0.0}
+
+    def stepped_timer() -> float:
+        clock["now"] += 5.0
+        return clock["now"]
+
+    executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(
+            nfpm_held_positions=51,
+            held_token_ids=list(range(900, 951)),
+            position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+        ),
+        timer=stepped_timer,
+        progress=lines.append,
+    )
+
+    snapshot = executor.safe_position_inventory("FIXc")
+
+    assert [position.token_id for position in snapshot.live_positions] == list(range(900, 951))
+    # The balanceOf count lands before any per-NFT read.
+    assert lines[0].startswith("held-position inventory: balanceOf reported 51 NFT(s) on NFPM ")
+    # One cadence line at every 25 enumerated NFTs: 25 and 50 of 51.
+    cadence = [line for line in lines if " of 51 NFT(s)" in line]
+    assert len(cadence) == 2
+    assert cadence[0].startswith("held-position inventory: enumerated 25 of 51 NFT(s)")
+    assert cadence[1].startswith("held-position inventory: enumerated 50 of 51 NFT(s)")
+    # The completion line carries the total, the live count, and the elapsed
+    # time from the injected clock.
+    assert lines[-1].startswith("held-position inventory: enumerated 51 NFT(s) on NFPM ")
+    assert "(51 live) in " in lines[-1]
+    assert lines[-1].endswith("s")
+
+    # An empty inventory still reports its shape honestly.
+    empty_lines: list[str] = []
+    empty_executor, _, _ = make_lp_executor(
+        rpc_script=LpRpcScript(nfpm_held_positions=0),
+        timer=stepped_timer,
+        progress=empty_lines.append,
+    )
+    empty_snapshot = empty_executor.safe_position_inventory("FIXc")
+    assert empty_snapshot.positions == ()
+    assert len(empty_lines) == 2
+    assert empty_lines[0].startswith(
+        "held-position inventory: balanceOf reported 0 NFT(s) on NFPM "
+    )
+    assert "(0 live) in " in empty_lines[-1]
 
 
 def test_safe_position_inventory_refuses_when_enumeration_reverts() -> None:

@@ -6485,6 +6485,7 @@ def build_cycle_runner(
         rpc=rpc,
         safe_rpc=safe_rpc,
         audit_sink=audit_store,
+        progress=progress,
         receipt_backends=receipt_backends,
         pool_pin_store=pin_store,
     )

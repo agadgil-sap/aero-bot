@@ -46,6 +46,7 @@ from aero_bot.executor import (
     LiveExecutionSources,
 )
 from aero_bot.history import (
+    MAX_HEADER_BATCH_SIZE,
     EventHistoryRpcBackend,
     HistoryUnavailableError,
     price_usdc_per_stock,
@@ -377,6 +378,7 @@ class LiveStrategySources:
         )
         self._pool_pin_store = pool_pin_store
         self._progress = progress
+        self._timer = timer
         # The bounded ranging-evidence backend is built lazily on first use
         # so decision runs that never solve a width pay no history reads.
         self._ranging_backend: EventHistoryRpcBackend | None = None
@@ -643,11 +645,15 @@ class LiveStrategySources:
             self._ranging_backend = EventHistoryRpcBackend(
                 rpc_url=self._rpc_url,
                 log_window_blocks=RANGING_READ_LOG_WINDOW_BLOCKS,
+                header_batch_size=MAX_HEADER_BATCH_SIZE,
                 transport=self._transport,
                 sleep=self._sleep,
+                progress=self._progress,
+                timer=self._timer,
             )
+        started = self._timer()
         try:
-            return build_ranging_evidence(
+            evidence = build_ranging_evidence(
                 self._ranging_backend,
                 pool,
                 snapshot_price_usdc=snapshot_price_usdc,
@@ -656,10 +662,18 @@ class LiveStrategySources:
         except HistoryUnavailableError as failure:
             if self._progress is not None:
                 self._progress(
-                    f"ranging evidence read failed for {pool.pool_address}: {failure}; "
-                    "entries and voluntary recenters defer fail-closed"
+                    f"ranging evidence read failed for {pool.pool_address} after "
+                    f"{self._timer() - started:.1f}s: {failure}; entries and "
+                    "voluntary recenters defer fail-closed"
                 )
             return None
+        if self._progress is not None:
+            self._progress(
+                f"ranging evidence for {pool.pool_address}: "
+                f"{len(evidence.trailing_path)} point(s) in "
+                f"{self._timer() - started:.1f}s"
+            )
+        return evidence
 
 
 def assemble_observation(
