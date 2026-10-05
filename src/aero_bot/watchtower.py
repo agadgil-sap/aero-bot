@@ -55,6 +55,7 @@ from typing import Annotated, Protocol, TextIO
 from pydantic import BaseModel, Field
 
 from aero_bot.alerts import (
+    AlertMode,
     AlertTransportError,
     build_alert_transport,
     compose_cycle_email,
@@ -1115,6 +1116,11 @@ def deliver_watchtower_trigger(
     except ValueError as error:
         print(f"email alerts are misconfigured: {error}", file=stream)
         return False
+    if config.mode is AlertMode.DIGEST:
+        # Digest routing suppresses watchtower trip emails too; monitoring,
+        # local logging, the audit chain's status records, and the policy
+        # cycle's own actions are all unchanged - only the email is gone.
+        return False
     transport = build_alert_transport(config)
     if transport is None:
         return False
@@ -1152,6 +1158,10 @@ def deliver_watchtower_notice(
         config = parse_alert_config(resolved_environ)
     except ValueError as error:
         print(f"email alerts are misconfigured: {error}", file=stream)
+        return False
+    if config.mode is AlertMode.DIGEST:
+        # Digest routing suppresses fail-safe notice emails the same way;
+        # the notice's evidence stays in local logs and on the audit chain.
         return False
     transport = build_alert_transport(config)
     if transport is None:

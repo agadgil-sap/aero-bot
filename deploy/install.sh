@@ -233,6 +233,10 @@ AERO_BOT_WATCHTOWER_POLL_SECONDS=5
 #AERO_BOT_ALERT_SMTP_HOST=smtp.example.com
 #AERO_BOT_ALERT_SMTP_USER=aero-bot@example.com
 #AERO_BOT_ALERT_SMTP_PASSWORD=<sealed>
+# Alert routing (see docs/alerts.md): per_cycle (default) emails every
+# cycle and trigger immediately; digest suppresses every immediate email
+# and leaves the 09:00 daily-report digest as the only one.
+#AERO_BOT_ALERT_MODE=digest
 EOF
     chown root:"${SERVICE_USER}" "${CONFIG_DIR}/cycle.env"
     chmod 0640 "${CONFIG_DIR}/cycle.env"
@@ -242,7 +246,9 @@ if [[ ! -f "${CONFIG_DIR}/daily-report.env" ]]; then
 # Aero Bot daily-report environment - seal real values here (mode 0640).
 # The daily-report unit overlays this onto cycle.env: the Resend transport
 # (see docs/alerts.md) and the reporting recipient live here, while the
-# cycle's own alert routing stays in cycle.env.
+# cycle's own alert routing stays in cycle.env. The unit's --daily-digest
+# flag composes the prior 24 hours into this one email; seal
+# AERO_BOT_ALERT_MODE=digest in cycle.env to suppress every other path.
 #AERO_BOT_ALERT_PROVIDER=resend
 #AERO_BOT_ALERT_RESEND_API_KEY=<sealed>
 #AERO_BOT_ALERT_TO=capn@example.com

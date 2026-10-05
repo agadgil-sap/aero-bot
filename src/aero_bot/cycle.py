@@ -6709,6 +6709,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--daily-digest",
+        action="store_true",
+        help=(
+            "Replace this run's per-cycle email with the daily digest: one "
+            "bounded summary of the prior 24 hours of audit history - "
+            "trading, actions, rewards, failures, and the student's latest "
+            "advice with its provenance - sent through the same sealed "
+            "transport. The daily-report unit carries this flag; pair it "
+            "with AERO_BOT_ALERT_MODE=digest so no other email path fires."
+        ),
+    )
+    parser.add_argument(
         "--stock-dust-floor-usdc",
         type=Decimal,
         default=None,
@@ -7034,7 +7046,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     # cycle's report and exit code stand on their own.
     from aero_bot.alerts import deliver_cycle_alerts
 
-    deliver_cycle_alerts(report)
+    if arguments.daily_digest:
+        from aero_bot.digest import deliver_daily_digest
+
+        deliver_daily_digest(
+            AuditStore(settings.audit_database_path),
+            now=datetime.now(UTC),
+        )
+    else:
+        deliver_cycle_alerts(report)
     if report.halted_reason:
         if report.reconciliation.out_of_band or any(
             action.status == "refused" for action in report.actions

@@ -27,7 +27,11 @@ ReadWritePaths=/var/lib/aero-bot
 # A dry cycle on a cold pool pin can pay one full Sugar sweep; the live
 # 1800 s ceiling keeps the report from timing out mid-enumeration.
 TimeoutStartSec=1800
-ExecStart=/opt/aero-bot/.venv/bin/aero-bot-cycle --symbol auto --dry-run --json
+# The digest flag replaces this run's per-cycle email with the daily
+# digest: the prior 24 hours of audit history in one bounded email. Pair
+# with AERO_BOT_ALERT_MODE=digest in the sealed cycle environment so no
+# other email path fires (the captain's 2026-10-05 ruling).
+ExecStart=/opt/aero-bot/.venv/bin/aero-bot-cycle --symbol auto --dry-run --json --daily-digest
 # A failed report retries on the next daily tick; the cycle's own email
 # hook stays the operational signal.
 Restart=no
