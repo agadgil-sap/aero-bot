@@ -5033,6 +5033,7 @@ class LpLifecycleExecutor:
                 the held inventory cannot be established honestly.
         """
         enumeration_started = self._timer()
+        requests = 1
         try:
             held_count = self._read_word(
                 observation.nfpm_address,
@@ -5044,18 +5045,35 @@ class LpLifecycleExecutor:
                     f"held-position inventory: balanceOf reported {held_count} "
                     f"NFT(s) on NFPM {observation.nfpm_address}"
                 )
-            held: list[LpHeldPosition] = []
-            for index in range(held_count):
-                token_id = self._read_word(
+            # The per-token reads ride one JSON-RPC batch per chunk of the
+            # backend's live batch size, so the residual inventory costs one
+            # request per chunk instead of one per token; every entry is the
+            # same authoritative live view the sequential path read, and a
+            # reverting entry refuses exactly like the sequential call did.
+            # Each pass's request count mirrors the group read's own chunk
+            # arithmetic at the same live bound, so the completion line names
+            # the batches each pass actually fired.
+            token_id_calls = [
+                (
                     observation.nfpm_address,
                     self._erc721_token_of_owner_by_index_calldata(self._safe_address, index),
-                    "tokenOfOwnerByIndex(address,uint256)",
                 )
-                view = decode_lp_positions_view(
-                    self._rpc.eth_call(
-                        observation.nfpm_address, build_lp_positions_read_calldata(token_id)
-                    )
-                )
+                for index in range(held_count)
+            ]
+            requests += -(-len(token_id_calls) // max(1, self._rpc.call_batch_size))
+            token_ids = [
+                self._decode_word_result(result, "tokenOfOwnerByIndex(address,uint256)")
+                for result in self._rpc.eth_call_group_at(token_id_calls, "latest")
+            ]
+            position_calls = [
+                (observation.nfpm_address, build_lp_positions_read_calldata(token_id))
+                for token_id in token_ids
+            ]
+            requests += -(-len(position_calls) // max(1, self._rpc.call_batch_size))
+            position_results = self._rpc.eth_call_group_at(position_calls, "latest")
+            held: list[LpHeldPosition] = []
+            for token_id, result in zip(token_ids, position_results, strict=True):
+                view = decode_lp_positions_view(result)
                 held.append(
                     LpHeldPosition(
                         token_id=token_id,
@@ -5064,9 +5082,9 @@ class LpLifecycleExecutor:
                         tokens_owed1_units=view.tokens_owed1_units,
                     )
                 )
-                if self._progress is not None and (index + 1) % 25 == 0:
+                if self._progress is not None and len(held) % 25 == 0:
                     self._progress(
-                        f"held-position inventory: enumerated {index + 1} of "
+                        f"held-position inventory: enumerated {len(held)} of "
                         f"{held_count} NFT(s) on NFPM {observation.nfpm_address}"
                     )
         except (ExecutorRpcRevertError, ValueError) as error:
@@ -5081,7 +5099,7 @@ class LpLifecycleExecutor:
             self._progress(
                 f"held-position inventory: enumerated {len(held)} NFT(s) on NFPM "
                 f"{observation.nfpm_address} ({live_count} live) in "
-                f"{self._timer() - enumeration_started:.1f}s"
+                f"{self._timer() - enumeration_started:.1f}s through {requests} request(s)"
             )
         return tuple(held)
 
@@ -5427,16 +5445,32 @@ class LpLifecycleExecutor:
             return rpc.eth_call_at(contract_address, calldata, block_tag)
 
         pool_address = pin.pool_address
-        token0 = decode_address_view_result(read(pool_address, build_pool_token0_read_calldata()))
-        token1 = decode_address_view_result(read(pool_address, build_pool_token1_read_calldata()))
-        tick_spacing = decode_uint_view_result(
-            read(pool_address, build_pool_tick_spacing_read_calldata())
+        # Every identity and state view addresses contracts named by the
+        # verified pin, so they resolve as one batched pass; only the NFPM
+        # (from the gauge factory's own answer) depends on an earlier read.
+        batched = rpc.eth_call_group_at(
+            [
+                (pool_address, build_pool_token0_read_calldata()),
+                (pool_address, build_pool_token1_read_calldata()),
+                (pool_address, build_pool_tick_spacing_read_calldata()),
+                (pool_address, build_pool_gauge_read_calldata()),
+                (pool_address, build_pool_factory_read_calldata()),
+                (pin.gauge_address, build_gauge_gauge_factory_read_calldata()),
+                (pool_address, build_pool_slot0_read_calldata()),
+                (pool_address, build_pool_liquidity_read_calldata()),
+                (pool_address, build_pool_staked_liquidity_read_calldata()),
+                (BASE_USDC_ADDRESS, self._erc20_balance_calldata(pool_address)),
+                (pin.gauge_address, build_gauge_reward_token_read_calldata()),
+                (pin.gauge_address, build_gauge_reward_rate_read_calldata()),
+            ],
+            block_tag,
         )
-        gauge = decode_address_view_result(read(pool_address, build_pool_gauge_read_calldata()))
-        factory = decode_address_view_result(read(pool_address, build_pool_factory_read_calldata()))
-        gauge_factory = decode_address_view_result(
-            read(pin.gauge_address, build_gauge_gauge_factory_read_calldata())
-        )
+        token0 = decode_address_view_result(batched[0])
+        token1 = decode_address_view_result(batched[1])
+        tick_spacing = decode_uint_view_result(batched[2])
+        gauge = decode_address_view_result(batched[3])
+        factory = decode_address_view_result(batched[4])
+        gauge_factory = decode_address_view_result(batched[5])
         nfpm = decode_address_view_result(
             read(gauge_factory, build_gauge_factory_nft_read_calldata())
         )
@@ -5457,24 +5491,12 @@ class LpLifecycleExecutor:
                 f"with registry stock {listing_stock}; falling back to full discovery"
             )
         stock_is_token0 = token0 == listing_stock
-        sqrt_ratio, current_tick = decode_pool_slot0_view(
-            read(pool_address, build_pool_slot0_read_calldata())
-        )
-        pool_active_liquidity = decode_uint_view_result(
-            read(pool_address, build_pool_liquidity_read_calldata())
-        )
-        gauge_liquidity = decode_uint_view_result(
-            read(pool_address, build_pool_staked_liquidity_read_calldata())
-        )
-        usdc_reserve = decode_uint_view_result(
-            read(BASE_USDC_ADDRESS, self._erc20_balance_calldata(pool_address))
-        )
-        emissions_token = decode_address_view_result(
-            read(pin.gauge_address, build_gauge_reward_token_read_calldata())
-        )
-        emissions_per_second = decode_uint_view_result(
-            read(pin.gauge_address, build_gauge_reward_rate_read_calldata())
-        )
+        sqrt_ratio, current_tick = decode_pool_slot0_view(batched[6])
+        pool_active_liquidity = decode_uint_view_result(batched[7])
+        gauge_liquidity = decode_uint_view_result(batched[8])
+        usdc_reserve = decode_uint_view_result(batched[9])
+        emissions_token = decode_address_view_result(batched[10])
+        emissions_per_second = decode_uint_view_result(batched[11])
         return LpPoolObservation(
             symbol=listing.symbol,
             pool_address=pool_address,
@@ -6224,6 +6246,22 @@ class LpLifecycleExecutor:
             ExecutionUnavailableError: If the return is not one full word.
         """
         result = self._rpc.eth_call_at(to_address, calldata, block_tag)
+        return self._decode_word_result(result, source)
+
+    @staticmethod
+    def _decode_word_result(result: str, source: str) -> int:
+        """Decode one 32-byte word result or refuse it as unreadable.
+
+        Args:
+            result: The 0x-prefixed return bytes of one word-returning call.
+            source: Human label naming the call in diagnostics.
+
+        Returns:
+            The decoded unsigned integer.
+
+        Raises:
+            ExecutionUnavailableError: If the return is not one full word.
+        """
         if not result.startswith("0x") or len(result) != 2 + 64:
             raise ExecutionUnavailableError(
                 f"{source} returned {max(len(result) - 2, 0)} bytes instead of 32"

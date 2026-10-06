@@ -11,7 +11,7 @@ handful of block-pinned views and never enumerates at all.
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import httpx
 import pytest
@@ -202,6 +202,23 @@ class KnownPoolRpcScript:
 
         def handle(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content.decode())
+            if isinstance(body, list):
+                entries: list[dict[str, object]] = []
+                for call in body:
+                    if str(call["method"]) != "eth_call":
+                        raise AssertionError(f"unexpected batched method {call['method']}")
+                    params = call["params"][0]
+                    to_address = str(params["to"]).lower()
+                    data = str(params["data"])
+                    script.calls.append((to_address, data[:10]))
+                    entries.append(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": call["id"],
+                            "result": script._eth_call(to_address, data),
+                        }
+                    )
+                return httpx.Response(200, json=entries)
             if body["method"] == "eth_blockNumber":
                 return httpx.Response(
                     200, json={"jsonrpc": "2.0", "id": 1, "result": hex(FAST_BLOCK_NUMBER)}
@@ -713,3 +730,59 @@ class TestSugarPageDefault:
 def test_known_pool_source_label_is_stable() -> None:
     """The fast path's source label is a pinned constant."""
     assert KNOWN_POOL_SOURCE == "known-pool-fast-path"
+
+
+class _CountingMockTransport(httpx.MockTransport):
+    """Count every HTTP request a scripted transport serves, batch or single."""
+
+    def __init__(self, inner: httpx.MockTransport) -> None:
+        """Wrap one scripted transport with per-request counting."""
+        self._inner = inner
+        self.count = 0
+        super().__init__(self._handle)
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        self.count += 1
+        return cast("httpx.Response", self._inner.handler(request))
+
+
+def test_fast_path_reads_batched_and_match_the_sequential_wire_shape() -> None:
+    """The fast path reads one batched pass without changing its verification.
+
+    The pre-batching wire shape spent nineteen sequential eth_calls per pool
+    (x10 board pools, the journal's four-to-six-minute board phase in the
+    degraded latency regime). The batched shape reads the same views through
+    six requests - one blockNumber, one identity batch, the dependent NFPM
+    read, one state-and-factory batch, the dependent liveness read, and one
+    reserves batch - and a forced downgrade (batch size one) resolves the
+    identical candidate through the sequential shape.
+    """
+    batched_script = KnownPoolRpcScript()
+    counting = _CountingMockTransport(batched_script.transport())
+    batched_rpc = ExecutorRpcBackend(
+        rpc_url="https://fixture.example",
+        transport=counting,
+        sleep=lambda _seconds: None,
+        timer=lambda: 0.0,
+    )
+    batched_candidate, batched_block = resolve_known_pool_candidate(
+        batched_rpc, make_pin(), make_listing(), aerodrome_contract_evidence()
+    )
+
+    assert counting.count == 6
+    sequential_script = KnownPoolRpcScript()
+    sequential_rpc = ExecutorRpcBackend(
+        rpc_url="https://fixture.example",
+        transport=sequential_script.transport(),
+        sleep=lambda _seconds: None,
+        timer=lambda: 0.0,
+    )
+    sequential_rpc._call_batch_size = 1  # noqa: SLF001 - force the sequential shape
+    sequential_candidate, sequential_block = resolve_known_pool_candidate(
+        sequential_rpc, make_pin(), make_listing(), aerodrome_contract_evidence()
+    )
+
+    assert batched_candidate == sequential_candidate
+    assert batched_block == sequential_block == FAST_BLOCK_NUMBER
+    # Both wire shapes read exactly the same logical views.
+    assert batched_script.calls == sequential_script.calls

@@ -35,6 +35,7 @@ everything the slow way and refreshes the pin. The store is a cache,
 never a trust root, so the fast path can only ever cost speed.
 """
 
+from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
@@ -87,6 +88,10 @@ class ExecutorRpcBackendReader(Protocol):
 
     def eth_call_at(self, to_address: str, calldata: str, block_tag: str) -> str:
         """Perform one read-only eth_call pinned to an explicit block tag."""
+        ...
+
+    def eth_call_group_at(self, calls: Sequence[tuple[str, str]], block_tag: str) -> list[str]:
+        """Read one group of independent eth_calls at one block tag."""
         ...
 
 
@@ -185,16 +190,33 @@ def resolve_known_pool_candidate(
         return rpc.eth_call_at(contract_address, calldata, block_tag)
 
     pool_address = pin.pool_address
-    token0 = decode_address_view_result(read(pool_address, build_pool_token0_read_calldata()))
-    token1 = decode_address_view_result(read(pool_address, build_pool_token1_read_calldata()))
-    tick_spacing = decode_uint_view_result(
-        read(pool_address, build_pool_tick_spacing_read_calldata())
-    )
-    gauge = decode_address_view_result(read(pool_address, build_pool_gauge_read_calldata()))
-    factory = decode_address_view_result(read(pool_address, build_pool_factory_read_calldata()))
-    gauge_factory = decode_address_view_result(
-        read(pin.gauge_address, build_gauge_gauge_factory_read_calldata())
-    )
+    # The identity, pool-state, factory, gauge, and reserve views address
+    # contracts named by the verified pin, so they resolve as independent
+    # reads in one batched pass; only the NFPM (from the gauge factory) and
+    # the liveness verdict (from the factory's Voter) depend on earlier
+    # results and follow in a second pass.
+    identity_calls: list[tuple[str, str]] = [
+        (pool_address, build_pool_token0_read_calldata()),
+        (pool_address, build_pool_token1_read_calldata()),
+        (pool_address, build_pool_tick_spacing_read_calldata()),
+        (pool_address, build_pool_gauge_read_calldata()),
+        (pool_address, build_pool_factory_read_calldata()),
+        (pin.gauge_address, build_gauge_gauge_factory_read_calldata()),
+    ]
+    state_calls: list[tuple[str, str]] = [
+        (pin.gauge_address, build_gauge_reward_token_read_calldata()),
+        (pin.gauge_address, build_gauge_reward_rate_read_calldata()),
+        (pool_address, build_pool_slot0_read_calldata()),
+        (pool_address, build_pool_liquidity_read_calldata()),
+        (pool_address, build_pool_staked_liquidity_read_calldata()),
+    ]
+    identity_results = rpc.eth_call_group_at(identity_calls, block_tag)
+    token0 = decode_address_view_result(identity_results[0])
+    token1 = decode_address_view_result(identity_results[1])
+    tick_spacing = decode_uint_view_result(identity_results[2])
+    gauge = decode_address_view_result(identity_results[3])
+    factory = decode_address_view_result(identity_results[4])
+    gauge_factory = decode_address_view_result(identity_results[5])
     nfpm = decode_address_view_result(read(gauge_factory, build_gauge_factory_nft_read_calldata()))
 
     listing_stock = listing.address.lower()
@@ -237,57 +259,50 @@ def resolve_known_pool_candidate(
             f"the live pool {pool_address} reports factory {factory} outside the "
             "official Slipstream allowlist"
         )
-    if not decode_boolean_view_result(
-        read(factory, build_factory_is_pool_read_calldata(pool_address))
-    ):
+    factory_calls: list[tuple[str, str]] = [
+        (factory, build_factory_is_pool_read_calldata(pool_address)),
+        (factory, build_factory_voter_read_calldata()),
+        (factory, build_factory_get_swap_fee_read_calldata(pool_address)),
+        (factory, build_factory_get_unstaked_fee_read_calldata(pool_address)),
+    ]
+    batched = rpc.eth_call_group_at([*state_calls, *factory_calls], block_tag)
+    emissions_token = decode_address_view_result(batched[0])
+    emissions_per_second = decode_uint_view_result(batched[1])
+    sqrt_ratio, current_tick = decode_pool_slot0_view(batched[2])
+    pool_active_liquidity = decode_uint_view_result(batched[3])
+    gauge_liquidity = decode_uint_view_result(batched[4])
+    if not decode_boolean_view_result(batched[5]):
         raise ValueError(f"the factory {factory} does not claim the pool {pool_address} as its own")
 
     # The gauge kill switch is read through the factory's own Voter.
-    voter = decode_address_view_result(read(factory, build_factory_voter_read_calldata()))
+    voter = decode_address_view_result(batched[6])
     gauge_alive = decode_boolean_view_result(
         read(voter, build_voter_is_alive_read_calldata(pin.gauge_address))
     )
     if not gauge_alive:
         raise ValueError(f"the gauge {pin.gauge_address} for {listing.symbol} is not alive")
 
-    emissions_token = decode_address_view_result(
-        read(pin.gauge_address, build_gauge_reward_token_read_calldata())
-    )
-    emissions_per_second = decode_uint_view_result(
-        read(pin.gauge_address, build_gauge_reward_rate_read_calldata())
-    )
     if emissions_per_second <= 0 or emissions_token != contracts.reward_token_address.lower():
         raise ValueError(
             f"the gauge {pin.gauge_address} for {listing.symbol} is not emitting "
             "official AERO rewards"
         )
 
-    sqrt_ratio, current_tick = decode_pool_slot0_view(
-        read(pool_address, build_pool_slot0_read_calldata())
-    )
-    pool_active_liquidity = decode_uint_view_result(
-        read(pool_address, build_pool_liquidity_read_calldata())
-    )
-    gauge_liquidity = decode_uint_view_result(
-        read(pool_address, build_pool_staked_liquidity_read_calldata())
-    )
+    reserve_calls: list[tuple[str, str]] = [
+        (token0, build_erc20_balance_of_read_calldata(pool_address)),
+        (token1, build_erc20_balance_of_read_calldata(pool_address)),
+    ]
+    reserves = rpc.eth_call_group_at(reserve_calls, block_tag)
+
     staked0, staked1 = staked_sides_for_gauge_liquidity(
         sqrt_ratio, current_tick, tick_spacing, gauge_liquidity
     )
 
-    pool_fee_ppm = decode_uint_view_result(
-        read(factory, build_factory_get_swap_fee_read_calldata(pool_address))
-    )
-    unstaked_fee_ppm = decode_uint_view_result(
-        read(factory, build_factory_get_unstaked_fee_read_calldata(pool_address))
-    )
+    pool_fee_ppm = decode_uint_view_result(batched[7])
+    unstaked_fee_ppm = decode_uint_view_result(batched[8])
 
-    reserve0 = decode_uint_view_result(
-        read(token0, build_erc20_balance_of_read_calldata(pool_address))
-    )
-    reserve1 = decode_uint_view_result(
-        read(token1, build_erc20_balance_of_read_calldata(pool_address))
-    )
+    reserve0 = decode_uint_view_result(reserves[0])
+    reserve1 = decode_uint_view_result(reserves[1])
 
     candidate = PoolCandidate(
         pool_address=EvmAddress(pool_address),
