@@ -158,9 +158,10 @@ BASE_BACKOFF_SECONDS = 0.5
 # at most four seconds while a tripped limiter costs eight per request.
 REQUEST_PACING_SECONDS = 0.2
 # Read-only eth_calls grouped into one JSON-RPC batch request. Ten is the
-# batch bound the sealed production endpoint has already been observed to
-# accept live for block-header batches (the PR45 verification), and batched
-# reads pay one politeness gap per batch instead of one per call.
+# batch bound the public Base endpoint has already been observed to accept
+# live for block-header batches (the PR45 verification; the sealed endpoint
+# stays unverified until the sanctioned dry run), and batched reads pay one
+# politeness gap per batch instead of one per call.
 MAX_CALL_BATCH_SIZE = 10
 # One MiB bounds every response far above the fixed-word calls made here.
 MAX_RESPONSE_BYTES = 1024 * 1024
