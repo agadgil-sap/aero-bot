@@ -90,13 +90,8 @@ class ExecutorRpcBackendReader(Protocol):
         """Perform one read-only eth_call pinned to an explicit block tag."""
         ...
 
-    def eth_call_batch_at(self, calls: Sequence[tuple[str, str]], block_tag: str) -> list[str]:
-        """Perform one JSON-RPC batch of read-only eth_calls at one block tag."""
-        ...
-
-    @property
-    def call_batch_size(self) -> int:
-        """Return the live batch size for read-only calls."""
+    def eth_call_group_at(self, calls: Sequence[tuple[str, str]], block_tag: str) -> list[str]:
+        """Read one group of independent eth_calls at one block tag."""
         ...
 
 
@@ -194,23 +189,6 @@ def resolve_known_pool_candidate(
     def read(contract_address: str, calldata: str) -> str:
         return rpc.eth_call_at(contract_address, calldata, block_tag)
 
-    def read_batch(calls: Sequence[tuple[str, str]]) -> list[str]:
-        """Read one chunk of independent views at the pinned block.
-
-        The chunk size follows the backend's live batch bound, so an
-        endpoint that rejected batches degrades to the sequential wire
-        shape with the same views and the same verification.
-        """
-        chunk_size = max(1, rpc.call_batch_size)
-        results: list[str] = []
-        for chunk_start in range(0, len(calls), chunk_size):
-            results.extend(
-                rpc.eth_call_batch_at(
-                    list(calls[chunk_start : chunk_start + chunk_size]), block_tag
-                )
-            )
-        return results
-
     pool_address = pin.pool_address
     # The identity, pool-state, factory, gauge, and reserve views address
     # contracts named by the verified pin, so they resolve as independent
@@ -232,7 +210,7 @@ def resolve_known_pool_candidate(
         (pool_address, build_pool_liquidity_read_calldata()),
         (pool_address, build_pool_staked_liquidity_read_calldata()),
     ]
-    identity_results = read_batch(identity_calls)
+    identity_results = rpc.eth_call_group_at(identity_calls, block_tag)
     token0 = decode_address_view_result(identity_results[0])
     token1 = decode_address_view_result(identity_results[1])
     tick_spacing = decode_uint_view_result(identity_results[2])
@@ -287,7 +265,7 @@ def resolve_known_pool_candidate(
         (factory, build_factory_get_swap_fee_read_calldata(pool_address)),
         (factory, build_factory_get_unstaked_fee_read_calldata(pool_address)),
     ]
-    batched = read_batch([*state_calls, *factory_calls])
+    batched = rpc.eth_call_group_at([*state_calls, *factory_calls], block_tag)
     emissions_token = decode_address_view_result(batched[0])
     emissions_per_second = decode_uint_view_result(batched[1])
     sqrt_ratio, current_tick = decode_pool_slot0_view(batched[2])
@@ -314,7 +292,7 @@ def resolve_known_pool_candidate(
         (token0, build_erc20_balance_of_read_calldata(pool_address)),
         (token1, build_erc20_balance_of_read_calldata(pool_address)),
     ]
-    reserves = read_batch(reserve_calls)
+    reserves = rpc.eth_call_group_at(reserve_calls, block_tag)
 
     staked0, staked1 = staked_sides_for_gauge_liquidity(
         sqrt_ratio, current_tick, tick_spacing, gauge_liquidity

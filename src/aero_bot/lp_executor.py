@@ -5050,52 +5050,43 @@ class LpLifecycleExecutor:
             # request per chunk instead of one per token; every entry is the
             # same authoritative live view the sequential path read, and a
             # reverting entry refuses exactly like the sequential call did.
-            batch_size = max(1, self._rpc.call_batch_size)
-            token_ids: list[int] = []
-            for chunk_start in range(0, held_count, batch_size):
-                chunk_results = self._rpc.eth_call_batch_at(
-                    [
-                        (
-                            observation.nfpm_address,
-                            self._erc721_token_of_owner_by_index_calldata(
-                                self._safe_address, index
-                            ),
-                        )
-                        for index in range(chunk_start, min(chunk_start + batch_size, held_count))
-                    ],
-                    "latest",
+            # Each pass's request count mirrors the group read's own chunk
+            # arithmetic at the same live bound, so the completion line names
+            # the batches each pass actually fired.
+            token_id_calls = [
+                (
+                    observation.nfpm_address,
+                    self._erc721_token_of_owner_by_index_calldata(self._safe_address, index),
                 )
-                requests += 1
-                token_ids.extend(
-                    self._decode_word_result(result, "tokenOfOwnerByIndex(address,uint256)")
-                    for result in chunk_results
-                )
+                for index in range(held_count)
+            ]
+            requests += -(-len(token_id_calls) // max(1, self._rpc.call_batch_size))
+            token_ids = [
+                self._decode_word_result(result, "tokenOfOwnerByIndex(address,uint256)")
+                for result in self._rpc.eth_call_group_at(token_id_calls, "latest")
+            ]
+            position_calls = [
+                (observation.nfpm_address, build_lp_positions_read_calldata(token_id))
+                for token_id in token_ids
+            ]
+            requests += -(-len(position_calls) // max(1, self._rpc.call_batch_size))
+            position_results = self._rpc.eth_call_group_at(position_calls, "latest")
             held: list[LpHeldPosition] = []
-            for chunk_start in range(0, len(token_ids), batch_size):
-                chunk = token_ids[chunk_start : chunk_start + batch_size]
-                chunk_results = self._rpc.eth_call_batch_at(
-                    [
-                        (observation.nfpm_address, build_lp_positions_read_calldata(token_id))
-                        for token_id in chunk
-                    ],
-                    "latest",
-                )
-                requests += 1
-                for token_id, result in zip(chunk, chunk_results, strict=True):
-                    view = decode_lp_positions_view(result)
-                    held.append(
-                        LpHeldPosition(
-                            token_id=token_id,
-                            liquidity=view.liquidity,
-                            tokens_owed0_units=view.tokens_owed0_units,
-                            tokens_owed1_units=view.tokens_owed1_units,
-                        )
+            for token_id, result in zip(token_ids, position_results, strict=True):
+                view = decode_lp_positions_view(result)
+                held.append(
+                    LpHeldPosition(
+                        token_id=token_id,
+                        liquidity=view.liquidity,
+                        tokens_owed0_units=view.tokens_owed0_units,
+                        tokens_owed1_units=view.tokens_owed1_units,
                     )
-                    if self._progress is not None and len(held) % 25 == 0:
-                        self._progress(
-                            f"held-position inventory: enumerated {len(held)} of "
-                            f"{held_count} NFT(s) on NFPM {observation.nfpm_address}"
-                        )
+                )
+                if self._progress is not None and len(held) % 25 == 0:
+                    self._progress(
+                        f"held-position inventory: enumerated {len(held)} of "
+                        f"{held_count} NFT(s) on NFPM {observation.nfpm_address}"
+                    )
         except (ExecutorRpcRevertError, ValueError) as error:
             raise LpExecutionRefusalError(
                 LpExecutionRefusalCode.ENUMERATION_UNREADABLE,
@@ -5453,23 +5444,11 @@ class LpLifecycleExecutor:
         def read(contract_address: str, calldata: str) -> str:
             return rpc.eth_call_at(contract_address, calldata, block_tag)
 
-        def read_batch(calls: Sequence[tuple[str, str]]) -> list[str]:
-            """Read one chunked group of independent views at the pinned block."""
-            chunk_size = max(1, rpc.call_batch_size)
-            results: list[str] = []
-            for chunk_start in range(0, len(calls), chunk_size):
-                results.extend(
-                    rpc.eth_call_batch_at(
-                        list(calls[chunk_start : chunk_start + chunk_size]), block_tag
-                    )
-                )
-            return results
-
         pool_address = pin.pool_address
         # Every identity and state view addresses contracts named by the
         # verified pin, so they resolve as one batched pass; only the NFPM
         # (from the gauge factory's own answer) depends on an earlier read.
-        batched = read_batch(
+        batched = rpc.eth_call_group_at(
             [
                 (pool_address, build_pool_token0_read_calldata()),
                 (pool_address, build_pool_token1_read_calldata()),
@@ -5483,7 +5462,8 @@ class LpLifecycleExecutor:
                 (BASE_USDC_ADDRESS, self._erc20_balance_calldata(pool_address)),
                 (pin.gauge_address, build_gauge_reward_token_read_calldata()),
                 (pin.gauge_address, build_gauge_reward_rate_read_calldata()),
-            ]
+            ],
+            block_tag,
         )
         token0 = decode_address_view_result(batched[0])
         token1 = decode_address_view_result(batched[1])

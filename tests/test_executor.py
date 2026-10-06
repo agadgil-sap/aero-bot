@@ -1000,6 +1000,35 @@ def test_rpc_batch_garbage_shapes_fail_closed() -> None:
         )
 
 
+def test_rpc_group_reads_chunk_at_the_live_batch_bound() -> None:
+    """One group of any length rides batches of the live bound.
+
+    A group longer than the batch bound splits into bounded batches and an
+    empty group costs no request at all; a downgraded backend rides the
+    sequential wire shape through the same group entry point.
+    """
+    transport = BatchedCallTransport([_word(index) for index in range(10)])
+    backend = ExecutorRpcBackend(
+        rpc_url="https://fixture.example", transport=transport, sleep=lambda _: None
+    )
+    calls = [("0x" + "aa" * 20, "0x11111111")] * 25
+    results = backend.eth_call_group_at(calls, "latest")
+    # Each chunk's entries carry fresh per-batch ids, so every chunk answers
+    # with the transport's scripted words from the first index in order.
+    expected = [_word(index) for index in range(10)] * 2 + [_word(index) for index in range(5)]
+    assert results == expected
+    assert transport.served_batches == [10, 10, 5]
+    assert transport.single_requests == 0
+    assert backend.eth_call_group_at([], "latest") == []
+    assert transport.batch_requests == 3
+
+    backend._call_batch_size = 1  # noqa: SLF001 - force the sequential shape
+    downgraded = backend.eth_call_group_at(calls[:3], "latest")
+    assert downgraded == [_word(index) for index in range(3)]
+    assert transport.batch_requests == 3
+    assert transport.single_requests == 3
+
+
 def test_rpc_backend_fails_closed_on_garbage_responses() -> None:
     """Malformed quantities, short words, and unknown errors fail closed."""
 

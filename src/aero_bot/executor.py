@@ -1274,6 +1274,40 @@ class ExecutorRpcBackend:
             f"RPC eth_call batch failed after {self._max_attempts} attempts: {failure}"
         )
 
+    def eth_call_group_at(self, calls: Sequence[tuple[str, str]], block_tag: str) -> list[str]:
+        """Read one group of independent eth_calls at a pinned block.
+
+        The group splits into chunks of the backend's live batch bound and
+        rides ``eth_call_batch_at`` chunk by chunk, so every caller hands
+        over one pass's independent views at once while the wire keeps its
+        bounded shape; a backend whose endpoint rejected batches rides the
+        sequential wire shape through the same reads.
+
+        Args:
+            calls: (contract address, calldata) pairs in response order; the
+                group may be empty or of any length.
+            block_tag: The block tag every call in the group evaluates
+                against, a hex quantity like ``0x30a9973`` or ``latest``.
+
+        Returns:
+            The 0x-prefixed return bytes aligned with the request order.
+
+        Raises:
+            ExecutionUnavailableError: If retries are exhausted or a
+                response is unusable.
+            ExecutorRpcRevertError: If any batched call reverted inside its
+                contract, exactly like the single-call path.
+        """
+        results: list[str] = []
+        chunk_size = max(1, self._call_batch_size)
+        for chunk_start in range(0, len(calls), chunk_size):
+            results.extend(
+                self.eth_call_batch_at(
+                    list(calls[chunk_start : chunk_start + chunk_size]), block_tag
+                )
+            )
+        return results
+
     def eth_call_from_at(
         self,
         from_address: str,
