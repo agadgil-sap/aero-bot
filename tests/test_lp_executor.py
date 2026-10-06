@@ -7,7 +7,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal, localcontext
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 import httpx
@@ -65,6 +65,7 @@ from aero_bot.lp_plan import (
     BalancingSwapDirection,
     LpExecutionPolicy,
     LpPlanRefusalError,
+    LpPoolObservation,
     position_amounts_at_sqrt_ratio,
 )
 from aero_bot.registry import B20AssetListing, B20RegistryResult, RegistryStatus
@@ -600,6 +601,7 @@ class LpRpcScript:
         self.broadcasts: list[str] = []
         self.estimate_requests: list[str] = []
         self.position_view_reads = 0
+        self.batch_calls: list[list[dict[str, object]]] = []
         self.allow_broadcasts = allow_broadcasts
         self.send_http_status = send_http_status
         self.relayer_eth_wei = relayer_eth_wei
@@ -641,7 +643,47 @@ class LpRpcScript:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         """Answer one JSON-RPC request from the scripted state."""
-        call = json.loads(request.content)
+        payload = json.loads(request.content)
+        if isinstance(payload, list):
+            return self._handle_batch(payload)
+        return self._handle_single(payload)
+
+    def _handle_batch(self, payload: list[dict[str, object]]) -> httpx.Response:
+        """Answer one JSON-RPC batch of read-only eth_calls entry by entry.
+
+        Each entry resolves through the same scripted eth_call logic as the
+        single-call path, so batched and sequential reads observe identical
+        fixture state; a reverting entry fails alone with its own id.
+        """
+        self.batch_calls.append(payload)
+        entries: list[dict[str, object]] = []
+        for call in payload:
+            call_id = int(str(call["id"]))
+            method = str(call["method"])
+            params = cast("list[dict[str, object]]", call["params"])
+            if method != "eth_call":
+                raise AssertionError(f"unexpected LP batched RPC method {method}")
+            block_tag = str(params[1]) if len(params) > 1 else "latest"
+            try:
+                result: object = self._eth_call(
+                    str(params[0]["to"]).lower(),
+                    str(params[0]["data"]),
+                    block_tag,
+                )
+            except _ScriptedRevertError as revert:
+                entries.append(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": call_id,
+                        "error": {"code": 3, "message": f"execution reverted: {revert}"},
+                    }
+                )
+            else:
+                entries.append({"jsonrpc": "2.0", "id": call_id, "result": result})
+        return httpx.Response(200, json=entries)
+
+    def _handle_single(self, call: dict[str, Any]) -> httpx.Response:
+        """Answer one single JSON-RPC request from the scripted state."""
         method = str(call["method"])
         params = call["params"]
         result: object
@@ -1738,7 +1780,10 @@ def test_safe_position_inventory_reports_progress_lines() -> None:
     # time from the injected clock.
     assert lines[-1].startswith("held-position inventory: enumerated 51 NFT(s) on NFPM ")
     assert "(51 live) in " in lines[-1]
-    assert lines[-1].endswith("s")
+    # The completion line also names the request count: one balanceOf plus two
+    # batched passes (tokenOfOwnerByIndex then positions) at ten per batch -
+    # the bounded batching that keeps the residual scan inside the cycle budget.
+    assert lines[-1].endswith("through 13 request(s)")
 
     # An empty inventory still reports its shape honestly.
     empty_lines: list[str] = []
@@ -1766,6 +1811,158 @@ def test_safe_position_inventory_refuses_when_enumeration_reverts() -> None:
         executor.safe_position_inventory("FIXc")
 
     assert raised.value.code is LpExecutionRefusalCode.ENUMERATION_UNREADABLE
+
+
+class _CountingMockTransport(httpx.MockTransport):
+    """Count every HTTP request a scripted transport serves, batch or single."""
+
+    def __init__(self, inner: httpx.MockTransport) -> None:
+        self._inner = inner
+        self.count = 0
+        super().__init__(self._handle)
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        self.count += 1
+        return cast("httpx.Response", self._inner.handler(request))
+
+
+def _pacing_counting_executor(
+    script: LpRpcScript, progress: Callable[[str], None] | None = None
+) -> tuple[LpLifecycleExecutor, _CountingMockTransport]:
+    """Build the real lifecycle executor over a counting transport."""
+    counting = _CountingMockTransport(script.transport())
+    executor = LpLifecycleExecutor(
+        policy=LpSafeExecutionPolicy(),
+        plan_policy=LpExecutionPolicy(),
+        safe_address=SAFE_ADDRESS,
+        sources=FakeSources(),
+        rpc=ExecutorRpcBackend(
+            rpc_url="https://fixture.example",
+            transport=counting,
+            sleep=lambda _seconds: None,
+            timer=lambda: 0.0,
+        ),
+        safe_rpc=SafeTransactionRpcBackend(
+            rpc_url="https://fixture.example",
+            safe_address=SAFE_ADDRESS,
+            transport=SafeRpcScript(nonce_reads=[4], signature_verdicts=[True] * 5).transport(),
+        ),
+        progress=progress,
+    )
+    return executor, counting
+
+
+def test_held_inventory_batches_at_the_production_residual_shape() -> None:
+    """The 2026-10-06 timeout shape reads 43 requests, not 405.
+
+    The production journal's two 30-minute kills each re-enumerated the
+    Safe's 202 residual empty NFTs serially - 405 requests and an 80.8-second
+    pacing floor per pass at the 0.2-second politeness gap. The batched
+    enumeration reads the same authoritative views through 43 requests: one
+    balanceOf plus two ten-per-batch passes, collapsing pacing to 8.4 seconds.
+    """
+    script = LpRpcScript(
+        nfpm_held_positions=202,
+        held_token_ids=[7_000_000 + index for index in range(202)],
+        position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+    )
+    executor, counting = _pacing_counting_executor(script)
+    lines: list[str] = []
+    executor._progress = lines.append  # noqa: SLF001
+
+    held = executor._enumerate_held_positions(_fixture_observation())  # noqa: SLF001
+
+    assert len(held) == 202
+    assert all(not position.live for position in held)
+    # One balanceOf plus ceil(202/10) tokenOfOwnerByIndex batches and the
+    # same count of positions batches: 1 + 21 + 21.
+    assert counting.count == 43
+    assert len(script.batch_calls) == 42
+    # The tokenOfOwnerByIndex pass and the positions pass each run twenty
+    # ten-entry batches and one two-entry tail.
+    token_pass = script.batch_calls[:21]
+    positions_pass = script.batch_calls[21:]
+    assert all(len(batch) == 10 for batch in token_pass[:-1])
+    assert len(token_pass[-1]) == 2
+    assert all(len(batch) == 10 for batch in positions_pass[:-1])
+    assert len(positions_pass[-1]) == 2
+    assert lines[-1].endswith("through 43 request(s)")
+
+
+def test_held_inventory_batched_and_sequential_reads_agree() -> None:
+    """Batched enumeration returns exactly the sequential wire shape's truth.
+
+    Drives the same fixture twice: once through the batched path and once
+    after a forced downgrade (batch size one), asserting identical held
+    tuples - the custody semantics change only the wire shape.
+    """
+    script = LpRpcScript(
+        nfpm_held_positions=12,
+        held_token_ids=list(range(500, 512)),
+        position_words=make_position_words(liquidity=RECENTER_LIQUIDITY),
+    )
+    executor, _ = _pacing_counting_executor(script)
+    observation = _fixture_observation()
+    batched = executor._enumerate_held_positions(observation)  # noqa: SLF001
+
+    executor._rpc._call_batch_size = 1  # noqa: SLF001 - force the sequential shape
+    sequential = executor._enumerate_held_positions(observation)  # noqa: SLF001
+
+    assert batched == sequential
+    assert [position.token_id for position in batched] == list(range(500, 512))
+    assert all(position.live for position in batched)
+
+
+def test_held_inventory_reads_replaced_ids_and_new_liveness_every_pass() -> None:
+    """No custody assumption rides the batching: every pass re-reads the truth.
+
+    Two out-of-band shapes from the custody investigation's warnings: a
+    same-count replacement (an NFT burned and another minted between passes)
+    and an empty residual gaining live liquidity externally. Both surface in
+    the next enumeration because nothing about the count or prior pass is
+    trusted - each pass reads tokenOfOwnerByIndex and positions afresh.
+    """
+    script = LpRpcScript(
+        nfpm_held_positions=2,
+        held_token_ids=[11, 12],
+        position_words=make_position_words(liquidity=0, fees_owed0=0, fees_owed1=0),
+    )
+    executor, _ = _pacing_counting_executor(script)
+    observation = _fixture_observation()
+    first = executor._enumerate_held_positions(observation)  # noqa: SLF001
+    assert [position.token_id for position in first] == [11, 12]
+    assert all(not position.live for position in first)
+
+    # Same balanceOf count, different ids (out-of-band burn plus mint), and
+    # the second id now carries live liquidity (an external increase).
+    script.held_token_ids = [11, 99]
+    script.position_words = make_position_words(liquidity=RECENTER_LIQUIDITY)
+    second = executor._enumerate_held_positions(observation)  # noqa: SLF001
+    assert [position.token_id for position in second] == [11, 99]
+    assert all(position.live for position in second)
+
+
+def _fixture_observation() -> LpPoolObservation:
+    """Build one pool observation pinning the fixture NFPM address."""
+    return LpPoolObservation(
+        symbol="FIXc",
+        pool_address=POOL_ADDRESS,
+        factory_address=GAUGE_FACTORY_ADDRESS,
+        nfpm_address=NFPM_ADDRESS,
+        gauge_address=GAUGE_ADDRESS,
+        token0_address=BASE_USDC_ADDRESS,
+        token1_address=B20_ADDRESS,
+        stock_is_token0=False,
+        stock_decimals=6,
+        quote_decimals=6,
+        tick_spacing=10,
+        current_tick=-60,
+        sqrt_ratio=1 << 96,
+        pool_active_liquidity=1,
+        usdc_reserve_units=1,
+        snapshot_block=51_000_000,
+        observed_at=BASE_NOW,
+    )
 
 
 def fixture_expected_exit_out_units(stock_whole: Decimal) -> int:

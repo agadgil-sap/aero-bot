@@ -157,6 +157,11 @@ BASE_BACKOFF_SECONDS = 0.5
 # pacing the Sugar enumeration's own page delay provides; twenty reads cost
 # at most four seconds while a tripped limiter costs eight per request.
 REQUEST_PACING_SECONDS = 0.2
+# Read-only eth_calls grouped into one JSON-RPC batch request. Ten is the
+# batch bound the sealed production endpoint has already been observed to
+# accept live for block-header batches (the PR45 verification), and batched
+# reads pay one politeness gap per batch instead of one per call.
+MAX_CALL_BATCH_SIZE = 10
 # One MiB bounds every response far above the fixed-word calls made here.
 MAX_RESPONSE_BYTES = 1024 * 1024
 # Base's public endpoint reports rate limiting with this JSON-RPC error code.
@@ -1038,6 +1043,9 @@ class ExecutorRpcBackend:
         self._client: httpx.Client | None = None
         # The instant the next request may fire under the politeness pacing.
         self._next_request_at: float | None = None
+        # The live batch size for read-only eth_calls: MAX_CALL_BATCH_SIZE
+        # until the endpoint itself rejects a batch, then one (sequential).
+        self._call_batch_size = MAX_CALL_BATCH_SIZE
 
     def _http_client(self) -> httpx.Client:
         """Return the backend's lazily created shared HTTP client.
@@ -1100,6 +1108,170 @@ class ExecutorRpcBackend:
                 "eth_call",
                 [{"to": normalize_evm_address(to_address), "data": calldata}, block_tag],
             ),
+        )
+
+    @property
+    def call_batch_size(self) -> int:
+        """Return the live read-only call batch size (one after a rejection)."""
+        return self._call_batch_size
+
+    def eth_call_batch_at(self, calls: Sequence[tuple[str, str]], block_tag: str) -> list[str]:
+        """Perform one JSON-RPC batch of read-only eth_calls at a pinned block.
+
+        Every call pays one shared politeness gap per batch instead of one
+        per call, which is what keeps the Safe's residual-NFT enumeration and
+        the known-pool fast path inside the cycle's wall budget when the
+        endpoint's latency regime degrades. An endpoint that rejects the
+        batch itself (a non-list body, like the documented
+        maximum-calls-per-batch error) permanently downgrades this backend to
+        the unbatched wire shape and re-reads the whole group sequentially,
+        so at most one batch request is ever wasted on a rejection.
+
+        Args:
+            calls: (contract address, calldata) pairs, never empty and never
+                more than MAX_CALL_BATCH_SIZE entries.
+            block_tag: The block tag every call in the batch evaluates
+                against, a hex quantity like ``0x30a9973`` or ``latest``.
+
+        Returns:
+            The 0x-prefixed return bytes aligned with the request order.
+
+        Raises:
+            ValueError: If the call list is empty or above the batch bound.
+            ExecutionUnavailableError: If retries are exhausted or the
+                response is unusable.
+            ExecutorRpcRevertError: If any batched call reverted inside its
+                contract, exactly like the single-call path.
+        """
+        if not calls:
+            raise ValueError("calls must not be empty")
+        if len(calls) > MAX_CALL_BATCH_SIZE:
+            raise ValueError(f"calls must not exceed {MAX_CALL_BATCH_SIZE} entries")
+        if self._call_batch_size == 1:
+            return [
+                self.eth_call_at(contract_address, calldata, block_tag)
+                for contract_address, calldata in calls
+            ]
+        payload = [
+            {
+                "jsonrpc": "2.0",
+                "id": index + 1,
+                "method": "eth_call",
+                "params": [
+                    {
+                        "to": normalize_evm_address(contract_address),
+                        "data": calldata,
+                    },
+                    block_tag,
+                ],
+            }
+            for index, (contract_address, calldata) in enumerate(calls)
+        ]
+        failure = "no attempt was made"
+        client = self._http_client()
+        for attempt in range(self._max_attempts):
+            if attempt > 0:
+                backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                if self._progress is not None:
+                    self._progress(
+                        f"rpc eth_call batch attempt {attempt + 1} of "
+                        f"{self._max_attempts} failed ({failure}); backing off "
+                        f"{backoff:.1f}s"
+                    )
+                self._sleep(backoff)
+            elif self._next_request_at is not None:
+                wait = self._next_request_at - self._timer()
+                if wait > 0:
+                    self._sleep(wait)
+            try:
+                endpoint = self._rpc_urls[attempt % len(self._rpc_urls)]
+                response = client.post(endpoint, json=payload)
+            except httpx.TransportError as error:
+                failure = f"transport error: {error}"
+                continue
+            finally:
+                self._next_request_at = self._timer() + REQUEST_PACING_SECONDS
+            if response.status_code in {403, 408, 425, 429} or response.status_code >= 500:
+                failure = f"HTTP status {response.status_code}"
+                continue
+            response_size = len(response.content)
+            if response_size > self._max_response_bytes:
+                raise ExecutionUnavailableError(
+                    f"RPC batch response contained {response_size} bytes, above the limit"
+                )
+            if response.status_code != 200:
+                raise ExecutionUnavailableError(
+                    f"RPC batch request failed with unexpected HTTP status {response.status_code}"
+                )
+            try:
+                body = cast(object, response.json())
+            except ValueError as error:
+                raise ExecutionUnavailableError("RPC batch response was not valid JSON") from error
+            if not isinstance(body, list):
+                # A non-list body is the endpoint's own rejection of the
+                # batch request itself; downgrade once, permanently, and
+                # re-read the whole group through the sequential path.
+                self._call_batch_size = 1
+                if self._progress is not None:
+                    self._progress(
+                        "RPC endpoint rejected a batched eth_call request; "
+                        "permanently downgrading this backend to single calls"
+                    )
+                return [
+                    self.eth_call_at(contract_address, calldata, block_tag)
+                    for contract_address, calldata in calls
+                ]
+            if len(body) != len(calls):
+                raise ExecutionUnavailableError(
+                    f"RPC batch response held {len(body)} entries for {len(calls)} requests"
+                )
+            entries_by_id: dict[int, dict[str, object]] = {}
+            for entry in body:
+                entry_id = entry.get("id") if isinstance(entry, dict) else None
+                if not isinstance(entry, dict) or not isinstance(entry_id, int):
+                    raise ExecutionUnavailableError(
+                        "RPC batch response held an entry without an integer id"
+                    )
+                entries_by_id[entry_id] = entry
+            if set(entries_by_id) != set(range(1, len(calls) + 1)):
+                raise ExecutionUnavailableError(
+                    "RPC batch response ids did not cover every request exactly once"
+                )
+            results: list[str] = []
+            retriable: str | None = None
+            for index in range(len(calls)):
+                entry = entries_by_id[index + 1]
+                if "result" in entry:
+                    result_value = entry["result"]
+                    if not isinstance(result_value, str):
+                        raise ExecutionUnavailableError(
+                            "RPC batch entry result was not a hex string"
+                        )
+                    results.append(result_value)
+                    continue
+                error_body = entry.get("error")
+                if not isinstance(error_body, dict):
+                    raise ExecutionUnavailableError("RPC batch entry had neither result nor error")
+                error_code = error_body.get("code")
+                error_message = str(error_body.get("message", ""))
+                if error_code == EXECUTION_REVERT_ERROR_CODE or "revert" in error_message.lower():
+                    revert_data = self._extract_revert_data(error_body.get("data"))
+                    raise ExecutorRpcRevertError(
+                        f"RPC call reverted: {error_message}",
+                        revert_data=revert_data,
+                    )
+                if error_code == RATE_LIMIT_ERROR_CODE or "rate limit" in error_message.lower():
+                    retriable = f"rate-limited eth_call entry: {error_message}"
+                    break
+                raise ExecutionUnavailableError(
+                    f"RPC error {error_code} on batched eth_call: {error_message}"
+                )
+            if retriable is not None:
+                failure = retriable
+                continue
+            return results
+        raise ExecutionUnavailableError(
+            f"RPC eth_call batch failed after {self._max_attempts} attempts: {failure}"
         )
 
     def eth_call_from_at(

@@ -207,6 +207,17 @@ JSON-RPC batch support was verified against the PUBLIC endpoint only; production
 Steady-state pinned cycles complete in tens of seconds end to end (22 s measured live over a healthy public endpoint on 2026-09-09, versus the multi-minute sweep every run before the fast path).
 See [the LP execution fast-path section](docs/lp_execution.md) for the verified read set and the safety invariant.
 
+### Batched read-only calls (the 2026-10-06 cycle-timeout repair)
+
+The 2026-10-06 journal showed two consecutive funded cycles killed at exactly the thirty-minute systemd budget under a degraded free-endpoint latency regime: the same cycle re-enumerated the Safe's growing residual-NFT inventory (202 and rising, one more per mint/exit cycle) five times serially - 405 requests and an 80.8-second politeness-pacing floor per pass - beside the known-board fast path's 180 sequential per-pool reads, which the degraded regime stretched to four-to-six minutes.
+Read-only `eth_call`s therefore travel in JSON-RPC batches of at most ten on the executor backend (`ExecutorRpcBackend.eth_call_batch_at`), the same wire shape and the same ten-entry bound the header batching already proved live against the sealed endpoint:
+
+- The held-NFT enumeration batches both passes - `tokenOfOwnerByIndex` for every index, then `positions()` for every id - reading the production 202-residual shape through 43 requests instead of 405 (pacing floor 8.4 s instead of 80.8 s), pinned as the deterministic offline regression in `tests/test_lp_executor.py`.
+- The known-pool fast path (both the board selector's `resolve_known_pool_candidate` and the executor's own `_known_pool_observation`) batches its independent identity, state, factory, gauge, and reserve views at the shared snapshot block, reading a pool through 6 requests instead of 18-19; only the dependent NFPM and liveness reads follow as singles.
+- Batching changes the wire shape only: every entry is the same authoritative live view the sequential path read, a reverting entry refuses exactly like the sequential call (`ENUMERATION_UNREADABLE` for the enumeration, the typed revert for the fast path), and nothing about a prior pass, a balanceOf count, or the residual set is ever trusted across reads - no out-of-band actor (a second Safe owner, standing approvals) can change what a pass reports, because every pass re-reads the truth (`tests/test_lp_executor.py`'s replaced-id and gained-liquidity regressions pin exactly those shapes).
+- An endpoint that rejects a batch itself - a non-list body - downgrades that backend once and permanently to single calls, re-reads the group through the sequential path, and journals one downgrade line; the whole wasted-request cost of a rejection is one request, and every malformed batch shape (wrong entry count, mismatched ids, non-hex results, missing result and error) fails closed with no fallback.
+- The completion line names the request count beside the elapsed time ("through 43 request(s)"), so the next sanctioned dry run proves the batched wire shape live end to end.
+
 ## systemd wiring
 
 `deploy/systemd/aero-bot-cycle@.service` and `aero-bot-cycle@.timer` carry the deployment contract, pinned by tests:

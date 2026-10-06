@@ -810,6 +810,196 @@ def test_rpc_backend_raises_revert_errors_immediately() -> None:
         backend.estimate_gas(SAFE_ADDRESS, "0x00")
 
 
+def _word(value: int) -> str:
+    """Encode one 32-byte ABI word result."""
+    return "0x" + format(value, "064x")
+
+
+class BatchedCallTransport(httpx.MockTransport):
+    """Serve batched eth_calls from per-index word results, counting requests."""
+
+    def __init__(
+        self,
+        results: list[str],
+        *,
+        reject_first_batch: bool = False,
+        revert_entry: int | None = None,
+    ) -> None:
+        """Configure per-index word results and optional batch fault modes."""
+        self.results = results
+        self.reject_first_batch = reject_first_batch
+        self.revert_entry = revert_entry
+        self.batch_requests = 0
+        self.single_requests = 0
+        self.served_batches: list[int] = []
+        self._single_cursor = 0
+        super().__init__(self._handle)
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if isinstance(payload, list):
+            self.batch_requests += 1
+            if self.reject_first_batch and self.batch_requests == 1:
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "error": {"code": -32014, "message": "too many"},
+                    },
+                )
+            self.served_batches.append(len(payload))
+            entries: list[dict[str, object]] = []
+            for call in payload:
+                index = int(str(call["id"])) - 1
+                if self.revert_entry is not None and index == self.revert_entry:
+                    entries.append(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": call["id"],
+                            "error": {"code": 3, "message": "execution reverted: ID"},
+                        }
+                    )
+                else:
+                    entries.append(
+                        {"jsonrpc": "2.0", "id": call["id"], "result": self.results[index]}
+                    )
+            return httpx.Response(200, json=entries)
+        # Sequential eth_calls all carry the fixed single-request identifier,
+        # so they serve from an ordered cycling cursor mirroring read order.
+        self.single_requests += 1
+        index = self._single_cursor % len(self.results)
+        self._single_cursor += 1
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": self.results[index]})
+
+
+def test_rpc_backend_batches_read_only_calls_in_order() -> None:
+    """One batch request returns every entry's result aligned with the order."""
+    transport = BatchedCallTransport([_word(index) for index in range(3)])
+    backend = ExecutorRpcBackend(
+        rpc_url="https://fixture.example", transport=transport, sleep=lambda _: None
+    )
+    assert backend.call_batch_size == 10
+    results = backend.eth_call_batch_at(
+        [
+            ("0x" + "aa" * 20, "0x11111111"),
+            ("0x" + "bb" * 20, "0x22222222"),
+            ("0x" + "cc" * 20, "0x33333333"),
+        ],
+        "latest",
+    )
+    assert results == [_word(0), _word(1), _word(2)]
+    assert transport.batch_requests == 1
+    assert transport.served_batches == [3]
+
+
+def test_rpc_batch_rejects_empty_and_oversized_groups() -> None:
+    """The batch bound mirrors the live-verified size and refuses bad shapes."""
+    backend = ExecutorRpcBackend(
+        rpc_url="https://fixture.example",
+        transport=BatchedCallTransport([]),
+        sleep=lambda _: None,
+    )
+    with pytest.raises(ValueError, match="must not be empty"):
+        backend.eth_call_batch_at([], "latest")
+    with pytest.raises(ValueError, match="must not exceed 10 entries"):
+        backend.eth_call_batch_at([("0x" + "aa" * 20, "0x11111111")] * 11, "latest")
+
+
+def test_rpc_batch_entry_revert_fails_closed_immediately() -> None:
+    """One reverting entry surfaces as the typed revert error, exactly like a single call."""
+    transport = BatchedCallTransport([_word(0), _word(1)], revert_entry=1)
+    backend = ExecutorRpcBackend(
+        rpc_url="https://fixture.example", transport=transport, sleep=lambda _: None
+    )
+    with pytest.raises(ExecutorRpcRevertError, match="execution reverted: ID"):
+        backend.eth_call_batch_at(
+            [("0x" + "aa" * 20, "0x11111111"), ("0x" + "bb" * 20, "0x22222222")], "latest"
+        )
+
+
+def test_rpc_batch_rejection_downgrades_once_and_rereads_sequentially() -> None:
+    """An endpoint batch rejection wastes one request, then degrades to singles."""
+    transport = BatchedCallTransport([_word(0), _word(1)], reject_first_batch=True)
+    progress: list[str] = []
+    backend = ExecutorRpcBackend(
+        rpc_url="https://fixture.example",
+        transport=transport,
+        sleep=lambda _: None,
+        progress=progress.append,
+    )
+    results = backend.eth_call_batch_at(
+        [("0x" + "aa" * 20, "0x11111111"), ("0x" + "bb" * 20, "0x22222222")], "latest"
+    )
+    assert results == [_word(0), _word(1)]
+    assert transport.batch_requests == 1
+    assert transport.single_requests == 2
+    assert backend.call_batch_size == 1
+    assert any("downgrading this backend to single calls" in line for line in progress)
+    # The downgrade is permanent for this backend: a later group rides singles.
+    later = backend.eth_call_batch_at(
+        [("0x" + "aa" * 20, "0x11111111"), ("0x" + "bb" * 20, "0x22222222")], "latest"
+    )
+    assert later == [_word(0), _word(1)]
+    assert transport.batch_requests == 1
+    assert transport.single_requests == 4
+
+
+def test_rpc_batch_garbage_shapes_fail_closed() -> None:
+    """Wrong entry counts, missing ids, and non-hex results refuse, never guess."""
+
+    def wrong_count(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"jsonrpc": "2.0", "id": 1, "result": _word(0)}])
+
+    backend = ExecutorRpcBackend(
+        rpc_url="https://fixture.example",
+        transport=httpx.MockTransport(wrong_count),
+        sleep=lambda _: None,
+    )
+    with pytest.raises(ExecutionUnavailableError, match="held 1 entries for 2 requests"):
+        backend.eth_call_batch_at(
+            [("0x" + "aa" * 20, "0x11111111"), ("0x" + "bb" * 20, "0x22222222")], "latest"
+        )
+
+    def wrong_ids(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {"jsonrpc": "2.0", "id": 1, "result": _word(0)},
+                {"jsonrpc": "2.0", "id": 1, "result": _word(1)},
+            ],
+        )
+
+    backend = ExecutorRpcBackend(
+        rpc_url="https://fixture.example",
+        transport=httpx.MockTransport(wrong_ids),
+        sleep=lambda _: None,
+    )
+    with pytest.raises(ExecutionUnavailableError, match="did not cover every request"):
+        backend.eth_call_batch_at(
+            [("0x" + "aa" * 20, "0x11111111"), ("0x" + "bb" * 20, "0x22222222")], "latest"
+        )
+
+    def non_hex_results(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {"jsonrpc": "2.0", "id": 1, "result": 5},
+                {"jsonrpc": "2.0", "id": 2, "result": _word(1)},
+            ],
+        )
+
+    backend = ExecutorRpcBackend(
+        rpc_url="https://fixture.example",
+        transport=httpx.MockTransport(non_hex_results),
+        sleep=lambda _: None,
+    )
+    with pytest.raises(ExecutionUnavailableError, match="was not a hex string"):
+        backend.eth_call_batch_at(
+            [("0x" + "aa" * 20, "0x11111111"), ("0x" + "bb" * 20, "0x22222222")], "latest"
+        )
+
+
 def test_rpc_backend_fails_closed_on_garbage_responses() -> None:
     """Malformed quantities, short words, and unknown errors fail closed."""
 
