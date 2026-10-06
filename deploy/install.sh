@@ -366,6 +366,14 @@ if [[ -f "${CONFIG_DIR}/cycle.env" ]]; then
         SEAL_DRIFT=1
         log "WARNING: cycle.env seals AERO_BOT_ALERT_PROVIDER='${SEALED_PROVIDER:-none}' while a Resend key is sealed; alerts compute and never email"
     fi
+    # The captain's 2026-10-05 ruling (docs/alerts.md, "The daily digest"):
+    # one email per rolling 24 hours. A per_cycle or unset mode floods -
+    # every completed cycle and every watchtower trip emails immediately.
+    SEALED_MODE="$(seal_effective_value "${CONFIG_DIR}/cycle.env" AERO_BOT_ALERT_MODE)"
+    if [[ -z "$SEALED_MODE" || "$SEALED_MODE" == "per_cycle" ]]; then
+        SEAL_DRIFT=1
+        log "WARNING: cycle.env seals AERO_BOT_ALERT_MODE='${SEALED_MODE:-<unset>}' while the captain's 2026-10-05 ruling wants digest; every completed cycle and watchtower trip emails immediately"
+    fi
 fi
 if [[ $SEAL_DRIFT -eq 0 ]]; then
     log "no seal drift detected"

@@ -1,5 +1,6 @@
 """Pin the Ubuntu deployment kit's install contract and unit files."""
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -692,6 +693,7 @@ class TestSealRepairScript:
         fallback_url: str | None,
         provider: str | None,
         resend_key: str | None = "re_sealed_key",
+        alert_mode: str | None = "digest",
     ) -> Path:
         """Build one drifted seal pair matching the 2026-09-28 defect."""
         config_dir = tmp_path / "aero-bot"
@@ -705,6 +707,8 @@ class TestSealRepairScript:
         cycle_lines = ["# cycle seal", "AERO_BOT_SAFE_ADDRESS=0x0"]
         if provider:
             cycle_lines.append(f"AERO_BOT_ALERT_PROVIDER={provider}")
+        if alert_mode is not None:
+            cycle_lines.append(f"AERO_BOT_ALERT_MODE={alert_mode}")
         if resend_key:
             cycle_lines.append(f"AERO_BOT_ALERT_RESEND_API_KEY={resend_key}")
             cycle_lines.append("AERO_BOT_ALERT_FROM=on@resend.dev")
@@ -839,6 +843,88 @@ class TestSealRepairScript:
         assert "AERO_BOT_ALERT_PROVIDER=smtp" in (config_dir / "cycle.env").read_text(
             encoding="utf-8"
         )
+
+    def test_check_reports_alert_mode_drift_when_unset_or_per_cycle(self, tmp_path: Path) -> None:
+        """The 2026-10-05 ruling makes every non-digest seal drift."""
+        for drifted in (None, "per_cycle"):
+            config_dir = self._fixture_config(
+                tmp_path,
+                advisor_url="http://100.106.111.37:11435",
+                fallback_url="http://100.106.111.37:11434",
+                provider="resend",
+                alert_mode=drifted,
+            )
+            before = (config_dir / "cycle.env").read_text(encoding="utf-8")
+            completed = self._run("--check", config_dir, self._recording_systemctl(tmp_path))
+            assert completed.returncode == 3
+            assert "alert mode: DRIFT" in completed.stdout
+            assert (config_dir / "cycle.env").read_text(encoding="utf-8") == before
+            shutil.rmtree(config_dir)
+
+    def test_apply_enables_digest_mode_and_restarts_the_watchtower(self, tmp_path: Path) -> None:
+        """Mode repair alone lands one line, one backup, one watchtower restart."""
+        config_dir = self._fixture_config(
+            tmp_path,
+            advisor_url="http://100.106.111.37:11435",
+            fallback_url="http://100.106.111.37:11434",
+            provider="resend",
+            alert_mode="per_cycle",
+        )
+        system_ctl = self._recording_systemctl(tmp_path)
+        completed = self._run("--apply", config_dir, system_ctl)
+        assert completed.returncode == 0
+        cycle = (config_dir / "cycle.env").read_text(encoding="utf-8")
+        assert cycle.count("AERO_BOT_ALERT_MODE=") == 1
+        assert "AERO_BOT_ALERT_MODE=digest" in cycle
+        # The per_cycle line the template shipped is replaced, not duplicated.
+        assert "AERO_BOT_ALERT_MODE=per_cycle" not in cycle
+        restarts = (tmp_path / "systemctl.log").read_text(encoding="utf-8").splitlines()
+        assert restarts == ["try-restart", "aero-bot-watchtower@auto.service"]
+        assert len(list(config_dir.glob("*.bak-*"))) == 1
+        # The second apply converges: no further backup, no further restart.
+        again = self._run("--apply", config_dir, system_ctl)
+        assert again.returncode == 0
+        assert "alert mode already digest" in again.stdout
+        assert len(list(config_dir.glob("*.bak-*"))) == 1
+
+    def test_apply_repairs_provider_and_mode_with_one_cycle_backup(self, tmp_path: Path) -> None:
+        """Two cycle-seal repairs share one backup beside the file."""
+        config_dir = self._fixture_config(
+            tmp_path,
+            advisor_url="http://100.106.111.37:11435",
+            fallback_url="http://100.106.111.37:11434",
+            provider="none",
+            alert_mode=None,
+        )
+        system_ctl = self._recording_systemctl(tmp_path)
+        completed = self._run("--apply", config_dir, system_ctl)
+        assert completed.returncode == 0
+        cycle = (config_dir / "cycle.env").read_text(encoding="utf-8")
+        assert "AERO_BOT_ALERT_PROVIDER=resend" in cycle
+        assert "AERO_BOT_ALERT_MODE=digest" in cycle
+        assert len(list(config_dir.glob("*.bak-*"))) == 1
+        restarts = (tmp_path / "systemctl.log").read_text(encoding="utf-8").splitlines()
+        assert restarts == ["try-restart", "aero-bot-watchtower@auto.service"]
+
+    def test_a_foreign_alert_mode_is_a_manual_decision_never_a_rewrite(
+        self, tmp_path: Path
+    ) -> None:
+        """An unknown mode value is reported, never stomped."""
+        config_dir = self._fixture_config(
+            tmp_path,
+            advisor_url="http://100.106.111.37:11435",
+            fallback_url="http://100.106.111.37:11434",
+            provider="resend",
+            alert_mode="weekly",
+        )
+        system_ctl = self._recording_systemctl(tmp_path)
+        completed = self._run("--apply", config_dir, system_ctl)
+        assert completed.returncode == 4
+        assert "REFUSED" in completed.stdout
+        assert "AERO_BOT_ALERT_MODE=weekly" in (config_dir / "cycle.env").read_text(
+            encoding="utf-8"
+        )
+        assert not (tmp_path / "systemctl.log").exists()
 
     def test_the_root_guard_protects_the_real_seal_directory(self) -> None:
         """Without root, the real /etc/aero-bot is refused even in check mode."""
