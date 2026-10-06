@@ -99,18 +99,19 @@ Alerts showed the same shape one level down: `AERO_BOT_ALERT_PROVIDER=none` seal
 Every deploy now checks the seals it refuses to fix and says so loudly:
 
 - a sealed advisor primary that is not the documented dedicated plane (`http://100.106.111.37:11435`), or a missing fallback line;
-- an alert provider sealed `none` while a Resend key is sealed in the same file.
+- an alert provider sealed `none` while a Resend key is sealed in the same file;
+- an alert mode sealed `per_cycle` or unset while the captain's 2026-10-05 ruling wants `digest` (every completed cycle and every watchtower trip would email immediately).
 
 The repair itself stays the operator's explicit act, through the guarded idempotent kit shipped in the deploy tree:
 
 ```
 sudo bash deploy/seal-repair.sh --check   # report drift, change nothing (exit 3 on drift)
-sudo bash deploy/seal-repair.sh --apply   # repair, back up, and try-restart the advisor
+sudo bash deploy/seal-repair.sh --apply   # repair, back up, and try-restart
 ```
 
-`--apply` repoints `advisor.env` to the dedicated plane with the shared plane sealed as fallback and enables `AERO_BOT_ALERT_PROVIDER=resend` in `cycle.env` - but only when the Resend key, FROM, and TO are already sealed there; incomplete credentials are a refusal (exit 4), never a guess, and an existing non-none provider (for example `smtp`) is reported as a manual decision rather than stomped.
-Every modified file is backed up beside itself (`.bak-<timestamp>`) with ownership and mode preserved, and a converged seal is a no-op: the repair is idempotent like the installer.
-The one mutating step beyond the seals is `systemctl try-restart aero-bot-advisor.service`, which restarts only an already-active unit; every timer-driven pass reads the repaired seal at its next start regardless.
+`--apply` repoints `advisor.env` to the dedicated plane with the shared plane sealed as fallback, enables `AERO_BOT_ALERT_PROVIDER=resend` in `cycle.env` - but only when the Resend key, FROM, and TO are already sealed there - and enables `AERO_BOT_ALERT_MODE=digest` (the captain's 2026-10-05 ruling; an unset or `per_cycle` seal is repaired, any other value is a manual decision). Incomplete credentials are a refusal (exit 4), never a guess, and an existing non-none provider (for example `smtp`) is reported as a manual decision rather than stomped.
+Every modified file is backed up beside itself (`.bak-<timestamp>`) with ownership and mode preserved - one backup per file per run however many variables inside it need repair - and a converged seal is a no-op: the repair is idempotent like the installer.
+The mutating steps beyond the seals are `systemctl try-restart` on `aero-bot-advisor.service` (when the advisor seal changed) and on the armed watchtower (`aero-bot-watchtower@auto.service`, when the alert mode changed - the long-running monitor re-reads its sealed mode only through a restart); both restart only already-active units, and every timer-driven pass reads the repaired seal at its next start regardless.
 
 ## The Mac-side teacher kit
 

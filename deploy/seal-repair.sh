@@ -18,6 +18,13 @@
 #      ONLY when the Resend key, FROM, and TO are already sealed -
 #      nothing is provisioned and a missing credential is a refusal,
 #      never a guess.
+#   3. /etc/aero-bot/cycle.env: AERO_BOT_ALERT_MODE=digest enabled (the
+#      captain's 2026-10-05 ruling: one email per rolling 24 hours -
+#      every immediate path suppressed, the 09:00 Melbourne digest
+#      alone remains), then `systemctl try-restart` on the armed
+#      watchtower so its long-running process re-reads the seal; an
+#      unset or per_cycle seal is repaired, any other value is a manual
+#      decision, never a stomp.
 #
 # Every modified file is backed up beside itself (.bak-<timestamp>) with
 # its ownership and mode preserved.
@@ -35,6 +42,7 @@ SYSTEMCTL="${AERO_BOT_SYSTEMCTL:-systemctl}"
 ADVISOR_ENV="$CONFIG_DIR/advisor.env"
 CYCLE_ENV="$CONFIG_DIR/cycle.env"
 ADVISOR_UNIT="${AERO_BOT_ADVISOR_UNIT:-aero-bot-advisor.service}"
+WATCHTOWER_UNIT="${AERO_BOT_WATCHTOWER_UNIT:-aero-bot-watchtower@auto.service}"
 # The documented planes (docs/advisor.md, "The student plane"); the
 # installer template carries the same pair.
 DEDICATED_PLANE="${AERO_BOT_SEAL_DEDICATED_URL:-http://100.106.111.37:11435}"
@@ -83,6 +91,16 @@ rewrite_seal() {
     log "backed up ${file} to ${file}.bak-${stamp}"
 }
 
+# Rewrite a seal at most once per run however many variables inside it
+# need repair, so one apply leaves one backup beside each touched file.
+CYCLE_REWRITTEN=0
+ensure_cycle_rewrite() {
+    if [[ $CYCLE_REWRITTEN -eq 0 ]]; then
+        rewrite_seal "$CYCLE_ENV"
+        CYCLE_REWRITTEN=1
+    fi
+}
+
 MODE="${1:-}"
 [[ "$MODE" == "--check" || "$MODE" == "--apply" ]] \
     || die "usage: seal-repair.sh --check | --apply"
@@ -127,6 +145,20 @@ else
     fi
 fi
 
+# ------------------------------------------------------------- alert mode
+# The captain's 2026-10-05 ruling makes digest the standing desired seal:
+# every immediate email path suppressed, one 09:00 Melbourne digest per
+# rolling 24 hours (docs/alerts.md, "The daily digest").
+ALERT_MODE_NOW="$(effective_value "$CYCLE_ENV" AERO_BOT_ALERT_MODE)"
+if [[ "$ALERT_MODE_NOW" == "digest" ]]; then
+    log "alert mode: OK (digest - one daily email, every immediate path suppressed)"
+elif [[ -z "$ALERT_MODE_NOW" || "$ALERT_MODE_NOW" == "per_cycle" ]]; then
+    DRIFT=1
+    log "alert mode: DRIFT - sealed '${ALERT_MODE_NOW:-<unset>}' while the captain's 2026-10-05 ruling wants digest (one email per rolling 24 hours)"
+else
+    log "alert mode: MANUAL - '$ALERT_MODE_NOW' is neither per_cycle nor digest; left untouched"
+fi
+
 if [[ "$MODE" == "--check" ]]; then
     if [[ $DRIFT -eq 1 ]]; then
         log "CHECK: drift found; run with --apply to repair (see docs/deployment.md)"
@@ -157,9 +189,22 @@ elif [[ -z "$RESEND_KEY" || -z "$ALERT_FROM" || -z "$ALERT_TO" ]]; then
     REFUSED=1
     log "REFUSED: cannot enable resend - key, FROM, and TO must all be sealed in $CYCLE_ENV first"
 else
-    rewrite_seal "$CYCLE_ENV"
+    ensure_cycle_rewrite
     set_env_var "$CYCLE_ENV" AERO_BOT_ALERT_PROVIDER "resend"
     log "alert provider enabled: resend (credentials already sealed)"
+fi
+
+ALERT_MODE_CHANGED=0
+if [[ "$ALERT_MODE_NOW" == "digest" ]]; then
+    log "alert mode already digest; no change"
+elif [[ -n "$ALERT_MODE_NOW" && "$ALERT_MODE_NOW" != "per_cycle" ]]; then
+    REFUSED=1
+    log "REFUSED: alert mode '$ALERT_MODE_NOW' is neither per_cycle nor digest; a manual decision is required"
+else
+    ensure_cycle_rewrite
+    set_env_var "$CYCLE_ENV" AERO_BOT_ALERT_MODE "digest"
+    ALERT_MODE_CHANGED=1
+    log "alert mode enabled: digest (every immediate email suppressed; one 09:00 Melbourne digest per rolling 24 hours)"
 fi
 
 if [[ $ADVISOR_CHANGED -eq 1 ]]; then
@@ -167,6 +212,15 @@ if [[ $ADVISOR_CHANGED -eq 1 ]]; then
     # pass also reads the repaired seal at its next start regardless.
     "$SYSTEMCTL" try-restart "$ADVISOR_UNIT"
     log "restarted $ADVISOR_UNIT (only if it was active)"
+fi
+
+if [[ $ALERT_MODE_CHANGED -eq 1 ]]; then
+    # The armed watchtower is a long-running monitor: it re-reads the
+    # sealed mode only through a restart, and try-restart touches
+    # nothing that is not already active. Timer-driven units (the cycle
+    # and the daily report) read the repaired seal at their next start.
+    "$SYSTEMCTL" try-restart "$WATCHTOWER_UNIT"
+    log "restarted $WATCHTOWER_UNIT (only if it was active)"
 fi
 
 if [[ $REFUSED -eq 1 ]]; then
